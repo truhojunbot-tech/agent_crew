@@ -424,6 +424,113 @@ _WORKTREE_SYNC_DISABLED = os.getenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "").low
 )
 
 
+# #875: per-agent worktree slots. `{"claude": 2}` lets two claude tasks run at
+# once, each in its own checkout; unset (or invalid) is one slot per agent —
+# exactly the pre-#875 dispatcher.
+_AGENT_SLOTS_PARSED: dict[str, dict[str, int]] = {}
+
+
+def _agent_slot_counts() -> dict[str, int]:
+    """Parse AGENT_CREW_AGENT_SLOTS; invalid → {} (1 for every agent), logged once."""
+    raw = os.getenv("AGENT_CREW_AGENT_SLOTS", "").strip()
+    if not raw:
+        return {}
+    cached = _AGENT_SLOTS_PARSED.get(raw)
+    if cached is not None:
+        return cached
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict) and all(
+            isinstance(k, str) and k.strip() and type(v) is int and v >= 1
+            for k, v in parsed.items()):
+        counts = {k.strip().lower(): v for k, v in parsed.items()}
+    else:
+        logger.warning(
+            "AGENT_CREW_AGENT_SLOTS=%r is not a JSON object of agent -> int >= 1; "
+            "using 1 slot for every agent (#875)", raw)
+        counts = {}
+    _AGENT_SLOTS_PARSED[raw] = counts
+    return counts
+
+
+def _agent_slot_key(agent: str, slot: int) -> str:
+    """Execution-slot lease key. Slot 1 keeps the bare agent name."""
+    return agent if slot == 1 else f"{agent}-{slot}"
+
+
+def _agent_slot_worktree(base: str, slot: int) -> str:
+    """Slot 1 is the existing worktree; slot k>1 is `<base>-<k>` beside it."""
+    return base if slot == 1 else f"{base.rstrip(os.sep)}-{slot}"
+
+
+def _git_out(path: str, *args: str) -> Optional[str]:
+    try:
+        proc = subprocess.run(["git", "-C", path, *args],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _is_linked_worktree_of(base: str, path: str) -> bool:
+    """True only if `path` is a linked worktree registered in slot 1's repository.
+
+    `.git` existing proves nothing: a stale clone or an unrelated checkout can
+    sit at `<base>-<k>`, and dispatching there runs the task in the wrong tree
+    (review of PR #878). Same common git dir + listed by `git worktree list`
+    on the base is what makes a reused slot equivalent to a freshly added one.
+    """
+    real = os.path.realpath(path)
+    if real == os.path.realpath(base):
+        logger.error("dispatcher: slot path %s is the slot-1 worktree itself", path)
+        return False
+    common = [_git_out(p, "rev-parse", "--path-format=absolute", "--git-common-dir")
+              for p in (base, path)]
+    top = _git_out(path, "rev-parse", "--show-toplevel")
+    listed = _git_out(base, "worktree", "list", "--porcelain")
+    if None in common or top is None or listed is None:
+        logger.error("dispatcher: could not inspect existing slot path %s", path)
+        return False
+    registered = {os.path.realpath(line[len("worktree "):])
+                  for line in listed.splitlines() if line.startswith("worktree ")}
+    if (os.path.realpath(common[0].strip()) != os.path.realpath(common[1].strip())
+            or os.path.realpath(top.strip()) != real or real not in registered):
+        logger.error("dispatcher: slot path %s is not a worktree of %s's repository; "
+                     "refusing to dispatch there (#875)", path, base)
+        return False
+    return True
+
+
+def _ensure_slot_worktree(base: str, path: str) -> bool:
+    """Create a slot worktree from the slot-1 repository on first use (#875).
+
+    Detached on purpose: the per-task prepare step checks out the task's ref,
+    and a named branch here would be one more shared ref to collide on (#280).
+    Protocol files are left to `_ensure_role_protocol` at dispatch.
+    """
+    if os.path.exists(os.path.join(path, ".git")):
+        return _is_linked_worktree_of(base, path)
+    if os.path.exists(path):
+        logger.error("dispatcher: slot path %s exists but is not a git worktree", path)
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", base, "worktree", "add", "--detach", path],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.exception("dispatcher: could not create slot worktree %s from %s", path, base)
+        return False
+    if proc.returncode != 0:
+        logger.error("dispatcher: git worktree add %s failed: %s", path,
+                     (proc.stderr or proc.stdout or "").strip())
+        return False
+    logger.info("dispatcher: created slot worktree %s from %s (#875)", path, base)
+    return True
+
+
 def _ensure_role_protocol(
     role: str, worktree_path: str, project: str, port_file: str, *, agent: str, port: int = 0,
 ) -> bool:
@@ -5728,13 +5835,20 @@ def create_app(
                 _fail_if_active(task_id, "dispatch_exception")
 
     async def _dispatch_task(task: TaskRequest, role: str,
-                             dispatch_agent: Optional[str] = None) -> None:
-        """Spawn a headless agent subprocess for one task and await its exit."""
+                             dispatch_agent: Optional[str] = None,
+                             dispatch_worktree: Optional[str] = None) -> None:
+        """Spawn a headless agent subprocess for one task and await its exit.
+
+        ``dispatch_worktree`` is the #875 slot checkout the dispatcher leased
+        for this task; ``None`` means the agent's own (slot-1) worktree.
+        """
         _ctx = task.context if isinstance(task.context, dict) else {}
         _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
         agent, wt = _resolve_dispatch_target(task, role)
         if dispatch_agent is not None:
             agent = dispatch_agent
+        if dispatch_worktree:
+            wt = dispatch_worktree
         if _refuse_self_review(task, agent):
             return
         if task.task_type == "test" and agent == _script_tester.SCRIPT_TESTER:
@@ -7316,9 +7430,17 @@ def create_app(
                         if slot:
                             active_workers.discard(slot)
 
+                    _slot_counts = _agent_slot_counts()
                     for worker in _workers:
-                        if worker in active_workers:
+                        # #875: a worker is skipped only when every one of its
+                        # slots is held. Default (no env) is one slot: unchanged.
+                        _worker_slots = _slot_counts.get(worker, 1)
+                        if all(_agent_slot_key(worker, _k) in active_workers
+                               for _k in range(1, _worker_slots + 1)):
                             continue
+                        # Slot 1 busy ⇒ only implement/review/fix may take an
+                        # extra slot; do not claim a test task just to requeue it.
+                        _primary_busy = worker in active_workers
                         _worker_roles = _AGENT_TO_ROLES.get(worker, [])
                         _cloud_local_fallback = False
                         _cloud_capacity_skip = False
@@ -7362,6 +7484,8 @@ def create_app(
                         _default_role = _worker_roles[0] if _worker_roles else ""
                         task = None
                         for _candidate_role in _worker_roles:
+                            if _primary_busy and _candidate_role == "tester":
+                                continue
                             # Stage 1 checks overrides independent of task type;
                             # Stage 2 checks each role this worker owns.
                             _shadow_skip_ids = None
@@ -7386,6 +7510,23 @@ def create_app(
                                 _target_agent == _claude_cloud.CLOUD_PROVIDER_NAME):
                             _target_agent = _dispatch_agent = "claude"
                         _slot = _target_agent or worker
+                        _slot_wt: Optional[str] = None
+                        _base_wt = _target_wt
+                        if ((_slot in active_workers or
+                                (_target_wt and _target_wt in active_worktrees)) and
+                                _target_wt and _dispatch_agent is None and
+                                task.task_type in ("implement", "review", "fix") and
+                                _slot not in (_script_tester.SCRIPT_TESTER,
+                                              _claude_cloud.CLOUD_PROVIDER_NAME)):
+                            # #875: first free extra slot of this agent. Lease,
+                            # attribution, cleanup and the #272 lock all key on
+                            # the worktree path, so nothing else changes.
+                            for _k in range(2, _slot_counts.get(_slot, 1) + 1):
+                                _k_key = _agent_slot_key(_slot, _k)
+                                _k_wt = _agent_slot_worktree(_target_wt, _k)
+                                if _k_key not in active_workers and _k_wt not in active_worktrees:
+                                    _slot, _target_wt, _slot_wt = _k_key, _k_wt, _k_wt
+                                    break
                         if _slot in active_workers:
                             # override 가 이미 바쁜 worker 를 가리켰다.
                             logger.info(
@@ -7420,9 +7561,22 @@ def create_app(
                             t: TaskRequest = task, r: str = role, s: str = _slot,
                             w: Optional[str] = _target_wt,
                             a: Optional[str] = _dispatch_agent,
+                            sw: Optional[str] = _slot_wt,
+                            base: Optional[str] = _base_wt,
                         ) -> None:
                             try:
-                                await _dispatch_task(t, r, dispatch_agent=a)
+                                if sw and not await asyncio.to_thread(
+                                        _ensure_slot_worktree, base or "", sw):
+                                    # Not a task failure: leave it pending for a
+                                    # slot (or slot 1) that can actually take it.
+                                    await _recover_unspawned_dispatch(
+                                        t.task_id, "slot_worktree_unavailable")
+                                    return
+                                if sw:
+                                    await app.state.dispatch_task(
+                                        t, r, dispatch_agent=a, dispatch_worktree=sw)
+                                else:
+                                    await app.state.dispatch_task(t, r, dispatch_agent=a)
                             except Exception as exc:
                                 logger.exception("dispatcher: task %s raised", t.task_id)
                                 await _recover_dispatch_exception(t.task_id, exc)
@@ -7507,6 +7661,8 @@ def create_app(
     # Exposed for integration tests and operational introspection of the exact
     # provider/worktree decision the dispatcher will use.
     app.state.resolve_dispatch_target = _resolve_dispatch_target
+    # The dispatcher loop calls through this attribute, so a test can hold a
+    # dispatch open and observe slot/lease decisions (#875).
     app.state.dispatch_task = _dispatch_task
     app.state.review_implementer_agent = _review_implementer_agent
     app.state.refuse_self_review = _refuse_self_review
