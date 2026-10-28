@@ -10,7 +10,8 @@ from agent_crew import server
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.role_mapping import (
-    ROLE_PROVIDER_POLICY, provider_family, role_policy, role_policy_refusal,
+    ROLE_PROVIDER_POLICY, anonymous_pull_refusal, provider_family, role_policy,
+    role_policy_refusal,
 )
 
 ROLES = {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}
@@ -238,3 +239,39 @@ def test_mcp_pull_delivers_implement_to_codex(tmp_path):
     payload = _mcp_get_next(db, agent="codex", role="implementer")
     assert payload["task_id"] == "impl-pull-889"
     assert "dispatch_refused" not in payload
+
+
+@pytest.mark.parametrize("role", ["implementer", "tester", ""])
+def test_anonymous_pull_refusal_for_restricted_or_unscoped_roles(role):
+    assert anonymous_pull_refusal(role, "")
+    assert anonymous_pull_refusal(role, "  ")
+
+
+def test_anonymous_pull_allowed_for_unrestricted_role_and_named_agents():
+    assert anonymous_pull_refusal("reviewer", "") is None
+    assert anonymous_pull_refusal("implementer", "codex") is None
+
+
+@pytest.mark.parametrize("params", [{"role": "implementer"}, {}, {"role": "implementer", "agent": " "}])
+def test_http_pull_refuses_anonymous_implement_without_claiming(tmp_path, monkeypatch, params):
+    """#889: a blank agent has no provider family, so it may not pull restricted work."""
+    monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+    with TestClient(_app(tmp_path)) as client:
+        queue = _queued_implement(str(tmp_path / "tasks.db"))
+        resp = client.get("/tasks/next", params=params,
+                          headers={"X-Agent-Crew-Project": "demo"})
+    assert resp.status_code == 409, resp.text
+    assert "role_policy" in resp.text
+    assert "dispatch_nonce" not in resp.text
+    # Refused before the claim: the task stays pending for a named provider.
+    assert queue.get_task_status("impl-pull-889") == "pending"
+
+
+@pytest.mark.parametrize("kwargs", [{"role": "implementer"}, {}, {"agent": "", "role": "tester"}])
+def test_mcp_pull_refuses_anonymous_implement_without_claiming(tmp_path, kwargs):
+    db = str(tmp_path / "tasks.db")
+    queue = _queued_implement(db)
+    payload = _mcp_get_next(db, **kwargs)
+    assert "role_policy" in payload["dispatch_refused"]
+    assert "description" not in payload and "dispatch_nonce" not in payload
+    assert queue.get_task_status("impl-pull-889") == "pending"

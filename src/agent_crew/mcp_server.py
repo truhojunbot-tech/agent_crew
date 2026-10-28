@@ -53,7 +53,7 @@ from agent_crew.queue import (
     LateResultRejected, PausedError as _PausedError, TaskQueue,
 )
 from agent_crew.role_mapping import (
-    LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE, role_policy_refusal,
+    LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE, anonymous_pull_refusal, role_policy_refusal,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,6 +141,10 @@ def build_mcp_server(
         atomically.
         """
         resolved_role = role or _DEFAULT_ROLE_FOR_AGENT.get(agent, "")
+        # #889: refuse an unnamed restricted pull before it claims anything.
+        anonymous = anonymous_pull_refusal(resolved_role, agent)
+        if anonymous is not None:
+            return {"task_id": None, "dispatch_refused": anonymous}
         task = queue.dequeue(agent=agent, role=resolved_role, claimed_via="mcp")
         if task is None:
             return None

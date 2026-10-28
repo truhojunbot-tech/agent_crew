@@ -99,7 +99,8 @@ from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import (
     DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE,
-    effective_role_mapping, provider_family, role_policy, role_policy_refusal,
+    anonymous_pull_refusal, effective_role_mapping, provider_family, role_policy,
+    role_policy_refusal,
 )
 from agent_crew.risk_tier import risk_declaration as _risk_declaration
 from agent_crew.testing_policy import (
@@ -8897,6 +8898,12 @@ def create_app(
                     "Use the MCP get_next_task tool instead of curl-polling this endpoint."
                 ),
             )
+        # #889: an unnamed poller has no provider family to check, so it may
+        # not claim restricted work. Refuse before the claim so the task stays
+        # pending for a named provider.
+        anonymous = anonymous_pull_refusal(role, agent)
+        if anonymous is not None:
+            raise HTTPException(status_code=409, detail=anonymous)
         task = q().dequeue(agent=agent, role=role, claimed_via="http_poll")
         if task is None:
             return None
