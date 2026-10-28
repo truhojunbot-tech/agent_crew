@@ -800,10 +800,14 @@ def _detached_cloud_ref(checkout: str) -> str:
 
 def _publishable_ref(name: object) -> bool:
     """A branch name that can be pushed and passed to ``--ref`` unquoted."""
+    # Mirrors ``git check-ref-format --branch`` for this charset: no empty
+    # component, none starting with "." or ending with ".lock", no trailing "."
+    # (review of PR #913: "foo." and "foo/.bar" used to pass).
     return (isinstance(name, str)
             and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", name))
-            and ".." not in name and "//" not in name
-            and not name.endswith(("/", ".lock")))
+            and ".." not in name and not name.endswith(".")
+            and all(part and not part.startswith(".") and not part.endswith(".lock")
+                    for part in name.split("/")))
 
 
 def _origin_branch_ref(checkout: str, branch: str) -> str:
@@ -1281,10 +1285,13 @@ def dispatch_cloud_for_role(
     prompt = build_cloud_task_prompt(task, repo=effective_repo)
     launch_ref = _launch_ref(task, cwd, prior_pr_head)
     context = task.context if isinstance(task.context, dict) else {}
-    if (task.task_type == "implement" and not resume_session_id
-            and not launch_ref and not context.get("prev_task_id")
-            and "fix_round" not in context):
-        return _fail_closed_dispatch(queue, task, task_type, "cloud_base_branch_invalid")
+    if task.task_type == "implement" and not resume_session_id and not launch_ref:
+        # Without --ref the session starts from the shared checkout's HEAD,
+        # which belongs to whoever used it last (review of PR #913).
+        lineage = bool(context.get("prev_task_id")) or "fix_round" in context
+        return _fail_closed_dispatch(queue, task, task_type,
+                                     "cloud_origin_ref_unavailable" if lineage
+                                     else "cloud_base_branch_invalid")
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
             if resume_session_id else build_launch_argv(
                 prompt, cli_path=cli_path, base_ref=launch_ref))

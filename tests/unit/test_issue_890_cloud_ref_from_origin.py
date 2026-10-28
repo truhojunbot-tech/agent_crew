@@ -167,3 +167,55 @@ def test_explicit_unpublishable_ref_still_fails_closed(tmp_path, env, branch, co
     assert outcome.launch_error == "cloud_branch_unpublishable"
     assert queue.get_task("impl-890").status == "failed"
     assert launches == []
+
+
+def test_lineage_implement_without_origin_ref_refuses_launch(tmp_path, env, monkeypatch):
+    """Review of PR #913: with neither the task branch nor origin's default
+    resolvable, a lineage launch must not fall back to the shared checkout's
+    HEAD (no --ref)."""
+    checkout = _checkout(tmp_path)
+    _leave_on_unpublished_local_branch(checkout)
+    monkeypatch.setattr("agent_crew.worktree_default_branch.remote_default_branch",
+                        lambda checkout, deadline=None: "")
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue(queue, branch="fix/890-not-pushed",
+             context={"prev_task_id": "impl-prior", "fix_round": 0})
+    launches = []
+    outcome = cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                            state_path=_state(tmp_path, checkout),
+                                            run_fn=_run(launches))
+    assert not outcome.dispatched
+    assert outcome.launch_error == "cloud_origin_ref_unavailable"
+    assert queue.get_task("impl-890").status == "failed"
+    assert launches == []
+
+
+@pytest.mark.parametrize("name", [
+    "foo.", "foo/.bar", ".foo", "foo/bar.", "foo.lock", "foo/bar.lock/baz",
+    "bad..ref", "trailing/", "a//b", "has space", "-lead",
+])
+def test_publishable_ref_rejects_what_git_rejects(name):
+    assert subprocess.run(["git", "check-ref-format", "--branch", name],
+                          capture_output=True).returncode != 0
+    assert not cloud._publishable_ref(name)
+
+
+@pytest.mark.parametrize("name", [
+    "main", "fix/890-cloud-ref-from-origin", "agent/agent_crew/impl-890", "v1.2", "a.b/c_d",
+])
+def test_publishable_ref_accepts_valid_branches(name):
+    assert subprocess.run(["git", "check-ref-format", "--branch", name],
+                          capture_output=True).returncode == 0
+    assert cloud._publishable_ref(name)
+
+
+@pytest.mark.parametrize("branch", ["foo.", "foo/.bar"])
+def test_invalid_git_branch_fails_closed_before_launch(tmp_path, env, branch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue(queue, branch=branch)
+    launches = []
+    outcome = cloud.dispatch_cloud_for_role(queue, role="implementer",
+                                            task_type="implement", run_fn=_run(launches))
+    assert outcome.launch_error == "cloud_branch_unpublishable"
+    assert queue.get_task("impl-890").status == "failed"
+    assert launches == []
