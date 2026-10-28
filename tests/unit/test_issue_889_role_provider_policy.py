@@ -44,6 +44,9 @@ def test_policy_is_exposed_as_json():
 def _app(tmp_path, roles=ROLES, **kwargs):
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"project": "demo", "role_agents": roles}))
+    # project= pins the server identity; without it an inherited
+    # AGENT_CREW_PROJECT answers the "demo" posts with 409 (review of #906).
+    kwargs.setdefault("project", "demo")
     return server.create_app(db_path=str(tmp_path / "tasks.db"), state_path=str(state),
                              watchdog_disabled=True, anomaly_disabled=True, **kwargs)
 
@@ -175,3 +178,63 @@ def test_dispatch_refuses_explicit_dispatch_agent(tmp_path, monkeypatch):
                                             "implementer", dispatch_agent="gemini"))
         result = queue.get_result("retry-889")
     assert result is not None and result.status == "needs_human"
+
+
+def _queued_implement(db):
+    queue = TaskQueue(db)
+    queue.enqueue(TaskRequest(task_id="impl-pull-889", task_type="implement",
+                              description="impl", branch="agent/889", project="demo"))
+    return queue
+
+
+def test_http_pull_refuses_implement_for_gemini(tmp_path, monkeypatch):
+    """GET /tasks/next is a delivery route: gemini never receives implement work."""
+    monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        queue = _queued_implement(str(tmp_path / "tasks.db"))
+        resp = client.get("/tasks/next", params={"agent": "gemini", "role": "implementer"},
+                          headers={"X-Agent-Crew-Project": "demo"})
+    assert resp.status_code == 409, resp.text
+    assert "role_policy" in resp.text
+    result = queue.get_result("impl-pull-889")
+    assert result is not None and result.status == "needs_human"
+    assert "role_policy" in result.summary
+
+
+def test_http_pull_delivers_implement_to_codex(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+    with TestClient(_app(tmp_path)) as client:
+        _queued_implement(str(tmp_path / "tasks.db"))
+        resp = client.get("/tasks/next", params={"agent": "codex", "role": "implementer"},
+                          headers={"X-Agent-Crew-Project": "demo"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["task_id"] == "impl-pull-889"
+
+
+def _mcp_get_next(db, **kwargs):
+    mcp_server = pytest.importorskip("agent_crew.mcp_server")
+    try:
+        mcp = mcp_server.build_mcp_server(db)
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+    return mcp._tool_manager._tools["get_next_task"].fn(**kwargs)
+
+
+def test_mcp_pull_refuses_implement_for_gemini(tmp_path):
+    db = str(tmp_path / "tasks.db")
+    queue = _queued_implement(db)
+    payload = _mcp_get_next(db, agent="gemini", role="implementer")
+    assert payload["task_id"] == "impl-pull-889"
+    assert "role_policy" in payload["dispatch_refused"]
+    assert "description" not in payload
+    result = queue.get_result("impl-pull-889")
+    assert result is not None and result.status == "needs_human"
+
+
+def test_mcp_pull_delivers_implement_to_codex(tmp_path):
+    db = str(tmp_path / "tasks.db")
+    _queued_implement(db)
+    payload = _mcp_get_next(db, agent="codex", role="implementer")
+    assert payload["task_id"] == "impl-pull-889"
+    assert "dispatch_refused" not in payload

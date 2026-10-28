@@ -8900,6 +8900,11 @@ def create_app(
         task = q().dequeue(agent=agent, role=role, claimed_via="http_poll")
         if task is None:
             return None
+        # #889: a pull is a delivery route too. The claim has committed, so a
+        # task this agent may not hold is left needs_human, never handed out.
+        if _refuse_role_policy(task, agent):
+            raise HTTPException(status_code=409, detail=role_policy_refusal(
+                TASK_TYPE_TO_ROLE.get(task.task_type), agent))
         try:
             nonce = q().record_dispatch(task.task_id, channel="api", agent=agent or None,
                                         target=f"http_poll:{agent or 'anonymous'}")
