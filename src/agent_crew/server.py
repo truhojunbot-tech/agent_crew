@@ -3875,6 +3875,10 @@ def create_app(
     watchdog_expiry_counts: dict[str, int] = {}
     #: G_DT: tmux pushes refused because the pane runs no agent, by verdict.
     delivery_guard_refusals: dict[str, int] = {}
+    #: #825: consecutive refusals of a task that is already in_progress, by
+    #: (task, pane). Those are not requeued, so `defer_push_delivery` never
+    #: counts them.
+    held_push_refusals: dict[tuple[str, str], int] = {}
 
     def _requeue_orphans() -> None:
         """On startup, reset this dispatcher's in-progress claims to pending.
@@ -4239,10 +4243,12 @@ def create_app(
         ``_PUSH_REFUSAL_MAX`` refusals on one pane it ends as `needs_human`:
         nothing will make that pane an agent without a person.
         ``requeue=False`` is for callers holding a task that is already
-        running elsewhere (watchdog reminders).
+        running elsewhere (watchdog reminders): the task is not requeued, but
+        its consecutive refusals still count towards ``_PUSH_REFUSAL_MAX`` (#825).
         """
         verdict, detail = _pane_process_kind(pane_id)
         if verdict == "agent":
+            held_push_refusals.pop((task_id, pane_id), None)
             return True
         reason = f"pane_not_agent_{verdict}"
         delivery_guard_refusals[reason] = delivery_guard_refusals.get(reason, 0) + 1
@@ -4256,11 +4262,20 @@ def create_app(
             count = q().defer_push_delivery(
                 task_id, pane_id, reason,
                 max_refusals=_PUSH_REFUSAL_MAX, backoff_s=_PUSH_REFUSAL_BACKOFF_S)
-            if count is not None and count >= _PUSH_REFUSAL_MAX:
-                logger.error(
-                    "tmux push refused %d times task_id=%s pane=%s reason=%s — needs_human",
-                    count, task_id, pane_id, reason)
-                _fail_if_active(task_id, f"push_refused_{reason}", status="needs_human")
+        else:
+            # #825: a task left in_progress on a non-agent pane (an
+            # agent_override pane that is a log viewer) has no reminder and so
+            # no watchdog timeout either; uncounted, it was refused every tick
+            # for 5.5h. Count it here and end it the same way.
+            count = held_push_refusals.get((task_id, pane_id), 0) + 1
+            held_push_refusals[(task_id, pane_id)] = count
+        if count is not None and count >= _PUSH_REFUSAL_MAX:
+            logger.error(
+                "tmux push refused %d times task_id=%s pane=%s reason=%s — needs_human",
+                count, task_id, pane_id, reason)
+            held_push_refusals.pop((task_id, pane_id), None)
+            _fail_if_active(task_id, f"push_refused_{reason}", status="needs_human",
+                            details={"pane_id": pane_id, "push_refusals": count})
         return False
 
     def _guard_tmx_push(task_id: str, target: str, *, require_agent: bool = True) -> str:
@@ -5716,6 +5731,8 @@ def create_app(
                 summary = reason
                 if details and "last_output_age_s" in details:
                     summary += f" (last output {details['last_output_age_s']:.1f}s ago)"
+                if details and "push_refusals" in details:
+                    summary += f" (pane {details['pane_id']}, {details['push_refusals']} refusals)"
                 terminal_result = TaskResult(
                     task_id=task_id, status=status, summary=summary,
                     error_info={"reason": reason, "final": status == "failed",
