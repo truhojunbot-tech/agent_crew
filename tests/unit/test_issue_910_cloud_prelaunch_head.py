@@ -84,3 +84,43 @@ def test_failed_review_enqueue_after_discovery_raises_notice(tmp_path, monkeypat
     assert queue.get_task("impl-noreview").status == "in_progress"
     assert [(t, k) for t, k, _ in notices] == [("impl-noreview", "cloud_review_enqueue_failed")]
     assert "pr=759" in notices[0][2]
+
+
+def test_prelaunch_pr_lookup_failure_defers_instead_of_launching(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    head = ["a" * 40]
+    queue.enqueue(TaskRequest(
+        task_id="impl-lookup-fail", task_type="implement",
+        description="Rebase continuation", branch="fix/275f-pace-alert-runtime",
+        project="agent_crew", context={"repo": "owner/repo", "rebase_onto": "main"},
+    ))
+    _cloud_env(monkeypatch, head)
+    launches = []
+
+    def run(argv, **kwargs):
+        if "--help" not in argv:
+            launches.append(argv)
+        return _run(argv, **kwargs)
+
+    def lookup_fails(*a, **kw):
+        raise RuntimeError("gh: rate limited")
+
+    monkeypatch.setattr(cloud._github, "pr_number_for_branch", lookup_fails)
+    outcome = cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                            run_fn=run)
+    assert not outcome.dispatched
+    assert outcome.skipped_reason == "cloud_pr_lookup_unavailable"
+    assert launches == []
+    task = queue.get_task("impl-lookup-fail")
+    assert task.status == "pending"
+    assert queue.get_task_context("impl-lookup-fail")["push_not_before"] > 0
+
+    # Lookup recovers and the branch's existing PR is found: the launch must
+    # now carry that PR's head, so reconcile does not mistake it for output.
+    monkeypatch.setattr(cloud._github, "pr_number_for_branch", lambda *a, **kw: 282)
+    monkeypatch.setattr(cloud.time, "time", lambda: 1e12)
+    assert cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                         run_fn=run).dispatched
+    assert queue.get_task_context("impl-lookup-fail")["cloud_pr_head_at_launch"] == head[0]
+    assert cloud.reconcile_all_cloud_tasks(queue)[0].action == "still_dispatched"
+    assert queue.get_task("impl-lookup-fail").status == "in_progress"

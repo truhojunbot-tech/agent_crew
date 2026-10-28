@@ -250,6 +250,8 @@ def test_at6_dispatch_uses_resume_argv_for_fix_task(q, monkeypatch):
     fix_id = f"fix-{uuid.uuid4().hex[:8]}"
     q.enqueue(TaskRequest(task_id=fix_id, task_type="implement", description="address findings",
                           branch=branch, context={"prev_task_id": impl_id, "repo": "owner/repo"}, project="agent_crew"))
+    # #910: a failed pre-launch PR lookup defers the launch; this branch has no PR yet.
+    monkeypatch.setattr(cc._github, "pr_number_for_branch", lambda *a, **kw: None)
 
     seen_argv = {}
 

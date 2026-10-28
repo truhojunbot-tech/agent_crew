@@ -1157,8 +1157,14 @@ def dispatch_cloud_for_role(
         try:
             existing_pr = _github.pr_number_for_branch(task.branch, repo=preflight_repo)
         except Exception:
-            logger.exception("claude_cloud: pre-launch PR lookup failed for %s", task.task_id)
-            existing_pr = None
+            # Launching without knowing whether a PR exists recreates the
+            # false completion this lookup exists to prevent; defer instead.
+            logger.exception("claude_cloud: pre-launch PR lookup failed for %s; leaving pending",
+                             task.task_id)
+            queue.patch_context(task.task_id, {"push_not_before": time.time() + 30})
+            queue.requeue(task.task_id)
+            return CloudDispatchOutcome(False, task_id=task.task_id,
+                                        skipped_reason="cloud_pr_lookup_unavailable")
     if role == "implementer" and (existing_pr or fix_round):
         task_repo = preflight_repo
         if not task_repo:
