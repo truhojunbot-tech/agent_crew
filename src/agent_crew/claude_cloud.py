@@ -54,6 +54,19 @@ from agent_crew.queue import (AdmissionRefused, TaskAlreadyExistsError, TaskQueu
 
 logger = logging.getLogger(__name__)
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_INTERACTIVE_PROMPT_MARKERS = (
+    "enter to confirm", "settings warning", "do you trust", "new mcp server",
+)
+
+
+def _interactive_prompt_text(output: str | bytes) -> str:
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    stripped = _ANSI_ESCAPE_RE.sub("", output)
+    return stripped[:300] if any(marker in stripped.casefold()
+                                for marker in _INTERACTIVE_PROMPT_MARKERS) else ""
+
 #: Fixed backend/provider identity. An operator opts a role into this
 #: backend by setting ``role_agents.<role> = "claude_cloud"`` — role_mapping.py
 #: is already provider-string-agnostic, so this needs no changes there.
@@ -790,7 +803,8 @@ def _launch_ref(task: TaskRequest, checkout: str, prior_pr_head: Optional[str]) 
 
 
 def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
-                          reason: str, *, retryable: bool = False) -> CloudDispatchOutcome:
+                          reason: str, *, retryable: bool = False,
+                          prompt_text: str = "") -> CloudDispatchOutcome:
     """Fail closed without losing the task (acceptance test 3): force_fail
     records why, then the SAME rate-limit-shaped fallback local providers use
     gets a chance to reroute it — never a new fallback policy (acceptance
@@ -803,8 +817,13 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
                                        "cloud_submit_retryable": retryable,
                                        "cloud_cost_finalized_at": ended,
                                        "cloud_usd": None})
-    queue.force_fail(task.task_id, reason, error_info=(
-        {"reason": "cloud_submit_timeout", "retryable": True} if retryable else None))
+    error_info = None
+    if retryable:
+        error_info = {"reason": "cloud_submit_timeout", "retryable": True}
+    elif reason == "cloud_launch_interactive_prompt":
+        error_info = {"reason": reason, "retryable": False,
+                      "prompt_text": prompt_text[:300]}
+    queue.force_fail(task.task_id, reason, error_info=error_info)
     if queue.get_attribution(task.task_id) is None:
         queue.record_attribution(task_id=task.task_id, project=task.project or "",
                                  agent=CLOUD_PROVIDER_NAME,
@@ -831,6 +850,10 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
         from agent_crew.server import coordinator_notice_once
         coordinator_notice_once(queue, task.task_id, "cloud_submit_timeout",
                                 f"retryable cloud submit failure: {reason[:300]}")
+    elif reason == "cloud_launch_interactive_prompt":
+        from agent_crew.server import coordinator_notice_once
+        coordinator_notice_once(queue, task.task_id, reason,
+                                "cloud launch blocked by an interactive CLI prompt")
     return CloudDispatchOutcome(False, task_id=task.task_id, launch_error=reason,
                                 retryable=retryable)
 
@@ -1215,8 +1238,10 @@ def dispatch_cloud_for_role(
 
     submit_deadline = time.monotonic() + DEFAULT_SUBMIT_TOTAL_BUDGET_SECONDS
     timeout_attempts = []
+    interactive_prompt = ""
 
     def launch_once(command: List[str], *, resuming: bool):
+        nonlocal interactive_prompt
         for attempt in range(3):
             remaining = submit_deadline - time.monotonic()
             if remaining <= 0:
@@ -1227,6 +1252,9 @@ def dispatch_cloud_for_role(
                 break
             except subprocess.TimeoutExpired as exc:
                 output = exc.stdout or exc.output or b""
+                interactive_prompt = _interactive_prompt_text(output)
+                if interactive_prompt:
+                    return None, "cloud_launch_interactive_prompt"
                 if isinstance(output, bytes):
                     output = output.decode("utf-8", errors="replace")
                 recovered = parse_cloud_launch_output(output)
@@ -1245,9 +1273,15 @@ def dispatch_cloud_for_role(
             except Exception as exc:
                 return None, f"cloud_cli_invocation_error: {exc}"
         if getattr(proc, "returncode", 1) != 0:
+            interactive_prompt = _interactive_prompt_text(proc.stdout or "")
+            if interactive_prompt:
+                return None, "cloud_launch_interactive_prompt"
             return None, f"cloud_cli_exit_{proc.returncode}: {(proc.stdout or '')[:500]}"
         result = parse_cloud_launch_output(proc.stdout or "")
         if not result.dispatched:
+            interactive_prompt = _interactive_prompt_text(proc.stdout or "")
+            if interactive_prompt:
+                return None, "cloud_launch_interactive_prompt"
             prefix = "cloud_continuation_unavailable" if resuming else "cloud_output_unrecognized"
             return None, f"{prefix}: {result.error}"
         return result, None
@@ -1255,7 +1289,8 @@ def dispatch_cloud_for_role(
     launch, launch_error = launch_once(argv, resuming=bool(resume_session_id))
     resume_error = None
     if (launch_error and resume_session_id
-            and not launch_error.startswith("cloud_submit_timeout:")):
+            and not launch_error.startswith("cloud_submit_timeout:")
+            and launch_error != "cloud_launch_interactive_prompt"):
         resume_error = launch_error
         queue.patch_context(task.task_id, {"cloud_resume_error": resume_error,
                                            "execution_policy": "fresh_cloud_after_resume_failed"})
@@ -1266,7 +1301,8 @@ def dispatch_cloud_for_role(
         reason = (f"resume failed: {resume_error}; fresh failed: {launch_error}"
                   if resume_error else launch_error)
         return _fail_closed_dispatch(queue, task, task_type, reason,
-                                     retryable="cloud_submit_timeout:" in reason)
+                                     retryable="cloud_submit_timeout:" in reason,
+                                     prompt_text=interactive_prompt)
 
     execution_policy = ("fresh_cloud_after_resume_failed" if resume_error else
                         "fresh_cloud_resume" if resume_session_id else "fresh_cloud")
