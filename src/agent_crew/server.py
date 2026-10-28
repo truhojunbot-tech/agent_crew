@@ -66,7 +66,7 @@ from agent_crew.pipeline import (
     MISSING_IMPLEMENT_REF_DETAIL,
     artifact_gate_applies,
     declared_artifact_kind,
-    no_artifact_result,
+    no_artifact_result, dispatch_base_absent_hold,
     verify_task_artifact,
     resume_tier3_gate as _resume_tier3_gate,
     review_publication_decision,
@@ -95,7 +95,6 @@ from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_L
 from agent_crew import claude_cloud as _claude_cloud
 from agent_crew import script_tester as _script_tester
 from agent_crew import contract_emit as _contract_emit
-from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import (
     DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE,
@@ -9225,22 +9224,12 @@ def create_app(
         #   `shadow`/`off` this is recorded and the result stands, because the
         #   whole point of shadow is to measure how many live tasks this would
         #   have caught before it catches any.
-        if (not _runtime_paused and not _REPLAYING.get() and _task is not None
-                and _task.task_type == "implement" and result.status == "completed"
-                and declared_artifact_kind(_task) is None
-                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
-                         or "rebase_onto" in _artifact_context)):
-            _no_base = ("dispatch base absent: this implement task declares no "
-                        "artifact contract and carries no worktree_base_sha or "
-                        "reviewed_sha, so its completion cannot be verified")
-            if _cea_callsites.enforcing(project=getattr(_task, "project", None) or None):
-                logger.warning("POST /tasks/%s/result: artifact gate FAILED — %s",
-                               task_id, _no_base)
-                _artifact_held = _no_base
-                result = no_artifact_result(result, _no_base)
-            else:
-                logger.info("POST /tasks/%s/result: artifact gate would FAIL under "
-                            "enforce — %s (shadow: result stands)", task_id, _no_base)
+        # #887: one helper for both transports — MCP walked around this rule.
+        _no_base = (None if _runtime_paused or _REPLAYING.get()
+                    else dispatch_base_absent_hold(_task, result))
+        if _no_base is not None:
+            _artifact_held = _no_base
+            result = no_artifact_result(result, _no_base)
         # #374: the check follows the task's declared contract; undeclared
         # tasks keep #353's commit rule exactly (artifact_gate_applies).
         if (not _runtime_paused and not _REPLAYING.get()

@@ -56,6 +56,7 @@ from agent_crew import tokenomics_canary as _tokenomics_canary
 #   is what made this file a second decision implementation; the static rule in
 #   tests/unit/test_sev0_cea_guard_count.py fails if the import comes back.
 from agent_crew.cea import cascade_contract as _cascade
+from agent_crew.cea import callsites as _cea_callsites
 
 logger = logging.getLogger(__name__)
 
@@ -606,6 +607,36 @@ def verify_review_artifact(task: TaskRequest, result: TaskResult) -> tuple[bool,
     if result.verdict == "request_changes" and not [f for f in result.findings if str(f).strip()]:
         return False, "request_changes review has no findings"
     return True, f"review verdict {result.verdict}"
+
+
+#: T5, ADR §11.1 row 10 / fixture CXC-6a.
+DISPATCH_BASE_ABSENT_DETAIL = (
+    "dispatch base absent: this implement task declares no artifact contract "
+    "and carries no worktree_base_sha or reviewed_sha, so its completion "
+    "cannot be verified")
+
+
+def dispatch_base_absent_hold(task: Optional[TaskRequest], result: TaskResult) -> Optional[str]:
+    """The T5 "dispatch base absent" rule, shared by HTTP and MCP (#887).
+
+    Returns the hold detail when the result must be held, else ``None``. An
+    implement completion with no declared contract and no dispatch base has
+    nothing to be checked against: a FAIL, never a pass. Held only under the
+    project's enforce mode; under shadow/off it is logged and the result stands.
+    """
+    context = task.context if task is not None and isinstance(task.context, dict) else {}
+    if (task is None or task.task_type != "implement" or result.status != "completed"
+            or declared_artifact_kind(task) is not None
+            or context.get("worktree_base_sha") or context.get("reviewed_sha")
+            or "rebase_onto" in context):
+        return None
+    if _cea_callsites.enforcing(project=getattr(task, "project", None) or None):
+        logger.warning("artifact gate FAILED for %s — %s", task.task_id,
+                       DISPATCH_BASE_ABSENT_DETAIL)
+        return DISPATCH_BASE_ABSENT_DETAIL
+    logger.info("artifact gate would FAIL under enforce for %s — %s (shadow: result stands)",
+                task.task_id, DISPATCH_BASE_ABSENT_DETAIL)
+    return None
 
 
 def no_artifact_result(result: TaskResult, detail: str) -> TaskResult:

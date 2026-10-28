@@ -34,7 +34,6 @@ try:
 except ImportError:  # pragma: no cover — surfaced loud at import time
     FastMCP = None  # type: ignore
 
-from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.pipeline import (
     auto_enqueue_fix,
@@ -42,7 +41,7 @@ from agent_crew.pipeline import (
     auto_enqueue_test,
     fix_task_id,
     auto_fallback_failed_task,    hold_mismatched_pr_result,
-    artifact_gate_applies, declared_artifact_kind, no_artifact_result,
+    artifact_gate_applies, declared_artifact_kind, dispatch_base_absent_hold, no_artifact_result,
     verify_implement_artifact, verify_task_artifact, review_publication_decision,
 )
 from agent_crew.protocol import (
@@ -255,26 +254,12 @@ def build_mcp_server(
             _runtime_paused = queue.get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
             _runtime_paused = True
-        _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
         _artifact_verified = None
-        if (not _runtime_paused and _task is not None
-                and _task.task_type == "implement" and result.status == "completed"
-                and declared_artifact_kind(_task) is None
-                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
-                         or "rebase_onto" in _artifact_context)):
-            # #887: same T5 rule as HTTP — "dispatch base absent" is held under
-            # the project's enforce mode and only logged under shadow/off.
-            _no_base = ("dispatch base absent: this implement task declares no "
-                        "artifact contract and carries no worktree_base_sha or "
-                        "reviewed_sha, so its completion cannot be verified")
-            if _cea_callsites.enforcing(project=getattr(_task, "project", None) or None):
-                logger.warning("MCP submit_result: artifact gate FAILED — %s (task=%s)",
-                               _no_base, task_id)
-                _artifact_held = _no_base
-                result = no_artifact_result(result, _no_base)
-            else:
-                logger.info("MCP submit_result: artifact gate would FAIL under enforce — "
-                            "%s (task=%s, shadow: result stands)", _no_base, task_id)
+        # #887: the same T5 rule as HTTP, from the one shared helper.
+        _no_base = None if _runtime_paused else dispatch_base_absent_hold(_task, result)
+        if _no_base is not None:
+            _artifact_held = _no_base
+            result = no_artifact_result(result, _no_base)
         if not _runtime_paused and artifact_gate_applies(_task, result):
             # MCP is a per-worker subprocess launched from that worker's
             # checkout. Unlike HTTP it has no in-process worktree map; its cwd
