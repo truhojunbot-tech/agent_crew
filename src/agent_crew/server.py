@@ -24,7 +24,7 @@ from typing import Callable, Literal, Optional
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from agent_crew import instructions
+from agent_crew import instructions, pane_submit
 from agent_crew.cea.input_providers.budget import QuotaBudgetProvider
 from agent_crew.port_validation import require_project_port
 from agent_crew import claude_transcript as _claude_transcript
@@ -3149,16 +3149,18 @@ def _pane_clear_context(pane_id: str, *, task_id: str = "", project: str = "",
     provider runs with cleared state while the economics stay attached to a
     context whose recorded policy still says `resume`.
 
-    A successful send is only ``attempted`` until a subsequent measurement from
-    the same source drops below the threshold. A non-zero return is
-    ``send_failed``. The return value is the observed outcome.
+    A verified submit (#888) is only ``attempted`` until a subsequent
+    measurement from the same source drops below the threshold. tmux refusing
+    the text is ``send_failed``; ``/clear`` still in the input line after the
+    bounded Enter retries is ``unsubmitted``. The return value is the observed
+    outcome.
     """
-    r = subprocess.run(["tmux", "send-keys", "-t", pane_id, "/clear", "Enter"],
-                       capture_output=True, text=True)
-    sent = getattr(r, "returncode", 1) == 0
+    submitted = pane_submit.submit(pane_id, "/clear", paste=False, settle=0.2,
+                                   label="/clear")
+    sent = submitted == "submitted"
     import time as _time
     _time.sleep(2.0)
-    outcome = "attempted" if sent else "send_failed"
+    outcome = "attempted" if sent else submitted
     post_tokens, post_source = None, "unknown"
     if sent and context_tokens is not None and token_source:
         try:
@@ -3261,8 +3263,20 @@ def _pane_has_task(pane_id: str) -> bool:
         ["tmux", "capture-pane", "-p", "-t", pane_id],
         capture_output=True, text=True,
     )
-    out = r.stdout
+    return _screen_has_task(r.stdout)
+
+
+def _screen_has_task(out: str) -> bool:
     return ("=== AGENT_CREW TASK ===" in out) or ("[Pasted text" in out)
+
+
+def _task_pending(screen: str) -> bool:
+    """Push predicate (#888): look only at the input box when it is visible,
+    so the transcript echo of a submitted task is not read as still pending.
+    Without a visible prompt marker, fall back to the whole screen."""
+    if pane_submit.has_prompt(screen):
+        return _screen_has_task(pane_submit.input_region(screen))
+    return _screen_has_task(screen)
 
 
 # Backoff schedule (seconds) for the per-attempt wait after Enter. The first
@@ -3275,51 +3289,24 @@ _PUSH_RETRY_DELAYS = (0.3, 0.5, 1.0, 2.0)
 def _default_push(pane_id: str, text: str) -> None:
     """Send task via tmux bracketed paste, then retry Enter until submitted.
 
-    Bracketed-paste mode delivers the entire blob atomically. After paste we
-    wait for the TUI to finish consuming it, then send Enter. Some Claude UI
+    Bracketed-paste mode delivers the entire blob atomically. Some Claude UI
     states (post-task footer animations, cache writes between back-to-back
-    tasks — issue #74) drop the first Enter without submitting; we re-send
-    Enter with backoff up to len(_PUSH_RETRY_DELAYS) times.
+    tasks — issue #74) drop the first Enter without submitting; the verified
+    submit (#888) re-sends Enter with backoff up to len(_PUSH_RETRY_DELAYS)
+    times, holding the pane's lock so no other writer interleaves.
     """
     logger.debug(f"_default_push called: pane_id={pane_id}")
     task_id = text.split("\n")[1].split(": ")[1] if "task_id:" in text else "unknown"
     logger.info(f"PUSH START: task_id={task_id}, pane_id={pane_id}")
-
-    r1 = subprocess.run(
-        ["tmux", "load-buffer", "-"],
-        input=text,
-        text=True,
-        capture_output=True,
-    )
-    logger.debug(f"load-buffer result: rc={r1.returncode}, stderr={r1.stderr[:100] if r1.stderr else 'ok'}")
-
-    r2 = subprocess.run(
-        ["tmux", "paste-buffer", "-p", "-d", "-t", pane_id],
-        capture_output=True,
-    )
-    logger.debug(f"paste-buffer result: rc={r2.returncode}, stderr={r2.stderr[:100] if r2.stderr else 'ok'}")
-
-    # Give the TUI time to process the bracketed-paste sequence.
-    time.sleep(0.5)
-
-    for attempt, wait_after in enumerate(_PUSH_RETRY_DELAYS, start=1):
-        subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
-        time.sleep(wait_after)
-        if not _pane_has_task(pane_id):
-            logger.info(
-                f"PUSH SUCCESS: task_id={task_id} pushed to {pane_id} "
-                f"(attempt {attempt}/{len(_PUSH_RETRY_DELAYS)})"
-            )
-            return
-        logger.warning(
-            f"PUSH retry: attempt {attempt}/{len(_PUSH_RETRY_DELAYS)} for "
-            f"task_id={task_id} — composer still holding input"
+    outcome = pane_submit.submit(pane_id, text, pending=_task_pending,
+                                 delays=_PUSH_RETRY_DELAYS, label=f"task {task_id}")
+    if outcome == "submitted":
+        logger.info(f"PUSH SUCCESS: task_id={task_id} pushed to {pane_id}")
+    else:
+        logger.error(
+            f"PUSH FAILED: task_id={task_id} {outcome} after "
+            f"{len(_PUSH_RETRY_DELAYS)} Enter attempts on {pane_id}"
         )
-
-    logger.error(
-        f"PUSH FAILED: task_id={task_id} still pending after "
-        f"{len(_PUSH_RETRY_DELAYS)} Enter attempts on {pane_id}"
-    )
 
 
 def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, project: str = "", mcp_mode: bool = False, task_type: str = "") -> str:

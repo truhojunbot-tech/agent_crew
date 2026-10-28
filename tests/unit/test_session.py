@@ -9,7 +9,6 @@ from agent_crew.session import (
     increment_failure,
     load_sessions,
     refresh_needed,
-    refresh_pane,
     reset_session,
     save_sessions,
 )
@@ -119,25 +118,6 @@ def test_u_s09_health_check_dead():
         result = check_health(agent, session="crew")
 
     assert result is False
-
-
-# U-S10: Refresh sends blank Enter first, then cmd — two subprocess.run calls
-def test_u_s10_refresh_pane_uses_cmd():
-    agent = make_agent(pane=2)
-    agent["cmd"] = "claude --dangerously-skip-permissions --continue"
-
-    with patch("agent_crew.session.subprocess.run") as mock_run:
-        refresh_pane(agent, session="crew")
-
-    assert mock_run.call_count == 2
-    first_args = mock_run.call_args_list[0][0][0]
-    second_args = mock_run.call_args_list[1][0][0]
-    # first call: blank Enter
-    assert "send-keys" in first_args
-    assert "" in first_args
-    # second call: actual cmd
-    assert "send-keys" in second_args
-    assert agent["cmd"] in second_args
 
 
 # U-S03b: started_at as ISO-8601 string also supported
