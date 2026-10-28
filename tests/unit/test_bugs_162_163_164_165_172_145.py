@@ -455,3 +455,59 @@ class TestMcpNoClientAutoFail:
         assert "mcp" in (result.summary or "").lower(), (
             f"summary must mention mcp, got: {result.summary}"
         )
+
+
+# ---------------------------------------------------------------------------
+# #873 — watchdog must not auto-fail as mcp_no_client when the dispatcher
+# owns delivery (DELIVERY=mcp + DISPATCHER=1)
+# ---------------------------------------------------------------------------
+
+class TestMcpNoClientDispatcherOwnsDelivery:
+    def test_u873_stale_pending_not_failed_when_dispatcher_enabled(self):
+        db, q = _make_db()
+        # A running claude implement occupies the lane; the queued one waits.
+        q.enqueue(TaskRequest(task_id="running-873", task_type="implement",
+                              description="running", branch="main"))
+        assert q.dequeue(role="implementer").task_id == "running-873"
+        task_id = "queued-873"
+        q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
+                              description="queued behind busy lane", branch="main"))
+        TestMcpNoClientAutoFail()._make_stale_pending(db, task_id, seconds_ago=200)
+
+        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
+                                        "AGENT_CREW_DISPATCHER": "1",
+                                        # The loop sleeps first; keep it idle so
+                                        # only the watchdog tick acts.
+                                        "AGENT_CREW_DISPATCH_INTERVAL": "3600",
+                                        "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
+            from agent_crew.server import create_app
+            app = create_app(db, pane_map={"implementer": "%93"}, port=9999,
+                             watchdog_disabled=True, anomaly_disabled=True,
+                             pane_busy_fn=lambda _: False)
+            with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
+                result = app.state.watchdog_tick(time.time())
+
+        assert task_id not in result.get("mcp_no_client_failed", [])
+        task_row = next(r for r in q.list_all_with_status() if r["task_id"] == task_id)
+        assert task_row["status"] == "pending"
+
+    def test_u873_dispatcher_off_still_fails_as_mcp_no_client(self):
+        db, q = _make_db()
+        task_id = "queued-873-off"
+        q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
+                              description="no consumer", branch="main"))
+        TestMcpNoClientAutoFail()._make_stale_pending(db, task_id, seconds_ago=200)
+
+        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
+                                        "AGENT_CREW_DISPATCHER": "0",
+                                        "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
+            from agent_crew.server import create_app
+            app = create_app(db, pane_map={"implementer": "%93"}, port=9999,
+                             watchdog_disabled=True, anomaly_disabled=True,
+                             pane_busy_fn=lambda _: False)
+            with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
+                result = app.state.watchdog_tick(time.time())
+
+        assert task_id in result.get("mcp_no_client_failed", [])
+        task_row = next(r for r in q.list_all_with_status() if r["task_id"] == task_id)
+        assert task_row["status"] == "failed"

@@ -5345,7 +5345,10 @@ def create_app(
         # #145: in MCP-only mode, tmux re-dispatch is a no-op. If tasks are still
         # pending after the stale window, no MCP client is connected — auto-fail them
         # so the crew doesn't hang silently forever.
-        if not _push_enabled and stale:
+        # #873: with the headless dispatcher on, the dispatcher (not an MCP
+        # client) consumes pending tasks. A task pending because its role lane
+        # is busy is normal backlog there, so leave it to the dispatcher.
+        if not _push_enabled and not _dispatcher_enabled and stale:
             for sp in stale:
                 tid = sp.get("task_id")
                 if not tid:
