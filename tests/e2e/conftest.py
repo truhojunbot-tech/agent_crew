@@ -22,7 +22,9 @@ inside a pane) — are gone afterward, even if the test fails.
 import json
 import os
 import signal
+import socket
 import subprocess
+import time
 import uuid
 
 import pytest
@@ -77,12 +79,7 @@ def _cleanup_project_dir(proj_dir: str) -> None:
     except (OSError, ValueError):
         return
 
-    pid = state.get("server_pid")
-    if pid:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
+    terminate_pids([state.get("server_pid")])
 
     # Belt-and-suspenders: some shells survive the tmux pane's HUP long
     # enough to relaunch crew-log-viewer once more before exiting. Kill
@@ -126,3 +123,139 @@ def e2e_project(monkeypatch, isolated_tmux_session, base_dir):
     finally:
         for proj_dir in _discover_project_dirs(base_dir, registered):
             _cleanup_project_dir(proj_dir)
+
+
+# ── #879: crew server reaper + port isolation ────────────────────────────────
+
+CREW_PORT_RANGE = range(8100, 8200)
+
+
+def _os_ephemeral_port() -> int:
+    """A port the kernel considers free, taken from its ephemeral range —
+    never the 8100-8199 crew range a live dispatcher would use."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if `pid` is running. A zombie counts as dead; it is not reaped
+    here, so the owning Popen still sees its real exit status."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def terminate_pids(pids, grace: float = 3.0) -> None:
+    """SIGTERM every pid, then SIGKILL whatever is still alive after `grace`."""
+    pids = {p for p in pids if isinstance(p, int) and p > 1 and p != os.getpid()}
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + grace
+    while time.time() < deadline and any(_pid_alive(p) for p in pids):
+        time.sleep(0.05)
+    for pid in pids:
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def _state_server_pids(root: str) -> set:
+    pids: set = set()
+    for dirpath, _dirs, files in os.walk(root):
+        if "state.json" not in files:
+            continue
+        try:
+            pid = json.loads(open(os.path.join(dirpath, "state.json")).read()).get("server_pid")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(pid, int):
+            pids.add(pid)
+    return pids
+
+
+class CrewServerReaper:
+    """Records every crew server a test starts and kills them all on exit.
+
+    `crew setup` and `crew recover` each spawn a uvicorn and overwrite
+    state.json's `server_pid`, so reading state.json once at the end misses
+    the setup-time server whenever recover started a second one (#879).
+    The reaper therefore records pids at spawn time (Popen of the crew
+    server command, plus the listener pid `_server_pid` resolves behind an
+    `sg` wrapper) and *also* sweeps every state.json under `root`.
+
+    It also points the allocator's scan at a kernel-chosen ephemeral port,
+    so a test server can never occupy — or look like — a live crew in
+    8100-8199. Tests only; product defaults are untouched.
+    """
+
+    def __init__(self, monkeypatch, root: str):
+        self._mp = monkeypatch
+        self.root = str(root)
+        self.pids: set = set()
+        self.ports: set = set()
+
+    def __enter__(self):
+        from agent_crew import cli as cli_module
+        from agent_crew import setup as setup_module
+
+        reaper = self
+        real_find_free_port = setup_module.find_free_port
+        real_server_pid = cli_module._server_pid
+        real_popen = subprocess.Popen
+
+        def find_free_port(start=8100, *, base=None, project="", limit=65535):
+            if start in CREW_PORT_RANGE:
+                start = _os_ephemeral_port()
+                while start in CREW_PORT_RANGE:  # paranoia: tiny ip_local_port_range
+                    start = _os_ephemeral_port()
+            port = real_find_free_port(start, base=base, project=project, limit=limit)
+            reaper.ports.add(port)
+            return port
+
+        def server_pid(proc, command, port):
+            pid = real_server_pid(proc, command, port)
+            reaper.pids.add(pid)
+            return pid
+
+        class RecordingPopen(real_popen):
+            def __init__(self, args, *a, **kw):
+                super().__init__(args, *a, **kw)
+                if isinstance(args, (list, tuple)) and "agent_crew.server:app" in args:
+                    reaper.pids.add(self.pid)
+
+        self._mp.setattr(setup_module, "find_free_port", find_free_port)
+        self._mp.setattr(cli_module, "_server_pid", server_pid)
+        self._mp.setattr(cli_module.subprocess, "Popen", RecordingPopen)
+        return self
+
+    def all_pids(self) -> set:
+        return self.pids | _state_server_pids(self.root)
+
+    def reap(self) -> None:
+        terminate_pids(self.all_pids())
+
+    def __exit__(self, *exc):
+        self.reap()
+        return False
+
+
+@pytest.fixture(autouse=True)
+def crew_server_reaper(monkeypatch, tmp_path):
+    """Autouse for every E2E test: no crew server outlives its test, on
+    success or failure, and none is ever started in the crew port range."""
+    with CrewServerReaper(monkeypatch, tmp_path) as reaper:
+        yield reaper
