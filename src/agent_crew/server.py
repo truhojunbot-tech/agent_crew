@@ -4648,9 +4648,16 @@ def create_app(
         if _refuse_self_review(task, _target_agent):
             return
 
+        # #861: the worktree follows the pane, i.e. the same resolution the
+        # dispatcher uses. `worktree_map[role]` belongs to the role's default
+        # agent; with `agent_override` that is another provider's worktree,
+        # which the busy check above (keyed by THIS pane) never looked at — so
+        # an override implement task re-checked-out a running review's tree.
+        _push_worktree = (_resolve_dispatch_target(task, role)[1] or "") if worktree_map else ""
+
         # #140/#141: prepare worktree branch before task delivery.
         if worktree_map and not _WORKTREE_SYNC_DISABLED:
-            wt_path = worktree_map.get(role)
+            wt_path = _push_worktree
             if wt_path:
                 try:
                     _reviewed_sha = _prepare_worktree_for_task(
@@ -4719,7 +4726,6 @@ def create_app(
         ):
             return
 
-        _push_worktree = worktree_map.get(role) if worktree_map else ""
         _push_project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
         if _push_worktree and not _ensure_role_protocol(
             role, _push_worktree, _push_project,
