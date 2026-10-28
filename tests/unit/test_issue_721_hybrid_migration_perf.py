@@ -36,7 +36,9 @@ def test_supersedes_migration_large_corpus_is_index_backed(tmp_path, caplog):
         with caplog.at_level("INFO"):
             ensure_index_schema(db)
         elapsed = time.perf_counter() - started
-        assert elapsed < 2.0, f"10,110-row migration took {elapsed:.2f}s"
+        # #742 builds both FTS indexes in bounded write transactions, so
+        # the first start takes longer while concurrent writers stay live.
+        assert elapsed < 10.0, f"10,110-row migration took {elapsed:.2f}s"
         linked = db.execute("SELECT key,superseded_by FROM adr001_memory "
                             "WHERE superseded_by IS NOT NULL").fetchall()
         assert len(linked) == 900

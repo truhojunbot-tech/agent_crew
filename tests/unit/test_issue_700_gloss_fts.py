@@ -3,14 +3,19 @@ import hashlib
 import json
 import sqlite3
 
+import pytest
+
 from agent_crew.memory_hybrid import ensure_index_schema
 from agent_crew.memory_runtime import HybridMemoryStorage, MemoryRecord, MemoryScope
 
 
 def _fts_keys(db_path, term):
     with sqlite3.connect(db_path) as db:
+        # Trigram MATCH cannot index fewer than three Unicode characters.
+        query = ("SELECT key FROM adr001_fts WHERE adr001_fts MATCH ?" if len(term) >= 3
+                 else "SELECT key FROM adr001_fts WHERE instr(body, ?) > 0")
         return {row[0] for row in db.execute(
-            "SELECT key FROM adr001_fts WHERE adr001_fts MATCH ?", (term,))}
+            query, (term,))}
 
 
 def _install_old_triggers(db):
@@ -91,7 +96,7 @@ def test_old_trigger_migration_rebuilds_once(tmp_path):
         db.commit()
         db.set_trace_callback(None)
     rebuilds = [statement for statement in statements if
-                statement.strip().startswith("INSERT INTO adr001_fts(rowid,layer,key,body) SELECT")]
+                statement.strip().startswith("INSERT INTO adr001_fts_new(rowid,layer,key,body) SELECT")]
     assert len(rebuilds) == 1
 
 
@@ -100,14 +105,24 @@ def test_interrupted_trigger_migration_retries_rebuild(tmp_path):
     store.put(MemoryRecord("authoritative", "owner:old",
                            {"text": "기존 규칙", "gloss_en": "durable obligation"},
                            MemoryScope(project="alfred")))
-    with sqlite3.connect(store.path) as db:
+    class FailSwap(sqlite3.Connection):
+        fail_swap = True
+
+        def execute(self, sql, *args):
+            if self.fail_swap and sql.startswith("ALTER TABLE adr001_fts_new RENAME"):
+                raise sqlite3.OperationalError("injected swap failure")
+            return super().execute(sql, *args)
+
+    with sqlite3.connect(store.path, factory=FailSwap) as db:
         _install_old_triggers(db)
         db.execute("UPDATE adr001_memory SET value=value WHERE key='owner:old'")
         db.commit()
         assert "owner:old" not in _fts_keys(store.path, "obligation")
-        ensure_index_schema(db)
-        db.rollback()  # A failed backfill or process death before commit.
+        with pytest.raises(sqlite3.OperationalError, match="injected swap failure"):
+            ensure_index_schema(db)
+        db.rollback()  # A failed swap leaves the old index and triggers intact.
         assert "owner:old" not in _fts_keys(store.path, "obligation")
+        db.fail_swap = False
         ensure_index_schema(db)
         db.commit()
     assert "owner:old" in _fts_keys(store.path, "obligation")
