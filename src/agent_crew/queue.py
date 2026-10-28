@@ -7344,7 +7344,11 @@ class TaskQueue:
     def expire_stale(self, older_than_seconds: float = 600.0, *,
                      on_cancelled: Optional[Callable[[str], None]] = None,
                      dry_run: bool = False) -> List[str]:
-        """Preview or cancel in_progress tasks whose last_activity_at is stale.
+        """Preview or cancel in_progress tasks with no recent activity.
+
+        A task is stale only when both ``last_activity_at`` and
+        ``last_heartbeat_at`` are older than the cutoff: dispatcher workers
+        report liveness through heartbeats alone (#885).
 
         ``dry_run=True`` returns the selected IDs without changing any row.
         The caller may scope a subsequent cancellation to these IDs.
@@ -7366,8 +7370,9 @@ class TaskQueue:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT task_id FROM tasks WHERE status = 'in_progress' AND last_activity_at < ?",
-                (cutoff,),
+                "SELECT task_id FROM tasks WHERE status = 'in_progress' "
+                "AND last_activity_at < ? AND COALESCE(last_heartbeat_at, 0) < ?",
+                (cutoff, cutoff),
             ).fetchall()
             candidates = [r["task_id"] for r in rows]
         finally:
@@ -7429,6 +7434,10 @@ class TaskQueue:
     def reset_stale_to_pending(self, older_than_seconds: float = 600.0) -> List[str]:
         """Reset in_progress tasks idle > ``older_than_seconds`` back to pending.
 
+        Idle means neither ``last_activity_at`` nor ``last_heartbeat_at`` moved
+        within the window. A reset ends the claim and lease and writes a
+        ``requeued`` event, like :meth:`requeue` (#885).
+
         Unlike ``expire_stale`` (which cancels them), this returns the tasks to
         the queue so they can be picked up again. Used by ``crew recover
         --reset-stale`` (#155).
@@ -7438,8 +7447,9 @@ class TaskQueue:
         try:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT task_id FROM tasks WHERE status = 'in_progress' AND last_activity_at < ?",
-                (cutoff,),
+                "SELECT task_id FROM tasks WHERE status = 'in_progress' "
+                "AND last_activity_at < ? AND COALESCE(last_heartbeat_at, 0) < ?",
+                (cutoff, cutoff),
             ).fetchall()
             # §8 again, and per row: one stale task whose receipt cannot be
             # re-admitted must not keep the others in_progress, and must not be
@@ -7451,13 +7461,16 @@ class TaskQueue:
                     reason=f"idle > {older_than_seconds:.0f}s")
                 if requeued:
                     task_ids.append(r["task_id"])
-            if task_ids:
-                placeholders = ",".join("?" * len(task_ids))
+            now = time.time()
+            for task_id in task_ids:
                 conn.execute(
-                    f"UPDATE tasks SET status = 'pending', last_activity_at = ? "
-                    f"WHERE task_id IN ({placeholders})",
-                    [time.time()] + task_ids,
+                    "UPDATE tasks SET status = 'pending', claim_source = '', "
+                    "last_activity_at = ? WHERE task_id = ?",
+                    (now, task_id),
                 )
+                # Same end-of-claim record as requeue(): clear the lease and
+                # log the requeue (#885).
+                self._record_end_on(conn, task_id, now, "requeued", posted=False)
             conn.execute("COMMIT")
             return task_ids
         except Exception:
