@@ -1046,6 +1046,13 @@ def _prepare_worktree_for_task(
         return ""
 
 
+#: #896: prep failures that are infrastructure, not the task. Retried
+#: ``AGENT_CREW_PREP_TRANSIENT_RETRIES`` times (default 1) after a backoff.
+_PREP_TRANSIENT_ERRORS = frozenset({"TimeoutExpired"})
+_PREP_TRANSIENT_RETRIES = int(os.environ.get("AGENT_CREW_PREP_TRANSIENT_RETRIES", "1"))
+_PREP_RETRY_BACKOFF_S = float(os.environ.get("AGENT_CREW_PREP_RETRY_BACKOFF_S", "60"))
+
+
 def _worktree_head(worktree_path: str) -> str:
     """The commit a worktree currently sits on, or "" if it cannot be read."""
     try:
@@ -4764,6 +4771,20 @@ def create_app(
                         wt_path, task.task_id, task.branch or "", role,
                         task_context=task.context if isinstance(task.context, dict) else {},
                     )
+                    # #896: a transient prep error is retried before anything
+                    # is recorded or delivered — including an implementer whose
+                    # prep fell back to a caller/HEAD SHA, which is not the base
+                    # this task asked for. Not recording it also keeps a HEAD
+                    # fallback from being re-read as a "caller" base next time.
+                    if _retry_transient_prep(task):
+                        return
+                    # #896: retries spent — a caller/HEAD fallback is not the
+                    # base this task asked for, so it is not delivered on.
+                    if _transient_prep_exhausted(task):
+                        _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                        status="needs_human",
+                                        details=_prep_failure_details(task))
+                        return
                     # #253: persist it on the task BEFORE the push, so it also
                     # reaches the agent in the task block — a reviewer that can
                     # see which commit it was given can say so in its result,
@@ -4776,7 +4797,8 @@ def create_app(
                         return
                     if (task.context or {}).get("prep_error") and not _reviewed_sha:
                         _fail_if_active(task.task_id, "prepared_base_not_recorded",
-                                        status="needs_human")
+                                        status="needs_human",
+                                        details=_prep_failure_details(task))
                         return
                     if _reviewed_sha:
                         _restore_task_wip(q(), task, wt_path)
@@ -5695,6 +5717,43 @@ def create_app(
     # instead of just inferrable (#202 acceptance criterion).
     _seen_context_keys_this_process: set[str] = set()
 
+    def _retry_transient_prep(task: TaskRequest) -> bool:
+        """Requeue a transient prep failure once before it needs a human (#896).
+
+        A git timeout under host load (alpha_engine 10-28: load 27-37, a fetch
+        taking 36.5 s) is infrastructure, not a broken task. The first one
+        backs off and retries; once retries are spent the caller ends it in
+        needs_human (`_transient_prep_exhausted`) — even for an implementer
+        whose prep returned a caller/HEAD fallback, which may be an unrelated
+        stale commit. Any other prep error keeps the pre-#896 handling (#812).
+        Callers ask this BEFORE recording a base.
+        """
+        ctx = task.context or {}
+        prep_error = ctx.get("prep_error")
+        if prep_error not in _PREP_TRANSIENT_ERRORS:
+            return False
+        if int(ctx.get("prep_retry_count") or 0) >= _PREP_TRANSIENT_RETRIES:
+            return False
+        try:
+            requeued = q().defer_prep_retry(task.task_id, delay_s=_PREP_RETRY_BACKOFF_S,
+                                            prep_error=str(prep_error))
+        except Exception:
+            logger.exception("prep retry: requeue failed task_id=%s", task.task_id)
+            return False
+        if requeued:
+            logger.warning("prep retry: %s hit %s — requeued, not before %.0fs",
+                           task.task_id, prep_error, _PREP_RETRY_BACKOFF_S)
+        return requeued
+
+    def _transient_prep_exhausted(task: TaskRequest) -> bool:
+        """A transient prep error that `_retry_transient_prep` did not requeue (#896)."""
+        return (task.context or {}).get("prep_error") in _PREP_TRANSIENT_ERRORS
+
+    def _prep_failure_details(task: TaskRequest) -> dict:
+        ctx = task.context or {}
+        return {"prep_error": ctx.get("prep_error"),
+                "prep_retry_count": int(ctx.get("prep_retry_count") or 0)}
+
     def _fail_if_active(task_id: str, reason: str, *, status: str = "failed",
                         details: Optional[dict] = None) -> bool:
         """End a task only when it is still in_progress (agent may have submitted first).
@@ -6190,6 +6249,18 @@ def create_app(
                     task_context=task.context if isinstance(task.context, dict) else {},
                     task_type=task.task_type,
                 )
+                # #896: retry a transient prep error before recording or
+                # delivering anything, whatever fallback SHA prep returned.
+                if _retry_transient_prep(task):
+                    _lock_stack.close()
+                    return
+                # #896: retries spent — needs_human even with a fallback SHA.
+                if _transient_prep_exhausted(task):
+                    _lock_stack.close()
+                    _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                    status="needs_human",
+                                    details=_prep_failure_details(task))
+                    return
                 # #253/#358: record the exact prepared commit, or explicit
                 # unknown, before prompt construction.  A prep failure still
                 # dispatches, but can no longer masquerade as an unrecorded
@@ -6203,7 +6274,8 @@ def create_app(
                 if (task.context or {}).get("prep_error") and not _reviewed_sha:
                     _lock_stack.close()
                     _fail_if_active(task.task_id, "prepared_base_not_recorded",
-                                    status="needs_human")
+                                    status="needs_human",
+                                    details=_prep_failure_details(task))
                     return
                 if _reviewed_sha:
                     await asyncio.to_thread(_restore_task_wip, q(), task, wt)
