@@ -67,6 +67,28 @@ def test_review_and_test_bash_timeout_covers_pytest_bound(role, delivery):
     assert "`status: failed`" in content
 
 
+@pytest.mark.parametrize("role", ["implementer", "reviewer", "tester"])
+def test_dispatcher_protocol_keeps_every_role_in_foreground(role):
+    """#881: a headless claude implementer backgrounded the suite, called
+    ScheduleWakeup, and ended its turn — the session exited and no result
+    was posted. The rule must reach every role in dispatcher mode."""
+    content = generate(role, "myproject", 8123, delivery="dispatcher")
+    rule = content.split("Stay in the foreground until the result is posted")[1]
+    rule = rule.split("## Autonomous Collaboration Baseline")[0]
+    for term in ("run_in_background", "Monitor", "ScheduleWakeup",
+                 "background wait", "pgrep -f",
+                 "Run every command in the foreground",
+                 "POST the result before ending the turn",
+                 "Implementers run targeted tests only",
+                 # 10-28 impl-887 ran the whole suite split into chunks and
+                 # hit the 1h dispatcher_timeout without breaking the wording.
+                 "Implementers never run the full suite",
+                 "split into chunks, partitions or loops over test files",
+                 "about 10 minutes in total",
+                 "let the tester gate run it"):
+        assert term in rule, term
+
+
 def test_implementer_protocol_has_no_pytest_rule():
     content = generate("implementer", "myproject", 8123, delivery="dispatcher")
     assert "Bounded pytest runs" not in content
