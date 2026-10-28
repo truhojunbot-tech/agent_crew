@@ -779,8 +779,11 @@ running or scheduled is lost, and no result is ever posted.
 - Never block silently for longer than the dispatcher's idle limit (600
   seconds without output). Bound long commands with `timeout`.
 - Implementers run targeted tests only: the files you touch plus their
-  directly related tests. The full suite is the tester's merge gate;
-  implementers do not run it.
+  directly related tests. The full suite is the tester's merge gate.
+  Implementers never run the full suite, whether in one run or
+  split into chunks, partitions or loops over test files.
+- Targeted tests are capped at about 10 minutes in total. If more is
+  needed, push and let the tester gate run it.
 - POST the result before ending the turn. Never end a turn with "still
   running in the background" — the session exits then.
 

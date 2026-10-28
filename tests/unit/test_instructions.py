@@ -79,7 +79,13 @@ def test_dispatcher_protocol_keeps_every_role_in_foreground(role):
                  "background wait", "pgrep -f",
                  "Run every command in the foreground",
                  "POST the result before ending the turn",
-                 "Implementers run targeted tests only"):
+                 "Implementers run targeted tests only",
+                 # 10-28 impl-887 ran the whole suite split into chunks and
+                 # hit the 1h dispatcher_timeout without breaking the wording.
+                 "Implementers never run the full suite",
+                 "split into chunks, partitions or loops over test files",
+                 "about 10 minutes in total",
+                 "let the tester gate run it"):
         assert term in rule, term
 
 
