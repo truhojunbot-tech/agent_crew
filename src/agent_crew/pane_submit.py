@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from typing import Callable, Generator
 
@@ -65,10 +66,11 @@ def _locked(key: str) -> Generator[bool, None, None]:
             os.makedirs(_lock_dir(), exist_ok=True)
             fh = open(os.path.join(_lock_dir(), f"{safe}.lock"), "w")
         except OSError:
-            # No lock dir is not a reason to stop delivering tasks; the
-            # in-process lock still serialises this server's own writers.
+            # Without the flock another process (a second server, a CLI) can
+            # type into the same pane mid-submit; refuse rather than inject
+            # unlocked.
             logger.warning("pane_submit: cannot open lock file for %s", key)
-        got = fh is None
+        got = False
         if fh is not None:
             for _ in range(_LOCK_ATTEMPTS):
                 try:
@@ -157,7 +159,10 @@ def submit(target: str, text: str, *, pending: Callable[[str], bool] | None = No
     - ``send_failed``: tmux refused the text, or the pane lock was busy.
 
     ``paste`` uses a bracketed paste (load-buffer + paste-buffer -p), which
-    delivers multi-line text atomically; otherwise ``send-keys -l``.
+    delivers multi-line text atomically; otherwise ``send-keys -l``. The paste
+    goes through a uniquely named buffer: tmux buffers are server-global while
+    the lock is per pane, so a shared default buffer would let a concurrent
+    submit to another pane overwrite it between load and paste.
     """
     if pending is None:
         pending = text_pending(text)
@@ -167,11 +172,14 @@ def submit(target: str, text: str, *, pending: Callable[[str], bool] | None = No
             logger.warning("pane_submit: lock busy for %s (%s); nothing sent", target, label)
             return "send_failed"
         if paste:
-            r1 = subprocess.run(["tmux", "load-buffer", "-"], input=text,
+            buf = f"agent_crew-{uuid.uuid4().hex}"
+            r1 = subprocess.run(["tmux", "load-buffer", "-b", buf, "-"], input=text,
                                 text=True, capture_output=True)
-            r2 = subprocess.run(["tmux", "paste-buffer", "-p", "-d", "-t", target],
+            r2 = subprocess.run(["tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", target],
                                 capture_output=True)
             failed = getattr(r1, "returncode", 0) != 0 or getattr(r2, "returncode", 0) != 0
+            if failed:  # a failed paste does not consume (-d) the buffer
+                subprocess.run(["tmux", "delete-buffer", "-b", buf], capture_output=True)
         else:
             r = subprocess.run(["tmux", "send-keys", "-l", "-t", target, text],
                                capture_output=True, text=True)

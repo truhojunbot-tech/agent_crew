@@ -170,3 +170,93 @@ def test_log_viewer_launch_is_verified(fake, monkeypatch, tmp_path):
 
 def test_dead_refresh_pane_is_gone():
     assert not hasattr(session, "refresh_pane")
+
+
+class MultiPaneTmux:
+    """tmux buffers are server-global; inputs are per pane. Two concurrent
+    load-buffers both land before either paste (the barrier), which is the
+    interleaving per-pane locks do not prevent."""
+
+    def __init__(self):
+        self.buffers = {}
+        self.inputs = {}
+        self.barrier = threading.Barrier(2, timeout=5)
+
+    @staticmethod
+    def _opt(cmd, flag):
+        return cmd[cmd.index(flag) + 1] if flag in cmd else None
+
+    def run(self, cmd, *a, **kw):
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        r = R()
+        if cmd[:2] == ["tmux", "load-buffer"]:
+            # Without -b tmux creates a new top-of-stack buffer; paste without
+            # -b takes the top one — i.e. whichever load ran last.
+            self.buffers[self._opt(cmd, "-b") or "__top__"] = kw.get("input", "")
+            self.barrier.wait()
+        elif cmd[:2] == ["tmux", "paste-buffer"]:
+            name = self._opt(cmd, "-b") or "__top__"
+            pane = self._opt(cmd, "-t")
+            self.inputs[pane] = self.inputs.get(pane, "") + self.buffers.get(name, "")
+            if "-d" in cmd:
+                self.buffers.pop(name, None)
+        elif cmd[:2] == ["tmux", "send-keys"] and cmd[-1] == "Enter":
+            self.inputs[self._opt(cmd, "-t")] = ""
+        elif cmd[:2] == ["tmux", "capture-pane"]:
+            r.stdout = f"❯ {self.inputs.get(self._opt(cmd, '-t'), '')}\n────────\n"
+        return r
+
+
+def test_concurrent_submits_to_different_panes_never_cross_paste(monkeypatch, tmp_path):
+    t = MultiPaneTmux()
+    pasted = {}
+    real = t.run
+
+    def spy(cmd, *a, **kw):
+        if cmd[:2] == ["tmux", "paste-buffer"]:
+            pane = MultiPaneTmux._opt(cmd, "-t")
+            name = MultiPaneTmux._opt(cmd, "-b") or "__top__"
+            pasted[pane] = t.buffers.get(name)
+        return real(cmd, *a, **kw)
+    monkeypatch.setattr(pane_submit.subprocess, "run", spy)
+    monkeypatch.setattr(pane_submit.time, "sleep", lambda *_a: None)
+    monkeypatch.setenv("AGENT_CREW_PANE_LOCK_DIR", str(tmp_path / "locks"))
+
+    out = {}
+    threads = [threading.Thread(target=lambda p=p, s=s: out.__setitem__(
+        p, pane_submit.submit(p, s))) for p, s in (("%1", "task for one"), ("%2", "task for two"))]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(10)
+    assert pasted == {"%1": "task for one", "%2": "task for two"}
+    assert out == {"%1": "submitted", "%2": "submitted"}
+    assert t.buffers == {}  # every named buffer was deleted by its paste
+
+
+def test_unopenable_lock_file_sends_nothing(fake, tmp_path, monkeypatch):
+    t = fake()
+    not_a_dir = tmp_path / "locks-is-a-file"
+    not_a_dir.write_text("")
+    monkeypatch.setenv("AGENT_CREW_PANE_LOCK_DIR", str(not_a_dir))
+    assert pane_submit.submit("%1", "x") == "send_failed"
+    assert t.calls == []
+
+
+def test_failed_paste_deletes_its_named_buffer(fake):
+    t = fake()
+    real = t.run
+
+    def failing(cmd, *a, **kw):
+        r = real(cmd, *a, **kw)
+        if cmd[:2] == ["tmux", "paste-buffer"]:
+            r.returncode = 1
+        return r
+    pane_submit.subprocess.run = failing
+    assert pane_submit.submit("%1", "hello") == "send_failed"
+    load = next(c for c in t.calls if c[:2] == ["tmux", "load-buffer"])
+    assert ["tmux", "delete-buffer", "-b", load[3]] in t.calls
+    assert t.enters() == []
