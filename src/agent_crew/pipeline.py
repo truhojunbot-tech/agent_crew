@@ -187,6 +187,7 @@ def verify_implement_artifact(
         return False, "rebase_onto target is empty or invalid"
     try:
         ancestor = base
+        rebase_tip = ""
         if has_rebase_target:
             target_fetch = subprocess.run(
                 ["git", "-C", repo_cwd, "fetch", "origin",
@@ -201,9 +202,20 @@ def verify_implement_artifact(
                  f"origin/{rebase_target}^{{commit}}"],
                 capture_output=True, text=True, timeout=30,
             )
-            ancestor = resolved_target.stdout.strip()
-            if resolved_target.returncode != 0 or not ancestor:
+            rebase_tip = resolved_target.stdout.strip()
+            if resolved_target.returncode != 0 or not rebase_tip:
                 return False, f"rebase_onto target origin/{rebase_target} is not resolvable"
+            # #908: the floor is the target as it was at dispatch. main keeps
+            # moving while the worker runs; a rebase onto the dispatch-time tip
+            # is still valid after another PR merges. A recorded base that is
+            # not on the target's history (e.g. the pre-rebase branch head) is
+            # no floor, so fall back to the current tip.
+            ancestor = rebase_tip
+            if base and base != rebase_tip and subprocess.run(
+                ["git", "-C", repo_cwd, "merge-base", "--is-ancestor", base, rebase_tip],
+                capture_output=True, text=True, timeout=30,
+            ).returncode == 0:
+                ancestor = base
 
         # Workers should report their full SHA, but a missing typed field must
         # not discard code that origin can prove was pushed.  Deriving only
@@ -241,7 +253,7 @@ def verify_implement_artifact(
             result.commit = commit
             derived_commit = True
 
-        if commit == ancestor:
+        if commit == ancestor or (has_rebase_target and commit == rebase_tip):
             if has_rebase_target:
                 return False, "reported commit is the rebase_onto target (no new artifact)"
             if named_no_ref and derived_commit and commit == base:
