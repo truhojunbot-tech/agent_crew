@@ -314,7 +314,7 @@ def test_persistent_non_agent_pane_ends_the_task_as_needs_human_after_n(
     import sqlite3
     with sqlite3.connect(tmp_db) as conn:
         summary = conn.execute("SELECT summary FROM tasks WHERE task_id='stuck'").fetchone()[0]
-    assert summary == "push_refused_pane_not_agent_log_viewer"
+    assert summary == "push_refused_pane_not_agent_log_viewer (pane %101, 3 refusals)"
     ctx = _context(tmp_db, "stuck")
     assert ctx["push_refusals"] == {"%101": 3}                        # bounded: stops at N
     assert ctx["push_refusal_reason"] == "pane_not_agent_log_viewer"
@@ -367,3 +367,76 @@ def test_defer_backoff_doubles_per_refusal_on_the_same_pane(tmp_db, monkeypatch)
         waits.append(q.get_task_context("b")["push_not_before"] - clock[0])
     assert waits == [30, 60, 120]
     assert q.defer_push_delivery("b", "%101", "r", max_refusals=10, backoff_s=30) is None  # pending
+
+
+# ---------------------------------------------------------------------------
+# #825: a task already in_progress on a non-agent pane is never requeued, so
+# `defer_push_delivery` never counted it. With no reminder delivered there was
+# no watchdog timeout either: apify-forge impl-2b2de608 (agent_override=codex,
+# whose pane was a crew-log-viewer) was refused every tick for 5.5h.
+# ---------------------------------------------------------------------------
+
+def _stranded_override_app(db, tmp_path, push, notices):
+    state = tmp_path / "override-state.json"
+    state.write_text(json.dumps({"project": "owned", "pane_ids": ["%101", "%201"]}))
+    return create_app(db, pane_map={"implementer": "%101", "codex": "%201"},
+                      state_path=str(state), port=8100, push_fn=push,
+                      pane_busy_fn=lambda _pane: False,
+                      coordinator_notify_fn=lambda msg: notices.append(msg) or True,
+                      reminder_seconds=300.0, timeout_seconds=10_000.0,
+                      watchdog_disabled=True, anomaly_disabled=True)
+
+
+def _strand_in_progress(db, task_id):
+    """The observed state: claimed via tmux_push, never delivered."""
+    q = TaskQueue(db)
+    q.enqueue(TaskRequest(task_id=task_id, task_type="implement", description="w",
+                          context={"agent_override": "codex"}))
+    assert q.dequeue(role="implementer", claimed_via="tmux_push").task_id == task_id
+    q.bump_activity(task_id, ts=1000.0)
+
+
+def test_override_task_refused_every_watchdog_tick_ends_needs_human_with_notice(
+    tmp_db, tmp_path, monkeypatch, caplog,
+):
+    monkeypatch.setattr("agent_crew.server._pane_process_kind",
+                        _panes({"%101": "agent", "%201": "log_viewer"}))
+    monkeypatch.setattr("agent_crew.server._PUSH_REFUSAL_MAX", 3)
+    push, notices = RecordingPush(), []
+    app = _stranded_override_app(tmp_db, tmp_path, push, notices)
+
+    with TestClient(app):
+        _strand_in_progress(tmp_db, "stranded")
+        for tick in range(20):                     # ten minutes of 30s ticks
+            app.state.watchdog_tick(now=1400.0 + 30 * tick)
+
+    assert push.calls == []
+    assert _status(tmp_db, "stranded") == "needs_human"
+    # Bounded: N refusals, not one per tick.
+    assert app.state.delivery_guard_refusals == {"pane_not_agent_log_viewer": 3}
+    assert "tmux push refused 3 times task_id=stranded pane=%201" in caplog.text
+    [notice] = [n for n in notices if "task=stranded" in n]
+    assert "kind=push_refused_pane_not_agent_log_viewer" in notice
+    assert "pane %201" in notice
+
+
+def test_held_refusals_must_be_consecutive(tmp_db, tmp_path, monkeypatch):
+    """An agent seen between refusals resets the count: one bad probe in a
+    long-running task does not accumulate towards needs_human."""
+    kinds = {"%101": "agent", "%201": "log_viewer"}
+    monkeypatch.setattr("agent_crew.server._pane_process_kind", _panes(kinds))
+    monkeypatch.setattr("agent_crew.server._PUSH_REFUSAL_MAX", 3)
+    app = _stranded_override_app(tmp_db, tmp_path, RecordingPush(), [])
+
+    with TestClient(app):
+        _strand_in_progress(tmp_db, "flapping")
+        app.state.watchdog_tick(now=1400.0)
+        app.state.watchdog_tick(now=1430.0)
+        kinds["%201"] = "agent"                    # reminder delivered
+        app.state.watchdog_tick(now=1460.0)
+        app.state.reminded_task_ids.discard("flapping")
+        kinds["%201"] = "log_viewer"
+        app.state.watchdog_tick(now=1490.0)
+        app.state.watchdog_tick(now=1520.0)
+
+    assert _status(tmp_db, "flapping") == "in_progress"
