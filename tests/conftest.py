@@ -73,6 +73,18 @@ def _isolate_shadow_memory_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
 
 
+@pytest.fixture(autouse=True)
+def _no_live_coordinator_notice_sink(monkeypatch):
+    """Keep the server's real notice delivery routes out of every test (#874).
+
+    Crew workers run pytest with the serving environment, so an inherited
+    AGENT_CREW_COORDINATOR_NOTICE_CMD posted fixture tasks to the live
+    blackboard. Tests that exercise a sink set their own fake one.
+    """
+    monkeypatch.delenv("AGENT_CREW_COORDINATOR_NOTICE_CMD", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+
 #: Every function in `agent_crew.github` that MUTATES something on GitHub.
 #: Reads (`get_repo`, `pr_state`, `pr_head_sha`, `branch_has_pr`, …) are left
 #: alone: they are safe, and blocking them would push tests toward mocking the
