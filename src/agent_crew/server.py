@@ -4778,6 +4778,13 @@ def create_app(
                     # fallback from being re-read as a "caller" base next time.
                     if _retry_transient_prep(task):
                         return
+                    # #896: retries spent — a caller/HEAD fallback is not the
+                    # base this task asked for, so it is not delivered on.
+                    if _transient_prep_exhausted(task):
+                        _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                        status="needs_human",
+                                        details=_prep_failure_details(task))
+                        return
                     # #253: persist it on the task BEFORE the push, so it also
                     # reaches the agent in the task block — a reviewer that can
                     # see which commit it was given can say so in its result,
@@ -5712,11 +5719,11 @@ def create_app(
 
         A git timeout under host load (alpha_engine 10-28: load 27-37, a fetch
         taking 36.5 s) is infrastructure, not a broken task. The first one
-        backs off and retries; a second one, or any other prep error, falls
-        through to the pre-#896 handling: needs_human without a base, or — for
-        an implementer with a verified caller/HEAD fallback — dispatch on it
-        (#812). Callers ask this BEFORE recording a base, so the retry also
-        covers an implementer whose prep returned a fallback SHA.
+        backs off and retries; once retries are spent the caller ends it in
+        needs_human (`_transient_prep_exhausted`) — even for an implementer
+        whose prep returned a caller/HEAD fallback, which may be an unrelated
+        stale commit. Any other prep error keeps the pre-#896 handling (#812).
+        Callers ask this BEFORE recording a base.
         """
         ctx = task.context or {}
         prep_error = ctx.get("prep_error")
@@ -5734,6 +5741,10 @@ def create_app(
             logger.warning("prep retry: %s hit %s — requeued, not before %.0fs",
                            task.task_id, prep_error, _PREP_RETRY_BACKOFF_S)
         return requeued
+
+    def _transient_prep_exhausted(task: TaskRequest) -> bool:
+        """A transient prep error that `_retry_transient_prep` did not requeue (#896)."""
+        return (task.context or {}).get("prep_error") in _PREP_TRANSIENT_ERRORS
 
     def _prep_failure_details(task: TaskRequest) -> dict:
         ctx = task.context or {}
@@ -6235,6 +6246,13 @@ def create_app(
                 # delivering anything, whatever fallback SHA prep returned.
                 if _retry_transient_prep(task):
                     _lock_stack.close()
+                    return
+                # #896: retries spent — needs_human even with a fallback SHA.
+                if _transient_prep_exhausted(task):
+                    _lock_stack.close()
+                    _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                    status="needs_human",
+                                    details=_prep_failure_details(task))
                     return
                 # #253/#358: record the exact prepared commit, or explicit
                 # unknown, before prompt construction.  A prep failure still

@@ -274,7 +274,19 @@ def test_implementer_head_fallback_still_retries_on_push_path(tmp_path, monkeypa
     assert ctx.get("worktree_base_sha") is None
 
 
-def test_implementer_second_timeout_falls_back_to_812_dispatch(tmp_path, monkeypatch):
+def _assert_exhausted_needs_human(queue, task_id):
+    assert queue.get_task_status(task_id) == "needs_human"
+    info = queue.get_result(task_id).error_info
+    assert info["reason"] == "prepared_base_not_recorded"
+    assert info["prep_error"] == "TimeoutExpired"
+    assert info["prep_retry_count"] == 1
+    # The stale HEAD fallback was never recorded as this task's base.
+    assert queue.get_task_context(task_id).get("worktree_base_sha") is None
+
+
+def test_implementer_second_timeout_needs_human_on_push_path(tmp_path, monkeypatch):
+    """review-fix-review-impl-896p-r0-r1-r1: a nonempty HEAD fallback must not
+    turn an exhausted transient prep failure into a push on a stale base."""
     worker, head = _impl_repo(tmp_path)
     pushed = []
     monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
@@ -289,8 +301,33 @@ def test_implementer_second_timeout_falls_back_to_812_dispatch(tmp_path, monkeyp
         queue.merge_task_context("impl-896-twice", {"push_not_before": 0})
         app.state.try_push_next("implementer")
 
-    ctx = queue.get_task_context("impl-896-twice")
-    assert ctx["prep_retry_count"] == 1
-    assert ctx["worktree_base_sha"] == head
-    assert ctx["worktree_base_status"] == "head_after_prep_error"
-    assert pushed and queue.get_task_status("impl-896-twice") == "in_progress"
+    assert pushed == []
+    _assert_exhausted_needs_human(queue, "impl-896-twice")
+
+
+def test_implementer_second_timeout_needs_human_on_dispatcher_path(tmp_path, monkeypatch):
+    worker, head = _impl_repo(tmp_path)
+    pushed = []
+    monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
+    launched = []
+
+    async def fake_exec(*args, **kwargs):
+        launched.append(args)
+        raise RuntimeError("provider launch stubbed out")
+    monkeypatch.setattr(sv.asyncio, "create_subprocess_exec", fake_exec)
+    app, queue = _impl_app(tmp_path, monkeypatch, pushed, worker)
+
+    with TestClient(app):
+        queue.enqueue(TaskRequest("impl-896-disp2", "implement", "fix", branch="feature",
+                                  project="demo", context={}))
+        task = queue.dequeue(role="implementer")
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+        queue.merge_task_context("impl-896-disp2", {"push_not_before": 0})
+        task = queue.dequeue(role="implementer")
+        assert task is not None
+        assert sv._prepare_worktree_for_task(str(worker), task.task_id, "feature",
+                                             "implementer", task_context=dict(task.context)) == head
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    assert launched == [] and pushed == []
+    _assert_exhausted_needs_human(queue, "impl-896-disp2")
