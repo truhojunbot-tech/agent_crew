@@ -81,3 +81,36 @@ def test_reset_stale_clears_lease_and_claim_and_logs_requeued(tmp_path):
     assert row["lease_expires_at"] is None
     events = [e["event"] for e in q.get_exec_state("dead")["events"]]
     assert "requeued" in events
+
+
+def test_expire_stale_spares_task_heartbeating_between_scan_and_cancel(tmp_path, monkeypatch):
+    """r0 review: the scan and the cancel are separate transactions. A
+    heartbeat landing between them must still spare the task — the staleness
+    predicate is re-checked under the cancel's write lock."""
+    db, q = _in_progress(tmp_path, "live", heartbeat_ago=1200)
+    real_cancel = q.cancel
+
+    def heartbeat_then_cancel(task_id, **kw):
+        q.record_heartbeat(task_id, source="output_progress")
+        return real_cancel(task_id, **kw)
+
+    monkeypatch.setattr(q, "cancel", heartbeat_then_cancel)
+    assert q.expire_stale(older_than_seconds=600) == []
+    assert _row(db, "live")["status"] == "in_progress"
+
+
+def test_expire_stale_spares_task_with_activity_between_scan_and_cancel(tmp_path, monkeypatch):
+    db, q = _in_progress(tmp_path, "live", heartbeat_ago=1200)
+    real_cancel = q.cancel
+
+    def touch_then_cancel(task_id, **kw):
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE tasks SET last_activity_at=? WHERE task_id=?",
+                     (time.time(), task_id))
+        conn.commit()
+        conn.close()
+        return real_cancel(task_id, **kw)
+
+    monkeypatch.setattr(q, "cancel", touch_then_cancel)
+    assert q.expire_stale(older_than_seconds=600) == []
+    assert _row(db, "live")["status"] == "in_progress"

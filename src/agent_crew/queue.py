@@ -7235,12 +7235,15 @@ class TaskQueue:
             conn.close()
 
     def cancel(self, task_id: str, *, reason: str = CANCEL_REASON_ATTEMPT,
-               expected_status: Optional[str] = None) -> bool:
+               expected_status: Optional[str] = None,
+               stale_before: Optional[float] = None) -> bool:
         return self.cancel_with_binding(task_id, reason=reason,
-                                        expected_status=expected_status)[0]
+                                        expected_status=expected_status,
+                                        stale_before=stale_before)[0]
 
     def cancel_with_binding(self, task_id: str, *, reason: str = CANCEL_REASON_ATTEMPT,
                             expected_status: Optional[str] = None,
+                            stale_before: Optional[float] = None,
                             ) -> tuple[bool, Optional[str], str]:
         """Cancel a task. Dependent tasks (prev_task_id points to task_id) are marked
         'orphaned' rather than cancelled — operators can manually cancel them if desired.
@@ -7256,6 +7259,11 @@ class TaskQueue:
         given, makes this a CAS: the cancel is skipped if the row moved on since
         the caller selected it, so a task that finished between a stale-lease
         scan and its expiry is not cancelled retroactively.
+
+        ``stale_before``, when given, extends that CAS to liveness: the cancel
+        is skipped unless both ``last_activity_at`` and ``last_heartbeat_at``
+        are still older than it. A worker that heartbeats between a stale scan
+        and the expiry is alive, not stale (#885 r0 review).
 
         ⛔Cancellation applies to *active* rows only. A row already in
           :data:`TERMINAL_TASK_STATUSES` is refused — no status write, no receipt
@@ -7277,7 +7285,8 @@ class TaskQueue:
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT status, receipt_id, dispatch_pane_id FROM tasks WHERE task_id = ?",
+                "SELECT status, receipt_id, dispatch_pane_id, last_activity_at, "
+                "last_heartbeat_at FROM tasks WHERE task_id = ?",
                 (task_id,)).fetchone()
             if row is None:
                 conn.execute("ROLLBACK")
@@ -7285,6 +7294,11 @@ class TaskQueue:
             status = row["status"]
             pane = row["dispatch_pane_id"] or ""
             if expected_status is not None and status != expected_status:
+                conn.execute("ROLLBACK")
+                return False, status, pane
+            if stale_before is not None and (
+                    (row["last_activity_at"] or 0) >= stale_before
+                    or (row["last_heartbeat_at"] or 0) >= stale_before):
                 conn.execute("ROLLBACK")
                 return False, status, pane
             if status in TERMINAL_TASK_STATUSES:
@@ -7382,10 +7396,11 @@ class TaskQueue:
         cancelled: List[str] = []
         for task_id in candidates:
             try:
-                # CAS on in_progress: a task that posted its result between the
-                # scan and here is finished, not stale.
+                # CAS on in_progress and on staleness: a task that posted its
+                # result, or heartbeated, between the scan and here is not stale.
                 if not self.cancel(task_id, reason=CANCEL_REASON_STALE_LEASE,
-                                   expected_status="in_progress"):
+                                   expected_status="in_progress",
+                                   stale_before=cutoff):
                     continue
             except Exception:
                 logger.exception("expire_stale: cancel failed task_id=%s", task_id)
