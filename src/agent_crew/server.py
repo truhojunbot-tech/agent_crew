@@ -99,6 +99,7 @@ from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import (
     DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, effective_role_mapping,
+    provider_family,
 )
 from agent_crew.risk_tier import risk_declaration as _risk_declaration
 from agent_crew.testing_policy import (
@@ -3995,7 +3996,7 @@ def create_app(
         if task.task_type != "review":
             return False
         implementer = _review_implementer_agent(task)
-        if not implementer or implementer.strip().lower() != agent.strip().lower():
+        if not implementer or provider_family(implementer) != provider_family(agent):
             return False
         reason = f"reviewer_matches_implementer: {agent}"
         logger.error("dispatcher: refusing review task=%s — %s", task.task_id, reason)
@@ -7508,6 +7509,7 @@ def create_app(
     app.state.resolve_dispatch_target = _resolve_dispatch_target
     app.state.dispatch_task = _dispatch_task
     app.state.review_implementer_agent = _review_implementer_agent
+    app.state.refuse_self_review = _refuse_self_review
     app.state.try_push_next = _try_push_next
     app.state.active_dispatch_processes = _active_dispatch_processes
     # Exposed so a test can assert no kill is left armed after it finishes —
