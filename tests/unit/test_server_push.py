@@ -338,7 +338,8 @@ def test_u_sp13_default_push_uses_bracketed_paste(monkeypatch):
     enter_args = mock_run.call_args_list[2][0][0]
     capture_args = mock_run.call_args_list[3][0][0]
 
-    assert load_args[:3] == ["tmux", "load-buffer", "-"]
+    assert load_args[:3] == ["tmux", "load-buffer", "-b"]
+    assert load_args[-1] == "-"
     load_kwargs = mock_run.call_args_list[0][1]
     assert load_kwargs.get("input") == text
 
@@ -346,6 +347,7 @@ def test_u_sp13_default_push_uses_bracketed_paste(monkeypatch):
     assert "-p" in paste_args  # bracketed paste mode
     assert "-d" in paste_args  # delete buffer after paste
     assert "%942" in paste_args
+    assert paste_args[paste_args.index("-b") + 1] == load_args[3]  # same named buffer
 
     assert enter_args == ["tmux", "send-keys", "-t", "%942", "Enter"]
     assert "capture-pane" in capture_args
