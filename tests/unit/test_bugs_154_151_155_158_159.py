@@ -103,7 +103,7 @@ class TestGetTasksStatusField:
         with TestClient(app) as client:
             client.post("/tasks", json=_impl_payload("t4"))
             # Dequeue via GET /tasks/next (transitions pending → in_progress)
-            client.get("/tasks/next?role=implementer")
+            client.get("/tasks/next?role=implementer&agent=codex")
             resp = client.get("/tasks/t4")
         task = resp.json()
         assert task["status"] == "in_progress"

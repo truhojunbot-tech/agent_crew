@@ -249,7 +249,7 @@ class TestHttpPollBlockedInMcpMode:
             from agent_crew.server import create_app
             app = create_app(db, pane_map={}, port=9999, watchdog_disabled=True)
         with TestClient(app, raise_server_exceptions=False) as client:
-            resp = client.get("/tasks/next?role=implementer")
+            resp = client.get("/tasks/next?role=implementer&agent=codex")
         assert resp.status_code == 405, (
             f"Expected 405 in MCP mode, got {resp.status_code}: {resp.text}"
         )
@@ -274,7 +274,7 @@ class TestHttpPollBlockedInMcpMode:
             from agent_crew.server import create_app
             app = create_app(db, pane_map={}, port=9999, watchdog_disabled=True)
         with TestClient(app) as client:
-            resp = client.get("/tasks/next?role=implementer")
+            resp = client.get("/tasks/next?role=implementer&agent=codex")
         assert resp.status_code == 200
 
     def test_u172_get_tasks_next_works_in_both_mode(self):
@@ -284,7 +284,7 @@ class TestHttpPollBlockedInMcpMode:
             from agent_crew.server import create_app
             app = create_app(db, pane_map={}, port=9999, watchdog_disabled=True)
         with TestClient(app) as client:
-            resp = client.get("/tasks/next?role=implementer")
+            resp = client.get("/tasks/next?role=implementer&agent=codex")
         assert resp.status_code == 200
 
 

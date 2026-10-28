@@ -280,7 +280,7 @@ def test_http_poll_hands_the_nonce_to_the_worker(client):
     api, db = client
     _enqueue(db, task_id="t-http")
 
-    body = api.get("/tasks/next", params={"role": "implementer"}).json()
+    body = api.get("/tasks/next", params={"role": "implementer", "agent": "codex"}).json()
 
     assert body["task_id"] == "t-http"
     assert body["dispatch_nonce"], "the poller cannot present what it was not given"
@@ -296,7 +296,7 @@ def test_http_result_presents_the_nonce_and_it_is_not_persisted(client):
     api, db = client
     _enqueue(db, task_id="t-e2e")
 
-    handed = api.get("/tasks/next", params={"role": "implementer"}).json()
+    handed = api.get("/tasks/next", params={"role": "implementer", "agent": "codex"}).json()
     nonce = handed["dispatch_nonce"]
 
     go = api.post("/tasks/t-e2e/start", json={"nonce": nonce, "presenter": "claude"}).json()

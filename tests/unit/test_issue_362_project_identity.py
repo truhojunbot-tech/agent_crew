@@ -22,7 +22,7 @@ from agent_crew.loop import _post_task_http
 _WORKER_HTTP_ROUTES = [
     ("post", "/tasks", {"task_id": "impl-route", "task_type": "implement",
                         "description": "work", "project": "alpha"}),
-    ("get", "/tasks/next?role=implementer", None),
+    ("get", "/tasks/next?role=implementer&agent=codex", None),
     ("get", "/tasks", None),
     ("get", "/tasks/impl-route", None),
     ("post", "/tasks/impl-route/start", {"nonce": "x"}),
@@ -93,8 +93,8 @@ def test_worker_transport_refuses_missing_and_foreign_identity_before_claim(tmp_
         assert client.post("/tasks", json=payload, headers={
             "X-Agent-Crew-Project": "alpha"}).status_code == 201
         result = {"task_id": "impl-identity", "status": "completed", "summary": "done"}
-        assert client.get("/tasks/next?role=implementer").status_code == 428
-        assert client.get("/tasks/next?role=implementer", headers={
+        assert client.get("/tasks/next?role=implementer&agent=codex").status_code == 428
+        assert client.get("/tasks/next?role=implementer&agent=codex", headers={
             "X-Agent-Crew-Project": "beta"}).status_code == 409
         assert client.post("/tasks/impl-identity/result", json=result).status_code == 428
         assert client.post("/tasks/impl-identity/result", json=result, headers={
@@ -104,7 +104,7 @@ def test_worker_transport_refuses_missing_and_foreign_identity_before_claim(tmp_
             "X-Agent-Crew-Project": "beta"}).status_code == 409
         assert client.get("/tasks/impl-identity", headers={
             "X-Agent-Crew-Project": "alpha"}).json()["status"] == "pending"
-        claimed = client.get("/tasks/next?role=implementer", headers={
+        claimed = client.get("/tasks/next?role=implementer&agent=codex", headers={
             "X-Agent-Crew-Project": "alpha"})
         assert claimed.status_code == 200
         assert claimed.json()["task_id"] == "impl-identity"
