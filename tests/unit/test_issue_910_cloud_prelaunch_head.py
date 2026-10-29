@@ -3,6 +3,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from agent_crew import claude_cloud as cloud
 from agent_crew import github
 from agent_crew.protocol import TaskRequest
@@ -160,7 +162,7 @@ def test_strict_pr_lookup_distinguishes_no_pr_from_failure(monkeypatch):
     responses[0] = (0, '[{"number": 282}]')
     assert _REAL_PR_LOOKUP("b", repo="o/r", strict=True) == 282
 
-    for failure in [(1, ""), (0, "not json"), (0, '{"x": 1}'), (0, '[{"number": null}]'),
+    for failure in [(1, ""), (0, ""), (0, "  \n"), (0, "not json"), (0, '{"x": 1}'), (0, '[{"number": null}]'),
                     subprocess.TimeoutExpired(["gh"], 15)]:
         responses[0] = failure
         # The default (fail-closed) form keeps its None contract for every caller.
@@ -174,9 +176,12 @@ def test_strict_pr_lookup_distinguishes_no_pr_from_failure(monkeypatch):
         _REAL_PR_LOOKUP("b", repo="o/r", strict=True)
 
 
-def test_real_gh_lookup_failure_defers_then_recovers_with_launch_head(tmp_path, monkeypatch):
-    """The reviewer's reproduction: gh fails (nonzero exit) at launch time, the
-    helper's real shape is exercised, and the task must not launch headless."""
+@pytest.mark.parametrize("failure", [(1, ""), (0, "")], ids=["nonzero_exit", "empty_stdout"])
+def test_real_gh_lookup_failure_defers_then_recovers_with_launch_head(tmp_path, monkeypatch,
+                                                                     failure):
+    """The reviewer's reproduction: gh fails at launch time — a nonzero exit, or
+    a zero exit with no output at all, which is no answer either — the helper's
+    real shape is exercised, and the task must not launch headless."""
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     head = ["a" * 40]
     queue.enqueue(TaskRequest(
@@ -186,7 +191,7 @@ def test_real_gh_lookup_failure_defers_then_recovers_with_launch_head(tmp_path, 
     ))
     _cloud_env(monkeypatch, head)
     monkeypatch.setattr(cloud._github, "pr_number_for_branch", _REAL_PR_LOOKUP)
-    responses = [(1, "")]
+    responses = [failure]
     gh_calls = _gh(monkeypatch, responses)
     launches = []
 

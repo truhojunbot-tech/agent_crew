@@ -500,7 +500,11 @@ def pr_number_for_branch(branch: str, repo: Optional[str] = None,
         )
         if result.returncode != 0:
             return _unknown(f"gh exit {result.returncode}: {(result.stderr or '').strip()[:200]}")
-        rows = json.loads(result.stdout or "[]")
+        if not (result.stdout or "").strip():
+            # A zero exit with no output is not "gh answered []": "no PR" is
+            # only ever the JSON empty list.
+            return _unknown("empty gh output")
+        rows = json.loads(result.stdout)
         if not isinstance(rows, list):
             return _unknown("unexpected gh output")
         if not rows:
