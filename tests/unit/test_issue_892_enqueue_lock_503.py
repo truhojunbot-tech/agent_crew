@@ -13,16 +13,23 @@ from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 
+PROJECT = "issue892"
+
+
 def _client(tmp_db):
-    return TestClient(create_app(db_path=tmp_db, watchdog_disabled=True,
-                                 anomaly_disabled=True, push_fn=lambda *a, **k: None),
+    # Identity is on explicitly (as on a served dispatcher), so _post must carry
+    # a matching X-Agent-Crew-Project or it stops at 428 before enqueue.
+    return TestClient(create_app(db_path=tmp_db, project=PROJECT, identity_required=True,
+                                 watchdog_disabled=True, anomaly_disabled=True,
+                                 push_fn=lambda *a, **k: None),
                       raise_server_exceptions=False)
 
 
 def _post(c, task_id):
-    return c.post("/tasks", json={"task_id": task_id, "task_type": "review",
-                                  "description": "d", "branch": "b", "priority": 3,
-                                  "context": {}, "project": ""})
+    return c.post("/tasks", headers={"X-Agent-Crew-Project": PROJECT},
+                  json={"task_id": task_id, "task_type": "review",
+                        "description": "d", "branch": "b", "priority": 3,
+                        "context": {}, "project": PROJECT})
 
 
 def _lock(monkeypatch, times):
