@@ -253,3 +253,27 @@ def test_invalid_git_branch_fails_closed_before_launch(tmp_path, env, branch):
     assert outcome.launch_error == "cloud_branch_unpublishable"
     assert queue.get_task("impl-890").status == "failed"
     assert launches == []
+
+
+@pytest.mark.parametrize("returncode", [128, 1])
+def test_origin_probe_error_does_not_fall_back_to_default(tmp_path, monkeypatch, returncode):
+    """Review of PR #913 (round 3): an ls-remote transport/command error used
+    to read as "branch not published" and launch a lineage task on main."""
+    checkout = _checkout(tmp_path)
+    _git("push", "origin", "HEAD:refs/heads/fix/existing", cwd=checkout)
+    real_run = subprocess.run
+
+    def run(argv, *args, **kwargs):
+        if argv[:2] == ["git", "ls-remote"]:
+            return SimpleNamespace(returncode=returncode, stdout="",
+                                   stderr="fatal: unable to access origin")
+        return real_run(argv, *args, **kwargs)
+    monkeypatch.setattr(cloud.subprocess, "run", run)
+    assert cloud._origin_branch_ref(str(checkout), "fix/existing") == ""
+
+
+def test_origin_probe_confirmed_no_match_falls_back_to_default(tmp_path):
+    checkout = _checkout(tmp_path)
+    assert cloud._origin_branch_ref(str(checkout), "fix/not-pushed") == "main"
+    _git("push", "origin", "HEAD:refs/heads/fix/existing", cwd=checkout)
+    assert cloud._origin_branch_ref(str(checkout), "fix/existing") == "fix/existing"

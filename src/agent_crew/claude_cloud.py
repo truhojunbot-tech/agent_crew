@@ -829,6 +829,12 @@ def _origin_branch_ref(checkout: str, branch: str) -> str:
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
             if published.returncode == 0 and published.stdout.strip():
                 return branch
+            # ``--exit-code`` exits 2 only for a confirmed no-match; anything
+            # else (128 transport failure, ...) says nothing about the branch,
+            # so falling back to the default would launch on the wrong base
+            # (review of PR #913, round 3).
+            if published.returncode != 2:
+                return ""
         from agent_crew.worktree_default_branch import remote_default_branch
         default = remote_default_branch(checkout, deadline=time.monotonic() + 10)
     except (OSError, subprocess.SubprocessError):
