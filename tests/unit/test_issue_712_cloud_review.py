@@ -1,5 +1,6 @@
 """#712: cloud review uses the existing review result and cascade contract."""
 
+import json
 import time
 from types import SimpleNamespace
 
@@ -15,7 +16,7 @@ SHA = "a" * 40
 OTHER_SHA = "b" * 40
 PR = 712
 REPO = "owner/repo"
-MARKER = f"<!-- agent_crew:cloud-review task=review-712 sha={SHA} -->"
+MARKER = "<!-- agent_crew:cloud-review "
 FINDING = "HIGH src/agent_crew/queue.py:42 - Preserve the review cascade"
 
 
@@ -37,19 +38,17 @@ def _review(queue):
 
 
 def _comment(verdict="approve", sha=SHA, findings=""):
-    return (f"[agent_crew review] verdict: {verdict}\n"
-            f"reviewed_sha {sha}\n"
-            f"Summary: Reviewed the pinned code and checked the relevant tests.\n"
-            f"{findings}"
-            f"<!-- agent_crew:cloud-review task=review-712 sha={sha} -->")
+    return MARKER + json.dumps({
+        "task_id": "review-712", "reviewed_sha": sha, "verdict": verdict,
+        "findings": [line[2:] for line in findings.splitlines() if line.startswith("- ")],
+    }) + " -->"
 
 
 def test_review_prompt_contains_pinned_contract(queue):
     task = _review(queue)
     prompt = cloud.build_cloud_task_prompt(task, repo=REPO)
     for expected in (REPO, str(PR), SHA, task.description, MARKER,
-                     "[agent_crew review] verdict: approve|request_changes",
-                     "reviewed_sha", "HIGH|MED|LOW", "no push", "no merge"):
+                     '"verdict"', '"reviewed_sha"', "HIGH|MED|LOW", "no push", "no merge"):
         assert expected.lower() in prompt.lower()
     assert "PR_READY" not in prompt
 
@@ -58,13 +57,13 @@ def test_review_prompt_names_observed_comment_channel_and_finding_rules(queue):
     prompt = cloud.build_cloud_task_prompt(_review(queue), repo=REPO)
     assert "gh pr comment" in prompt
     assert "gh pr review" in prompt
-    assert "- " in prompt
+    assert "HTML-comment JSON" in prompt
     assert "path:line" in prompt
-    assert "other '- ' lines" in prompt
+    assert "No other keys or text" in prompt
     assert "line number" in prompt
-    with pytest.raises(ValueError, match="finding is malformed"):
+    with pytest.raises(ValueError, match="missing or has extra text"):
         cloud.parse_cloud_review_comment(
-            _comment().replace("Summary:", "- Tests run: 35 passed\nSummary:"),
+            _comment() + "\n- Tests run: 35 passed",
             task_id="review-712", reviewed_sha=SHA, pr_number=PR,
         )
 
@@ -105,7 +104,7 @@ def test_wrong_marker_sha_fails_closed_and_uses_fallback(queue, monkeypatch):
 
 
 @pytest.mark.parametrize("body", [
-    _comment().replace(f"reviewed_sha {SHA}", f"reviewed_sha {OTHER_SHA}"),
+    _comment().replace(SHA, OTHER_SHA),
     _comment("request_changes"),  # no actionable finding
     _comment("approve", findings=f"- {FINDING}\n"),
 ])
@@ -186,7 +185,7 @@ def test_cloud_is_disabled_by_default(monkeypatch):
 
 
 def test_cloud_and_local_review_use_same_server_fix_cascade(tmp_path, monkeypatch):
-    """The cloud comment becomes a normal review result; it is not reposted."""
+    """Both results go through one formatter and the same fix cascade."""
     import agent_crew.server as server
     fix_calls = []
     published = []
@@ -226,4 +225,5 @@ def test_cloud_and_local_review_use_same_server_fix_cascade(tmp_path, monkeypatc
         assert queue.get_task(task.task_id).status == "completed"
 
     assert fix_calls == ["review-712", "review-712"]
-    assert len(published) == 1  # local handler only; cloud posted its own comment
+    assert len(published) == 2
+    assert published[0] == published[1]

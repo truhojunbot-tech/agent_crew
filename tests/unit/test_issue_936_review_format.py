@@ -1,0 +1,121 @@
+"""#936: cloud reviews are structured input to the one server comment writer."""
+
+import json
+from types import SimpleNamespace
+
+import pytest
+from fastapi.testclient import TestClient
+
+from agent_crew import claude_cloud, github
+from agent_crew.github import post_review_comment as format_review_comment
+from agent_crew.protocol import TaskRequest
+from agent_crew.queue import TaskQueue
+from agent_crew.server import create_app
+
+
+SHA = "a" * 40
+FINDING = "HIGH src/agent_crew/queue.py:42 - Preserve review routing"
+
+
+def _block(*, verdict="approve", findings=None, **changes):
+    record = {"task_id": "review-936", "reviewed_sha": SHA,
+              "verdict": verdict, "findings": findings if findings is not None else []}
+    record.update(changes)
+    return f"<!-- agent_crew:cloud-review {json.dumps(record)} -->"
+
+
+def test_cloud_prompt_requests_one_json_block_only():
+    task = TaskRequest(task_id="review-936", task_type="review", description="Review",
+                       context={"pr_number": 936, "reviewed_sha": SHA})
+    prompt = claude_cloud.build_cloud_task_prompt(task, repo="owner/repo")
+    assert "HTML-comment JSON" in prompt
+    assert "task_id" in prompt and "findings" in prompt
+    assert "[agent_crew review] verdict:" not in prompt
+    assert f"reviewed_sha {SHA}" not in prompt
+
+
+@pytest.mark.parametrize("body", [
+    f"[agent_crew review] verdict: approve\nreviewed_sha {SHA}",
+    _block() + "\nLooks good",
+    '<!-- agent_crew:cloud-review {"task_id":"review-936"} -->',
+    _block(verdict="approve", findings=[FINDING]),
+    _block(verdict="request_changes"),
+    _block(verdict="request_changes", findings=["no anchored location"]),
+    _block(extra="unexpected"),
+    _block(findings="not a list"),
+    _block(task_id="different-task"),
+    _block(reviewed_sha="b" * 40),
+    f'<!-- agent_crew:cloud-review {{"task_id":"review-936",'
+    f'"task_id":"review-936","reviewed_sha":"{SHA}",'
+    '"verdict":"approve","findings":[]} -->',
+])
+def test_parser_rejects_prose_and_malformed_blocks(body):
+    with pytest.raises(ValueError):
+        claude_cloud.parse_cloud_review_comment(
+            body, task_id="review-936", reviewed_sha=SHA, pr_number=936)
+
+
+def test_cloud_review_uses_server_formatter(tmp_db, monkeypatch):
+    import agent_crew.server as server
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(
+        task_id="review-936", task_type="review", description="Review",
+        branch="fix/936", project="demo", pr_number=936,
+        context={"pr_number": 936, "reviewed_sha": SHA, "repo": "owner/repo",
+                 "risk_tier": 2}))
+    task = queue.dequeue(role="reviewer")
+    queue.record_dispatch(task.task_id, channel=claude_cloud.DISPATCH_CHANNEL,
+                          agent=claude_cloud.CLOUD_PROVIDER_NAME, target="pending")
+    monkeypatch.setattr(server, "review_publication_decision",
+                        lambda *_a, **_kw: SimpleNamespace(publish=True))
+    monkeypatch.setattr(server, "_pipeline_auto_enqueue_test", lambda *_a, **_kw: None)
+    posted = []
+    monkeypatch.setattr(github, "post_review_comment",
+                        lambda **kwargs: posted.append(kwargs) or True)
+    app = create_app(db_path=tmp_db, project="demo", watchdog_disabled=True,
+                     anomaly_disabled=True)
+    with TestClient(app) as client:
+        def submit(task_id, result):
+            response = client.post(f"/tasks/{task_id}/result", json=result.__dict__,
+                                   headers={"X-Agent-Crew-Project": "demo"})
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        outcome = claude_cloud.reconcile_cloud_dispatch(
+            queue, task, pr_comments_fn=lambda *_a, **_kw: [{"body": _block()}],
+            submit_review_result_fn=submit)
+    assert outcome.action == "review_completed"
+    assert len(posted) == 1
+    assert posted[0]["verdict"] == "approve"
+    assert posted[0]["task_id"] == "review-936"
+    assert posted[0]["repo"] == "owner/repo"
+    bodies = []
+    monkeypatch.setattr(github, "check_gh_installed", lambda: True)
+    monkeypatch.setattr(github.subprocess, "run", lambda argv, **_kwargs:
+                        bodies.append(argv[argv.index("--body") + 1]) or
+                        SimpleNamespace(returncode=0))
+    assert format_review_comment(**posted[0])
+    assert bodies == [
+        "[agent_crew review] verdict: ✅ approve\n\n"
+        f"**Summary:** Cloud review of PR #936 at {SHA}\n\n"
+        "> reviewer: agent | task: review-936"
+    ]
+
+
+def test_unrelated_cloud_marker_does_not_fail_this_review(tmp_db):
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(
+        task_id="review-936", task_type="review", description="Review",
+        pr_number=936, context={"pr_number": 936, "reviewed_sha": SHA,
+                                "repo": "owner/repo", "risk_tier": 2}))
+    task = queue.dequeue(role="reviewer")
+    queue.record_dispatch(task.task_id, channel=claude_cloud.DISPATCH_CHANNEL,
+                          agent=claude_cloud.CLOUD_PROVIDER_NAME, target="pending")
+    other = _block(task_id="review-other")
+    submitted = []
+    outcome = claude_cloud.reconcile_cloud_dispatch(
+        queue, task, pr_comments_fn=lambda *_a, **_kw: [
+            {"body": other}, {"body": _block()}],
+        submit_review_result_fn=lambda _task_id, result: submitted.append(result) or {})
+    assert outcome.action == "review_completed"
+    assert len(submitted) == 1

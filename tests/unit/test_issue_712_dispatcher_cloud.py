@@ -136,9 +136,10 @@ def test_cloud_review_records_result_verdict_and_end_time(tmp_path):
                           agent=cloud.CLOUD_PROVIDER_NAME, target="pending")
     queue.patch_context(task.task_id, {"cloud_session_id": SESSION,
                                        "cloud_launched_at": time.time() - 1})
-    comment = ("[agent_crew review] verdict: approve\n"
-               f"reviewed_sha {SHA}\n"
-               f"<!-- agent_crew:cloud-review task={task.task_id} sha={SHA} -->")
+    comment = ("<!-- agent_crew:cloud-review " + json.dumps({
+        "task_id": task.task_id, "reviewed_sha": SHA,
+        "verdict": "approve", "findings": [],
+    }) + " -->")
 
     outcome = cloud.reconcile_cloud_dispatch(
         queue, task, pr_comments_fn=lambda *_args, **_kw: [{"body": comment}],
@@ -185,9 +186,10 @@ def test_shadow_review_records_cloud_without_replacing_local_verdict(tmp_path, m
 
     assert cloud.launch_shadow_review(queue, task, run_fn=run)
     assert queue.get_task_context(task.task_id)["cloud_shadow_session_id"] == SESSION
-    comment = ("[agent_crew review] verdict: request_changes\n"
-               f"reviewed_sha {SHA}\n- HIGH src/app.py:1 - fix issue\n"
-               f"<!-- agent_crew:cloud-review task={task.task_id} sha={SHA} -->")
+    comment = ("<!-- agent_crew:cloud-review " + json.dumps({
+        "task_id": task.task_id, "reviewed_sha": SHA,
+        "verdict": "request_changes", "findings": ["HIGH src/app.py:1 - fix issue"],
+    }) + " -->")
     cloud.reconcile_shadow_reviews(queue, pr_comments_fn=lambda *_args, **_kw: [{"body": comment}])
     context = queue.get_task_context(task.task_id)
     assert context["cloud_shadow_verdict"] == "request_changes"
