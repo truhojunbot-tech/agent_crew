@@ -79,41 +79,77 @@ def _registry_capability_for_paths(project: str, paths: set[str], registry_path:
     return scored[0][1] if len(scored) == 1 or scored[0][0] > scored[1][0] else ""
 
 
+def test_pass_for_head(queue, review_task_id: str, pr_number: int,
+                       head_sha: str) -> bool:
+    """Require a persisted, structured test PASS for the approved PR revision."""
+    if not review_task_id or not head_sha:
+        return False
+    tasks = {task.task_id: task for task in queue.list_tasks()}
+    review = tasks.get(review_task_id)
+    if review is None or review.task_type != "review":
+        return False
+    review_ctx = review.context if isinstance(review.context, dict) else {}
+    if (review_ctx.get("pr_number") != pr_number
+            or (review_ctx.get("reviewed_sha") or review_ctx.get("expected_head_sha")) != head_sha):
+        return False
+    for task in tasks.values():
+        if task.task_type != "test":
+            continue
+        ctx = task.context if isinstance(task.context, dict) else {}
+        if (ctx.get("prev_task_id") != review_task_id
+                or ctx.get("pr_number") != pr_number
+                or (ctx.get("reviewed_sha") or ctx.get("expected_head_sha")) != head_sha):
+            continue
+        result = queue.get_result(task.task_id)
+        info = result.error_info if result and isinstance(result.error_info, dict) else {}
+        record = info.get("script_test")
+        if (result and result.status == "completed" and result.pr_number == pr_number
+                and isinstance(record, dict)
+                and record.get("outcome") == "PASSED"
+                and record.get("head_sha") == head_sha):
+            return True
+    return False
+
+
 def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
                                    pr_number: int, title: str, task_desc: str,
                                    issue: int | None, receipt_dir: str,
-                                   repo: str, fail_closed: bool = False) -> bool:
+                                   repo: str) -> bool:
     """#588: run the ADR-004 conformance gate (``--enforce``) before auto-merge.
 
-    Off unless ``AGENT_CREW_CONFORMANCE_GATE_CMD`` names the gate command
-    prefix; the gate itself lives in the alfred repo and is only called here.
+    ``AGENT_CREW_CONFORMANCE_GATE_CMD`` must name the gate command prefix;
+    an absent command blocks automatic merge.
     The verdict, receipt path and sha are recorded on ``task_id``:
 
     * ALLOW  — merge.
     * REVIEW — merge, and post the receipt as a PR comment for the reviewer.
-      Any gate error, timeout, non-zero exit other than 10, or
-      EVIDENCE_UNAVAILABLE counts as REVIEW.
+      Gate errors, timeouts, and unavailable evidence block merge.
     * BLOCK (exit 10) — do not merge; the task goes to ``needs_human``.
     """
     prefix = os.environ.get("AGENT_CREW_CONFORMANCE_GATE_CMD", "").strip()
     if not prefix:
-        if fail_closed:
-            reason = "conformance gate not configured"
-            queue.mark_needs_human(task_id, reason,
-                                   {"conformance_gate": {"error": reason,
-                                                         "merge_allowed": False,
-                                                         "pr_number": pr_number}})
-            return False
-        return True
+        reason = "conformance gate not configured"
+        queue.mark_needs_human(task_id, reason,
+                               {"conformance_gate": {"error": reason,
+                                                     "merge_allowed": False,
+                                                     "pr_number": pr_number}})
+        return False
     import hashlib
     import shlex
     from agent_crew import github
     ctx: dict = {}
+    evidence_error = ""
     try:
         ctx = queue.get_task_context(task_id) or {}
-    except Exception:
-        pass
-    head_sha = github.pr_head_sha(pr_number, repo=repo, timeout=5)
+    except Exception as exc:
+        evidence_error = f"task context unavailable: {exc}"
+    try:
+        head_sha = github.pr_head_sha(pr_number, repo=repo, timeout=5)
+    except Exception as exc:
+        head_sha = ""
+        evidence_error = f"PR head unavailable: {exc}"
+    if not head_sha:
+        evidence_error = "PR head unavailable"
     prior = ctx.get("conformance_gate") if isinstance(ctx, dict) else None
     if (head_sha and isinstance(prior, dict)
             and prior.get("pr_number") == pr_number
@@ -122,12 +158,18 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
         receipt_path = prior.get("receipt_path")
         try:
             with open(receipt_path, "rb") as fh:
-                receipt_matches = (hashlib.sha256(fh.read()).hexdigest()
-                                   == prior.get("receipt_sha256"))
-        except (OSError, TypeError, ValueError):
+                receipt_bytes = fh.read()
+            receipt = json.loads(receipt_bytes)
+            receipt_matches = (
+                hashlib.sha256(receipt_bytes).hexdigest() == prior.get("receipt_sha256")
+                and isinstance(receipt, dict) and not receipt.get("error")
+                and str(receipt.get("verdict") or receipt.get("decision") or "").upper()
+                == prior.get("verdict")
+                and prior.get("verdict") in ("ALLOW", "REVIEW"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
             receipt_matches = False
-        if receipt_matches and (not fail_closed or not prior.get("error")):
-            return bool(prior.get("merge_allowed", prior["verdict"] != "BLOCK"))
+        if receipt_matches and not prior.get("error"):
+            return bool(prior.get("merge_allowed") is True)
     change = {
         "stage": "PRE_MERGE",
         "project": project,
@@ -175,7 +217,7 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
         diff = subprocess.run(
             ["gh", "pr", "diff", str(pr_number), "--repo", repo, "--patch"],
             capture_output=True, text=True, timeout=30)
-        if diff.returncode == 0:
+        if diff.returncode == 0 and diff.stdout.strip():
             paths, private_files = set(), set()
             path = ""
             for line in diff.stdout.splitlines():
@@ -210,12 +252,13 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
                     {"kind": "private_fleet", "project": "alfred", "file": p}
                     for p in sorted(private_files)]
                 change["evidence_source"]["dependencies"] = "derived"
-    except Exception:
-        # No diff is evidence unavailable; the checker keeps REVIEW.
-        pass
+        else:
+            evidence_error = "PR diff unavailable"
+    except Exception as exc:
+        evidence_error = f"PR diff unavailable: {exc}"
     stem = os.path.join(receipt_dir, f"{task_id}-pr{pr_number}")
     change_path, receipt_path = f"{stem}.change.json", f"{stem}.receipt.json"
-    verdict, error, exit_code = "REVIEW", "", None
+    verdict, error, exit_code = "REVIEW", evidence_error, None
     try:
         os.makedirs(receipt_dir, exist_ok=True)
         with open(change_path, "w") as fh:
@@ -233,11 +276,14 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
         else:
             with open(receipt_path) as fh:
                 raw = json.load(fh)
+            if not isinstance(raw, dict):
+                raise ValueError("gate receipt is not an object")
+            if raw.get("error"):
+                error = f"gate receipt error: {raw['error']}"
             reported = str(raw.get("verdict") or raw.get("decision") or "").upper()
             if reported in ("ALLOW", "REVIEW"):
                 verdict = reported
             else:
-                # EVIDENCE_UNAVAILABLE, or BLOCK without exit 10, is REVIEW.
                 error = f"gate verdict {reported!r} with exit 0"
     except subprocess.TimeoutExpired:
         error = "gate timeout after 30s"
@@ -251,8 +297,7 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
         with open(receipt_path, "rb") as fh:
             receipt_bytes = fh.read()
     except OSError as exc:
-        # A broken receipt directory is a gate failure, not a merge veto.
-        # Keep the REVIEW/BLOCK evidence at a usable fallback path.
+        # Keep failure evidence at a usable fallback path; merge stays blocked.
         import tempfile
         error = f"{error}; receipt error: {exc}".strip("; ")
         receipt_error = True
@@ -261,7 +306,7 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
             json.dump({"verdict": verdict, "error": error, "source": "agent_crew"}, fh, indent=2)
         with open(receipt_path, "rb") as fh:
             receipt_bytes = fh.read()
-    merge_allowed = verdict != "BLOCK" and not (fail_closed and (error or receipt_error))
+    merge_allowed = verdict != "BLOCK" and not error and not receipt_error
     record = {"verdict": verdict, "receipt_path": receipt_path,
               "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
               "exit_code": exit_code, "pr_number": pr_number,
@@ -271,6 +316,7 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
     if error:
         record["error"] = error
     click.echo(f"  Conformance gate: {verdict} — receipt {receipt_path}")
+    persisted = False
     try:
         if not merge_allowed:
             queue.mark_needs_human(
@@ -278,8 +324,11 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
                 {"conformance_gate": record})
         else:
             queue.patch_context(task_id, {"conformance_gate": record})
+        persisted = True
     except Exception as exc:
         click.echo(f"Warning: could not record conformance gate receipt: {exc}")
+    if not persisted:
+        return False
     if verdict == "REVIEW" and merge_allowed:
         body = (f"**Conformance gate (ADR-004, PRE_MERGE): REVIEW** — merging, "
                 f"reviewer must address this receipt.\n\n"

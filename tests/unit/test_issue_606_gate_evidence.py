@@ -34,6 +34,7 @@ def real_gate(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENT_CREW_CEA_REGISTRY_PATH", raising=False)
     monkeypatch.delenv("AGENT_CREW_CEA_CAPABILITY_REGISTRY", raising=False)
     monkeypatch.setattr(github, "post_pr_comment", lambda *a, **k: True)
+    monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: "a" * 40)
     return wrapper
 
 
@@ -88,9 +89,9 @@ def test_cross_project_duplicate_blocks_with_real_registry(tmp_path, monkeypatch
     assert q.get_task_status("impl-606") == "needs_human"
 
 
-def test_diff_unavailable_keeps_review(tmp_path, monkeypatch, real_gate):
+def test_diff_unavailable_blocks_merge(tmp_path, monkeypatch, real_gate):
     q, allowed, change, receipt = _gate(tmp_path, monkeypatch, diff=None)
-    assert allowed and receipt["verdict"] == "REVIEW"
+    assert not allowed and "PR diff unavailable" in receipt["error"]
     assert "portable_core" not in change and "dependencies" not in change
 
 
@@ -329,9 +330,12 @@ def _server_review_fixture(tmp_path, monkeypatch, *, reviewer, head, publish=Tru
     q.enqueue(TaskRequest(task_id="review-server", task_type="review", description="review",
                           branch="fix/606", context={"pr_number": 606,
                                                      "repo": "owner/repo",
-                                                     "no_tester": True,
                                                      "prev_task_id": "impl-server",
                                                      "reviewed_sha": "a" * 40}))
+    q.enqueue(TaskRequest(task_id="test-review-server", task_type="test",
+                          description="test", branch="fix/606",
+                          context={"prev_task_id": "review-server", "pr_number": 606,
+                                   "repo": "owner/repo", "reviewed_sha": "a" * 40}))
     q.record_attribution("impl-server", agent="codex", task_type="implement")
     q.record_attribution("review-server", agent=reviewer, task_type="review")
     calls = []
@@ -354,6 +358,12 @@ def _server_review_fixture(tmp_path, monkeypatch, *, reviewer, head, publish=Tru
             "task_id": "review-server", "status": "completed",
             "summary": "Reviewed the PR head and found no blocking changes.",
             "verdict": "approve", "findings": [], "pr_number": 606})
+        assert response.status_code == 200, response.text
+        response = client.post("/tasks/test-review-server/result", json={
+            "task_id": "test-review-server", "status": "completed",
+            "summary": "passed", "pr_number": 606,
+            "error_info": {"script_test": {"outcome": "PASSED",
+                                           "head_sha": "a" * 40}}})
     assert response.status_code == 200, response.text
     return calls, q.external_op_get("merge:pr:606")
 

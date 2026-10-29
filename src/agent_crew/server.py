@@ -4225,33 +4225,14 @@ def create_app(
 
     def _hold_or_skip_provider_limit(task: TaskRequest, agent: str,
                                      until: Optional[float]) -> None:
-        note = f"{agent} tester stage not run (provider limit)"
         recorded_until = until if until is None or math.isfinite(until) else "unknown"
-        if task.task_type == "test":
-            fields = {"reason": note, "provider": agent,
-                      "cooldown_until": recorded_until}
-            q().requeue(task.task_id, reason="provider_cooldown")
-            q().patch_context(task.task_id, {
-                "test_stage_skip": fields, "post_recovery_verification": True,
-            })
-            parent = (task.context or {}).get("prev_task_id")
-            if parent:
-                q().patch_context(parent, {"test_stage_skip": fields})
-            if not (task.context or {}).get("post_recovery_verification"):
-                pr_number = (task.context or {}).get("pr_number")
-                if isinstance(pr_number, int):
-                    _auto_merge_pr(pr_number, repo=(task.context or {}).get("repo") or "",
-                                   review_task_id=(task.context or {}).get("prev_task_id") or "")
-            action = "held" if (task.context or {}).get("post_recovery_verification") else "skipped"
-        else:
-            q().requeue(task.task_id, reason="provider_cooldown")
-            action = "held"
+        q().requeue(task.task_id, reason="provider_cooldown")
         logger.warning(
             "provider cooldown: provider=%s since=unknown until=%s task=%s "
-            "tasks_%s=1", agent, recorded_until, task.task_id, action)
+            "tasks_held=1", agent, recorded_until, task.task_id)
 
     def _honor_provider_cooldown(task: TaskRequest, agent: str) -> bool:
-        """Hold work or skip a tester before spending this provider's slot."""
+        """Hold work before spending this provider's slot."""
         if task.task_type not in ("implement", "review", "test"):
             return False
         until = QuotaBudgetProvider().active_cooldown_until(agent)
@@ -4396,9 +4377,8 @@ def create_app(
             _auto_enqueue_fix(survivor_id, repo=repo)
         elif verdict == "approve":
             if ctx.get("no_tester"):
-                if pr:
-                    _auto_merge_pr(int(pr), repo=repo, repo_cwd=_any_worktree_path(),
-                                   review_task_id=survivor_id)
+                logger.warning("duplicate review %s has no tester; merge remains blocked",
+                               survivor_id)
             else:
                 _auto_enqueue_test(survivor_id, repo=repo)
 
@@ -7943,14 +7923,6 @@ def create_app(
         )
         if test_id:
             _try_push_next("tester")
-        else:
-            review_ctx = q().get_task_context(review_task_id) or {}
-            skipped = review_ctx.get("test_stage_skip") or {}
-            if skipped.get("reason") == "gemini tester stage not run (provider limit)":
-                pr_number = review_ctx.get("pr_number")
-                if isinstance(pr_number, int):
-                    _auto_merge_pr(pr_number, repo=repo or review_ctx.get("repo") or "",
-                                   review_task_id=review_task_id)
 
     def _any_worktree_path() -> str:
         """A worktree that is a checkout of THIS project's repository.
@@ -8458,7 +8430,8 @@ def create_app(
             fail("PR 상태 불명(gh 실패) — 다음 재확인 대기")
             logger.warning(f"_auto_merge_pr: PR #{pr_number} 상태 불명 → merge 보류(fail-closed, 재확인)")
             return
-        from agent_crew.conformance_gate import _conformance_gate_allows_merge
+        from agent_crew.conformance_gate import (_conformance_gate_allows_merge,
+                                                 test_pass_for_head)
 
         tasks_by_id = {task.task_id: task for task in q().list_tasks()}
         review_task = tasks_by_id.get(review_task_id)
@@ -8477,8 +8450,7 @@ def create_app(
                 title=implement_task.description.splitlines()[0][:72],
                 task_desc=implement_task.description, issue=implement_ctx.get("issue"),
                 receipt_dir=os.path.join(os.path.dirname(os.path.abspath(db_path)),
-                                         "conformance_receipts"), repo=_merge_repo,
-                fail_closed=True):
+                                         "conformance_receipts"), repo=_merge_repo):
             gate_record = q().get_task_context(implement_task.task_id).get("conformance_gate", {})
             reason = gate_record.get("error") or f"conformance gate BLOCK on PR #{pr_number}"
             fail(reason)
@@ -8494,6 +8466,19 @@ def create_app(
         if not head:
             fail(reason)
             logger.warning("_auto_merge_pr: PR #%s review status refused: %s", pr_number, reason)
+            return
+        if not test_pass_for_head(q(), review_task_id, int(pr_number), head):
+            reason = "structured test PASS for reviewed head missing"
+            fail(reason)
+            q().mark_needs_human(implement_task.task_id, reason,
+                                 {"merge_test_gate": {"error": reason,
+                                                       "pr_number": int(pr_number),
+                                                       "head_sha": head}})
+            coordinator_notice_once(q(), implement_task.task_id,
+                                    "merge_test_pass_missing", reason,
+                                    coordinator_notify_fn)
+            logger.warning("_auto_merge_pr: PR #%s has no test PASS for head %s",
+                           pr_number, head)
             return
         if not publish_independent_review_status(
                 _merge_repo, head, approved_review_id, reviewer_agent):
@@ -9556,7 +9541,11 @@ def create_app(
                             resend="POST the result again with branch, full commit SHA and pr_number")
             return held
         if task_type == "test" and isinstance(ctx, dict) and ctx.get("post_recovery_verification"):
-            outcome = "PASS" if result.status == "completed" else "FAIL"
+            _record = ((result.error_info or {}).get("script_test")
+                       if isinstance(result.error_info, dict) else None)
+            outcome = ("PASS" if result.status == "completed"
+                       and isinstance(_record, dict)
+                       and _record.get("outcome") == "PASSED" else "FAIL")
             q().patch_context(task_id, {"post_recovery_verification_result": outcome})
             pr_number = ctx.get("pr_number")
             repo = ctx.get("repo") or ""
@@ -9779,11 +9768,8 @@ def create_app(
                 review_ctx = ctx if isinstance(ctx, dict) else {}
                 pr_number = result.pr_number or review_ctx.get("pr_number")
                 if review_ctx.get("no_tester"):
-                    logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
-                    # #171: no tester stage → merge immediately on review approval
-                    if pr_number:
-                        _auto_merge_pr(int(pr_number), repo=_review_repo, repo_cwd=_reviewer_wt,
-                                       review_task_id=task_id)
+                    logger.warning("POST /tasks/%s/result: no_tester prevents automatic merge",
+                                   task_id)
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
                     _auto_enqueue_test(task_id, repo=_review_repo)
@@ -9797,8 +9783,7 @@ def create_app(
                 logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
                 _auto_enqueue_fix(task_id, repo=_review_repo)
             # #171: test passed → merge the PR. pr_number carried via test context.
-            if (task_type == "test" and result.status == "completed"
-                    and not _task_ctx.get("post_recovery_verification")):
+            if task_type == "test" and result.status == "completed":
                 test_pr = result.pr_number or _task_ctx.get("pr_number")
                 if test_pr:
                     _test_wt = _any_worktree_path()

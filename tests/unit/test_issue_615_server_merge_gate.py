@@ -37,7 +37,7 @@ def checker(tmp_path, monkeypatch):
 
 def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
                  change_type="create", gate_failure="", status_details=None,
-                 ci_state=None):
+                 ci_state=None, test_record=None):
     if not gate_enabled:
         monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
     db = str(tmp_path / "tasks.db")
@@ -49,13 +49,15 @@ def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
     queue.enqueue(TaskRequest(
         task_id="review-615", task_type="review", branch="fix/615",
         description="review", context={"prev_task_id": "impl-615",
-                                       "pr_number": 615, "repo": "owner/repo"}))
+                                       "pr_number": 615, "repo": "owner/repo",
+                                       "reviewed_sha": "a" * 40}))
     queue.submit_result("review-615", TaskResult(
         "review-615", "completed", "approved", verdict="approve", pr_number=615))
     queue.enqueue(TaskRequest(
         task_id="test-615", task_type="test", branch="fix/615",
         description="test", context={"prev_task_id": "review-615",
-                                     "pr_number": 615, "repo": "owner/repo"}))
+                                     "pr_number": 615, "repo": "owner/repo",
+                                     "reviewed_sha": "a" * 40}))
     calls = []
     monkeypatch.setattr(github, "pr_state", lambda *a, **k: "open")
     monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: "a" * 40)
@@ -93,10 +95,12 @@ def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
     app = create_app(db, pane_map={}, project="agent_crew",
                      push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
+    test_record = ({"outcome": "PASSED", "head_sha": "a" * 40}
+                   if test_record is None else test_record)
     with TestClient(app) as client:
         response = client.post("/tasks/test-615/result", json={
             "task_id": "test-615", "status": "completed", "summary": "tests passed",
-            "pr_number": 615})
+            "pr_number": 615, "error_info": {"script_test": test_record}})
     assert response.status_code == 200, response.text
     return queue, calls
 
@@ -120,6 +124,17 @@ def test_server_review_comments_and_merges(tmp_path, monkeypatch, checker):
     assert record["verdict"] == "REVIEW"
     assert Path(record["receipt_path"]).parent == tmp_path / "conformance_receipts"
     assert json.loads(Path(record["receipt_path"]).read_text())["verdict"] == "REVIEW"
+
+
+@pytest.mark.parametrize("record", [{},
+                                    {"outcome": "INCOMPLETE", "head_sha": "a" * 40},
+                                    {"outcome": "PASSED", "head_sha": "b" * 40}])
+def test_server_rejects_unjudged_or_wrong_head_test(
+        tmp_path, monkeypatch, checker, record):
+    queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
+                                change_type="modify", test_record=record)
+    assert "merge" not in calls and "status" not in calls
+    assert "structured test PASS" in queue.external_op_get("merge:pr:615")["last_error"]
 
 
 def test_server_gate_unset_refuses_merge(tmp_path, monkeypatch):
@@ -178,17 +193,20 @@ def test_server_auto_merge_unset_still_merges(tmp_path, monkeypatch, checker):
 
 
 def _post_followup_test(tmp_path, queue, task_id, review_id):
+    head = queue.get_task_context(review_id)["reviewed_sha"]
     queue.enqueue(TaskRequest(
         task_id=task_id, task_type="test", branch="fix/615", description="test",
         context={"prev_task_id": review_id, "pr_number": 615,
-                 "repo": "owner/repo", "allow_duplicate_review": True}))
+                 "repo": "owner/repo", "reviewed_sha": head,
+                 "allow_duplicate_review": True}))
     app = create_app(str(tmp_path / "tasks.db"), pane_map={}, project="agent_crew",
                      push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
         response = client.post(f"/tasks/{task_id}/result", json={
             "task_id": task_id, "status": "completed", "summary": "tests passed",
-            "pr_number": 615})
+            "pr_number": 615, "error_info": {"script_test": {
+                "outcome": "PASSED", "head_sha": head}}})
     assert response.status_code == 200, response.text
 
 
@@ -259,7 +277,8 @@ def test_opt_out_publishes_each_approved_head(tmp_path, monkeypatch, checker):
     queue.enqueue(TaskRequest(
         task_id="test-615-r1", task_type="test", branch="fix/615",
         description="test new head", context={"prev_task_id": "review-615-r1",
-            "pr_number": 615, "repo": "owner/repo", "allow_duplicate_review": True}))
+            "pr_number": 615, "repo": "owner/repo", "reviewed_sha": "b" * 40,
+            "allow_duplicate_review": True}))
     monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: "b" * 40)
     monkeypatch.setattr(github, "independent_review_for_head",
                         lambda *a, **k: ("b" * 40, "claude", "review-615-r1", "ok"))
@@ -269,7 +288,8 @@ def test_opt_out_publishes_each_approved_head(tmp_path, monkeypatch, checker):
     with TestClient(app) as client:
         response = client.post("/tasks/test-615-r1/result", json={
             "task_id": "test-615-r1", "status": "completed",
-            "summary": "tests passed", "pr_number": 615})
+            "summary": "tests passed", "pr_number": 615,
+            "error_info": {"script_test": {"outcome": "PASSED", "head_sha": "b" * 40}}})
     assert response.status_code == 200, response.text
     assert published == [
         ("owner/repo", "a" * 40, "review-615", "claude"),
@@ -281,11 +301,13 @@ def test_opt_out_publishes_each_approved_head(tmp_path, monkeypatch, checker):
     queue.enqueue(TaskRequest(
         task_id="test-615-r1-retry", task_type="test", branch="fix/615",
         description="test new head again", context={"prev_task_id": "review-615-r1",
-            "pr_number": 615, "repo": "owner/repo", "allow_duplicate_review": True}))
+            "pr_number": 615, "repo": "owner/repo", "reviewed_sha": "b" * 40,
+            "allow_duplicate_review": True}))
     with TestClient(app) as client:
         response = client.post("/tasks/test-615-r1-retry/result", json={
             "task_id": "test-615-r1-retry", "status": "completed",
-            "summary": "tests passed", "pr_number": 615})
+            "summary": "tests passed", "pr_number": 615,
+            "error_info": {"script_test": {"outcome": "PASSED", "head_sha": "b" * 40}}})
     assert response.status_code == 200, response.text
     assert calls[-2:] == ["status", "merge"]
     assert queue.external_op_get("merge:pr:615")["state"] == "done"

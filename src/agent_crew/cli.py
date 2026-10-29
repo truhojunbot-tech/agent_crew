@@ -18,6 +18,7 @@ from agent_crew import setup as setup_module
 from agent_crew.cea_launch import client_command, parse_env_file, resolve_cea_file
 from agent_crew.conformance_gate import (
     _conformance_gate_allows_merge, _registry_capability_for_paths,
+    test_pass_for_head,
 )
 from agent_crew.pipeline import ARTIFACT_KINDS
 from agent_crew.queue import CANCEL_REASON_ATTEMPT, _TYPE_TO_ROLE
@@ -3022,47 +3023,6 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             f"Inspect with `crew status {project}` and re-dispatch if needed."
         )
 
-    def _auto_resolve_gates(port: int) -> int:
-        """Resolve any pending gates via HTTP. Returns count of resolved gates."""
-        resolved = 0
-        try:
-            req = _urllib_req.Request(
-                f"http://127.0.0.1:{port}/gates/pending",
-                headers={"X-Agent-Crew-Project": project})
-            with _urllib_req.urlopen(req, timeout=2) as resp:
-                gates = json.loads(resp.read())
-            for gate in gates:
-                gate_id = gate.get("id") or gate.get("gate_id")
-                if not gate_id:
-                    continue
-                payload = json.dumps({"status": "approved"}).encode()
-                req = _urllib_req.Request(
-                    f"http://127.0.0.1:{port}/gates/{gate_id}/resolve",
-                    data=payload,
-                    headers={"Content-Type": "application/json",
-                             "X-Agent-Crew-Project": project},
-                    method="POST",
-                )
-                try:
-                    with _urllib_req.urlopen(req, timeout=2):
-                        pass
-                    click.echo(f"  Gate {gate_id} auto-approved.")
-                    resolved += 1
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return resolved
-
-    def _drain_resolvable_gates(port: int) -> int:
-        """Resolve gates until the pending set is empty."""
-        total = 0
-        while True:
-            resolved = _auto_resolve_gates(port)
-            if resolved == 0:
-                return total
-            total += resolved
-
     def _auto_merge_pr(pr_number: int | None, repo_url: str) -> None:
         if not pr_number:
             click.echo("  Note: no PR number in results — skipping auto-merge")
@@ -3086,6 +3046,15 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             queue, pr_number, resolved_repo, review_id)
         if not head:
             click.echo(f"Warning: cannot auto-merge PR #{pr_number} — {reason}")
+            return
+        if not test_pass_for_head(queue, review_id, pr_number, head):
+            reason = "structured test PASS for reviewed head missing"
+            queue.mark_needs_human(impl_id, reason,
+                                   {"merge_test_gate": {"error": reason,
+                                                         "pr_number": pr_number,
+                                                         "head_sha": head}})
+            click.echo(f"Warning: cannot auto-merge PR #{pr_number} — "
+                       f"{reason}")
             return
         if not github.publish_independent_review_status(
                 resolved_repo, head, approved_review_id, reviewer_agent):
@@ -3397,8 +3366,6 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
         if outcome == "approved":
             click.echo(f"[{iteration}/{max_iter}] ✅ Review approved ({review_elapsed}s)")
             # Auto-resolve any pending gates before proceeding
-            if _run_port:
-                _drain_resolvable_gates(_run_port)
             if not no_tester:
                 test_context = {**review_context, **artifact_context}
                 # The tester is independent of the reviewer; preserve both
@@ -3430,8 +3397,6 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
                     return
                 if test_outcome == "passed":
                     _loop_pr_number = _loop_pr_number or getattr(test_result, "pr_number", None)
-                    if _run_port:
-                        _drain_resolvable_gates(_run_port)
                     click.echo(f"[{iteration}/{max_iter}] ✅ Tests passed ({test_elapsed}s). Loop complete.")
                     # Create PR if requested
                     if create_pr:
@@ -3463,8 +3428,6 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
                                                 context=retry_context, port=_run_port)
                     continue
             else:
-                if _run_port:
-                    _drain_resolvable_gates(_run_port)
                 click.echo(f"[{iteration}/{max_iter}] ✅ Loop complete ({review_elapsed}s, no tester).")
                 # Create PR if requested
                 if create_pr:

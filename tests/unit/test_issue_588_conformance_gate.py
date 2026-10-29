@@ -45,6 +45,7 @@ sys.exit(10 if mode == "BLOCK" and "--enforce" in args else 0)
 
 @pytest.fixture
 def gate(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_crew.github.pr_head_sha", lambda *a, **k: "a" * 40)
     script = tmp_path / "fake_gate.py"
     script.write_text(_FAKE_GATE)
     log = tmp_path / "gate.log"
@@ -53,7 +54,11 @@ def gate(tmp_path, monkeypatch):
     real_run = subprocess.run
 
     def run(cmd, *args, **kwargs):
-        if cmd[:3] in (["gh", "issue", "view"], ["gh", "pr", "diff"]):
+        if cmd[:3] == ["gh", "pr", "diff"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, "diff --git a/src/agent_crew/x.py b/src/agent_crew/x.py\n"
+                        "+++ b/src/agent_crew/x.py\n+new code\n", "")
+        if cmd[:3] == ["gh", "issue", "view"]:
             return subprocess.CompletedProcess(cmd, 1, "", "unavailable")
         return real_run(cmd, *args, **kwargs)
 
@@ -97,9 +102,9 @@ def test_unset_env_makes_no_call(tmp_path, monkeypatch, comments):
     called = []
     monkeypatch.setattr(cli_module.subprocess, "run", lambda *a, **k: called.append(a))
 
-    assert _gate(q, tmp_path) is True
+    assert _gate(q, tmp_path) is False
     assert called == [] and comments == []
-    assert "conformance_gate" not in q.get_task_context("impl-1")
+    assert q.get_task_context("impl-1")["conformance_gate"]["merge_allowed"] is False
     assert not (tmp_path / "receipts").exists()
 
 
@@ -122,7 +127,7 @@ def test_allow_merges_and_records_receipt(tmp_path, monkeypatch, gate, comments)
     assert change["owner_evidence"] == {"project": "proj", "ref": "issue#588"}
     assert change["text"].startswith("add widget")
     assert change["change_type"] == "modify"
-    assert "changed_paths" not in change
+    assert change["changed_paths"] == ["src/agent_crew/x.py"]
     assert comments == []
     assert q.get_task_status("impl-1") == "pending"
 
@@ -154,21 +159,25 @@ def test_declared_change_evidence_reaches_gate_contract(tmp_path, monkeypatch, g
     assert _gate(q, tmp_path) is True
     rec = _record(q)
     assert rec["verdict"] == "ALLOW"
-    change = json.loads(Path(rec["receipt_path"]).read_text())["change"]
+    change = json.loads((tmp_path / "receipts" / "impl-1-pr42.change.json").read_text())
     assert change["portable_core"] is False
     assert change["dependencies"] == []
     assert change["role"] == "worker"
     assert change["change_type"] == "create"
 
 
-def test_missing_change_evidence_is_not_invented(tmp_path, monkeypatch, gate, comments):
+def test_missing_change_evidence_blocks_merge(tmp_path, monkeypatch, gate, comments):
     monkeypatch.setenv("FAKE_GATE_MODE", "contract")
+    original_run = cli_module.subprocess.run
+    monkeypatch.setattr(cli_module.subprocess, "run", lambda cmd, *a, **k:
+                        subprocess.CompletedProcess(cmd, 1, "", "diff unavailable")
+                        if cmd[:3] == ["gh", "pr", "diff"] else original_run(cmd, *a, **k))
     q = _queue(tmp_path, {"capability_id": "cap.widget"})
 
-    assert _gate(q, tmp_path) is True
+    assert _gate(q, tmp_path) is False
     rec = _record(q)
     assert rec["verdict"] == "REVIEW"
-    change = json.loads(Path(rec["receipt_path"]).read_text())["change"]
+    change = json.loads((tmp_path / "receipts" / "impl-1-pr42.change.json").read_text())
     assert "portable_core" not in change
     assert "dependencies" not in change
     assert change["role"] == "implementer"
@@ -191,14 +200,14 @@ def test_review_merges_records_receipt_and_comments(tmp_path, monkeypatch, gate,
 
 
 @pytest.mark.parametrize("mode", ["crash", "EVIDENCE_UNAVAILABLE"])
-def test_gate_error_or_unavailable_is_review_and_merges(tmp_path, monkeypatch, gate, comments, mode):
+def test_gate_error_or_unavailable_blocks(tmp_path, monkeypatch, gate, comments, mode):
     monkeypatch.setenv("FAKE_GATE_MODE", mode)
     q = _queue(tmp_path)
 
-    assert _gate(q, tmp_path) is True
+    assert _gate(q, tmp_path) is False
     rec = _record(q)
     assert rec["verdict"] == "REVIEW" and rec["error"]
-    assert len(comments) == 1
+    assert comments == []
 
 
 def test_gate_timeout_is_review(tmp_path, monkeypatch, gate, comments):
@@ -208,24 +217,24 @@ def test_gate_timeout_is_review(tmp_path, monkeypatch, gate, comments):
         raise subprocess.TimeoutExpired(a[0], k.get("timeout"))
     monkeypatch.setattr(cli_module.subprocess, "run", _timeout)
 
-    assert _gate(q, tmp_path) is True
+    assert _gate(q, tmp_path) is False
     rec = _record(q)
     assert rec["verdict"] == "REVIEW" and "timeout" in rec["error"]
     assert json.load(open(rec["receipt_path"]))["verdict"] == "REVIEW"
 
 
-def test_malformed_command_is_review_and_merges(tmp_path, monkeypatch, comments):
+def test_malformed_command_blocks(tmp_path, monkeypatch, comments):
     monkeypatch.setenv("AGENT_CREW_CONFORMANCE_GATE_CMD", "'")
     merges, q, impl_id, _ = _run_auto_merge(tmp_path, monkeypatch)
-    assert len(merges) == 1
+    assert merges == []
     rec = q.get_task_context(impl_id)["conformance_gate"]
     assert rec["verdict"] == "REVIEW"
     assert "No closing quotation" in rec["error"]
     assert Path(rec["receipt_path"]).exists()
-    assert len(comments) == 1
+    assert comments == []
 
 
-def test_unwritable_receipt_location_is_review_and_merges(tmp_path, monkeypatch, gate, comments):
+def test_unwritable_receipt_location_blocks(tmp_path, monkeypatch, gate, comments):
     monkeypatch.setenv("FAKE_GATE_MODE", "ALLOW")
     q = _queue(tmp_path)
     blocked_path = tmp_path / "file-instead-of-directory"
@@ -234,11 +243,11 @@ def test_unwritable_receipt_location_is_review_and_merges(tmp_path, monkeypatch,
     assert _conformance_gate_allows_merge(
         q, "impl-1", project="proj", pr_number=42, title="add widget",
         task_desc="add widget", issue=588, receipt_dir=str(blocked_path),
-        repo="owner/repo") is True
+        repo="owner/repo") is False
     rec = _record(q)
     assert rec["verdict"] == "REVIEW"
     assert Path(rec["receipt_path"]).exists()
-    assert len(comments) == 1
+    assert comments == []
     assert gate() == []
 
 
@@ -264,6 +273,7 @@ def _run_auto_merge(tmp_path, monkeypatch, review_evidence=None, events=None):
                           pr_number=42)
     monkeypatch.setattr(TaskQueue, "get_result", fake_result)
     monkeypatch.setattr("agent_crew.github.check_gh_installed", lambda: True)
+    monkeypatch.setattr("agent_crew.github.pr_head_sha", lambda *a, **k: "a" * 40)
     monkeypatch.setattr("agent_crew.github.independent_review_for_head",
                         lambda q, pr, repo, review_id: review_evidence or
                         ("a" * 40, "claude", review_id, "ok"))
@@ -276,7 +286,9 @@ def _run_auto_merge(tmp_path, monkeypatch, review_evidence=None, events=None):
         if cmd[:3] == ["gh", "issue", "view"]:
             return subprocess.CompletedProcess(cmd, 1, "", "issue unavailable")
         if cmd[:3] == ["gh", "pr", "diff"]:
-            return subprocess.CompletedProcess(cmd, 1, "", "diff unavailable")
+            return subprocess.CompletedProcess(
+                cmd, 0, "diff --git a/src/agent_crew/x.py b/src/agent_crew/x.py\n"
+                        "+++ b/src/agent_crew/x.py\n+new code\n", "")
         if cmd[:3] == ["gh", "pr", "merge"]:
             merges.append(cmd)
             if events is not None:
@@ -295,10 +307,11 @@ def _run_auto_merge(tmp_path, monkeypatch, review_evidence=None, events=None):
 
 
 @pytest.mark.parametrize("verdict", ["ALLOW", "REVIEW"])
-def test_crew_run_allow_or_review_merges(tmp_path, monkeypatch, gate, comments, verdict):
+def test_crew_run_no_tester_does_not_merge_even_with_gate_verdict(
+        tmp_path, monkeypatch, gate, comments, verdict):
     monkeypatch.setenv("FAKE_GATE_MODE", verdict)
     merges, q, impl_id, _ = _run_auto_merge(tmp_path, monkeypatch)
-    assert len(merges) == 1
+    assert merges == []
     assert q.get_task_context(impl_id)["conformance_gate"]["verdict"] == verdict
     assert len(comments) == (1 if verdict == "REVIEW" else 0)
 
@@ -312,26 +325,26 @@ def test_crew_run_block_does_not_merge(tmp_path, monkeypatch, gate, comments):
     assert "not merging PR #42" in out
 
 
-def test_crew_run_without_gate_env_merges_without_call(tmp_path, monkeypatch, comments):
+def test_crew_run_without_gate_env_blocks(tmp_path, monkeypatch, comments):
     monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
     merges, q, impl_id, _ = _run_auto_merge(tmp_path, monkeypatch)
-    assert len(merges) == 1
-    assert "conformance_gate" not in q.get_task_context(impl_id)
+    assert merges == []
+    assert q.get_task_context(impl_id)["conformance_gate"]["merge_allowed"] is False
     assert comments == []
 
 
-def test_review_status_is_published_before_merge(tmp_path, monkeypatch, comments):
-    monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
+def test_review_status_is_not_published_without_test_pass(tmp_path, monkeypatch, gate, comments):
+    monkeypatch.setenv("FAKE_GATE_MODE", "ALLOW")
     events = []
     merges, _, _, _ = _run_auto_merge(tmp_path, monkeypatch, events=events)
-    assert len(merges) == 1 and events == ["status", "merge"]
+    assert merges == [] and events == []
 
 
 @pytest.mark.parametrize("reason", ["reviewer agent equals implementer agent",
                                     "PR head differs from reviewed SHA"])
 def test_invalid_review_evidence_prevents_status_and_merge(tmp_path, monkeypatch,
-                                                           comments, reason):
-    monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
+                                                           gate, comments, reason):
+    monkeypatch.setenv("FAKE_GATE_MODE", "ALLOW")
     events = []
     merges, _, _, out = _run_auto_merge(
         tmp_path, monkeypatch, review_evidence=("", "", "", reason), events=events)
