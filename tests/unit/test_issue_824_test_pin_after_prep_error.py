@@ -83,7 +83,17 @@ def test_test_from_two_round_fix_chain_carries_the_approving_review_pin(tmp_path
     assert context["fix_round"] == 2
 
 
-def test_tester_fetch_timeout_keeps_and_checks_out_the_review_pin(tmp_path, monkeypatch):
+def _prep_error_name():
+    """The class name `_timeout` raises: #896 changed it from TimeoutExpired
+    (now retried, never reaching the fallback) to a non-transient error."""
+    try:
+        _timeout()
+    except Exception as exc:  # noqa: BLE001 - only its type name is wanted
+        return type(exc).__name__
+    raise AssertionError("_timeout must raise")
+
+
+def test_tester_prep_error_keeps_and_checks_out_the_review_pin(tmp_path, monkeypatch):
     worker, pin = _two_commit_repo(tmp_path)
     pushed = []
     monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
@@ -100,7 +110,7 @@ def test_tester_fetch_timeout_keeps_and_checks_out_the_review_pin(tmp_path, monk
     context = queue.get_task_context("test-review-824")
     assert context["reviewed_sha"] == pin
     assert context["worktree_base_status"] == "caller_after_prep_error"
-    assert context["prep_error"] == "TimeoutExpired"
+    assert context["prep_error"] == _prep_error_name()
     assert _git(worker, "rev-parse", "HEAD") == pin
     assert queue.get_task_status("test-review-824") != "needs_human"
     assert pushed
