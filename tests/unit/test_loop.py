@@ -2,6 +2,7 @@ from unittest.mock import MagicMock, patch
 import json
 import io
 import urllib.error
+import click
 
 import pytest
 
@@ -251,6 +252,17 @@ def test_http_successor_sends_pr_column_and_head_pin(stage):
     payload = json.loads(urlopen.call_args.args[0].data)
     assert payload["pr_number"] == 938
     assert payload["context"]["reviewed_sha"] == "a" * 40
+
+
+def test_http_review_without_pr_reports_admission_error():
+    queue = MagicMock()
+    queue.project_identity = "test-project"
+    queue.list_tasks.return_value = []
+    refused = urllib.error.HTTPError("http://localhost/tasks", 422,
+                                      "Unprocessable Entity", {}, io.BytesIO(b'{}'))
+    with patch("agent_crew.loop._post_task_http", side_effect=refused):
+        with pytest.raises(click.ClickException, match="PR number"):
+            enqueue_review(queue, "work", "fix/935", "impl-935", port=8101)
 
 
 # U-L14: enqueue_review is idempotent — if review already exists for impl task, return its ID

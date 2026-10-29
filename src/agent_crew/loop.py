@@ -5,6 +5,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+import click
+
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult, normalize_pr_number
 from agent_crew.tokenomics_canary import REUSED_FROM_KEY, SUPPRESSED_REASON
 
@@ -224,6 +226,17 @@ def _adopt_http_duplicate(queue, exc: urllib.error.HTTPError, task_type: str,
     return _successor_after_conflict(queue, task_type, prev_task_id, context)
 
 
+def _raise_http_admission_error(exc: urllib.error.HTTPError, task_type: str) -> None:
+    try:
+        detail = json.loads(exc.read()).get("detail", "")
+    except (AttributeError, TypeError, ValueError):
+        detail = ""
+    suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+    raise click.ClickException(
+        f"{task_type.capitalize()} successor rejected (HTTP 422; check PR number and task metadata){suffix}"
+    ) from exc
+
+
 def _successor_after_conflict(queue, task_type: str, prev_task_id: str,
                               context: dict | None = None) -> str | None:
     """Give a competing server cascade about five seconds to become visible."""
@@ -266,6 +279,8 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
                 existing = _adopt_http_duplicate(queue, exc, "review", prev_task_id, context)
                 if existing:
                     return existing
+            if exc.code == 422:
+                _raise_http_admission_error(exc, "review")
             raise
     from agent_crew.queue import DuplicateReviewError
     try:
@@ -304,6 +319,8 @@ def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", con
                 existing = _adopt_http_duplicate(queue, exc, "test", prev_task_id, context)
                 if existing:
                     return existing
+            if exc.code == 422:
+                _raise_http_admission_error(exc, "test")
             raise
     from agent_crew.queue import DuplicateReviewError
     try:

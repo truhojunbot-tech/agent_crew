@@ -21,6 +21,7 @@ from agent_crew.conformance_gate import (
     test_pass_for_head,
 )
 from agent_crew.pipeline import ARTIFACT_KINDS
+from agent_crew.protocol import normalize_pr_number
 from agent_crew.queue import CANCEL_REASON_ATTEMPT, _TYPE_TO_ROLE
 from agent_crew.worktree_default_branch import remote_default_branch
 from agent_crew.role_mapping import (
@@ -3852,9 +3853,13 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
             # #302: retry a review that failed to RUN, bounded — same rule as
             # the main loop above.
             _review_attempts = 0
+            review_context = {"risk_tier": risk_tier}
+            impl_pr = normalize_pr_number(getattr(_wait_result, "pr_number", None))
+            if impl_pr is not None:
+                review_context["pr_number"] = impl_pr
             while True:
                 review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id,
-                                           context={"risk_tier": risk_tier}, port=_run_port)
+                                           context=review_context, port=_run_port)
                 review_result = None
                 deadline = time.time() + wait_timeout
                 while time.time() < deadline:
