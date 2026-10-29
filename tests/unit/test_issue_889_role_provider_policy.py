@@ -53,10 +53,14 @@ def _app(tmp_path, roles=ROLES, **kwargs):
 
 
 def _post(client, task_id, task_type, context=None, branch="agent/x"):
-    return client.post("/tasks", headers={"X-Agent-Crew-Project": "demo"}, json={
+    payload = {
         "task_id": task_id, "task_type": task_type, "description": "d",
         "branch": branch, "project": "demo",
-        "context": {"risk_tier": 1, **(context or {})}})
+        "context": {"risk_tier": 1, **(context or {})}}
+    if task_type in {"review", "test"}:
+        payload["pr_number"] = 889
+        payload["context"]["reviewed_sha"] = "a" * 40
+    return client.post("/tasks", headers={"X-Agent-Crew-Project": "demo"}, json=payload)
 
 
 @pytest.mark.parametrize("context", [

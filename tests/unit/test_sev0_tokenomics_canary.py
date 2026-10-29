@@ -533,7 +533,7 @@ def _post_rereview(client, *, pr=7, sha=SHA_A):
     return client.post("/tasks", json={
         "task_id": "review-impl-77-r1", "task_type": "review",
         "description": f"Review PR #{pr} for task impl-77.", "branch": "feat/x",
-        "priority": 3,
+        "priority": 3, "pr_number": pr,
         "context": {"prev_task_id": "impl-77", "pr_number": pr, "reviewed_sha": sha,
                     "allow_duplicate_review": True},
         "project": "",
@@ -566,16 +566,13 @@ def test_branch_review_dispatches_for_distinct_lineage_at_shared_head(
     push = _RecordingPush()
     app = create_app(db_path=tmp_db, project="demo", pane_map={"reviewer": "%200"},
                      push_fn=push, watchdog_disabled=True, anomaly_disabled=True)
-    with TestClient(app) as client:
-        response = client.post("/tasks", json={
-            "task_id": "review-second", "task_type": "review",
-            "description": "Review second artifact", "branch": "main",
-            "project": "demo", "context": {
-                "prev_task_id": "impl-second", "reviewed_sha": SHA_A,
-                "allow_duplicate_review": True,
-            },
-        }, headers={"X-Agent-Crew-Project": "demo"})
-    assert response.status_code == 201, response.text
+    with TestClient(app):
+        queue.enqueue(TaskRequest(
+            task_id="review-second", task_type="review",
+            description="Review second artifact", branch="main", project="demo",
+            context={"prev_task_id": "impl-second", "reviewed_sha": SHA_A,
+                     "allow_duplicate_review": True}))
+        app.state.try_push_next("reviewer")
     assert len(push.calls) == 1
     assert queue.get_result("review-second") is None
     receipt = queue.get_tokenomics_shadow_receipt("review-second")
@@ -615,14 +612,13 @@ def test_branch_fix_round_uses_root_artifact_and_pin_in_dispatch(
     push = _RecordingPush()
     app = create_app(db_path=tmp_db, project="demo", pane_map={"reviewer": "%200"},
                      push_fn=push, watchdog_disabled=True, anomaly_disabled=True)
-    with TestClient(app) as client:
-        response = client.post("/tasks", json={
-            "task_id": "review-fix", "task_type": "review",
-            "description": "Review fix", "branch": "feature", "project": "demo",
-            "context": {"prev_task_id": "fix-root", "reviewed_sha": SHA_A,
-                        "allow_duplicate_review": True},
-        }, headers={"X-Agent-Crew-Project": "demo"})
-    assert response.status_code == 201, response.text
+    with TestClient(app):
+        queue.enqueue(TaskRequest(
+            task_id="review-fix", task_type="review",
+            description="Review fix", branch="feature", project="demo",
+            context={"prev_task_id": "fix-root", "reviewed_sha": SHA_A,
+                     "allow_duplicate_review": True}))
+        app.state.try_push_next("reviewer")
     assert len(push.calls) == (0 if expected_applied else 1)
     result = queue.get_result("review-fix")
     if expected_applied:

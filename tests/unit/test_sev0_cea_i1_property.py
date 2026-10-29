@@ -606,7 +606,17 @@ def test_i1_transport_persisted_decision_equals_http(tmp_path, monkeypatch, kind
         assert not validate_receipt(got), validate_receipt(got)
         assert got["caller_identity_status"] == "UNVERIFIED"
         n = len(spy.calls)
-        _via_http(tmp_path, req, f"base-{kind}-{req.task_id}.db")
+        response = _via_http(tmp_path, req, f"base-{kind}-{req.task_id}.db")
+        if req.task_type in {"review", "test"} and (
+                not req.pr_number or not isinstance(req.context, dict)
+                or not (req.context.get("reviewed_sha")
+                        or req.context.get("expected_head_sha"))):
+            # #935: a trusted in-process cascade may reach admission before
+            # its PR pin is ready. An external replay must stop at the HTTP
+            # write guard, so there is no receipt to compare for this shape.
+            assert response.status_code == 422, response.text
+            assert len(spy.calls) == n
+            continue
         _, _, b_adm, b_rid, b_db = spy.calls[n]
         base = persisted_receipt(b_db, b_rid)
         assert _view(admitted, got) == _view(b_adm, base), (

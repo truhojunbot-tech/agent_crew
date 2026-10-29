@@ -29,7 +29,8 @@ def _post(c, task_id):
     return c.post("/tasks", headers={"X-Agent-Crew-Project": PROJECT},
                   json={"task_id": task_id, "task_type": "review",
                         "description": "d", "branch": "b", "priority": 3,
-                        "context": {}, "project": PROJECT})
+                        "pr_number": 892,
+                        "context": {"reviewed_sha": "a" * 40}, "project": PROJECT})
 
 
 def _lock(monkeypatch, times):
