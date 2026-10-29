@@ -1650,8 +1650,9 @@ def _cloud_review_bodies_for_task(comments, task_id: str) -> list[str]:
                 record = json.loads(marker.group(1))
             except (TypeError, ValueError):
                 record = None
-            if isinstance(record, dict) and record.get("task_id") == task_id:
-                matches.append(body)
+            if isinstance(record, dict) and "task_id" in record:
+                if record["task_id"] == task_id:
+                    matches.append(body)
                 continue
         # A damaged marker naming this task must be rejected promptly rather
         # than waiting until the cloud stale timeout. The strict parser below

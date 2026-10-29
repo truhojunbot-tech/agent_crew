@@ -102,7 +102,13 @@ def test_cloud_review_uses_server_formatter(tmp_db, monkeypatch):
     ]
 
 
-def test_unrelated_cloud_marker_does_not_fail_this_review(tmp_db):
+@pytest.mark.parametrize("other", [
+    _block(task_id="review-other"),
+    _block(task_id="review-9360"),
+    _block(task_id="review-other", verdict="request_changes",
+           findings=["HIGH src/a.py:1 - follow up on review-936"]),
+])
+def test_unrelated_cloud_marker_does_not_fail_this_review(tmp_db, other):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(
         task_id="review-936", task_type="review", description="Review",
@@ -111,7 +117,6 @@ def test_unrelated_cloud_marker_does_not_fail_this_review(tmp_db):
     task = queue.dequeue(role="reviewer")
     queue.record_dispatch(task.task_id, channel=claude_cloud.DISPATCH_CHANNEL,
                           agent=claude_cloud.CLOUD_PROVIDER_NAME, target="pending")
-    other = _block(task_id="review-other")
     submitted = []
     outcome = claude_cloud.reconcile_cloud_dispatch(
         queue, task, pr_comments_fn=lambda *_a, **_kw: [
