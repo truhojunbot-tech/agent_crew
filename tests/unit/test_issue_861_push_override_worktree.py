@@ -91,19 +91,20 @@ def test_task_without_override_still_uses_its_role_worktree(tmp_db, tmp_path, mo
 
 def test_override_agent_without_a_role_worktree_is_not_prepared_in_another_agents_tree(
         tmp_db, tmp_path, monkeypatch):
-    # Review of PR #880: gemini has a pane but no role (tester is the script
-    # tester), so no worktree is gemini's. The resolver then falls back to
-    # `worktree_map["implementer"]` — claude's — while the push goes to the
-    # gemini pane. Refuse before prep instead of guessing a worktree.
-    role_to_agent = {"implementer": "claude", "reviewer": "codex", "tester": "script"}
+    # Review of PR #880: an agent with a pane but no role has no worktree of
+    # its own. The resolver then falls back to `worktree_map["implementer"]`
+    # — claude's — while the push goes to that agent's pane. Refuse before
+    # prep instead of guessing a worktree. (Codex, not gemini: #889 refuses a
+    # gemini implement override at enqueue, before this path is reached.)
+    role_to_agent = {"implementer": "claude", "reviewer": "claude", "tester": "script"}
     push_calls, prepared, protocols = [], [], []
     app, wts = _app(tmp_db, tmp_path, monkeypatch, push_calls, prepared, protocols,
                     role_to_agent=role_to_agent)
     with TestClient(app) as client:
-        assert client.post("/tasks", json=_payload("impl-gemini", "implement", "gemini")).status_code == 201
-        task = client.get("/tasks/impl-gemini").json()
+        assert client.post("/tasks", json=_payload("impl-codex", "implement", "codex")).status_code == 201
+        task = client.get("/tasks/impl-codex").json()
 
     assert prepared == [] and protocols == [], (
-        f"a gemini override touched another agent's worktree: {prepared + protocols}")
+        f"a codex override touched another agent's worktree: {prepared + protocols}")
     assert push_calls == []
     assert task["status"] == "pending"

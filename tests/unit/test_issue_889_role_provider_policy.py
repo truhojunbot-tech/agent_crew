@@ -241,7 +241,7 @@ def test_mcp_pull_delivers_implement_to_codex(tmp_path):
     assert "dispatch_refused" not in payload
 
 
-@pytest.mark.parametrize("role", ["implementer", "tester", ""])
+@pytest.mark.parametrize("role", ["implementer", "coder", "tester", ""])
 def test_anonymous_pull_refusal_for_restricted_or_unscoped_roles(role):
     assert anonymous_pull_refusal(role, "")
     assert anonymous_pull_refusal(role, "  ")
@@ -250,6 +250,12 @@ def test_anonymous_pull_refusal_for_restricted_or_unscoped_roles(role):
 def test_anonymous_pull_allowed_for_unrestricted_role_and_named_agents():
     assert anonymous_pull_refusal("reviewer", "") is None
     assert anonymous_pull_refusal("implementer", "codex") is None
+
+
+def test_anonymous_discussion_pull_is_allowed():
+    # E2E discussion stubs pull role=panel without naming a provider; no
+    # family is barred from discussion work, so the pull must not be refused.
+    assert anonymous_pull_refusal("panel", "") is None
 
 
 @pytest.mark.parametrize("params", [{"role": "implementer"}, {}, {"role": "implementer", "agent": " "}])

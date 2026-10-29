@@ -9,6 +9,7 @@ Environment variables:
   STUB_STATUS    completed | failed         (default: completed)
   STUB_TIMEOUT   poll timeout in seconds    (default: 30)
   STUB_TASK_ID   expected task ID           (optional; recovers timed-out claims)
+  STUB_AGENT     provider name sent with /tasks/next (default: per role)
 """
 import json
 import os
@@ -22,6 +23,9 @@ VERDICT = os.environ.get("STUB_VERDICT", "") or None
 STATUS = os.environ.get("STUB_STATUS", "completed")
 TIMEOUT = float(os.environ.get("STUB_TIMEOUT", "30"))
 TASK_ID = os.environ.get("STUB_TASK_ID", "")
+# #889: a pull for a provider-restricted role must name its provider.
+_DEFAULT_AGENT = {"coder": "codex", "implementer": "codex", "tester": "script"}
+AGENT = os.environ.get("STUB_AGENT", _DEFAULT_AGENT.get(ROLE, ""))
 BASE_URL = f"http://127.0.0.1:{PORT}"
 
 
@@ -45,6 +49,8 @@ def poll_task():
             except Exception:
                 pass
         url = f"{BASE_URL}/tasks/next?role={ROLE}"
+        if AGENT:
+            url += f"&agent={AGENT}"
         try:
             with urllib.request.urlopen(url, timeout=2.0) as resp:
                 data = json.loads(resp.read())

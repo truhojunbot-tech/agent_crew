@@ -54,6 +54,14 @@ ROLE_PROVIDER_POLICY: dict[str, tuple[str, ...] | None] = {
     "tester": ("gemini", "script"),
 }
 TASK_TYPE_TO_ROLE = {"implement": "implementer", "review": "reviewer", "test": "tester"}
+#: The pull routes also accept ``coder`` (an implementer alias) and ``panel``
+#: (discussion work, which no provider family is barred from). Without them an
+#: anonymous discussion pull was refused as if it were restricted work.
+_PULL_ROLE_POLICY: dict[str, tuple[str, ...] | None] = {
+    **ROLE_PROVIDER_POLICY,
+    "coder": ROLE_PROVIDER_POLICY["implementer"],
+    "panel": None,
+}
 
 
 def role_policy() -> dict[str, list[str] | None]:
@@ -85,7 +93,7 @@ def anonymous_pull_refusal(role: object, agent: object) -> str | None:
     if str(agent or "").strip():
         return None
     role = role.strip() if isinstance(role, str) else ""
-    if role and role in ROLE_PROVIDER_POLICY and ROLE_PROVIDER_POLICY[role] is None:
+    if role and role in _PULL_ROLE_POLICY and _PULL_ROLE_POLICY[role] is None:
         return None
     return (f"role_policy: an unnamed agent may not pull role {role or '(any)'!r}; "
             "name the provider so the role policy can check its family")
