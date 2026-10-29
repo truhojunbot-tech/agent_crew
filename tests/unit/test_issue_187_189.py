@@ -1,8 +1,7 @@
 """Tests for issues #187 (crew enqueue) and #189 (auto-SSH origin).
 
-#187: ``crew enqueue`` lets an agent delegate a review/test task without
-calling ``crew run`` (which always coerces task_type=implement and leaves
-the downstream pane idle).
+#187: ``crew enqueue`` lets an operator submit a pinned review/test task
+# without entering the top-level loop.
 
 #189: ``create_worktrees`` rewrites HTTPS GitHub origin to SSH so that
 agents whose shell wrappers strip git's credential helper chain (gemini-
@@ -56,6 +55,7 @@ def test_b187_enqueue_writes_review_task_type_via_http(tmp_path):
             "enqueue", "review", "Review PR #1666",
             "--project", "proj", "--base", str(tmp_path),
             "--branch", "agent/x/1665", "--pr", "1666",
+            "--reviewed-sha", "a" * 40,
             "--prev-task-id", "impl-abc12345",
         ])
 
@@ -65,6 +65,8 @@ def test_b187_enqueue_writes_review_task_type_via_http(tmp_path):
     assert body["task_type"] == "review"
     assert body["branch"] == "agent/x/1665"
     assert body["context"]["pr_number"] == 1666
+    assert body["pr_number"] == 1666
+    assert body["context"]["reviewed_sha"] == "a" * 40
     assert body["context"]["prev_task_id"] == "impl-abc12345"
     assert body["task_id"].startswith("review")
     # Echo the task_id back to stdout
@@ -101,13 +103,27 @@ def test_b187_enqueue_test_type(tmp_path):
         result = runner.invoke(cli.crew, [
             "enqueue", "test", "Verify PR #1666",
             "--project", "proj", "--base", str(tmp_path),
-            "--branch", "agent/x/1665", "--prev-task-id", "review-x",
+            "--branch", "agent/x/1665", "--pr", "1666",
+            "--reviewed-sha", "a" * 40,
+            "--prev-task-id", "review-x",
         ])
 
     assert result.exit_code == 0, result.output
     assert captured["body"]["task_type"] == "test"
     assert captured["body"]["context"]["prev_task_id"] == "review-x"
-    assert "pr_number" not in captured["body"]["context"]
+    assert captured["body"]["pr_number"] == 1666
+    assert captured["body"]["context"]["reviewed_sha"] == "a" * 40
+
+
+def test_review_enqueue_requires_explicit_pr_and_full_head(tmp_path):
+    runner = CliRunner()
+    db = str(tmp_path / "tasks.db")
+    result = runner.invoke(cli.crew, [
+        "enqueue", "review", "Review PR #1666", "--db", db,
+        "--risk-tier", "1", "--pr", "1666"])
+    assert result.exit_code != 0
+    assert "--reviewed-sha" in result.output
+    assert TaskQueue(db).list_tasks() == []
 
 
 def test_b187_enqueue_rejects_unknown_task_type():

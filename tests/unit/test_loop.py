@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock, patch
+import json
 import io
 import urllib.error
 
@@ -229,6 +230,27 @@ def test_u_l13_enqueue_review_and_test_honor_port():
 
     queue.enqueue.assert_not_called()
     assert mock_urlopen.call_count == 2
+
+
+@pytest.mark.parametrize("stage", ["review", "test"])
+def test_http_successor_sends_pr_column_and_head_pin(stage):
+    queue = MagicMock()
+    queue.project_identity = "test-project"
+    queue.list_tasks.return_value = []
+    response = MagicMock()
+    response.read.return_value = b'{"task_id":"created"}'
+    response.__enter__.return_value = response
+    context = {"pr_number": 938, "reviewed_sha": "a" * 40}
+    with patch("agent_crew.loop.urllib.request.urlopen", return_value=response) as urlopen:
+        if stage == "review":
+            enqueue_review(queue, "work", "fix/935", "impl-935", context,
+                           port=8101)
+        else:
+            enqueue_test(queue, "work", "fix/935", "review-935", context,
+                         port=8101)
+    payload = json.loads(urlopen.call_args.args[0].data)
+    assert payload["pr_number"] == 938
+    assert payload["context"]["reviewed_sha"] == "a" * 40
 
 
 # U-L14: enqueue_review is idempotent — if review already exists for impl task, return its ID

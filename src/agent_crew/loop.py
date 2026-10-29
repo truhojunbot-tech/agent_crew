@@ -5,7 +5,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
+from agent_crew.protocol import GateRequest, TaskRequest, TaskResult, normalize_pr_number
 from agent_crew.tokenomics_canary import REUSED_FROM_KEY, SUPPRESSED_REASON
 
 DEFAULT_MAX_ITER: int = 5
@@ -27,6 +27,7 @@ def _post_task_http(port: int, req: TaskRequest) -> str:
         "description": req.description,
         "branch": req.branch,
         "priority": req.priority,
+        "pr_number": req.pr_number,
         "context": req.context,
         # s4j: the project rides over the wire too. Dropping it here made the
         # `--port` variant of these helpers admit project-less through
@@ -254,6 +255,7 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
         description=task_desc,
         branch=branch,
         context={**_REVIEW_CONTEXT, "prev_task_id": prev_task_id, **context},
+        pr_number=normalize_pr_number(context.get("pr_number")),
         project=_adapter_project(queue, project),
     )
     if port:
@@ -291,6 +293,7 @@ def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", con
         description=task_desc,
         branch=branch,
         context=merged_context,
+        pr_number=normalize_pr_number(merged_context.get("pr_number")),
         project=_adapter_project(queue, project),
     )
     if port:

@@ -82,3 +82,12 @@ def test_top_level_pr_is_canonicalized_for_context_consumers(tmp_path, monkeypat
     task = queue.get_task("review-935")
     assert task.pr_number == 935
     assert task.context["pr_number"] == 935
+
+
+def test_numeric_string_context_pr_matches_top_level(tmp_path, monkeypatch):
+    app, queue = _harness(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        response = _post(client, pr_number="938",
+                         context={"pr_number": "938", "reviewed_sha": SHA})
+    assert response.status_code == 201, response.text
+    assert queue.get_task("review-935").pr_number == 938

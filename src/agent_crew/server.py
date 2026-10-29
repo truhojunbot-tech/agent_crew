@@ -79,7 +79,7 @@ from agent_crew.pipeline import (
 from agent_crew import provenance as _prov
 from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
-    RESULT_COMMIT_CONTEXT_KEY,
+    RESULT_COMMIT_CONTEXT_KEY, normalize_pr_number,
 )
 from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, DuplicateReviewError,
                               DuplicateReviewResult, InvalidReviewResult, InvalidRiskTierError,
@@ -8537,7 +8537,7 @@ def create_app(
                     or _object_id_or_empty(ctx.get("expected_head_sha"))):
                 raise HTTPException(status_code=422, detail="review/test requires pinned head SHA")
             context_pr = ctx.get("pr_number")
-            if context_pr is not None and context_pr != task.pr_number:
+            if context_pr is not None and normalize_pr_number(context_pr) != task.pr_number:
                 raise HTTPException(status_code=422, detail="context.pr_number differs from pr_number")
         # #889: one role policy on every route — explicit override, the
         # lineage's implementer/tester choice, and the role assignment itself.
