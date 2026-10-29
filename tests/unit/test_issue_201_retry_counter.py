@@ -78,7 +78,11 @@ def test_u_i201_transient_retry_counter_caps_and_fails(tmp_db, tmp_path, *, unus
         "AGENT_CREW_TRANSIENT_RETRY_MAX": "1",
     }):
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
-            with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
+            def fake_run(args, **kwargs):
+                stdout = "main\n" if args[:3] == ["gh", "pr", "view"] else ""
+                return MagicMock(returncode=0, stdout=stdout, stderr="")
+
+            with patch("subprocess.run", side_effect=fake_run):
                 app = create_app(
                     db_path=tmp_db,
                     pane_map={},
@@ -112,3 +116,5 @@ def test_u_i201_transient_retry_counter_caps_and_fails(tmp_db, tmp_path, *, unus
     assert spawn_count == 2, (
         f"expected exactly 2 dispatch attempts (initial + 1 retry), got {spawn_count}"
     )
+
+pytestmark = [pytestmark, pytest.mark.usefixtures("pinned_task_transport")]

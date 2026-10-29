@@ -226,3 +226,5 @@ def test_global_sweep_records_stop_error_and_continues(client, monkeypatch):
     assert body["worker_termination"]["stale-good"] == "pane_worker_not_killable"
     assert client.get("/tasks/stale-stop").json()["status"] == "cancelled"
     assert client.get("/tasks/stale-good").json()["status"] == "cancelled"
+
+pytestmark = pytest.mark.usefixtures("pinned_task_transport")

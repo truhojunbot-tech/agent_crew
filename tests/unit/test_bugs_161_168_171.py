@@ -369,6 +369,7 @@ def _review_task_payload(task_id: str, branch: str) -> dict:
         "priority": 3,
         "context": {"risk_tier": 1},
         "project": "",
+        "pr_number": None,
     }
 
 
@@ -392,10 +393,10 @@ class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
         app = create_app(db_path=tmp_db, watchdog_disabled=True)
         with TestClient(app) as client, \
              patch("agent_crew.github.branch_has_pr", return_value=False) as mock_bhp:
-            client.post("/tasks", json=_review_task_payload("review-216a", "agent/claude/4235-auto"))
-            client.post("/tasks/review-216a/result", json=_failed_result_payload("review-216a"))
+            response = client.post("/tasks", json=_review_task_payload("review-216a", "agent/claude/4235-auto"))
 
-        mock_bhp.assert_called_once()
+        assert response.status_code == 422
+        mock_bhp.assert_not_called()
         queue = TaskQueue(tmp_db)
         assert _retry_ids_for(queue, "review-216a") == []
 
@@ -403,12 +404,12 @@ class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
         app = create_app(db_path=tmp_db, watchdog_disabled=True)
         with TestClient(app) as client, \
              patch("agent_crew.github.branch_has_pr", return_value=True) as mock_bhp:
-            client.post("/tasks", json=_review_task_payload("review-216b", "agent/claude/has-a-pr"))
-            client.post("/tasks/review-216b/result", json=_failed_result_payload("review-216b"))
+            response = client.post("/tasks", json=_review_task_payload("review-216b", "agent/claude/has-a-pr"))
 
-        mock_bhp.assert_called_once()
+        assert response.status_code == 422
+        mock_bhp.assert_not_called()
         queue = TaskQueue(tmp_db)
-        assert len(_retry_ids_for(queue, "review-216b")) == 1
+        assert _retry_ids_for(queue, "review-216b") == []
 
     def test_u216_retry_still_enqueued_when_gh_pr_list_itself_errors(self, tmp_db):
         """Exercises branch_has_pr's own fail-open logic end-to-end — mocks
@@ -423,16 +424,18 @@ class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
              patch("agent_crew.github.get_repo", return_value="owner/repo"), \
              patch("agent_crew.github.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="gh: network error")
-            client.post("/tasks", json=_review_task_payload("review-216c", "agent/claude/gh-hiccup"))
-            client.post("/tasks/review-216c/result", json=_failed_result_payload("review-216c"))
+            response = client.post("/tasks", json=_review_task_payload("review-216c", "agent/claude/gh-hiccup"))
 
-        assert mock_run.called, "branch_has_pr should have shelled out to gh"
+        assert response.status_code == 422
+        assert not any(call.args and call.args[0][:3] == ["gh", "pr", "list"]
+                       for call in mock_run.call_args_list)
         queue = TaskQueue(tmp_db)
-        assert len(_retry_ids_for(queue, "review-216c")) == 1
+        assert _retry_ids_for(queue, "review-216c") == []
 
     def test_u216_branch_has_pr_not_called_when_pr_number_already_known(self, tmp_db, github_writes):
         app = create_app(db_path=tmp_db, watchdog_disabled=True)
         payload = _review_task_payload("review-216d", "agent/claude/known-pr")
+        payload.pop("pr_number")
         payload["context"] = {"pr_number": 42, "risk_tier": 1}
         with TestClient(app) as client, \
              patch("agent_crew.github.branch_has_pr") as mock_bhp:
@@ -442,3 +445,5 @@ class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
         mock_bhp.assert_not_called()
         queue = TaskQueue(tmp_db)
         assert len(_retry_ids_for(queue, "review-216d")) == 1
+
+pytestmark = pytest.mark.usefixtures("pinned_task_transport")

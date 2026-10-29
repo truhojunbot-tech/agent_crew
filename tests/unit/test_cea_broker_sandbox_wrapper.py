@@ -41,3 +41,5 @@ def test_broker_sandbox_e2e(tmp_path):
     for case in ("block", "allow"):
         assert evidence[case]["receipt"]["issuer"] == "agent_crew.cea.broker.sandbox"
         assert evidence[case]["receipt"]["downgrade_reason"] == "BROKER_TREE_USER_WRITABLE"
+
+pytestmark = pytest.mark.usefixtures("pinned_task_transport")

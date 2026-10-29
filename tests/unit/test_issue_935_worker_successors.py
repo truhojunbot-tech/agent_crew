@@ -42,16 +42,23 @@ def _post(client, task_id="review-935", task_type="review", *, pr_number=None,
 
 
 @pytest.mark.parametrize("task_type", ["review", "test"])
-def test_post_rejects_context_only_pr_and_missing_head(tmp_path, monkeypatch, task_type):
+def test_post_accepts_context_pr_without_head_but_rejects_unpinned_pr(tmp_path, monkeypatch, task_type):
     app, queue = _harness(tmp_path, monkeypatch)
     with TestClient(app) as client:
         context_only = _post(client, task_type=task_type,
                              context={"pr_number": 935, "reviewed_sha": SHA})
         no_head = _post(client, task_id="no-head", task_type=task_type,
-                        pr_number=935, context={"pr_number": 935})
-    assert context_only.status_code == 422, context_only.text
-    assert no_head.status_code == 422, no_head.text
-    assert queue.list_tasks() == []
+                        pr_number=936, context={"pr_number": 936})
+        no_pr = _post(client, task_id="no-pr", task_type=task_type,
+                      context={"reviewed_sha": SHA})
+    assert context_only.status_code == 201, context_only.text
+    assert no_head.status_code == 201, no_head.text
+    assert no_pr.status_code == 422, no_pr.text
+    assert queue.get_task("review-935").pr_number == 935
+    assert queue.get_task("review-935").context["pr_number"] == 935
+    assert queue.get_task("no-head").pr_number == 936
+    assert queue.get_task("no-head").context["pr_number"] == 936
+    assert queue.get_task("no-pr") is None
 
 
 @pytest.mark.parametrize("task_type", ["review", "test"])

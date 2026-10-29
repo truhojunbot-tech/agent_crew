@@ -8529,16 +8529,21 @@ def create_app(
         ctx = task.context if isinstance(task.context, dict) else {}
         if task.task_type in {"review", "test"}:
             # Pipeline successors are built in-process. An external PR review
-            # or test must identify the PR in its column and pin the exact
-            # revision before admission, not fail later in the dispatcher.
-            if type(task.pr_number) is not int or task.pr_number <= 0:
-                raise HTTPException(status_code=422, detail="review/test requires pr_number")
-            if not (_object_id_or_empty(ctx.get("reviewed_sha"))
-                    or _object_id_or_empty(ctx.get("expected_head_sha"))):
-                raise HTTPException(status_code=422, detail="review/test requires pinned head SHA")
-            context_pr = ctx.get("pr_number")
-            if context_pr is not None and normalize_pr_number(context_pr) != task.pr_number:
+            # or test must identify the PR before admission. The dispatcher
+            # resolves and pins its current head before delivery (#289).
+            field_pr = normalize_pr_number(task.pr_number)
+            context_value = ctx.get("pr_number")
+            context_pr = normalize_pr_number(context_value)
+            if ((task.pr_number is not None and field_pr is None)
+                    or (context_value is not None and context_pr is None)
+                    or (field_pr is not None and context_pr is not None and field_pr != context_pr)):
                 raise HTTPException(status_code=422, detail="context.pr_number differs from pr_number")
+            canonical_pr = field_pr or context_pr
+            if canonical_pr is None:
+                raise HTTPException(status_code=422, detail="review/test requires pr_number")
+            task.pr_number = canonical_pr
+            ctx["pr_number"] = canonical_pr
+            task.context = ctx
         # #889: one role policy on every route — explicit override, the
         # lineage's implementer/tester choice, and the role assignment itself.
         # The branch name is a label and never selects the agent.
