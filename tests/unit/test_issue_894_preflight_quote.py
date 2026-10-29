@@ -27,6 +27,10 @@ def test_policy_prose_is_not_a_local_file_requirement(description):
     "Read ~/alfred/governance/plan.md before editing",
     "Don't guess. Read ~/alfred/plan.md first.",
     "Read ~/alfred/plan.md, but do not edit it.",
+    # Review of PR #918: a negation that does not govern the path's access.
+    "Don't guess, read ~/alfred/plan.md before editing",
+    "Do not skip the input file: ~/alfred/plan.md",
+    "Never guess and read ~/alfred/plan.md first",
 ])
 def test_real_local_requirement_still_fails_closed(description):
     assert cloud._cloud_preflight_reason(_task(description), "owner/agent_crew") \

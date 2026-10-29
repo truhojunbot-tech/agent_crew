@@ -983,24 +983,38 @@ _LOCAL_ONLY_PATH = re.compile(
     r"(?<![\w/])(?:~/|/home/[^\s/'\"`]+/|/tmp/|/var/tmp/|\.agent_crew/)",
     re.IGNORECASE,
 )
-# #894: a path after a negation in the same sentence is policy prose ("don't
-# write to ~/.local/bin"), not a file the task needs. A negation after the path
-# ("read ~/x, but do not edit it") still counts, so a real requirement fails closed.
-_PREFLIGHT_SENTENCE = re.compile(r"\n|(?<=[.!?;])\s+")
-_PREFLIGHT_NEGATION = re.compile(
-    r"\b(?:don'?t|do not|does not|doesn'?t|never|must not|mustn'?t|should not|"
-    r"shouldn'?t|cannot|can'?t|not|avoid\w*|without|forbid\w*|prohibit\w*)\b|⛔",
+# #894: a path is policy prose ("don't write to ~/.local/bin") only when a
+# negation in its own clause governs an access verb on it, or sits right before
+# it ("avoid ~/ paths"). An unrelated negation ("Don't guess, read ~/x"), a
+# negated non-access verb ("do not skip the input file: ~/x") or a negation
+# after the path ("read ~/x, but do not edit it") still counts, so a real
+# requirement fails closed.
+_PREFLIGHT_CLAUSE = re.compile(r"\n|(?<=[.!?;:,])\s+")
+_PREFLIGHT_NEGATION = (
+    r"(?:\b(?:don'?t|do not|does not|doesn'?t|never|must not|mustn'?t|should not|"
+    r"shouldn'?t|cannot|can'?t|not|avoid\w*|without|forbid\w*|prohibit\w*)\b|⛔)"
+)
+_PREFLIGHT_ACCESS = (
+    r"(?:read\w*|writ\w*|touch\w*|edit\w*|modif\w*|us(?:e|es|ed|ing)|access\w*|"
+    r"open\w*|load\w*|cop(?:y|ies|ying)|mov\w*|delet\w*|remov\w*|creat\w*|put\w*|"
+    r"stor\w*|sav\w*|commit\w*|depend\w*|rel(?:y|ies|ying)|referenc\w*|"
+    r"look\w*|inspect\w*)\b"
+)
+_PREFLIGHT_NEGATED_ACCESS = re.compile(
+    _PREFLIGHT_NEGATION + r"(?:\s+(?!(?:and|or|then|but)\b)\w+){0,2}?\s+"
+    + _PREFLIGHT_ACCESS + "|"
+    + _PREFLIGHT_NEGATION + r"\s*$",
     re.IGNORECASE,
 )
 
 
 def _local_only_path_match(work: str) -> str:
     """Return the first local-only path the text requires, quoted as written."""
-    for sentence in _PREFLIGHT_SENTENCE.split(work):
-        for match in _LOCAL_ONLY_PATH.finditer(sentence):
-            if _PREFLIGHT_NEGATION.search(sentence, 0, match.start()):
+    for clause in _PREFLIGHT_CLAUSE.split(work):
+        for match in _LOCAL_ONLY_PATH.finditer(clause):
+            if _PREFLIGHT_NEGATED_ACCESS.search(clause[:match.start()]):
                 continue
-            token = re.match(r"[^\s'\"`]+", sentence[match.start():])
+            token = re.match(r"[^\s'\"`]+", clause[match.start():])
             return token.group(0).rstrip(".,;:)") if token else match.group(0)
     return ""
 
