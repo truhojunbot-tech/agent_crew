@@ -42,6 +42,7 @@ from agent_crew.protocol import (
     RESULT_COMMIT_CONTEXT_KEY, normalize_pr_number as _normalize_pr_number,
     validate_review_result,
 )
+from agent_crew.role_mapping import ROLE_BOUND_PROVIDERS
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
 from agent_crew.tokenomics_shadow import shadow_recommendation, shadow_recommendation_for_task_id
@@ -5252,16 +5253,23 @@ class TaskQueue:
             skip_sql = f" AND task_id NOT IN ({','.join('?' for _ in skipped)})" if skipped else ""
             if agent:
                 # Stage 1 — explicit override claim for this agent.
+                # #891: a role-bound backend has no checkout of its own, so its
+                # binding only counts for the role it is claiming as right now.
+                # Checked here, inside the claim transaction: a stale binding
+                # enqueued after the dispatcher's reroute sweep is still refused.
+                bound_type = (_ROLE_TO_TYPE.get(role)
+                              if role and agent in ROLE_BOUND_PROVIDERS else None)
+                bound_sql = " AND task_type = ?" if bound_type else ""
                 row = conn.execute(
                     f"""
                     SELECT * FROM tasks
                     WHERE status = 'pending'
                       AND json_extract(context, '$.agent_override') = ?
-                      {_defer_sql} {skip_sql}
+                      {bound_sql} {_defer_sql} {skip_sql}
                     ORDER BY priority ASC, created_at ASC
                     LIMIT 1
                     """,
-                    (agent, *skipped),
+                    (agent, *((bound_type,) if bound_type else ()), *skipped),
                 ).fetchone()
 
             if row is None and role:

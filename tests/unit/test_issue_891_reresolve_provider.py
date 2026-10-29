@@ -115,3 +115,34 @@ def test_local_operator_override_is_not_rerouted(tmp_path):
     with TestClient(app):
         assert app.state.reroute_stale_bindings() == []
     assert queue.get_task("impl-891-local").context["agent_override"] == "claude"
+
+
+def test_override_enqueued_after_sweep_is_not_claimed_by_cloud_review_seat(tmp_path):
+    """Review of PR #916: the sweep ran (implementer=claude, reviewer=claude_cloud),
+    then an implement task bound to claude_cloud arrived before the cloud
+    reviewer's dequeue. The claim itself must refuse it, not the sweep."""
+    state_path = tmp_path / "state.json"
+    _state(state_path, "claude", "claude_cloud")
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    app = server.create_app(db_path=db, state_path=str(state_path),
+                            watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        assert app.state.reroute_stale_bindings() == []
+        queue.enqueue(TaskRequest(
+            task_id="impl-891-race", task_type="implement", description="implement",
+            branch="fix/891", project="demo", context={"agent_override": "claude_cloud"}))
+        claimed = queue.dequeue(agent="claude_cloud", role="reviewer",
+                                claimed_via="cloud_push", skip_deferred=True)
+    assert claimed is None
+    assert queue.get_task("impl-891-race").status == "pending"
+    assert _claimed_by(db, "impl-891-race")[0] != "claude_cloud"
+
+
+def test_cloud_review_seat_still_claims_its_own_bound_review(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(
+        task_id="review-891-own", task_type="review", description="review",
+        project="demo", context={"agent_override": "claude_cloud"}))
+    claimed = queue.dequeue(agent="claude_cloud", role="reviewer", claimed_via="cloud_push")
+    assert claimed is not None and claimed.task_id == "review-891-own"
