@@ -1263,6 +1263,27 @@ def _enqueue_with_inherited_risk(queue: TaskQueue, task: TaskRequest,
             logger.exception("inherited risk telemetry failed for %s", task.task_id)
 
 
+def _record_successor_refused(queue: TaskQueue, task_id: str, reason: str,
+                              detail: str, coordinator_notify_fn=None) -> None:
+    """Make a refused successor visible instead of ending the lineage silently (#914).
+
+    Records the terminal reason on the task and sends one durable coordinator
+    notice (#864). Best effort: a refusal must never crash the cascade.
+    """
+    terminal = f"successor_refused: {reason}"
+    try:
+        queue.merge_task_context(task_id, {"lineage_terminal_reason": terminal})
+    except Exception:
+        logger.exception("successor refusal marker failed for %s", task_id)
+    try:
+        from agent_crew.server import coordinator_notice_once
+        coordinator_notice_once(queue, task_id, "successor_refused",
+                                f"{terminal} {detail} — lineage ended, needs a human",
+                                coordinator_notify_fn)
+    except Exception:
+        logger.exception("successor refusal notice failed for %s", task_id)
+
+
 def _round_cap_pinned(tasks_by_id: dict, review_task, queue: TaskQueue,
                       server_project: Optional[str] = None) -> bool:
     return _tokenomics_canary._is_pinned(
@@ -1701,12 +1722,22 @@ def auto_enqueue_fix(
             logger.warning(
                 "auto_enqueue_fix: %s cannot verify default branch for %r — "
                 "not creating an automated fix (#457)", review_task_id, repo)
+            if not failed_test:
+                _record_successor_refused(
+                    queue, review_task_id, "default_branch_unverified",
+                    f"repo={repo!r}", coordinator_notify_fn)
             return None
         if _normalize_branch(cascade_branch) in default_branches:
             logger.warning(
                 f"auto_enqueue_fix: {review_task_id} reviewed default branch "
                 f"{cascade_branch!r} — not creating an automated fix (#457)"
             )
+            # A failed test already gets test_failed_no_successor from the
+            # result handler; a review had only this log line (#914).
+            if not failed_test:
+                _record_successor_refused(
+                    queue, review_task_id, "default_branch",
+                    f"branch={cascade_branch!r}", coordinator_notify_fn)
             return None
 
         pr_number = review_result.pr_number or review_ctx.get("pr_number")
