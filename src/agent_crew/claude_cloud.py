@@ -552,20 +552,22 @@ def build_cloud_task_prompt(task: TaskRequest, *, repo: str = "") -> str:
             f"Review Agent Crew task {task.task_id}.",
             f"Repository: {repo}",
             f"PR: #{pr_number}",
-            f"reviewed_sha {reviewed_sha}",
+            f"Reviewed commit: {reviewed_sha}",
             "Description:", task.description,
             "Check out the exact reviewed_sha above, verify HEAD equals it, review the diff, "
             "and run the relevant tests. Post exactly ONE PR comment using "
-            "gh pr comment (not gh pr review --comment) whose first line is "
-            "[agent_crew review] verdict: approve|request_changes (choose one).",
-            f"Include a line: reviewed_sha {reviewed_sha}",
-            "For request_changes, list actionable findings as "
-            "- HIGH|MED|LOW path:line - text. Every finding needs a verified "
-            "path and line number; do not invent one. If a blocker cannot be "
-            "anchored to a line, do not post a marked verdict; let local review "
-            "handle it. For approve, include no findings. Put test notes in "
-            "plain prose, with no other '- ' lines.",
-            f"Include the exact marker line: <!-- agent_crew:cloud-review task={task.task_id} sha={reviewed_sha} -->",
+            "gh pr comment (not gh pr review --comment). The entire comment "
+            "must be one HTML-comment JSON block with no prose around it:",
+            "<!-- agent_crew:cloud-review " + json.dumps({
+                "task_id": task.task_id, "reviewed_sha": reviewed_sha,
+                "verdict": "approve", "findings": [],
+            }, separators=(",", ":")) + " -->",
+            "Choose verdict approve or request_changes. Approve requires an "
+            "empty findings list; request_changes requires at least one finding. "
+            "Each finding must be a JSON string in the form HIGH|MED|LOW "
+            "path:line - text, with a verified path and line number. If a "
+            "blocker cannot be anchored to a line, do not post a marked "
+            "block; let local review handle it. No other keys or text.",
             "No push, no merge, no GitHub review-state approval, and no file changes.",
         ])
     lines = [f"Implement Agent Crew task {task.task_id} ({task.task_type})."]
@@ -1559,9 +1561,7 @@ def reconcile_shadow_reviews(queue: TaskQueue, *, pr_comments_fn=None) -> None:
         sha = context.get("reviewed_sha") or ""
         try:
             comments = comments_for_pr(pr, repo=_resolve_task_repo(task, None)) or []
-            marker = f"<!-- agent_crew:cloud-review task={task.task_id} "
-            matches = [str(row.get("body") or "") for row in comments
-                       if isinstance(row, dict) and marker in str(row.get("body") or "")]
+            matches = _cloud_review_bodies_for_task(comments, task.task_id)
             if matches:
                 if len(matches) != 1:
                     raise ValueError("multiple marked comments")
@@ -1633,41 +1633,72 @@ class CloudReconciliationOutcome:
     detail: str = ""
 
 
-_REVIEW_MARKER_RE = re.compile(
-    r"<!-- agent_crew:cloud-review task=([^\s>]+) sha=([^\s>]+) -->")
-_REVIEW_VERDICT_RE = re.compile(
-    r"\A\[agent_crew review\] verdict: (approve|request_changes)\s*$")
-_REVIEW_FINDING_RE = re.compile(
-    r"^- (HIGH|MED|LOW) ([^\s:]+):(\d+) - (.+)$")
+_REVIEW_BLOCK_RE = re.compile(r"\A<!-- agent_crew:cloud-review (\{.*\}) -->\Z", re.DOTALL)
+_REVIEW_FINDING_RE = re.compile(r"\A(HIGH|MED|LOW) ([^\s:]+):([1-9]\d*) - (.+)\Z")
+
+
+def _cloud_review_bodies_for_task(comments, task_id: str) -> list[str]:
+    """Select this task's marker without treating another review as ours."""
+    matches = []
+    for row in comments:
+        body = str(row.get("body") or "") if isinstance(row, dict) else ""
+        if "<!-- agent_crew:cloud-review " not in body:
+            continue
+        marker = _REVIEW_BLOCK_RE.fullmatch(body.strip())
+        if marker is not None:
+            try:
+                record = json.loads(marker.group(1))
+            except (TypeError, ValueError):
+                record = None
+            if isinstance(record, dict) and "task_id" in record:
+                if record["task_id"] == task_id:
+                    matches.append(body)
+                continue
+        # A damaged marker naming this task must be rejected promptly rather
+        # than waiting until the cloud stale timeout. The strict parser below
+        # still owns all schema and identity validation.
+        if task_id in body:
+            matches.append(body)
+    return matches
 
 
 def parse_cloud_review_comment(body: str, *, task_id: str, reviewed_sha: str,
                                pr_number: int) -> TaskResult:
-    """Accept one pinned, actionable cloud review comment or raise ValueError."""
-    markers = _REVIEW_MARKER_RE.findall(body)
-    if markers != [(task_id, reviewed_sha)]:
-        raise ValueError("cloud review marker task/SHA mismatch or ambiguity")
-    lines = body.splitlines()
-    if not lines:
-        raise ValueError("cloud review comment is empty")
-    verdict_match = _REVIEW_VERDICT_RE.fullmatch(lines[0])
-    if verdict_match is None:
-        raise ValueError("cloud review verdict line is malformed")
-    sha_lines = [line for line in lines if line.startswith("reviewed_sha ")]
-    if sha_lines != [f"reviewed_sha {reviewed_sha}"]:
-        raise ValueError("cloud review reviewed_sha line does not match")
-    findings = []
-    for line in lines[1:]:
-        if line.startswith("- "):
-            if _REVIEW_FINDING_RE.fullmatch(line) is None:
-                raise ValueError("cloud review finding is malformed")
-            findings.append(line[2:])
-    verdict = verdict_match.group(1)
+    """Parse only the pinned JSON marker; prose cannot supply a verdict."""
+    match = _REVIEW_BLOCK_RE.fullmatch(body.strip())
+    if match is None:
+        raise ValueError("cloud review JSON block is missing or has extra text")
+
+    def unique_object(pairs):
+        record = {}
+        for key, value in pairs:
+            if key in record:
+                raise ValueError("cloud review JSON has duplicate keys")
+            record[key] = value
+        return record
+
+    try:
+        record = json.loads(match.group(1), object_pairs_hook=unique_object)
+    except json.JSONDecodeError as exc:
+        raise ValueError("cloud review JSON is malformed") from exc
+    if not isinstance(record, dict) or set(record) != {
+            "task_id", "reviewed_sha", "verdict", "findings"}:
+        raise ValueError("cloud review JSON schema is invalid")
+    if record["task_id"] != task_id or record["reviewed_sha"] != reviewed_sha:
+        raise ValueError("cloud review task/SHA mismatch")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", str(record["reviewed_sha"])):
+        raise ValueError("cloud review SHA is malformed")
+    verdict = record["verdict"]
+    findings = record["findings"]
+    if (verdict not in ("approve", "request_changes")
+            or not isinstance(findings, list)
+            or any(not isinstance(finding, str) or not _REVIEW_FINDING_RE.fullmatch(finding)
+                   for finding in findings)):
+        raise ValueError("cloud review verdict or findings are malformed")
     if (verdict == "approve" and findings) or (verdict == "request_changes" and not findings):
         raise ValueError("cloud review verdict/findings disagree")
     return TaskResult(task_id=task_id, status="completed", verdict=verdict,
-                      summary=f"Cloud review of PR #{pr_number} at {reviewed_sha}: " +
-                              "\n".join(line for line in lines[1:] if not line.startswith("<!--"))[:3500],
+                      summary=f"Cloud review of PR #{pr_number} at {reviewed_sha}",
                       findings=findings, pr_number=pr_number)
 
 
@@ -1686,9 +1717,7 @@ def _reconcile_cloud_review(
         return CloudReconciliationOutcome(task.task_id, "failed", detail="missing pinned PR/SHA")
     comments = pr_comments_fn(pr_number, repo=repo)
     if comments is not None:
-        prefix = f"<!-- agent_crew:cloud-review task={task.task_id} "
-        matches = [c.get("body", "") for c in comments if isinstance(c, dict)
-                   and prefix in str(c.get("body") or "")]
+        matches = _cloud_review_bodies_for_task(comments, task.task_id)
         if matches:
             try:
                 if len(matches) != 1:
@@ -1703,9 +1732,6 @@ def _reconcile_cloud_review(
             if submit_review_result_fn is None:
                 retry_detail = "result handler unavailable"
             else:
-                # The server's normal result handler consumes this flag to avoid
-                # reposting the cloud session's already published review comment.
-                queue.patch_context(task.task_id, {"cloud_review_comment_confirmed": True})
                 try:
                     acknowledgement = submit_review_result_fn(task.task_id, result)
                 except Exception:

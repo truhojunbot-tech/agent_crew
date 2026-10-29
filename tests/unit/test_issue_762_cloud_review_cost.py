@@ -15,6 +15,13 @@ SHA = "a" * 40
 SESSION = "session_abc12345"
 
 
+def _comment(task_id):
+    return "<!-- agent_crew:cloud-review " + json.dumps({
+        "task_id": task_id, "reviewed_sha": SHA,
+        "verdict": "approve", "findings": [],
+    }) + " -->"
+
+
 def _review(queue, task_id="review-cost"):
     queue.enqueue(TaskRequest(task_id=task_id, task_type="review", description="Review PR",
                               branch=f"agent/{task_id}", project="agent_crew",
@@ -50,9 +57,7 @@ def test_marked_review_records_credit_at_launch_and_completion(tmp_path, monkeyp
                                             run_fn=_runner)
     assert outcome.dispatched
     assert queue.get_attribution("review-cost")["cloud_credit_used_before"] == 10.0
-    comment = ("[agent_crew review] verdict: approve\n"
-               f"reviewed_sha {SHA}\n"
-               f"<!-- agent_crew:cloud-review task=review-cost sha={SHA} -->")
+    comment = _comment("review-cost")
     monkeypatch.setattr(cloud._github, "pr_comments", lambda *_a, **_kw: [{"body": comment}])
     outcomes = cloud.reconcile_all_cloud_tasks(
         queue, submit_review_result_fn=lambda task_id, result: queue.submit_result(task_id, result))
@@ -114,9 +119,7 @@ def test_shadow_review_records_cost_on_every_terminal(tmp_path, monkeypatch, clo
     launched = cloud.launch_shadow_review(queue, task, run_fn=runner)
     assert launched is (terminal != "launch_failure")
     if terminal == "marked":
-        comment = ("[agent_crew review] verdict: approve\n"
-                   f"reviewed_sha {SHA}\n"
-                   f"<!-- agent_crew:cloud-review task=review-cost sha={SHA} -->")
+        comment = _comment("review-cost")
         cloud.reconcile_shadow_reviews(queue,
             pr_comments_fn=lambda *_a, **_kw: [{"body": comment}])
     elif terminal == "stale":
@@ -155,9 +158,7 @@ def test_shadow_overlap_is_recorded_without_double_counting_daily_launch(tmp_pat
     assert cloud.dispatch_cloud_for_role(queue, role="reviewer", task_type="review",
                                          run_fn=_runner).dispatched
     assert queue.count_cloud_reviews_started_since(time.time() - 60) == 2
-    comment = ("[agent_crew review] verdict: approve\n"
-               f"reviewed_sha {SHA}\n"
-               f"<!-- agent_crew:cloud-review task=first sha={SHA} -->")
+    comment = _comment("first")
     cloud.reconcile_shadow_reviews(queue,
         pr_comments_fn=lambda *_a, **_kw: [{"body": comment}])
     assert queue.get_attribution("cloud-shadow:first")["cloud_usd"] is None

@@ -9368,12 +9368,7 @@ def create_app(
                     if _pub.requeue_head:
                         _requeue_review_at_head(task_id, _review_pr, _pub.requeue_head, ctx)
                     _review_pr = None
-                if _review_pr and ctx.get("cloud_review_comment_confirmed"):
-                    # #712: the cloud reviewer has already posted its one
-                    # marked PR comment. Reuse every result/cascade gate, but
-                    # do not publish a second copy of the same verdict.
-                    logger.info("POST /tasks/%s/result: cloud review comment already posted", task_id)
-                elif _review_pr and _REPLAYING.get():
+                if _review_pr and _REPLAYING.get():
                     # #314 §4 P0: replay 중 PR review comment 재게시 금지(gh comment는 receipt 없음
                     # → 게시 후 ACK 전 crash 시 중복). 라이브 경로에서만 게시. verdict 소비(test/merge)는
                     # 아래에서 계속되며 stable id/receipt로 멱등.
