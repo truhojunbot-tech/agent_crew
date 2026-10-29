@@ -28,26 +28,29 @@ BRANCH = "feat/login"
 
 
 def _submit(client, task_id: str, status: str = "completed",
-            summary: str = "done", verdict=None, findings=None):
+            summary: str = "done", verdict=None, findings=None, error_info=None):
     # #376: review submissions must meet the result contract; the short labels
     # below describe scenarios, not valid worker summaries for the HTTP API.
     if verdict and len(summary) < 40:
         summary = f"Reviewed this change and recorded the verdict: {summary}."
     payload = {"task_id": task_id, "status": status,
                "summary": summary, "findings": findings or []}
+    if error_info is not None:
+        payload["error_info"] = error_info
     if verdict:
         payload["verdict"] = verdict
     return client.post(f"/tasks/{task_id}/result", json=payload)
 
 
 def _make_result(task_id: str, status: str = "completed",
-                 summary: str = "done", verdict=None, findings=None):
+                 summary: str = "done", verdict=None, findings=None, error_info=None):
     return TaskResult(
         task_id=task_id,
         status=status,
         summary=summary,
         verdict=verdict,
         findings=findings or [],
+        error_info=error_info or {},
     )
 
 
@@ -164,9 +167,11 @@ def test_i_lo05_test_failure_reimplements(task_queue, test_client):
 
     # The HTTP review result already cascaded a test; adopt that successor.
     test_id = enqueue_test(task_queue, DESC, BRANCH, prev_task_id=review_id)
-    _submit(test_client, test_id, status="failed", summary="3 tests failed")
+    _submit(test_client, test_id, status="failed", summary="3 tests failed",
+            error_info={"kind": "test_failure"})
 
-    test_outcome = handle_test_result(_make_result(test_id, status="failed"))
+    test_outcome = handle_test_result(_make_result(
+        test_id, status="failed", error_info={"kind": "test_failure"}))
     assert test_outcome == "failed"
 
     # 실패 시 implement 재등록

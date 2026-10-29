@@ -150,7 +150,8 @@ def test_run_retry_keeps_artifact_kind(monkeypatch, tmp_path, retry_path):
             verdict="approve" if retry_path == "failed_test" else "request_changes",
             findings=[] if retry_path == "failed_test" else ["Report needs a source link"],
         ),
-        *([TaskResult(task_id="test-1", status="failed", summary="test failed")]
+        *([TaskResult(task_id="test-1", status="failed", summary="test failed",
+                      error_info={"kind": "test_failure"})]
           if retry_path == "failed_test" else []),
         TaskResult(task_id="impl-2", status="failed", summary="stop after retry"),
     ])

@@ -228,12 +228,13 @@ def test_never_delivered_notice_gives_up_after_bounded_attempts(tmp_db, monkeypa
     with sqlite3.connect(tmp_db) as db:
         events = [row[0] for row in db.execute(
             "SELECT event FROM task_exec_events WHERE task_id='impl-773' "
+            "AND json_extract(fields, '$.kind')='missing_result' "
             "AND event LIKE 'coordinator_notice%' ORDER BY event_id")]
-    assert len(attempts) == 3
+    assert len([message for message in attempts if "kind=missing_result" in message]) == 3
     assert events.count("coordinator_notice") == 3
     assert events.count("coordinator_notice_failed") == 3
     assert events.count("coordinator_notice_gave_up") == 1
-    assert queue.retryable_coordinator_notices() == []
+    assert not any(kind == "missing_result" for _, kind in queue.retryable_coordinator_notices())
     assert not queue.claim_coordinator_notice("impl-773", "missing_result")
 
 
@@ -320,7 +321,8 @@ def test_cli_test_failure_retry_preserves_full_lineage(tmp_db, monkeypatch):
         if task_id.startswith("test-"):
             return TaskResult(task_id, "failed", "one new failing test",
                               findings=["new failure: tests/test_new.py::test_one"],
-                              error_info={"script_test": {"outcome": "FAILED",
+                              error_info={"kind": "test_failure",
+                                          "script_test": {"outcome": "FAILED",
                                                           "reason": "new_failures",
                                                           "new_failures": ["tests/test_new.py::test_one"]}})
         return TaskResult(task_id, "completed", "done", branch=INTENT["branch"],

@@ -95,6 +95,8 @@ def test_zero_turn_error_uses_structured_status_not_error_message():
     assert classify_provider_record("gemini", record)["kind"] == FailureKind.CONFIG_ERROR.value
     assert classify_provider_record("gemini", {"status": "ERROR",
                                                "num_turns": 0})["kind"] == "agent_failed"
+    assert classify_provider_record("gemini", {"status": "ERROR", "num_turns": 0,
+                                               "error": "invalid model selection"})["kind"] == "config_error"
     assert classify_provider_record("gemini", {"status": "SUCCESS",
                                                   "num_turns": 1,
                                                   "result": "invalid model selection"}) is None
