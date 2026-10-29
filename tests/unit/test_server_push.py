@@ -8,6 +8,9 @@ The server's contract:
 - push_fn is injectable so these tests don't actually run tmux.
 """
 from fastapi.testclient import TestClient
+import pytest
+
+pytestmark = pytest.mark.usefixtures("pinned_task_transport")
 
 from agent_crew.server import create_app
 from agent_crew.queue import TaskQueue

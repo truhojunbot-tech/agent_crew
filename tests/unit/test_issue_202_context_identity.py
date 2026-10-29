@@ -828,3 +828,5 @@ def test_u_i235_terminal_outcome_survives_a_restart(tmp_db, tmp_path, *, unused_
     assert reborn["completed_at"] > 0
     assert reborn["context_id"] == "ctx-durable-1"
     assert reborn["started_at"] > 0
+
+pytestmark = [pytestmark, pytest.mark.usefixtures("pinned_task_transport")]

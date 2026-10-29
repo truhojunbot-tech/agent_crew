@@ -169,3 +169,7 @@ def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path, *, unused_tcp_p
     assert spawned_cwd == str(wt_claude), (
         f"without override the reviewer should run in claude worktree, got cwd={spawned_cwd}"
     )
+
+import pytest
+
+pytestmark = pytest.mark.usefixtures("pinned_task_transport")

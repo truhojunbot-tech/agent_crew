@@ -169,7 +169,7 @@ def test_u_se08b_log_viewer_panes_respawn_on_death(tmp_path):
     cmd = literal_calls[0][-1]
     assert "while true" in cmd
     assert "crew-log-viewer" in cmd
-    assert "crew enqueue" in cmd
+    assert "submit task results through the dispatcher" in cmd
 
 
 # U-SE09: _get_agent_cmd — claude omits --continue when .claude/projects/ absent

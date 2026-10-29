@@ -75,7 +75,8 @@ def _dispatch(tmp_path, monkeypatch, *, mode, context=None, receipt_extra=None,
     with TestClient(app) as client:
         resp = client.post("/tasks", headers={"X-Agent-Crew-Project": "demo"}, json={
             "task_id": task_id, "task_type": "test", "description": "run",
-            "branch": "main", "project": "demo", "context": context or {}})
+            "branch": "main", "project": "demo", "pr_number": 935,
+            "context": {**(context or {}), "reviewed_sha": "a" * 40}})
         assert resp.status_code < 300, resp.text
         q = TaskQueue(db)
         if receipt_extra is not None:

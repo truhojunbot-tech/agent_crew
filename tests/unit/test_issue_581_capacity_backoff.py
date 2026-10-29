@@ -20,7 +20,8 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
+pytestmark = [pytest.mark.usefixtures("legacy_gemini_tester_policy"),
+              pytest.mark.usefixtures("pinned_task_transport")]
 from fastapi.testclient import TestClient
 
 from agent_crew.failure_kind import provider_failure_from_log
@@ -170,11 +171,15 @@ def test_u_581_transient_budget_still_applies_to_other_tags(tmp_db, tmp_path, *,
         proc.wait = AsyncMock(return_value=1)
         return proc
 
+    def fake_run(args, **kwargs):
+        stdout = "main\n" if args[:3] == ["gh", "pr", "view"] else ""
+        return MagicMock(returncode=0, stdout=stdout, stderr="")
+
     with patch.dict(os.environ, {"AGENT_CREW_DISPATCHER": "1", "AGENT_CREW_DISPATCH_INTERVAL": "0.05",
                                  "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1",
                                  "AGENT_CREW_TRANSIENT_RETRY_MAX": "1"}), \
             patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess), \
-            patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
+            patch("subprocess.run", side_effect=fake_run):
         app = create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port,
                          state_path=_state(tmp_path), watchdog_disabled=True,
                          anomaly_disabled=True)

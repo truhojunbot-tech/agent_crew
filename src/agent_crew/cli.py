@@ -21,6 +21,7 @@ from agent_crew.conformance_gate import (
     test_pass_for_head,
 )
 from agent_crew.pipeline import ARTIFACT_KINDS
+from agent_crew.protocol import normalize_pr_number
 from agent_crew.queue import CANCEL_REASON_ATTEMPT, _TYPE_TO_ROLE
 from agent_crew.worktree_default_branch import remote_default_branch
 from agent_crew.role_mapping import (
@@ -3852,9 +3853,13 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
             # #302: retry a review that failed to RUN, bounded — same rule as
             # the main loop above.
             _review_attempts = 0
+            review_context = {"risk_tier": risk_tier}
+            impl_pr = normalize_pr_number(getattr(_wait_result, "pr_number", None))
+            if impl_pr is not None:
+                review_context["pr_number"] = impl_pr
             while True:
                 review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id,
-                                           context={"risk_tier": risk_tier}, port=_run_port)
+                                           context=review_context, port=_run_port)
                 review_result = None
                 deadline = time.time() + wait_timeout
                 while time.time() < deadline:
@@ -4184,7 +4189,9 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
 @click.option("--branch", default="main", show_default=True,
               help="Git branch the task targets")
 @click.option("--pr", "pr_number", default=0, type=int,
-              help="PR number to attach to context (for review/test tasks)")
+              help="PR number for an operator-created review/test task")
+@click.option("--reviewed-sha", default="",
+              help="Full PR head SHA required for an operator-created review/test task")
 @click.option("--artifact-kind", type=click.Choice(ARTIFACT_KINDS), default=None,
               help="Declare the task's completion artifact contract (for example, report).")
 @click.option("--prev-task-id", default="",
@@ -4196,24 +4203,25 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
 @click.option("--task-id", default="",
               help="Override task_id (default: <type>-<random8hex>)")
 def enqueue(task_type: str, description: str, project: str, db: str, base: str,
-            branch: str, pr_number: int, artifact_kind: str | None, risk_tier: int | None,
+            branch: str, pr_number: int, reviewed_sha: str,
+            artifact_kind: str | None, risk_tier: int | None,
             prev_task_id: str, priority: int,
             task_id: str):
     """Enqueue a single TASK_TYPE task without entering the loop.
 
-    Use this when an agent (e.g. a claude implementer) needs to delegate
-    work to the next role — POST a review or test task directly instead of
-    calling `crew run`, which always coerces task_type=implement and leaves
-    the downstream pane idle (#187).
+    Pipeline successors are created from worker results by the coordinator.
+    Operators may create a review or test task only with a PR and full head SHA.
 
     Examples:
 
         crew enqueue review "Review PR #1666" --project alpha_engine \\
             --branch agent/claude-cli/1665-feature --pr 1666 \\
+            --reviewed-sha <full-head-sha> \\
             --prev-task-id impl-abcd1234 --risk-tier 1
 
         crew enqueue test "Verify PR #1666" --project alpha_engine \\
-            --branch agent/claude-cli/1665-feature --prev-task-id review-... --risk-tier 1
+            --branch agent/claude-cli/1665-feature --pr 1666 \\
+            --reviewed-sha <full-head-sha> --prev-task-id review-... --risk-tier 1
     """
     import uuid as _uuid
     import urllib.request as _urllib_req
@@ -4272,8 +4280,15 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
             risk_tier = int(raw_tier)
     if risk_tier is not None:
         context["risk_tier"] = risk_tier
+    if task_type in {"review", "test"}:
+        if pr_number <= 0 or not re.fullmatch(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?", reviewed_sha):
+            raise click.UsageError("review/test requires --pr and --reviewed-sha (full head SHA)")
+    elif reviewed_sha:
+        raise click.UsageError("--reviewed-sha applies only to review/test tasks")
     if pr_number:
         context["pr_number"] = pr_number
+    if reviewed_sha:
+        context["reviewed_sha"] = reviewed_sha
     if artifact_kind is not None:
         context["artifact_kind"] = artifact_kind
 
@@ -4286,6 +4301,8 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
         "context": context,
         "project": project,
     }
+    if task_type in {"review", "test"}:
+        payload["pr_number"] = pr_number
 
     if port:
         if project:

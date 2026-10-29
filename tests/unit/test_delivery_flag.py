@@ -18,6 +18,8 @@ actually flips: a fresh ``crew setup`` reads the env when the server
 spawns, so a pure unit test against ``create_app`` mirrors production.
 """
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from agent_crew.server import create_app
 
@@ -148,7 +150,10 @@ def _review_task_payload(task_id="r1", no_tester=False):
         "description": "review the code",
         "branch": "feat",
         "priority": 3,
-        "context": {"no_tester": True, "risk_tier": 1} if no_tester else {"risk_tier": 1},
+        "context": ({"no_tester": True, "risk_tier": 1, "repo": "owner/repo",
+                     "cloud_review_comment_confirmed": True}
+                    if no_tester else {"risk_tier": 1, "repo": "owner/repo",
+                                       "cloud_review_comment_confirmed": True}),
         "project": "",
     }
 
@@ -195,9 +200,17 @@ class TestNoTesterFlag:
             push_fn=push,
             watchdog_disabled=True,
         )
-        with TestClient(app) as client:
-            client.post("/tasks", json=_review_task_payload("r-test", no_tester=False))
-            client.post(f"/tasks/r-test/result", json=_approved_result("r-test"))
-            tasks = client.get("/tasks").json()
+        with patch("agent_crew.server.review_publication_decision",
+                   return_value=SimpleNamespace(publish=True, status="current", reason="")), \
+             patch("agent_crew.github.post_review_comment", return_value=True), \
+             patch("agent_crew.github.pr_state", return_value="open"):
+            with TestClient(app) as client:
+                client.post("/tasks", json=_review_task_payload("r-test", no_tester=False))
+                client.post(f"/tasks/r-test/result", json=_approved_result("r-test"))
+                tasks = client.get("/tasks").json()
         test_tasks = [t for t in tasks if t["task_type"] == "test"]
         assert len(test_tasks) == 1, "test task must be enqueued when no_tester is absent"
+
+import pytest
+
+pytestmark = pytest.mark.usefixtures("pinned_task_transport")

@@ -187,6 +187,9 @@ def run_e2e():
                 payload = {"task_id": task_id, "task_type": task_type,
                            "description": "sandbox CEA broker HTTP admission check",
                            "project": "alfred", "context": {"risk_tier": 1}}
+                if task_type in {"review", "test"}:
+                    payload["pr_number"] = 935
+                    payload["context"]["pr_number"] = 935
                 req = urllib.request.Request(f"http://127.0.0.1:{port}/tasks",
                     data=json.dumps(payload).encode(), method="POST",
                     headers={"Content-Type": "application/json", "X-Crew-Project": "alfred"})

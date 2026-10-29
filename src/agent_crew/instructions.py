@@ -508,39 +508,8 @@ stored as `failed` with `reason: no_artifact`.
   If the report is committed, send `"path"` plus `commit` instead of `"body"`.
 - `review`: `verdict` plus the reviewed `pr_number`; `approve` requires `findings: []`, while `request_changes` needs only changes required to approve.
 
-### ⛔ Delegating review / test to the next role — DO NOT use `crew run`
-
-When you need the reviewer (claude) or script tester to take over after your
-implementation, **do not** call `crew run "Review PR ..."`. `crew run` is a
-top-level loop client and forces `task_type=implement` regardless of the
-prompt — the review pane only picks tasks with `task_type=review`, so your
-task sits unrouted and the reviewer goes idle.
-
-**Correct pattern**: POST directly to the server with the explicit task_type:
-
-Set `risk_tier` to the current task's tier (integer 0-3), or choose and
-declare a tier for this new root. Replace the example value below.
-
-```bash
-TASK_ID="review-$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
-curl -sS -X POST http://127.0.0.1:<port>/tasks \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "task_id": "'"$TASK_ID"'",
-    "task_type": "review",
-    "description": "Review PR #<n> — <one-line context>",
-    "branch": "<PR head branch>",
-    "priority": 3,
-    "project": "<your project name>",
-    "context": {"pr_number": <n>, "risk_tier": 1}
-  }'
-```
-
-- For tester delegation use `"task_type": "test"` and `"task_id": "test-..."`.
-- `pr_number` in context lets the dispatcher checkout the PR head branch
-  on the reviewer/tester worktree automatically (see #186).
-- After delegation, your implement task is done — POST your result and
-  return to polling. The next role will handle the rest of the loop.
+The pipeline creates review and test successors from your submitted result.
+Report the implementation result once and end this task.
 """,
     "reviewer": """\
 ## Role: reviewer
@@ -628,31 +597,8 @@ Before you POST the result, verify:
   `request_changes`, `findings` lists only changes required to approve
 - [ ] `summary` names the PR reviewed and the headline judgement
 
-### ⛔ Delegating test to the next role — DO NOT use `crew run`
-
-After you `approve`, if the loop needs the script tester to verify the PR
-on a clean checkout, **do not** call `crew run "Test PR ..."`. `crew run`
-forces `task_type=implement` and the tester pane only picks `task_type=test`.
-
-POST directly with the explicit type:
-
-Set `risk_tier` to the reviewed task's tier (integer 0-3), or choose and
-declare a tier for this new root. Replace the example value below.
-
-```bash
-TASK_ID="test-$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
-curl -sS -X POST http://127.0.0.1:<port>/tasks \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "task_id": "'"$TASK_ID"'",
-    "task_type": "test",
-    "description": "Test PR #<n> — verify <branch> passes the suite",
-    "branch": "<PR head branch>",
-    "priority": 3,
-    "project": "<your project name>",
-    "context": {"pr_number": <n>, "risk_tier": 1}
-  }'
-```
+The pipeline creates a test successor after an approved review. Submit the
+review verdict once and end this task.
 """,
     "tester": """\
 ## Role: tester

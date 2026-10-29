@@ -7,6 +7,8 @@ from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE
 from agent_crew.server import create_app
 
+PIN = "a" * 40
+
 
 @pytest.mark.parametrize("task_type", ["implement", "review", "test", "discuss"])
 @pytest.mark.parametrize("context", [{}, {"prev_task_id": "forged"},
@@ -16,8 +18,13 @@ def test_http_root_without_tier_is_422_and_not_inserted(tmp_path, task_type, con
     app = create_app(db, pane_map={}, project="agent_crew", push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
-        response = client.post("/tasks", json={"task_id": "root", "task_type": task_type,
-                       "description": "work", "context": context},
+        task_context = dict(context)
+        payload = {"task_id": "root", "task_type": task_type,
+                   "description": "work", "context": task_context}
+        if task_type in {"review", "test"}:
+            payload["pr_number"] = 935
+            task_context["reviewed_sha"] = PIN
+        response = client.post("/tasks", json=payload,
                        headers={"X-Agent-Crew-Project": "agent_crew"})
     assert response.status_code == 422
     assert "context.risk_tier" in response.text and "0-3" in response.text
@@ -31,7 +38,8 @@ def test_http_invalid_tier_is_422_and_not_inserted(tmp_path, tier):
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
         response = client.post("/tasks", json={"task_id": "root", "task_type": "review",
-                       "description": "work", "context": {"risk_tier": tier}},
+                       "description": "work", "pr_number": 935,
+                       "context": {"risk_tier": tier, "reviewed_sha": PIN}},
                        headers={"X-Agent-Crew-Project": "agent_crew"})
     assert response.status_code == 422
     assert TaskQueue(db).get_task("root") is None
@@ -44,7 +52,8 @@ def test_http_valid_tier_is_accepted(tmp_path, tier):
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
         response = client.post("/tasks", json={"task_id": "root", "task_type": "test",
-                       "description": "work", "context": {"risk_tier": tier}},
+                       "description": "work", "pr_number": 935,
+                       "context": {"risk_tier": tier, "reviewed_sha": PIN}},
                        headers={"X-Agent-Crew-Project": "agent_crew"})
     assert response.status_code == 201, response.text
     assert TaskQueue(db).get_task("root") is not None

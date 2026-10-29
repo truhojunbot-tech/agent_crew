@@ -183,7 +183,9 @@ def _client(tmp_db):
 def _post(c, task_id):
     return c.post("/tasks", json={"task_id": task_id, "task_type": "review",
                                   "description": "d", "branch": "b", "priority": 3,
-                                  "context": {}, "project": ""})
+                                  "pr_number": 273,
+                                  "context": {"reviewed_sha": "a" * 40},
+                                  "project": ""})
 
 
 def test_the_409_body_is_the_detail_envelope_exactly(tmp_db):

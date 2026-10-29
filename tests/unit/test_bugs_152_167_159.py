@@ -510,3 +510,5 @@ class TestFallbackCancellation:
         assert len(active) == 0, (
             "No retry task (in any active status) when DB context.retry_attempt >= MAX_RETRIES"
         )
+
+pytestmark = [pytestmark, pytest.mark.usefixtures("pinned_task_transport")]

@@ -19,9 +19,13 @@ def test_http_root_requires_risk_tier(tmp_path, task_type):
                      push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
-        response = client.post("/tasks", json={
+        payload = {
             "task_id": f"root-{task_type}", "task_type": task_type,
-            "description": "work", "context": {}},
+            "description": "work", "context": {}}
+        if task_type in {"review", "test"}:
+            payload["pr_number"] = 935
+            payload["context"]["reviewed_sha"] = "a" * 40
+        response = client.post("/tasks", json=payload,
             headers={"X-Agent-Crew-Project": "agent_crew"})
     assert response.status_code == 422
     assert "context.risk_tier" in response.text
@@ -89,11 +93,14 @@ def test_http_successor_with_declared_tier_inherits_root_risk(tmp_path):
         assert root.status_code == 201, root.text
         tierless = client.post("/tasks", json={
             "task_id": "review-tierless", "task_type": "review", "description": "review",
-            "context": {"prev_task_id": "impl-root"}}, headers=headers)
+            "pr_number": 935,
+            "context": {"prev_task_id": "impl-root", "reviewed_sha": "a" * 40}}, headers=headers)
         assert tierless.status_code == 422
         child = client.post("/tasks", json={
             "task_id": "review-root", "task_type": "review", "description": "review",
-            "context": {"prev_task_id": "impl-root", "risk_tier": 2}}, headers=headers)
+            "pr_number": 935,
+            "context": {"prev_task_id": "impl-root", "risk_tier": 2,
+                        "reviewed_sha": "a" * 40}}, headers=headers)
     assert child.status_code == 201, child.text
     queue = TaskQueue(db)
     root_context = queue.get_task_context("impl-root")
@@ -133,6 +140,7 @@ def test_enqueue_successor_inherits_root_without_flag(tmp_path, monkeypatch, def
         monkeypatch.setenv("AGENT_CREW_DEFAULT_RISK_TIER", default_tier)
     result = CliRunner().invoke(crew, ["enqueue", "review", "review work",
                                       "--db", db, "--prev-task-id", "impl-root",
+                                      "--pr", "935", "--reviewed-sha", "a" * 40,
                                       "--task-id", "review-root"])
     assert result.exit_code == 0, result.output
     child = queue.get_task("review-root")

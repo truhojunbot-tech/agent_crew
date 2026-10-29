@@ -315,15 +315,14 @@ def test_cx_4h_forged_review_verdict_is_refused_and_does_not_cascade(crew):
 def test_cx_4i_a_capability_match_runs_for_every_task_type(crew, tmp_path, monkeypatch):
     """4i: the same text typed `test` or `review` gave NOT_IMPLEMENT. §5.2: the
     match runs for every task type. A `test` task carrying the incident's
-    implement text with no lineage (no PR, no prev task) is not a test of
-    anything — it must not be admitted as ALLOW."""
+    implement text with a PR but no previous task must not be admitted as ALLOW."""
     make, push, db = crew
     seed_history(db)
     write_registry(tmp_path, monkeypatch)
     with make() as client:
-        r = post(client, {"task_id": "cx4i-a", "task_type": "test",
+        r = post(client, {"task_id": "cx4i-a", "task_type": "test", "pr_number": 935,
                           "description": "Implement risk-tier enforcement for Tokenomics dispatch",
-                          "branch": "main", "priority": 2, "context": {}, "project": "agent_crew"})
+                          "branch": "main", "priority": 2, "context": {"pr_number": 935}, "project": "agent_crew"})
         assert_not_admitted(r, push, db, "cx4i-a")
 
 

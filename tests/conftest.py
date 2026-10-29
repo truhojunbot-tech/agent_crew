@@ -3,13 +3,78 @@ import os
 import re
 import shutil
 import subprocess
+from copy import deepcopy
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.queue import TaskQueue
+from agent_crew.protocol import TaskRequest, normalize_pr_number
 from agent_crew.server import create_app
+
+
+def pinned_review_test_task(task, *, pr_number=935, reviewed_sha=None):
+    """Build a review/test fixture with one canonical PR on either transport."""
+    if isinstance(task, TaskRequest):
+        if task.task_type not in {"review", "test"}:
+            return task
+        context = dict(task.context or {})
+        pr = (normalize_pr_number(task.pr_number)
+              or normalize_pr_number(context.get("pr_number")) or pr_number)
+        context["pr_number"] = pr
+        if reviewed_sha:
+            context.setdefault("reviewed_sha", reviewed_sha)
+        return replace(task, pr_number=pr, context=context)
+    payload = deepcopy(task)
+    if payload.get("task_type") not in {"review", "test"}:
+        return payload
+    context = dict(payload.get("context") or {})
+    if "pr_number" in payload and payload["pr_number"] is None:
+        return payload  # Deliberately unpinned refusal fixture.
+    pr = (normalize_pr_number(payload.get("pr_number"))
+          or normalize_pr_number(context.get("pr_number")) or pr_number)
+    payload["pr_number"] = pr
+    context["pr_number"] = pr
+    if reviewed_sha:
+        context.setdefault("reviewed_sha", reviewed_sha)
+    payload["context"] = context
+    return payload
+
+
+@pytest.fixture
+def project_task_transport(monkeypatch):
+    """Give legacy HTTP fixtures their test server's project identity."""
+    original_request = TestClient.request
+    identities = {}
+
+    def request(client, method, url, *args, **kwargs):
+        if url.startswith("/tasks"):
+            headers = dict(kwargs.get("headers") or {})
+            if not any(key.lower() == "x-agent-crew-project" for key in headers):
+                key = id(client)
+                if key not in identities:
+                    identities[key] = original_request(client, "GET", "/health").json().get("project")
+                if identities[key]:
+                    headers["X-Agent-Crew-Project"] = identities[key]
+                    kwargs["headers"] = headers
+        return original_request(client, method, url, *args, **kwargs)
+
+    monkeypatch.setattr(TestClient, "request", request)
+
+
+@pytest.fixture
+def pinned_task_transport(monkeypatch, project_task_transport):
+    """Migrate legacy task HTTP fixtures to the pinned PR contract."""
+    original_post = TestClient.post
+
+    def post(client, url, *args, **kwargs):
+        if url == "/tasks" and isinstance(kwargs.get("json"), dict):
+            kwargs["json"] = pinned_review_test_task(kwargs["json"], reviewed_sha="a" * 40)
+        return original_post(client, url, *args, **kwargs)
+
+    monkeypatch.setattr(TestClient, "post", post)
 
 
 @pytest.fixture

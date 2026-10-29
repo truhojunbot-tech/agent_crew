@@ -200,8 +200,8 @@ def start_log_viewers_in_panes(
         # tells whoever is watching why their interactive session vanished.
         cmd = (
             f"while true; do crew-log-viewer {log_path}; "
-            f"echo '[crew] this pane is dispatcher-managed — use `crew enqueue`"
-            f" instead of running an agent CLI here directly; relaunching in 1s'; "
+            f"echo '[crew] this pane is dispatcher-managed — submit task results"
+            f" through the dispatcher; relaunching in 1s'; "
             f"sleep 1; done"
         )
         pane_submit.submit(target, cmd, paste=False, settle=0.2,

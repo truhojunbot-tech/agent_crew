@@ -304,3 +304,7 @@ def test_dispatcher_claim_without_live_lease_can_be_recovered(tmp_db):
             assert recovery["recovered"] is True
             assert client.get("/tasks/orphaned_dispatch").json()["status"] == "pending"
             assert TaskQueue(tmp_db).get_task_claim_source("orphaned_dispatch") == ""
+
+import pytest
+
+pytestmark = pytest.mark.usefixtures("pinned_task_transport")
