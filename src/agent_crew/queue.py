@@ -5257,9 +5257,12 @@ class TaskQueue:
                 # binding only counts for the role it is claiming as right now.
                 # Checked here, inside the claim transaction: a stale binding
                 # enqueued after the dispatcher's reroute sweep is still refused.
-                bound_type = (_ROLE_TO_TYPE.get(role)
-                              if role and agent in ROLE_BOUND_PROVIDERS else None)
+                # Fail closed: with no (known) role there is nothing to check the
+                # binding against, so a role-less pull claims no bound task.
+                role_bound = agent in ROLE_BOUND_PROVIDERS
+                bound_type = _ROLE_TO_TYPE.get(role) if role_bound else None
                 bound_sql = " AND task_type = ?" if bound_type else ""
+            if agent and not (role_bound and bound_type is None):
                 row = conn.execute(
                     f"""
                     SELECT * FROM tasks

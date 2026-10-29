@@ -146,3 +146,45 @@ def test_cloud_review_seat_still_claims_its_own_bound_review(tmp_path):
         project="demo", context={"agent_override": "claude_cloud"}))
     claimed = queue.dequeue(agent="claude_cloud", role="reviewer", claimed_via="cloud_push")
     assert claimed is not None and claimed.task_id == "review-891-own"
+
+
+def _stale_cloud_impl(queue, task_id="impl-891-norole"):
+    queue.enqueue(TaskRequest(
+        task_id=task_id, task_type="implement", description="implement",
+        branch="fix/891", project="demo", context={"agent_override": "claude_cloud"}))
+
+
+def test_role_less_cloud_pull_does_not_claim_a_bound_task(tmp_path):
+    """Review of PR #916 (round 2): with no role, the claim-time type filter had
+    nothing to bind to, so a role-less pull claimed what the reviewer seat refused.
+    A role-bound backend's binding is only valid for a role, so no role -> no claim."""
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    _stale_cloud_impl(queue)
+    assert queue.dequeue(agent="claude_cloud", role="reviewer", claimed_via="mcp") is None
+    assert queue.dequeue(agent="claude_cloud", role="", claimed_via="mcp") is None
+    assert queue.dequeue(agent="claude_cloud", claimed_via="http_poll") is None
+    assert queue.get_task("impl-891-norole").status == "pending"
+    assert _claimed_by(db, "impl-891-norole")[0] is None
+
+
+def test_role_less_cloud_pull_via_mcp_and_http_routes_claims_nothing(tmp_path, monkeypatch):
+    from agent_crew.mcp_server import build_mcp_server
+
+    state_path = tmp_path / "state.json"
+    _state(state_path, "claude", "claude_cloud")
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    _stale_cloud_impl(queue)
+    get_next = build_mcp_server(db)._tool_manager._tools["get_next_task"].fn
+    assert get_next(agent="claude_cloud") is None
+    app = server.create_app(db_path=db, state_path=str(state_path),
+                            watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        resp = client.get("/tasks/next", params={"agent": "claude_cloud"},
+                          headers={"X-Agent-Crew-Project": "demo"})
+    assert resp.status_code in (200, 405)
+    if resp.status_code == 200:
+        assert resp.json() is None
+    assert queue.get_task("impl-891-norole").status == "pending"
+    assert _claimed_by(db, "impl-891-norole")[0] is None
