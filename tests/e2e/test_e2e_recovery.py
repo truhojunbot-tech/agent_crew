@@ -17,12 +17,10 @@ import shutil
 import signal
 import socket
 import subprocess
-import threading
 import time
 import uuid
 
 import pytest
-import uvicorn
 from click.testing import CliRunner
 
 from agent_crew.cli import crew
@@ -167,7 +165,7 @@ def test_e_rc02_recover_server(monkeypatch, git_repo, base_dir, e2e_project):
 
 # ── E-RC03: SQLite persistence — task survives server kill ───────────────────
 
-def test_e_rc03_sqlite_persistence(tmp_path, e2e_project):
+def test_e_rc03_sqlite_persistence(tmp_path, e2e_project, crew_server_reaper):
     port = _find_free_port()
     db_path = str(tmp_path / "tasks.db")
 
@@ -180,12 +178,8 @@ def test_e_rc03_sqlite_persistence(tmp_path, e2e_project):
     with open(port_file, "w") as f:
         f.write(str(port))
 
-    # Start server in a thread
-    app = create_app(db_path)
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
-    server = uvicorn.Server(config)
-    t = threading.Thread(target=server.run, daemon=True)
-    t.start()
+    # Start server in a thread; the reaper stops it even if an assert fails
+    server, t = crew_server_reaper.serve_in_thread(create_app(db_path), port)
     assert _port_listening(port, timeout=10.0)
 
     # Enqueue a task via HTTP

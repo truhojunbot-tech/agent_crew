@@ -4,6 +4,8 @@
 E-RP01: setup + recover inside a reaper, then a forced assertion failure →
         every recorded server pid is dead and no port was in the crew range
 E-RP02: terminate_pids escalates to SIGKILL for a process ignoring SIGTERM
+E-RP03: an in-process (thread) uvicorn server started via the reaper, then a
+        forced assertion failure → the listener is down after the reaper exits
 """
 
 import json
@@ -19,6 +21,7 @@ import pytest
 from click.testing import CliRunner
 
 from agent_crew.cli import crew
+from agent_crew.server import create_app
 from tests.e2e.conftest import CREW_PORT_RANGE, CrewServerReaper, _pid_alive, terminate_pids
 
 pytestmark = pytest.mark.e2e
@@ -97,3 +100,25 @@ def test_e_rp02_terminate_escalates_to_sigkill():
     terminate_pids([proc.pid], grace=0.5)
     assert proc.wait(timeout=5) == -signal.SIGKILL
     assert time.time() - started < 5
+
+
+def test_e_rp03_failed_test_leaks_no_thread_server(tmp_path):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    with pytest.MonkeyPatch.context() as mp:
+        reaper = CrewServerReaper(mp, tmp_path)
+        with pytest.raises(AssertionError, match="forced"):
+            with reaper:
+                _, thread = reaper.serve_in_thread(create_app(str(tmp_path / "tasks.db")), port)
+                deadline = time.time() + 10
+                while not _port_listening(port) and time.time() < deadline:
+                    time.sleep(0.1)
+                assert _port_listening(port), "thread server never came up"
+                raise AssertionError("forced failure with a thread server running")
+
+    # No pid exists for an in-process server; only the thread shutdown saves it.
+    assert not reaper.all_pids()
+    assert not thread.is_alive()
+    assert not _port_listening(port)

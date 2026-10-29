@@ -207,6 +207,7 @@ class CrewServerReaper:
         self.root = str(root)
         self.pids: set = set()
         self.ports: set = set()
+        self.thread_servers: list = []
 
     def __enter__(self):
         from agent_crew import cli as cli_module
@@ -245,7 +246,29 @@ class CrewServerReaper:
     def all_pids(self) -> set:
         return self.pids | _state_server_pids(self.root)
 
+    def serve_in_thread(self, app, port: int):
+        """Run `app` with uvicorn in a daemon thread of this process.
+
+        Such a server has no pid of its own, so pid reaping cannot see it;
+        reap() stops it instead, whether or not the test got that far.
+        """
+        import threading
+
+        import uvicorn
+
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
+                                               log_level="error"))
+        thread = threading.Thread(target=server.run, daemon=True)
+        self.thread_servers.append((server, thread))
+        self.ports.add(port)
+        thread.start()
+        return server, thread
+
     def reap(self) -> None:
+        for server, _ in self.thread_servers:
+            server.should_exit = True
+        for _, thread in self.thread_servers:
+            thread.join(timeout=10.0)
         terminate_pids(self.all_pids())
 
     def __exit__(self, *exc):
