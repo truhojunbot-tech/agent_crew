@@ -34,6 +34,7 @@ Genuinely missing seams (documented, not invented — see the PR body):
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 import json
 import logging
@@ -692,12 +693,24 @@ def _claude_checkout_path(state: dict, state_path: str, project: str) -> str:
     return os.path.realpath(checkout)
 
 
+def _cloud_git(checkout: str, *args: str) -> str:
+    git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    result = subprocess.run(["git", *args], cwd=checkout, capture_output=True,
+                            text=True, timeout=10, env=git_env)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 def _validated_cloud_checkout(project: str, repo: str,
                               state_path: Optional[str] = None) -> tuple[str, str]:
-    """Resolve the configured Claude checkout and verify HEAD is on a remote branch.
+    """Resolve the configured Claude checkout and verify it is ``repo``'s clone.
 
     The server cwd can be a different repository. Never let a cloud launch
     inherit it, or trust the prompt alone to select the repository.
+
+    #890: the checkout is shared with the local implementer, which may leave
+    it on an unpublished branch, so its HEAD is not checked here. Implements
+    resolve ``--ref`` from origin; reviews, which pin the checkout's HEAD,
+    also check ``_checkout_head_published``.
     """
     path = state_path or os.getenv("AGENT_CREW_STATE", "")
     if not path or not project or not repo:
@@ -710,28 +723,34 @@ def _validated_cloud_checkout(project: str, repo: str,
         checkout = _claude_checkout_path(state, path, project)
         if not os.path.isdir(checkout):
             return "", ""
-
-        def git(*args: str) -> str:
-            git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-            result = subprocess.run(["git", *args], cwd=checkout, capture_output=True,
-                                    text=True, timeout=10, env=git_env)
-            return result.stdout.strip() if result.returncode == 0 else ""
-
-        top_level = git("rev-parse", "--show-toplevel")
+        top_level = _cloud_git(checkout, "rev-parse", "--show-toplevel")
         if not top_level or os.path.realpath(top_level) != checkout:
             return "", ""
         # Read the literal origin, not git remote get-url (which expands
         # insteadOf rewrites and may hide the registered GitHub identity).
-        remote = _github._repo_slug(git("config", "--get", "remote.origin.url"))
+        remote = _github._repo_slug(_cloud_git(checkout, "config", "--get",
+                                               "remote.origin.url"))
         expected = _github._repo_slug(repo)
         if not remote or not expected or remote.casefold() != expected.casefold():
             return "", remote.casefold()
-        head = git("rev-parse", "HEAD")
+        return checkout, remote.casefold()
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        logger.exception("claude_cloud: checkout validation failed for project=%s", project)
+        return "", ""
+
+
+def _checkout_head_published(checkout: str) -> bool:
+    """Whether the checkout's HEAD is on a remote branch (a review pins it)."""
+    if not os.path.isdir(checkout):
+        return True  # Test transports may provide a synthetic validated cwd.
+    try:
+        head = _cloud_git(checkout, "rev-parse", "HEAD")
         if not re.fullmatch(r"[0-9a-f]{40}", head):
-            return "", remote.casefold()
-        branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
-        published = (git("ls-remote", "--exit-code", "origin", f"refs/heads/{branch}")
-                     if branch else git("ls-remote", "--heads", "origin"))
+            return False
+        branch = _cloud_git(checkout, "symbolic-ref", "--quiet", "--short", "HEAD")
+        published = (_cloud_git(checkout, "ls-remote", "--exit-code", "origin",
+                                f"refs/heads/{branch}")
+                     if branch else _cloud_git(checkout, "ls-remote", "--heads", "origin"))
         tips = [line.split()[0] for line in published.splitlines()
                 if line.split() and re.fullmatch(r"[0-9a-f]{40}", line.split()[0])]
         # A reviewer checkout is often left detached at an earlier published
@@ -759,12 +778,10 @@ def _validated_cloud_checkout(project: str, repo: str,
                                                           "GIT_TERMINAL_PROMPT": "0"})
                 published_head = fetched.returncode == 0 and any(
                     contains_head(tip) for tip in tips)
-        if not published_head:
-            return "", remote.casefold()
-        return checkout, remote.casefold()
-    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
-        logger.exception("claude_cloud: checkout validation failed for project=%s", project)
-        return "", ""
+        return published_head
+    except (OSError, subprocess.TimeoutExpired):
+        logger.exception("claude_cloud: HEAD publication check failed for %s", checkout)
+        return False
 
 
 def _detached_cloud_ref(checkout: str) -> str:
@@ -781,6 +798,50 @@ def _detached_cloud_ref(checkout: str) -> str:
         r"[0-9a-f]{40}", head.stdout.strip()) else ""
 
 
+def _publishable_ref(name: object) -> bool:
+    """A branch name that can be pushed and passed to ``--ref`` unquoted."""
+    # Mirrors ``git check-ref-format --branch`` for this charset: no empty
+    # component, none starting with "." or ending with ".lock", no trailing "."
+    # (review of PR #913: "foo." and "foo/.bar" used to pass).
+    return (isinstance(name, str)
+            and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", name))
+            and ".." not in name and not name.endswith(".")
+            and all(part and not part.startswith(".") and not part.endswith(".lock")
+                    for part in name.split("/")))
+
+
+def _origin_branch_ref(checkout: str, branch: str) -> str:
+    """#890: the task branch if origin has it, else origin's default branch.
+
+    The checkout is shared with the local implementer, so its HEAD says
+    nothing about this task; only origin does.
+    """
+    if not os.path.isdir(checkout):
+        return ""  # Test transports may provide a synthetic validated cwd.
+    # The task is already claimed: a probe failure must become the caller's
+    # fail-closed "" rather than an exception that strands it in_progress
+    # (review of PR #913).
+    try:
+        if _publishable_ref(branch):
+            published = subprocess.run(
+                ["git", "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}"],
+                cwd=checkout, capture_output=True, text=True, timeout=10,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+            if published.returncode == 0 and published.stdout.strip():
+                return branch
+            # ``--exit-code`` exits 2 only for a confirmed no-match; anything
+            # else (128 transport failure, ...) says nothing about the branch,
+            # so falling back to the default would launch on the wrong base
+            # (review of PR #913, round 3).
+            if published.returncode != 2:
+                return ""
+        from agent_crew.worktree_default_branch import remote_default_branch
+        default = remote_default_branch(checkout, deadline=time.monotonic() + 10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return default if _publishable_ref(default) else ""
+
+
 def _launch_ref(task: TaskRequest, checkout: str, prior_pr_head: Optional[str]) -> str:
     """Use the prepared base for a new implement, and the PR head for a fix."""
     if task.task_type != "implement":
@@ -789,17 +850,12 @@ def _launch_ref(task: TaskRequest, checkout: str, prior_pr_head: Optional[str]) 
         return prior_pr_head
     context = task.context if isinstance(task.context, dict) else {}
     if context.get("prev_task_id") or "fix_round" in context:
-        return _detached_cloud_ref(checkout)
+        return _origin_branch_ref(checkout, (task.branch or "").strip())
     base_sha = context.get("worktree_base_sha")
     if isinstance(base_sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", base_sha):
         return base_sha
     base_branch = context.get("base_branch") or "main"
-    if (isinstance(base_branch, str)
-            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", base_branch)
-            and ".." not in base_branch and "//" not in base_branch
-            and not base_branch.endswith(("/", ".lock"))):
-        return base_branch
-    return ""
+    return base_branch if _publishable_ref(base_branch) else ""
 
 
 def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
@@ -928,11 +984,32 @@ _LOCAL_ONLY_PATH = re.compile(
 )
 
 
+def _derived_cloud_branch(task: TaskRequest) -> str:
+    """#890: name the output branch of a fresh implement queued on its base.
+
+    Local implementers create their own branch in that case; a cloud session
+    must be told one, as ``agent/<project>/<task_id>``. A continuing lineage
+    (fix round, retry, existing PR) keeps its branch: its PR lives there.
+    """
+    if task.task_type != "implement":
+        return ""
+    context = task.context if isinstance(task.context, dict) else {}
+    if (context.get("pr_number") or task.pr_number or context.get("prev_task_id")
+            or "fix_round" in context):
+        return ""
+    branch = (task.branch or "").strip()
+    base = context.get("base_branch") or "main"
+    if branch and branch not in {"main", "master", base}:
+        return ""
+    derived = f"agent/{task.project}/{task.task_id}" if task.project else f"agent/{task.task_id}"
+    return derived if _publishable_ref(derived) else ""
+
+
 def _cloud_preflight_reason(task: TaskRequest, repo: str) -> str:
-    if task.task_type == "implement":
+    if task.task_type == "implement" and not _derived_cloud_branch(task):
         branch = (task.branch or "").strip()
         base = (task.context or {}).get("base_branch") or "main"
-        if not branch or branch in {"main", "master", base}:
+        if branch in {"main", "master", base} or not _publishable_ref(branch):
             return "cloud_branch_unpublishable"
     if not repo or not _github._repo_slug(repo):
         return "cloud_repo_unresolved"
@@ -1138,6 +1215,12 @@ def dispatch_cloud_for_role(
     preflight_reason = _cloud_preflight_reason(task, preflight_repo)
     if preflight_reason:
         return _fail_closed_dispatch(queue, task, task_type, preflight_reason)
+    derived_branch = _derived_cloud_branch(task)
+    if derived_branch:
+        if not queue.set_claimed_branch(task.task_id, derived_branch):
+            return _fail_closed_dispatch(queue, task, task_type, "cloud_branch_unpublishable")
+        queue.patch_context(task.task_id, {"cloud_derived_branch": derived_branch})
+        task = dataclasses.replace(task, branch=derived_branch)
 
     # A fix round reuses the existing PR branch. Snapshot its head before the
     # dispatch channel becomes visible to reconciliation, otherwise the first
@@ -1206,16 +1289,21 @@ def dispatch_cloud_for_role(
                                      "cloud_review_repo_unresolved" if task.task_type == "review"
                                      else "cloud_repo_unresolved")
     cwd, cwd_remote = _validated_cloud_checkout(task.project or "", effective_repo, state_path)
+    if cwd and task.task_type != "implement" and not _checkout_head_published(cwd):
+        cwd = ""
     if not cwd:
         return _fail_closed_dispatch(queue, task, task_type,
                                      "cloud_review_cwd_repo_mismatch")
     prompt = build_cloud_task_prompt(task, repo=effective_repo)
     launch_ref = _launch_ref(task, cwd, prior_pr_head)
     context = task.context if isinstance(task.context, dict) else {}
-    if (task.task_type == "implement" and not resume_session_id
-            and not launch_ref and not context.get("prev_task_id")
-            and "fix_round" not in context):
-        return _fail_closed_dispatch(queue, task, task_type, "cloud_base_branch_invalid")
+    if task.task_type == "implement" and not resume_session_id and not launch_ref:
+        # Without --ref the session starts from the shared checkout's HEAD,
+        # which belongs to whoever used it last (review of PR #913).
+        lineage = bool(context.get("prev_task_id")) or "fix_round" in context
+        return _fail_closed_dispatch(queue, task, task_type,
+                                     "cloud_origin_ref_unavailable" if lineage
+                                     else "cloud_base_branch_invalid")
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
             if resume_session_id else build_launch_argv(
                 prompt, cli_path=cli_path, base_ref=launch_ref))
@@ -1372,6 +1460,8 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
     if not repo:
         return _log_shadow_skip(task, "no_repo")
     cwd, cwd_remote = _validated_cloud_checkout(task.project or "", repo, state_path)
+    if cwd and not _checkout_head_published(cwd):
+        cwd = ""
     if not cwd:
         queue.patch_context(task.task_id, {"cloud_shadow_terminal_error":
                                            "cloud_review_cwd_repo_mismatch"})

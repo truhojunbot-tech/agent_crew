@@ -8154,6 +8154,23 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def set_claimed_branch(self, task_id: str, branch: str) -> bool:
+        """Name the output branch of a claimed task (#890).
+
+        Claude Cloud derives a branch for an implement queued on its base
+        branch; reconciliation finds the PR through ``tasks.branch``.
+        """
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE tasks SET branch = ? WHERE task_id = ? AND status = 'in_progress'",
+                (branch, task_id),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
     def set_push_at(self, task_id: str, ts: Optional[float] = None,
                     pane_id: str = "") -> None:
         """Record when push_fn was called for a task (bug #152).

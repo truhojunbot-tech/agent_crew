@@ -153,9 +153,11 @@ def test_default_pr_state_lookup_is_bound_to_context_repo(tmp_path, monkeypatch)
     assert len(reviews) == 1
 
 
-@pytest.mark.parametrize("branch", ["main", " "])
-def test_cloud_implement_refuses_base_or_missing_branch_before_launch(tmp_path, monkeypatch,
-                                                                      branch):
+# #890: branch=main / missing now gets a derived task branch; only an explicit
+# ref that cannot be published still fails closed.
+@pytest.mark.parametrize("branch", ["bad..ref", "has space"])
+def test_cloud_implement_refuses_unpublishable_branch_before_launch(tmp_path, monkeypatch,
+                                                                    branch):
     _cloud_env(monkeypatch)
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("impl-branch", "implement", "Implement #762",

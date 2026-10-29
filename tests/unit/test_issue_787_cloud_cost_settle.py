@@ -198,7 +198,7 @@ def test_reconcile_relabels_legacy_zero_without_snapshot_proof(tmp_path, monkeyp
 def test_preflight_failure_writes_one_unknown_attribution_row(tmp_path, monkeypatch):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest(task_id="preflight", task_type="implement",
-                              description="Implement", branch="main",
+                              description="Implement", branch="bad..ref",
                               project="agent_crew", context={"repo": "owner/repo"}))
     monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
     monkeypatch.setattr("agent_crew.pipeline.auto_fallback_failed_task",
