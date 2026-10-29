@@ -31,7 +31,7 @@ from agent_crew.server import (
     create_app,
 )
 
-_CAPACITY_LOG = b'{"type":"error","code":"CODEX_CAPACITY","retry_after":120}\n'
+_CAPACITY_LOG = b'{"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}\n'
 
 
 def _state(tmp_path) -> str:
@@ -58,6 +58,14 @@ def test_u_581_codex_capacity_is_provider_capacity_not_transient(tmp_path):
     failure = provider_failure_from_log(str(log), agent="codex")
     assert failure["kind"] == "capacity"
     assert failure["retry_after"] == 120
+
+
+def test_u_581_capacity_words_outside_provider_error_do_not_classify(tmp_path):
+    log = tmp_path / "log"
+    log.write_text("Selected model is at capacity\n" + json.dumps({
+        "type": "item.completed", "item": {"type": "command_execution",
+                                            "aggregated_output": "Selected model is at capacity"}}) + "\n")
+    assert provider_failure_from_log(str(log), agent="codex") is None
 
 
 def test_u_581_cooldown_doubles_caps_at_15_min_with_jitter(monkeypatch):

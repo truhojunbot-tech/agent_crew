@@ -1,12 +1,16 @@
 """Typed provider failure evidence used by retry and escalation decisions.
 
-Only provider-owned JSON fields are interpreted. Human text, echoed prompts,
-pane captures and diagnostic messages are never a failure classification.
+Only provider-owned JSON events are interpreted. Codex supplies quota and
+capacity as terminal error messages in those events; echoed prompts, pane
+captures, and diagnostic log lines never classify a failure.
 """
 
 from __future__ import annotations
 
+import datetime
 import json
+import re
+import time
 from enum import Enum
 from typing import Optional
 
@@ -27,7 +31,40 @@ def failure_kind(error_info: Optional[dict]) -> Optional[str]:
     return kind if kind in {member.value for member in FailureKind} else None
 
 
-def classify_provider_record(agent: str, record: dict) -> Optional[dict]:
+_CODEX_QUOTA = re.compile(r"^\s*(?:error:\s*)?you['’]ve hit your usage limit\b", re.I)
+_CODEX_CAPACITY = re.compile(r"^\s*(?:error:\s*)?selected model is at capacity\b", re.I)
+_CODEX_RESET = re.compile(
+    r"try again at\s+(?:(?P<month>[A-Za-z]{3,9})\s+"
+    r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,\s+(?P<year>\d{4})\s+)?"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM)\b", re.I)
+
+
+def _codex_reset_after(message: str, failed_at: float) -> Optional[float]:
+    """Seconds until the reset stated in Codex's own error event."""
+    match = _CODEX_RESET.search(message)
+    if not match:
+        return None
+    hour, minute = int(match["hour"]), int(match["minute"])
+    if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+        return None
+    hour = hour % 12 + (12 if match["ampm"].lower() == "pm" else 0)
+    if match["month"]:
+        try:
+            month = datetime.datetime.strptime(match["month"][:3].title(), "%b").month
+            reset = datetime.datetime(int(match["year"]), month, int(match["day"]),
+                                      hour, minute, tzinfo=datetime.timezone.utc)
+        except ValueError:
+            return None
+    else:
+        day = datetime.datetime.fromtimestamp(failed_at, datetime.timezone.utc)
+        reset = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if reset.timestamp() <= failed_at:
+            reset += datetime.timedelta(days=1)
+    return reset.timestamp() - failed_at if reset.timestamp() > failed_at else None
+
+
+def classify_provider_record(agent: str, record: dict, *,
+                             failed_at: Optional[float] = None) -> Optional[dict]:
     """Classify a provider event from fields with defined machine meanings."""
     if not isinstance(record, dict):
         return None
@@ -57,6 +94,20 @@ def classify_provider_record(agent: str, record: dict) -> Optional[dict]:
     if not isinstance(retry_after, (int, float)) or isinstance(retry_after, bool) or retry_after < 0:
         retry_after = None
 
+    # Codex emits quota/capacity as provider-owned error events with a message,
+    # without a machine code. The anchored phrases are read only from those
+    # events; echoed commands, pane captures, and diagnostic log lines remain
+    # outside the adapter.
+    if agent == "codex":
+        message = error.get("message") if record.get("type") == "turn.failed" else record.get("message")
+        if isinstance(message, str) and _CODEX_QUOTA.match(message):
+            code = "CODEX_QUOTA_EXHAUSTED"
+            if retry_after is None:
+                retry_after = _codex_reset_after(
+                    message, failed_at if failed_at is not None else time.time())
+        elif isinstance(message, str) and _CODEX_CAPACITY.match(message):
+            code = "CODEX_CAPACITY"
+
     if code in {"MODEL_CAPACITY_EXHAUSTED", "CODEX_CAPACITY"}:
         kind = FailureKind.CAPACITY
         retry_after = retry_after if retry_after is not None else 120
@@ -78,7 +129,8 @@ def classify_provider_record(agent: str, record: dict) -> Optional[dict]:
 
 
 def provider_failure_from_log(log_path: str, *, agent: str,
-                              since_offset: int = 0) -> Optional[dict]:
+                              since_offset: int = 0,
+                              failed_at: Optional[float] = None) -> Optional[dict]:
     """Read this attempt's provider JSON events; ignore all other log text."""
     try:
         with open(log_path, "rb") as stream:
@@ -98,7 +150,7 @@ def provider_failure_from_log(log_path: str, *, agent: str,
             record = json.loads(line)
         except (TypeError, ValueError):
             continue
-        classified = classify_provider_record(agent, record)
+        classified = classify_provider_record(agent, record, failed_at=failed_at)
         if classified and (failure is None or
                            priority[classified["kind"]] >= priority[failure["kind"]]):
             failure = classified

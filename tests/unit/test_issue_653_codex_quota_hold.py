@@ -4,6 +4,7 @@ import json
 import os
 import pytest
 import time
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -36,19 +37,46 @@ def _marker(queue, task_id):
     return queue.get_task(task_id).error_info["codex_quota_hold"]
 
 
-def _real_codex_quota_stream(reset_after=7680):
-    return json.dumps({"type": "error", "code": "CODEX_QUOTA_EXHAUSTED",
-                       "retry_after": reset_after}) + "\n"
+def _real_codex_quota_stream(reset="3:10 PM"):
+    message = f"You’ve hit your usage limit. Try again at {reset}."
+    return "\n".join((
+        "[codex error] " + message,
+        json.dumps({"type": "error", "message": message}, ensure_ascii=False),
+        json.dumps({"type": "turn.failed", "error": {"message": message}},
+                   ensure_ascii=False),
+    )) + "\n"
 
 
-def test_codex_quota_requires_structured_code(tmp_path):
+@pytest.mark.parametrize("event_line", [1, 2])
+def test_codex_quota_requires_provider_error_event(tmp_path, event_line):
     log = tmp_path / "dispatch.log"
-    log.write_text("[codex error] You've hit your usage limit.\n")
+    lines = _real_codex_quota_stream().splitlines()
+    log.write_text(lines[0] + "\n")
     assert provider_failure_from_log(str(log), agent="codex") is None
-    log.write_text(_real_codex_quota_stream())
-    failure = provider_failure_from_log(str(log), agent="codex")
+    failed_at = datetime(2026, 10, 9, 13, 2, tzinfo=timezone.utc).timestamp()
+    log.write_text(lines[event_line] + "\n")
+    failure = provider_failure_from_log(str(log), agent="codex", failed_at=failed_at)
     assert failure == {"kind": "provider_limit",
                        "provider_code": "codex_quota_exhausted", "retry_after": 7680}
+
+
+def test_codex_quota_dated_reset_is_parsed_from_provider_error(tmp_path):
+    log = tmp_path / "dispatch.log"
+    log.write_text(_real_codex_quota_stream("Sep 30th, 2026 4:48 PM"))
+    failed_at = datetime(2026, 9, 24, 13, 2, tzinfo=timezone.utc).timestamp()
+    reset_at = datetime(2026, 9, 30, 16, 48, tzinfo=timezone.utc).timestamp()
+    failure = provider_failure_from_log(str(log), agent="codex", failed_at=failed_at)
+    assert failure["kind"] == "provider_limit"
+    assert failure["retry_after"] == reset_at - failed_at
+
+
+def test_codex_quota_real_event_without_reset_still_holds(tmp_path):
+    log = tmp_path / "dispatch.log"
+    log.write_text(json.dumps({"type": "turn.failed", "error": {
+        "message": "You've hit your usage limit."}}) + "\n")
+    failure = provider_failure_from_log(str(log), agent="codex")
+    assert failure == {"kind": "provider_limit",
+                       "provider_code": "codex_quota_exhausted", "retry_after": None}
 
 
 def test_fresher_cache_releases_one_probe_then_rest_without_duplicates(tmp_path, monkeypatch):

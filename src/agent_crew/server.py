@@ -6865,8 +6865,10 @@ def create_app(
                              _timeout_reason, task.task_id, _last_output_age)
             # The provider adapter reads only JSON event fields from this
             # attempt. Diagnostic prose and echoed task text carry no policy.
+            _provider_failed_at = time.time()
             _provider_failure = provider_failure_from_log(
-                log_path, since_offset=_task_log_start_offset, agent=agent)
+                log_path, since_offset=_task_log_start_offset, agent=agent,
+                failed_at=_provider_failed_at)
             _failure_kind = failure_kind(_provider_failure)
             if _provider_failure:
                 q().annotate_error_info(task.task_id, _provider_failure)
@@ -6977,7 +6979,7 @@ def create_app(
                         f"dispatcher: capacity requeue failed for task={task.task_id}")
                 _fail_if_active(task.task_id, "provider_capacity_requeue_failed")
             elif agent == "codex" and _failure_kind == FailureKind.PROVIDER_LIMIT.value:
-                failed_at = time.time()
+                failed_at = _provider_failed_at
                 cache = _codex_quota_cache()
                 _retry_after = _provider_failure.get("retry_after")
                 reset_at = (failed_at + _retry_after

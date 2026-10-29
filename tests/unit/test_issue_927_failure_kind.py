@@ -6,7 +6,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_crew import claude_cloud, pipeline, server
+from agent_crew import claude_cloud, instructions, pipeline, server
 from agent_crew.failure_kind import FailureKind, classify_provider_record, provider_failure_from_log
 from agent_crew.loop import handle_test_result
 from agent_crew.protocol import TaskRequest, TaskResult
@@ -65,6 +65,14 @@ def test_test_findings_do_not_classify_a_failure():
                        error_info={"kind": "test_failure"})
     assert handle_test_result(prose) == "not_run"
     assert handle_test_result(typed) == "failed"
+
+
+def test_llm_tester_protocol_requires_typed_test_failure():
+    prompt = instructions.generate("tester", "demo", 8105, agent="gemini",
+                                   delivery="dispatcher")
+    assert '"kind":"test_failure"' in prompt
+    assert '"status":"failed"' in prompt
+    assert "new failing tests" in prompt
 
 
 def test_provider_adapter_classifies_only_structured_fields(tmp_path):

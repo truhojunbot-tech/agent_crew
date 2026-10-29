@@ -206,7 +206,8 @@ time a result is skipped — there is no fallback.
 | `branch` | string | code tasks | The pushed branch; report it as a field, not only in prose. |
 | `commit` | string | code tasks | Full pushed commit SHA; report it as a field, not only in prose. |
 | `verdict` | enum\\|null | reviewers only | `approve` \\| `request_changes` \\| `null` |
-| `findings` | string[] or finding objects[] | reviewers only | `approve` requires `[]`; `request_changes` lists only changes required to approve. Put non-blocking notes in the summary or GitHub PR comment. Objects require severity, file, line, title, detail. Empty array for non-reviewers. |
+| `findings` | string[] or finding objects[] | reviewers and testers | Reviewers: `approve` requires `[]`; `request_changes` lists only changes required to approve. Testers: list new failing tests when reporting `test_failure`. Empty array for other roles. |
+| `error_info` | object\\|null | failed tests | Set `{"kind":"test_failure"}` when tests identify new failures on the PR head. |
 | `pr_number` | int\\|null | if opened | GitHub PR number, otherwise `null`. |
 
 ### Canonical POST template
@@ -405,7 +406,8 @@ A role stays `in_progress` until `submit_result` is called. Silence stalls the c
 | `branch` | code tasks | Pushed branch, supplied as a structured field. |
 | `commit` | code tasks | Full pushed commit SHA, supplied as a structured field. |
 | `verdict` | reviewers only | `approve` \\| `request_changes` \\| `null` |
-| `findings` | reviewers only | `approve` requires `[]`; `request_changes` lists only changes required to approve. Put non-blocking notes in the summary or GitHub PR comment. Empty list for non-reviewers. |
+| `findings` | reviewers and testers | Reviewers: `approve` requires `[]`; `request_changes` lists only changes required to approve. Testers: list new failing tests when reporting `test_failure`. Empty list for other roles. |
+| `error_info` | failed tests | Set `{"kind":"test_failure"}` when tests identify new failures on the PR head. |
 | `pr_number` | if opened | GitHub PR number, otherwise `null`. |
 | `executor_binding` | if your task block had a `dispatch_nonce` | `{"nonce": "<it>", "presenter": "<your agent name>"}` |
 
@@ -706,7 +708,8 @@ would be attributed to the wrong commit.
 ### Result checklist (tester)
 
 Before you POST the result, verify:
-- [ ] `status: completed` if the tests ran to completion (pass or fail), otherwise `failed`
+- [ ] `status: completed` only when the tests pass. For new failing tests on the PR head, POST `"status":"failed"` with `"error_info":{"kind":"test_failure"}` so the coordinator can enqueue a fix. Do not rely on summary or findings text to classify the failure.
+- [ ] If tests cannot run because of a provider, setup, or timeout problem, POST `status: needs_human` with `error_info.kind` set to `agent_failed`, `config_error`, or `timeout`; do not label that as `test_failure`.
 - [ ] `summary` names the scope you ran and the commands, plus pass/fail counts and lint outcome
 - [ ] `findings` lists failing tests and any independent diff-review concerns
 - [ ] `verdict: null` (only reviewers set verdict)
