@@ -8013,6 +8013,12 @@ def create_app(
             logger.warning("auto rebase: PR #%s no longer points at %s", pr_number, source)
             return None
 
+        # #908: the target tip the test could not squash onto is the floor the
+        # rebase result is held to, so later merges on base do not void it.
+        floor = str(script.get("base_sha") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", floor):
+            floor = ""
+
         rebase_id = f"rebase-pr{pr_number}-{source}"
         existing = q().get_task(rebase_id)
         if existing is not None:
@@ -8022,7 +8028,7 @@ def create_app(
         context = {"prev_task_id": test_task_id, "auto_rebase_of": test_task_id,
                    "artifact_kind": "rebase",
                    "rebase_onto": base, "rebase_source_sha": source,
-                   "base_branch": base, "pr_number": pr_number,
+                   "rebase_onto_sha": floor or None, "base_branch": base, "pr_number": pr_number,
                    "repo": repo, "issue": issue, "issue_number": issue,
                    "risk_tier": tier}
         for key in ("implementer_agent", "reviewer_agent", "coordinator_managed",
