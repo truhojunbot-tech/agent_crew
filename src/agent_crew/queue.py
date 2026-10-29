@@ -3190,8 +3190,8 @@ class TaskQueue:
                             time.time(), existing_task_id=row["task_id"], cap=cap)
             conn.execute(
                 """
-                INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project, receipt_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project, receipt_id, pr_number)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.task_id,
@@ -3204,6 +3204,8 @@ class TaskQueue:
                     time.time(),
                     task.project,
                     receipt_id,
+                    _normalize_pr_number(task.pr_number)
+                    or _normalize_pr_number(context.get("pr_number")),
                 ),
             )
             if _work_intent is not None:
@@ -4497,6 +4499,16 @@ class TaskQueue:
             task, refusal = self._project_from_queue_identity(task)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
+            # The row column and legacy context consumers must see the same
+            # PR. Accept either input spelling, then use one normalized value
+            # for admission, duplicate detection, and persistence.
+            field_pr = _normalize_pr_number(task.pr_number)
+            context_pr = _normalize_pr_number(context.get("pr_number"))
+            if field_pr is not None and context_pr is not None and field_pr != context_pr:
+                raise ValueError("task pr_number differs from context.pr_number")
+            canonical_pr = field_pr if field_pr is not None else context_pr
+            if canonical_pr is not None:
+                context["pr_number"] = canonical_pr
             # A verified HTTP parent can supply lineage metadata after the
             # public boundary has validated this request's own risk fields.
             # A claimed prev_task_id alone does not waive that boundary.

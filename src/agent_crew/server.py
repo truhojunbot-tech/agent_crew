@@ -8527,6 +8527,18 @@ def create_app(
                      (not _dispatcher_enabled and bool(pane_map and pane_map.get(agent)))))
 
         ctx = task.context if isinstance(task.context, dict) else {}
+        if task.task_type in {"review", "test"}:
+            # Pipeline successors are built in-process. An external PR review
+            # or test must identify the PR in its column and pin the exact
+            # revision before admission, not fail later in the dispatcher.
+            if type(task.pr_number) is not int or task.pr_number <= 0:
+                raise HTTPException(status_code=422, detail="review/test requires pr_number")
+            if not (_object_id_or_empty(ctx.get("reviewed_sha"))
+                    or _object_id_or_empty(ctx.get("expected_head_sha"))):
+                raise HTTPException(status_code=422, detail="review/test requires pinned head SHA")
+            context_pr = ctx.get("pr_number")
+            if context_pr is not None and context_pr != task.pr_number:
+                raise HTTPException(status_code=422, detail="context.pr_number differs from pr_number")
         # #889: one role policy on every route — explicit override, the
         # lineage's implementer/tester choice, and the role assignment itself.
         # The branch name is a label and never selects the agent.

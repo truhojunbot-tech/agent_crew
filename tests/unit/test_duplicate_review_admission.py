@@ -47,7 +47,7 @@ def task(task_id, *, kind="review", pr=23, sha=SHA_A, project="owner/repo", bran
         context["reviewed_sha"] = sha
     return TaskRequest(task_id=task_id, task_type=kind, description="check PR",
                        project=project, branch=branch,
-                       context=context)
+                       context=context, pr_number=pr)
 
 
 @pytest.mark.parametrize("kind", ["review", "test"])
@@ -135,7 +135,7 @@ def test_dispatch_pin_refuses_completed_judgement(queue, kind):
     assert queue.get_task_status(late.task_id) == "blocked"
 
 
-def test_duplicate_found_at_prepared_base_is_not_pushed(tmp_path, monkeypatch):
+def test_unpinned_http_review_is_rejected_before_push(tmp_path, monkeypatch):
     from agent_crew import server
 
     db = str(tmp_path / "push.db")
@@ -155,8 +155,8 @@ def test_duplicate_found_at_prepared_base_is_not_pushed(tmp_path, monkeypatch):
     )
     with TestClient(app) as client:
         response = client.post("/tasks", json=dataclasses.asdict(task("late", sha=None)))
-        assert response.status_code == 201, response.text
-    assert q.get_task_status("late") == "blocked"
+        assert response.status_code == 422, response.text
+    assert q.get_task("late") is None
     assert pushes == []
 
 
