@@ -18,6 +18,48 @@ from agent_crew.loop import (
 from agent_crew.protocol import TaskResult
 
 
+def test_wait_for_pipeline_successor_prefers_live_retry():
+    from agent_crew.loop import wait_for_pipeline_successor
+    from agent_crew.protocol import TaskRequest
+
+    queue = MagicMock()
+    queue.list_tasks.return_value = [
+        TaskRequest(task_id="review-dead", task_type="review", description="x",
+                    status="failed", context={"prev_task_id": "impl-1"}),
+        TaskRequest(task_id="review-retry", task_type="review", description="x",
+                    status="pending", context={"prev_task_id": "impl-1"}),
+    ]
+    assert wait_for_pipeline_successor(queue, "review", "impl-1", 0) == "review-retry"
+
+
+def test_wait_for_pipeline_successor_returns_single_dead_review_immediately():
+    from agent_crew.loop import wait_for_pipeline_successor
+    from agent_crew.protocol import TaskRequest
+
+    queue = MagicMock()
+    queue.list_tasks.return_value = [
+        TaskRequest(task_id="review-dead", task_type="review", description="x",
+                    status="failed", context={"prev_task_id": "impl-1"}),
+    ]
+    with patch("agent_crew.loop.time.sleep", side_effect=AssertionError("waited")):
+        assert wait_for_pipeline_successor(queue, "review", "impl-1", 1) == "review-dead"
+
+
+def test_wait_for_pipeline_successor_reports_multiple_dead_reviews():
+    from agent_crew.loop import wait_for_pipeline_successor
+    from agent_crew.protocol import TaskRequest
+
+    queue = MagicMock()
+    queue.list_tasks.return_value = [
+        TaskRequest(task_id=task_id, task_type="review", description="x",
+                    status="failed", context={"prev_task_id": "impl-1"})
+        for task_id in ("review-dead-1", "review-dead-2")
+    ]
+    with patch("agent_crew.loop.time.sleep", side_effect=AssertionError("waited")):
+        with pytest.raises(click.ClickException, match="Multiple terminal review successors"):
+            wait_for_pipeline_successor(queue, "review", "impl-1", 1)
+
+
 # U-L01: enqueue_implement — task_type=implement, TDD 지시 context 포함
 def test_u_l01_enqueue_implement():
     queue = MagicMock()

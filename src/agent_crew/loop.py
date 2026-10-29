@@ -204,6 +204,10 @@ def wait_for_pipeline_successor(queue, task_type: str, prev_task_id: str,
             return live[0].task_id
         if len(matches) == 1:
             return matches[0].task_id
+        if matches:
+            raise click.ClickException(
+                f"Multiple terminal {task_type} successors for {prev_task_id!r}; "
+                "refusing to choose one")
         if time.monotonic() >= deadline:
             raise click.ClickException(
                 f"Server did not create a {task_type} successor for "
