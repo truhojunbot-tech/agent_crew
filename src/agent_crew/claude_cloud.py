@@ -990,7 +990,8 @@ _LOCAL_ONLY_PATH = re.compile(
 # ("do not skip the input file: ~/x"), cut off by a contrast ("never read ~/a
 # but ~/b"), or after the path ("read ~/x, but do not edit it") does not
 # count, so a real requirement fails closed.
-_PREFLIGHT_CLAUSE = re.compile(r"\n|(?<=[.!?;:,])\s+")
+_PREFLIGHT_CLAUSE = re.compile(r"(?<=[.!?;:,])\s+")
+_PREFLIGHT_BULLET = re.compile(r"\s*(?:[-*+•]|\d+[.)])\s+")
 _PREFLIGHT_NEGATION = (
     r"(?:\b(?:don'?t|do not|does not|doesn'?t|never|must not|mustn'?t|should not|"
     r"shouldn'?t|cannot|can'?t|not|avoid\w*|without|forbid\w*|prohibit\w*)\b|⛔)"
@@ -1030,12 +1031,27 @@ def _preflight_path_negated(prefix: str) -> bool:
 
 def _local_only_path_match(work: str) -> str:
     """Return the first local-only path the text requires, quoted as written."""
-    for clause in _PREFLIGHT_CLAUSE.split(work):
-        for match in _LOCAL_ONLY_PATH.finditer(clause):
-            if _preflight_path_negated(clause[:match.start()]):
-                continue
-            token = re.match(r"[^\s'\"`]+", clause[match.start():])
-            return token.group(0).rstrip(".,;:)") if token else match.group(0)
+    # #894 review round 3: a heading such as "Do not edit these files:" scopes
+    # its negation over the bullets below it; "Read these files:" does not.
+    negated_list = False
+    for line in work.split("\n"):
+        bullet = _PREFLIGHT_BULLET.match(line)
+        if not bullet and line.strip():
+            negated_list = False
+        for clause in _PREFLIGHT_CLAUSE.split(line):
+            for match in _LOCAL_ONLY_PATH.finditer(clause):
+                prefix = clause[:match.start()]
+                if _preflight_path_negated(prefix):
+                    continue
+                # A bullet with no access verb of its own inherits the heading.
+                if bullet and negated_list and not _PREFLIGHT_ACCESS.search(prefix):
+                    continue
+                token = re.match(r"[^\s'\"`]+", clause[match.start():])
+                return token.group(0).rstrip(".,;:)") if token else match.group(0)
+        heading = line.rstrip()
+        if not bullet and heading.endswith(":"):
+            last = _PREFLIGHT_CLAUSE.split(heading)[-1]
+            negated_list = _preflight_path_negated(last[:-1] + " ")
     return ""
 
 

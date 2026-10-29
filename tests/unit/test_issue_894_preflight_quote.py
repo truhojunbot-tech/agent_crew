@@ -20,6 +20,9 @@ def _task(description):
     "Fix it and avoid ~/ paths entirely.",
     "Do not read or write ~/.agent_crew/state.json",
     "Do not ever write anything to ~/.local/bin",
+    # Review of PR #918 round 3: a negated heading scopes its bullets.
+    "Do not edit these files:\n- ~/.agent_crew/state.json",
+    "Fix the parser.\nNever touch these paths:\n\n- ~/.local/bin\n* /tmp/crew.lock",
 ])
 def test_policy_prose_is_not_a_local_file_requirement(description):
     assert cloud._cloud_preflight_reason(_task(description), "owner/agent_crew") == ""
@@ -38,6 +41,14 @@ def test_policy_prose_is_not_a_local_file_requirement(description):
     "Do not use remote API but read ~/alfred/plan.md",
     "Do not edit the repository and read ~/alfred/plan.md",
     "Never read ~/alfred/old.md but ~/alfred/plan.md is required",
+    # Review of PR #918 round 3: affirmative lists stay required, and a
+    # negated heading's scope ends at the next prose line.
+    "Read these input files:\n- ~/alfred/plan.md",
+    "Input files:\n1. ~/alfred/plan.md",
+    "Do not skip these files:\n- ~/alfred/plan.md",
+    "Do not edit these files:\n- ~/.agent_crew/state.json\nUse this file:\n- ~/alfred/plan.md",
+    "Do not edit these files:\n- ~/.agent_crew/state.json\nThen read ~/alfred/plan.md",
+    "Do not edit these files:\n- read ~/alfred/plan.md instead",
 ])
 def test_real_local_requirement_still_fails_closed(description):
     assert cloud._cloud_preflight_reason(_task(description), "owner/agent_crew") \
