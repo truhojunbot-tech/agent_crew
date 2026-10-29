@@ -29,7 +29,10 @@ def _state(tmp_path, claude_checkout):
     # Deliberately no repo_path: crews set up before it existed lack it.
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"project": "agent_crew",
-                                "worktrees": {"claude": str(claude_checkout)}}))
+                                "worktrees": {"claude": str(claude_checkout)},
+                                # #891: the claim checks cloud holds the role it dispatches.
+                                "role_agents": {"implementer": "claude_cloud", "reviewer": "codex",
+                                                "tester": "script"}}))
     return str(path)
 
 

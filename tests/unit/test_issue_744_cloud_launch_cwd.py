@@ -38,7 +38,10 @@ def _checkout(tmp_path, origin="https://github.com/owner/repo.git"):
 
 def _state(tmp_path, checkout):
     path = tmp_path / "state.json"
-    path.write_text(json.dumps({"project": "project", "worktrees": {"claude": str(checkout)}}))
+    path.write_text(json.dumps({"project": "project", "worktrees": {"claude": str(checkout)},
+                                # #891: the claim checks cloud holds the role it dispatches.
+                                "role_agents": {"implementer": "codex", "reviewer": "claude_cloud",
+                                                "tester": "script"}}))
     return str(path)
 
 

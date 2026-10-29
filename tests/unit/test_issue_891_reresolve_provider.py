@@ -244,3 +244,27 @@ def test_unreadable_state_fails_closed_for_cloud_claim(tmp_path):
         project="demo", context={"agent_override": "claude_cloud"}))
     assert queue.dequeue(agent="claude_cloud", role="reviewer", claimed_via="mcp") is None
     assert queue.get_task("review-891-corrupt").status == "pending"
+
+
+def test_stale_caller_role_map_snapshot_does_not_outrank_current_state(tmp_path):
+    """Review of PR #916 (round 4): the caller snapshotted reviewer=claude_cloud,
+    then state.json handed the reviewer role back to codex before the claim.
+    The snapshot is the caller's word; the claim re-reads the current map."""
+    state_path = tmp_path / "state.json"
+    _state(state_path, "claude", "claude_cloud")
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    queue.enqueue(TaskRequest(
+        task_id="review-891-snapshot", task_type="review", description="review",
+        project="demo", context={"agent_override": "claude_cloud"}))
+    snapshot = {"implementer": "claude", "reviewer": "claude_cloud", "tester": "script"}
+    _state(state_path, "claude", "codex")
+    assert queue.dequeue(agent="claude_cloud", role="reviewer", claimed_via="cloud_push",
+                         skip_deferred=True, role_to_agent=snapshot) is None
+    assert queue.get_task("review-891-snapshot").status == "pending"
+    assert _claimed_by(db, "review-891-snapshot")[0] is None
+    # Same snapshot, current map agrees again: the claim goes through.
+    _state(state_path, "claude", "claude_cloud")
+    claimed = queue.dequeue(agent="claude_cloud", role="reviewer", claimed_via="cloud_push",
+                            skip_deferred=True, role_to_agent=snapshot)
+    assert claimed is not None and claimed.task_id == "review-891-snapshot"

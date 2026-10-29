@@ -2677,26 +2677,29 @@ class TaskQueue:
                          role_to_agent: Optional[Mapping[str, str]]) -> bool:
         """Whether ``provider`` holds ``task_type`` under the CURRENT role map (#891).
 
-        ``role_to_agent`` is the caller's live map; otherwise ``state.json``
-        next to the DB is re-read on every claim, the file the dispatcher reads.
-        No state file means no declared map, so nothing to check against (bare
-        test queues). A state file that cannot be read fails closed.
+        ``state.json`` next to the DB -- the file the dispatcher reads -- is
+        re-read on every claim. ``role_to_agent`` is the caller's snapshot and
+        can only narrow that answer, never widen it: the role map may have
+        changed between the snapshot and this claim (review of PR #916 round 4).
+        No state file means no declared map, so the snapshot (if any) is all
+        there is (bare test queues). A state file that cannot be read fails closed.
         """
-        if role_to_agent is None:
-            path = str(self._db_path or "")
-            if not path or path == ":memory:":
-                return True
-            state_path = os.path.join(os.path.dirname(os.path.abspath(path)), "state.json")
-            if not os.path.exists(state_path):
-                return True
-            try:
-                with open(state_path, "r", encoding="utf-8") as fh:
-                    state = json.load(fh)
-                role_to_agent = effective_role_mapping(state)[0]
-            except Exception:
-                logger.warning("#891: unreadable %s; refusing %s claim", state_path, provider)
-                return False
-        return task_type in provider_task_types(provider, role_to_agent)
+        if role_to_agent is not None and task_type not in provider_task_types(provider, role_to_agent):
+            return False
+        path = str(self._db_path or "")
+        if not path or path == ":memory:":
+            return True
+        state_path = os.path.join(os.path.dirname(os.path.abspath(path)), "state.json")
+        if not os.path.exists(state_path):
+            return True
+        try:
+            with open(state_path, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+            current = effective_role_mapping(state)[0]
+        except Exception:
+            logger.warning("#891: unreadable %s; refusing %s claim", state_path, provider)
+            return False
+        return task_type in provider_task_types(provider, current)
 
     def _read_declared_project(self) -> str:
         """``state.json``'s ``project``, or ``""``. Never raises — an unreadable

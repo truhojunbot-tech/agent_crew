@@ -48,7 +48,10 @@ def _leave_on_unpublished_local_branch(checkout):
 def _state(tmp_path, checkout):
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"project": "agent_crew",
-                                "worktrees": {"claude": str(checkout)}}))
+                                "worktrees": {"claude": str(checkout)},
+                                # #891: the claim checks cloud holds the role it dispatches.
+                                "role_agents": {"implementer": "claude_cloud", "reviewer": "codex",
+                                                "tester": "script"}}))
     return str(path)
 
 
