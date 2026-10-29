@@ -33,7 +33,7 @@ def failure_kind(error_info: Optional[dict]) -> Optional[str]:
 
 _CODEX_QUOTA = re.compile(r"^\s*(?:error:\s*)?you['’]ve hit your usage limit\b", re.I)
 _CODEX_CAPACITY = re.compile(r"^\s*(?:error:\s*)?selected model is at capacity\b", re.I)
-_GEMINI_INVALID_MODEL = re.compile(r"^\s*invalid model selection\s*$", re.I)
+_GEMINI_INVALID_MODEL = re.compile(r"^\s*invalid model selection\b", re.I)
 _CODEX_RESET = re.compile(
     r"try again at\s+(?:(?P<month>[A-Za-z]{3,9})\s+"
     r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,\s+(?P<year>\d{4})\s+)?"
@@ -113,7 +113,7 @@ def classify_provider_record(agent: str, record: dict, *,
         # field without a code. Keep the match anchored to that provider event.
         message = record.get("error")
         if (record.get("status") == "ERROR" and record.get("num_turns") == 0
-                and isinstance(message, str) and _GEMINI_INVALID_MODEL.fullmatch(message)):
+                and isinstance(message, str) and _GEMINI_INVALID_MODEL.match(message)):
             code = "INVALID_MODEL"
 
     if code in {"MODEL_CAPACITY_EXHAUSTED", "CODEX_CAPACITY"}:

@@ -95,8 +95,13 @@ def test_zero_turn_error_uses_structured_status_not_error_message():
     assert classify_provider_record("gemini", record)["kind"] == FailureKind.CONFIG_ERROR.value
     assert classify_provider_record("gemini", {"status": "ERROR",
                                                "num_turns": 0})["kind"] == "agent_failed"
-    assert classify_provider_record("gemini", {"status": "ERROR", "num_turns": 0,
-                                               "error": "invalid model selection"})["kind"] == "config_error"
+    agy_error = (
+        'invalid model selection (--model "Gemini 3.7 Flash (Medium)" --effort ""): '
+        'model Gemini 3.7 Flash (Medium) is not recognized.\n'
+        'Available models:\n  Gemini 3.8 Flash (Medium)\n  Claude Sonnet 5.5 (High)'
+    )
+    assert classify_provider_record("agy", {"status": "ERROR", "num_turns": 0,
+                                            "error": agy_error})["kind"] == "config_error"
     assert classify_provider_record("gemini", {"status": "SUCCESS",
                                                   "num_turns": 1,
                                                   "result": "invalid model selection"}) is None
