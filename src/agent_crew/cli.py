@@ -2817,6 +2817,7 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             "task_id": task_id,
             "status": "failed",
             "summary": reason,
+            "error_info": {"kind": "timeout", "reason": "wrapper_timeout"},
             "findings": [],
             "verdict": None,
             "pr_number": None,

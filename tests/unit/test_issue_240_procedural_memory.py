@@ -157,8 +157,8 @@ def test_candidate_scope_comes_from_where_it_actually_happened():
 
 def test_provider_incident_is_flagged_not_promoted():
     """⛔#240 non-goal: a quota/runtime incident is not a project procedure."""
-    eps = [_ep("t-1", outcome="failed:agy_quota_exhausted"),
-           _ep("t-2", outcome="failed:agy_quota_exhausted")]
+    eps = [_ep("t-1", outcome="failed:agy_quota_exhausted", failure_kind="provider_limit"),
+           _ep("t-2", outcome="failed:agy_quota_exhausted", failure_kind="provider_limit")]
     c = extract_candidates(eps)[0]
 
     assert c.incomplete_reasons
@@ -533,8 +533,8 @@ class TestEvaluationFixtures:
 
     def test_4_provider_quota_failure_incorrectly_retried(self):
         """⛔Must NOT become a project procedure."""
-        eps = [_ep("t-1", outcome="failed:agy_quota_exhausted"),
-               _ep("t-2", outcome="failed:agy_quota_exhausted")]
+        eps = [_ep("t-1", outcome="failed:agy_quota_exhausted", failure_kind="provider_limit"),
+               _ep("t-2", outcome="failed:agy_quota_exhausted", failure_kind="provider_limit")]
         c = extract_candidates(eps)[0]
         assert not validate_candidate(c).ok
 

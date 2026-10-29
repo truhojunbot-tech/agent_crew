@@ -731,6 +731,8 @@ def build_episode(attribution: dict, result: Optional[dict] = None,
         "started_at": attribution.get("started_at", 0),
         "completed_at": attribution.get("completed_at", 0),
         "summary": (result.get("summary") or "")[:600],
+        "failure_kind": ((result.get("error_info") or {}).get("kind")
+                         if isinstance(result.get("error_info"), dict) else None),
         "findings": [str(f)[:300] for f in (result.get("findings") or [])[:8]],
         "pr_number": result.get("pr_number"),
         "retry_of": attribution.get("retry_of", ""),

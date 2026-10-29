@@ -1,76 +1,33 @@
-"""Regression tests for issues #190, #192, #194.
+"""#190/#192: structured quota evidence takes precedence over task prose."""
+import json
 
-#190 — Timeout path must still inspect the dispatch log for transient errors
-and requeue, instead of permanently failing the task as `dispatcher_timeout`.
-
-#192 — `QUOTA_EXHAUSTED` / `IneligibleTierError` are detected as separate,
-non-retriable categories. Auto-requeue does NOT fire (resetting takes hours).
-Tasks fail with a clear reason so operators see the actual cause.
-
-#194 — `_transient_retries` dict cleanup is best verified at the call-site
-level; we exercise it implicitly via the integration-shaped tests below.
-"""
-from agent_crew.server import (
-    _detect_transient_error_in_log,
-    _TRANSIENT_RETRIABLE_TAGS,
-    _TRANSIENT_NONRETRIABLE_TAGS,
-)
+from agent_crew.failure_kind import provider_failure_from_log
 
 
-def _w(tmp_path, body: str) -> str:
-    p = tmp_path / "dispatch.log"
-    p.write_text(body)
-    return str(p)
+def _log(tmp_path, record, prose=""):
+    path = tmp_path / "dispatch.log"
+    path.write_text(prose + "\n" + json.dumps(record) + "\n")
+    return str(path)
 
 
-# ---------------------------------------------------------------------------
-# #192 — QUOTA_EXHAUSTED / IneligibleTierError detection (non-retriable)
-# ---------------------------------------------------------------------------
-
-def test_b192_quota_exhausted_detected(tmp_path):
-    log = _w(tmp_path, '"reason": "QUOTA_EXHAUSTED",\n')
-    tag = _detect_transient_error_in_log(log, agent="gemini")
-    assert tag == "gemini_quota_exhausted"
-    assert tag in _TRANSIENT_NONRETRIABLE_TAGS
-    assert tag not in _TRANSIENT_RETRIABLE_TAGS
+def test_quota_exhausted_is_not_retriable(tmp_path):
+    failure = provider_failure_from_log(
+        _log(tmp_path, {"status": "ERROR", "reason": "QUOTA_EXHAUSTED"}),
+        agent="gemini")
+    assert failure["kind"] == "provider_limit"
+    assert failure["retry_after"] is None
 
 
-def test_b192_quota_reset_phrase_detected(tmp_path):
-    log = _w(tmp_path, "Your quota will reset after 2h37m8s.\n")
-    assert _detect_transient_error_in_log(log, agent="gemini") == "gemini_quota_exhausted"
+def test_model_capacity_has_cooldown(tmp_path):
+    failure = provider_failure_from_log(
+        _log(tmp_path, {"status": "ERROR", "reason": "MODEL_CAPACITY_EXHAUSTED"}),
+        agent="gemini")
+    assert failure["kind"] == "capacity"
+    assert failure["retry_after"] == 120
 
 
-def test_b192_ineligible_tier_detected(tmp_path):
-    log = _w(tmp_path,
-             "IneligibleTierError: This client is no longer supported "
-             "for Gemini Code Assist for individuals.\n")
-    tag = _detect_transient_error_in_log(log, agent="gemini")
-    assert tag == "gemini_ineligible_tier"
-    assert tag in _TRANSIENT_NONRETRIABLE_TAGS
-
-
-def test_b192_quota_takes_priority_over_resource_exhausted(tmp_path):
-    """Real gemini quota responses carry both markers. The more specific tag
-    must win so the dispatcher routes to the non-retriable branch.
-    """
-    log = _w(tmp_path,
-             '"status": "RESOURCE_EXHAUSTED",\n"reason": "QUOTA_EXHAUSTED",\n')
-    assert _detect_transient_error_in_log(log, agent="gemini") == "gemini_quota_exhausted"
-
-
-def test_b192_capacity_still_classified_retriable(tmp_path):
-    """MODEL_CAPACITY_EXHAUSTED (server-side throttle) remains retriable so
-    the existing gemini-capacity recovery path keeps working.
-    """
-    log = _w(tmp_path, '"reason": "MODEL_CAPACITY_EXHAUSTED",\n')
-    tag = _detect_transient_error_in_log(log, agent="gemini")
-    assert tag == "gemini_capacity"
-    assert tag in _TRANSIENT_RETRIABLE_TAGS
-
-
-# ---------------------------------------------------------------------------
-# Category invariants
-# ---------------------------------------------------------------------------
-
-def test_retriable_and_nonretriable_are_disjoint():
-    assert _TRANSIENT_RETRIABLE_TAGS.isdisjoint(_TRANSIENT_NONRETRIABLE_TAGS)
+def test_quota_prose_does_not_override_structured_timeout(tmp_path):
+    failure = provider_failure_from_log(
+        _log(tmp_path, {"status": "ERROR", "reason": "TIMEOUT"},
+             prose="Quota exhausted in a sample prompt"), agent="gemini")
+    assert failure["kind"] == "timeout"

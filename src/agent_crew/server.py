@@ -50,7 +50,7 @@ from agent_crew.context_identity import (
     extract_claude_session_id,
     record_context_event,
 )
-from agent_crew.fallback import has_rate_limit_signal, is_rate_limit_error
+from agent_crew.failure_kind import FailureKind, failure_kind, provider_failure_from_log
 from agent_crew import tokenomics_canary as _canary
 from agent_crew.github import get_repo, _repo_slug
 from agent_crew.loop import _resolve_verdict, handle_test_result
@@ -251,25 +251,6 @@ def _resolve_claude_model(worktree: str) -> str:
     model = settings.get("model") if isinstance(settings, dict) else None
     return model.strip() if isinstance(model, str) else ""
 
-
-def _provider_zero_turn_config_error(agent: str, output: str) -> bool:
-    """Identify provider launch/config errors before any test work occurred."""
-    if agent not in {"gemini", "claude", "codex"}:
-        return False
-    for line in [output, *output.splitlines()]:
-        try:
-            record = json.loads(line)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(record, dict) or record.get("num_turns") not in (0, "0"):
-            continue
-        if (str(record.get("status") or "").upper() == "ERROR"
-                or record.get("is_error") is True):
-            return True
-    lowered = output.lower()
-    return any(marker in lowered for marker in (
-        "invalid model selection", "model is not recognized", "unknown model",
-        "missing api key", "authentication required", "configuration error"))
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -1686,21 +1667,6 @@ _LATE_RESULT_STATUSES = frozenset({"failed"})
 # escalation 대상(무한 재시도 금지). 비가역 상태(closed)는 횟수와 무관하게 즉시 재시도 안 함.
 _MAX_MERGE_ATTEMPTS = 3
 
-_TRANSIENT_RETRIABLE_TAGS = frozenset({
-    "claude_429",
-    "claude_throttle",
-    "gemini_capacity",
-    "gemini_resource_exhausted",
-    "agy_timeout",
-    "agy_subscriber_lag",
-})
-# #581: provider capacity refusals, classified `provider_capacity`. Requeued
-# with a cooldown that never runs out and never spends the transient budget.
-_PROVIDER_CAPACITY_TAGS = frozenset({
-    "codex_capacity",
-})
-
-
 def _capacity_cooldown_s(refusal: int) -> float:
     """Cooldown before the ``refusal``-th capacity requeue (1-based) (#581).
 
@@ -1717,50 +1683,6 @@ def _capacity_cooldown_s(refusal: int) -> float:
     jitter = _f("AGENT_CREW_CAPACITY_JITTER", 0.2)
     raw = min(cap, base * (2 ** min(max(refusal, 1) - 1, 30)))
     return max(0.0, min(cap, raw * random.uniform(1 - jitter, 1 + jitter)))
-
-
-# Tags that mean "exhausted for hours+; retry is futile". Surface as a
-# clear-reason failure instead.
-_TRANSIENT_NONRETRIABLE_TAGS = frozenset({
-    "gemini_quota_exhausted",
-    "gemini_ineligible_tier",
-    "agy_quota_exhausted",
-})
-
-
-def _codex_quota_reset_at(log_path: str, *, failed_at: float,
-                          since_offset: int = 0) -> Optional[float]:
-    """Parse Codex's account-local reset clock as the next UTC occurrence."""
-    try:
-        with open(log_path, "rb") as stream:
-            stream.seek(max(0, since_offset))
-            tail = stream.read()[-16384:].decode("utf-8", errors="replace")
-    except OSError:
-        return None
-    match = re.search(
-        r"try again at\s+(?:(?P<month>[A-Za-z]{3,9})\s+"
-        r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,\s+(?P<year>\d{4})\s+)?"
-        r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM)\b",
-        tail, re.I)
-    if not match:
-        return None
-    hour, minute = int(match.group("hour")), int(match.group("minute"))
-    if not 1 <= hour <= 12 or not 0 <= minute <= 59:
-        return None
-    hour = hour % 12 + (12 if match.group("ampm").lower() == "pm" else 0)
-    if match.group("month"):
-        try:
-            month = datetime.datetime.strptime(match.group("month")[:3].title(), "%b").month
-            return datetime.datetime(int(match.group("year")), month,
-                                     int(match.group("day")), hour, minute,
-                                     tzinfo=datetime.timezone.utc).timestamp()
-        except ValueError:
-            return None
-    day = datetime.datetime.fromtimestamp(failed_at, datetime.timezone.utc)
-    reset = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if reset.timestamp() <= failed_at:
-        reset += datetime.timedelta(days=1)
-    return reset.timestamp()
 
 
 def _codex_quota_cache() -> dict:
@@ -1795,116 +1717,6 @@ def _codex_quota_ready(marker: dict, cache: dict, now: float) -> bool:
                   and isinstance(previous, str) and bool(previous) and current != previous)
                  or (isinstance(remaining, (int, float)) and not isinstance(remaining, bool)
                      and remaining > 0)))
-
-
-def _detect_transient_error_in_log(
-    log_path: str,
-    tail_bytes: int = 16384,
-    since_offset: int = 0,
-    *,
-    agent: str,
-) -> Optional[str]:
-    """Scan the tail of a dispatch log for upstream errors worth distinguishing.
-
-    ``dispatch_{role}.log`` is one continuously-appended file shared by every
-    task dispatched for that role, not one file per task. A blind tail scan
-    can therefore pick up an error signature left over from a *previous*
-    task's failure (e.g. a quota message a few hundred bytes before EOF) and
-    misattribute it to the current task, wrongly marking a retryable failure
-    (or even a clean run) as the older task's non-retryable reason. Pass the
-    file offset captured right after writing this task's ``TASK <id>``
-    marker as ``since_offset`` so the scan never looks earlier than where
-    this task's own output begins (#200).
-
-    Returns one of:
-      retryable (transient; requeue makes sense in a minute or two):
-        - ``claude_429``                — Anthropic temp throttle (api_error_status:429)
-        - ``claude_throttle``           — "Server is temporarily limiting requests"
-        - ``gemini_capacity``           — google MODEL_CAPACITY_EXHAUSTED (preview)
-        - ``gemini_resource_exhausted`` — generic 429 RESOURCE_EXHAUSTED
-        - ``codex_capacity``            — openai "Selected model is at capacity" (#196)
-        - ``agy_timeout``               — agy "Error: timeout waiting for response"
-          (#199); backend model-call timeout, distinct from the account-level
-          quota cap (agy_quota_exhausted below)
-        - ``agy_subscriber_lag``        — agy "the connection to the agent was
-          interrupted ... subscriber fell behind updates, stalled for Xs"
-          (#205); a client-side streaming/backpressure hiccup between agy
-          and its backend, distinct from a model-call timeout — previously
-          fell through undetected to a bare ``exit_N`` with no retry
-      non-retryable (clear reason; no point in immediate retry):
-        - ``gemini_quota_exhausted``    — daily user quota hit; reset 2-3h away
-        - ``gemini_ineligible_tier``    — oauth-personal serving-disabled (#195)
-        - ``agy_quota_exhausted``       — agy "Individual quota reached" (#197);
-          rolling per-account cap, log states its own reset countdown
-      ``None`` if no transient signature is present.
-    """
-    try:
-        with open(log_path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            start = max(0, size - tail_bytes, since_offset)
-            starts_mid_line = False
-            if agent == "codex" and start > 0 and start < size:
-                f.seek(start - 1)
-                starts_mid_line = f.read(1) != b"\n"
-            f.seek(min(start, size))
-            raw_tail = f.read()
-            if starts_mid_line:
-                raw_tail = raw_tail.partition(b"\n")[2]
-            tail = raw_tail.decode("utf-8", errors="replace")
-    except OSError:
-        return None
-    if agent == "codex":
-        # Stream JSON echoes commands and agent prose. Only error events are
-        # provider diagnostics; retain plain stderr lines as before.
-        filtered = []
-        for line in tail.splitlines():
-            try:
-                event = json.loads(line)
-            except (TypeError, ValueError):
-                if (line.lstrip().startswith("[codex error]")
-                        or not line.lstrip().startswith(("{", "["))):
-                    filtered.append(line)
-            else:
-                if isinstance(event, dict):
-                    item = event.get("item")
-                    error_event = event.get("type") in ("error", "turn.failed")
-                    error_item = (isinstance(item, dict)
-                                  and item.get("type") in ("error", "error_message"))
-                    if error_event or error_item:
-                        source = event if error_event else item
-                        for value in (source.get("message"), source.get("error")):
-                            if isinstance(value, dict):
-                                value = value.get("message")
-                            if isinstance(value, str):
-                                filtered.append(value)
-        tail = "\n".join(filtered)
-    # Order matters: more specific markers first (QUOTA before RESOURCE since
-    # QUOTA_EXHAUSTED responses also contain "RESOURCE_EXHAUSTED").
-    if agent == "gemini" and ("QUOTA_EXHAUSTED" in tail or "Your quota will reset" in tail):
-        return "gemini_quota_exhausted"
-    if agent == "codex" and ("you've hit your usage limit" in tail.lower()
-                             or "you’ve hit your usage limit" in tail.lower()):
-        return "codex_quota_exhausted"
-    if agent == "gemini" and ("IneligibleTierError" in tail):
-        return "gemini_ineligible_tier"
-    if agent in ("gemini", "agy") and ("Individual quota reached" in tail):
-        return "agy_quota_exhausted"
-    if agent == "claude" and ('"api_error_status":429' in tail):
-        return "claude_429"
-    if agent == "claude" and ("Server is temporarily limiting requests" in tail):
-        return "claude_throttle"
-    if agent == "gemini" and ("MODEL_CAPACITY_EXHAUSTED" in tail):
-        return "gemini_capacity"
-    if agent == "gemini" and ("RESOURCE_EXHAUSTED" in tail):
-        return "gemini_resource_exhausted"
-    if agent == "codex" and ("Selected model is at capacity" in tail):
-        return "codex_capacity"
-    if agent in ("gemini", "agy") and ("Error: timeout waiting for response" in tail):
-        return "agy_timeout"
-    if agent in ("gemini", "agy") and ("subscriber fell behind updates" in tail):
-        return "agy_subscriber_lag"
-    return None
 
 
 #: G12 / D6 `dispatch_channel` for a dispatcher subprocess, by agent.
@@ -2527,50 +2339,6 @@ def agy_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
     return (size > cap * 1024 * 1024, info)
 
 
-#: agy surfaces only the downstream symptom; the 429 stays in its own log.
-_AGY_QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|Individual quota reached", re.I)
-_AGY_LAG_RE = re.compile(r"subscriber fell behind updates", re.I)
-
-
-def agy_quota_correlated(since: float, until: float, *, home=None) -> bool:
-    """Did a 429 precede a subscriber-lag kill inside this task's window?
-
-    #232 measured that where both signals appear, the quota error comes
-    first in 1,412 of 1,442 cases (98%) — the lag is the mask, not the
-    cause. agent_crew never sees the 429 because it lives only in agy's own
-    ``antigravity-cli/log/cli-*.log``.
-
-    ⚠️Deliberately conservative on three axes, because a false "quota"
-      verdict would silently strip a genuinely retriable failure of its
-      retries:
-      - only logs modified inside ``[since, until]`` are considered, so
-        another task's quota failure is never attributed to this one;
-      - the 429 must appear *before* the lag line in the same file;
-      - anything unreadable returns False, preserving today's behaviour.
-    """
-    try:
-        d = _agy_home(home) / "antigravity-cli" / "log"
-        if not d.is_dir():
-            return False
-        for f in d.glob("cli-*.log"):
-            try:
-                mtime = f.stat().st_mtime
-                if not (since <= mtime <= until):
-                    continue
-                text = f.read_text(errors="replace")
-            except Exception:  # noqa: BLE001
-                continue
-            lag = _AGY_LAG_RE.search(text)
-            if not lag:
-                continue
-            quota = _AGY_QUOTA_RE.search(text)
-            if quota and quota.start() < lag.start():
-                return True
-        return False
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def _cap_gemini_session_size(cwd: str, max_mb: int = 50) -> None:
     """Archive gemini-cli session files larger than ``max_mb`` for ``cwd``.
 
@@ -2786,21 +2554,6 @@ def _pane_is_thinking(capture: str) -> bool:
     """
     tail = "\n".join(capture.splitlines()[-_THINKING_TAIL_LINES:])
     return bool(_THINKING_RE.search(tail))
-
-
-def _pane_has_usage_limit(pane_id: str) -> bool:
-    """Return True when the pane capture contains a rate-limit / usage-limit
-    message, meaning the agent is blocked and can't accept new tasks (#151)."""
-    try:
-        r = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", pane_id],
-            capture_output=True, text=True,
-        )
-        if r.returncode != 0:
-            return False
-        return is_rate_limit_error(r.stdout)
-    except Exception:
-        return False
 
 
 # Visible strings in pane content that indicate an agent CLI is running.
@@ -3384,13 +3137,14 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, pr
         f"\"summary\":\"...\",\"verdict\":{completed_verdict},\"findings\":[],\"pr_number\":null}}'\n"
         f"\n"
         f"2) STREAM/API TIMEOUT (partial response, can't recover) — POST\n"
-        f"   status=\"failed\". The fallback policy will reroute this task\n"
-        f"   to the next agent in the chain automatically:\n"
+        f"   status=\"failed\" with a typed timeout so the coordinator can\n"
+        f"   retry or hold according to the current policy:\n"
         f"  curl -sS -X POST http://127.0.0.1:{port}/tasks/{task_id}/result \\\n"
         f"{identity_header}"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"failed\","
         f"\"summary\":\"API stream timeout — partial response, no recovery\","
+        f"\"error_info\":{{\"kind\":\"timeout\"}},"
         f"\"verdict\":null,\"findings\":[],\"pr_number\":null}}'\n"
         f"\n"
         f"3) STILL WORKING — ignore this nudge. The next heartbeat will see\n"
@@ -4155,7 +3909,6 @@ def create_app(
         info = result.error_info if isinstance(result.error_info, dict) else {}
         reason = str(info.get("reason") or "failed")
         provider_not_run = (task_type == "test" and info.get("final")
-                            and not result.findings
                             and handle_test_result(result) == "not_run")
         detail = (f"failed_task={task_id} reason={reason} "
                   f"{'test not run (provider); ' if provider_not_run else ''}"
@@ -4911,12 +4664,6 @@ def create_app(
         if not guarded_pane_id:
             return
 
-        # #308: a pane usage-limit signal follows the same role policy as a
-        # cooldown; never substitute another provider into this role.
-        if _pane_has_usage_limit(guarded_pane_id):
-            _hold_or_skip_provider_limit(task, _target_agent, None)
-            return
-
         # #158: if pane shows a bare shell prompt (agent CLI crashed), requeue
         # the task instead of pushing bash commands into it.
         if _pane_has_bash_prompt(guarded_pane_id):
@@ -5418,6 +5165,7 @@ def create_app(
                 # #167: pass structured error_info so post-mortem queries have
                 # machine-readable data, not just the free-form summary text.
                 watchdog_error_info = {
+                    "kind": FailureKind.TIMEOUT.value,
                     "reason": "watchdog_timeout",
                     "idle_seconds": round(idle_for, 1),
                     "threshold_seconds": effective_timeout,
@@ -5444,37 +5192,14 @@ def create_app(
                 except Exception:
                     logger.warning(f"watchdog: failed to interrupt pane {pane_id}")
                 if tt is not None:
-                    # Reuse the rate-limit fallback hook so a stuck pane gets
-                    # routed to the next agent in the chain instead of just
-                    # falling through to the same role's pending queue. The
-                    # summary above contains "watchdog timeout" / "pane idle"
-                    # patterns that `is_rate_limit_error` recognizes (#85).
-                    synthetic_result = TaskResult(
-                        task_id=task_id,
-                        status="failed",
-                        summary=summary,
-                        verdict=None,
-                        findings=[],
-                        pr_number=None,
-                    )
-                    handled = False
-                    try:
-                        handled = _auto_fallback_failed_task(
-                            task_id, synthetic_result, tt
-                        )
-                    except Exception:
-                        logger.exception(
-                            f"watchdog: fallback hook raised for {task_id}"
-                        )
-                    if not handled:
-                        role = _TYPE_TO_ROLE.get(tt)
-                        if role:
-                            try:
-                                _try_push_next(role)
-                            except Exception:
-                                logger.exception(
-                                    f"watchdog: failed to push next task for role {role}"
-                                )
+                    role = _TYPE_TO_ROLE.get(tt)
+                    if role:
+                        try:
+                            _try_push_next(role)
+                        except Exception:
+                            logger.exception(
+                                f"watchdog: failed to push next task for role {role}"
+                            )
             elif idle_for >= reminder_seconds and task_id not in reminded_task_ids:
                 guarded_pane_id = _guard_tmx_push(task_id, pane_id, require_agent=False)
                 if not guarded_pane_id:
@@ -5826,7 +5551,8 @@ def create_app(
                 "prep_retry_count": int(ctx.get("prep_retry_count") or 0)}
 
     def _fail_if_active(task_id: str, reason: str, *, status: str = "failed",
-                        details: Optional[dict] = None) -> bool:
+                        details: Optional[dict] = None,
+                        kind: Optional[str] = None) -> bool:
         """End a task only when it is still in_progress (agent may have submitted first).
 
         `status` distinguishes two things the dispatcher used to conflate (#265):
@@ -5849,7 +5575,9 @@ def create_app(
                 terminal_result = TaskResult(
                     task_id=task_id, status=status, summary=summary,
                     error_info={"reason": reason, "final": status == "failed",
-                                **(details or {})})
+                                **(details or {}),
+                                "kind": kind or (FailureKind.TIMEOUT.value if status == "timed_out"
+                                                 else FailureKind.AGENT_FAILED.value)})
                 # The list above is only a snapshot; a worker result can land
                 # before this write. CAS on in_progress so it is never
                 # overwritten (#884).
@@ -7135,34 +6863,13 @@ def create_app(
                     pass
                 logger.error("dispatcher: %s task=%s last_output_age=%.1fs",
                              _timeout_reason, task.task_id, _last_output_age)
-            # Inspect the dispatch log tail for upstream errors — applies to
-            # both clean exit AND timeout (#190). Claude can return rc=0 with
-            # api_error_status:429; gemini-cli often hangs on retry loops past
-            # the 15-minute timeout. Both need the same routing decision.
-            _transient = _detect_transient_error_in_log(
-                log_path, since_offset=_task_log_start_offset, agent=agent
-            )
-            # #236: `subscriber fell behind updates` is usually a MASK. agy
-            # hits 429, its internal retry stalls the agent_state pubsub
-            # subscriber, agy kills the subscriber, and only that downstream
-            # line reaches us. #232 measured 0/414 recoveries for this tag —
-            # retrying it 3 more times cost 1,375 wasted attempts and ~225s
-            # median added time-to-fail, while `agy_quota_exhausted` is
-            # already correctly classified non-retriable.
-            #
-            # ⚠️Only reclassify when a 429 is actually correlated in agy's own
-            #   log inside this task's window. #232 could not attribute ~25%
-            #   of lag events, and those keep the retriable tag — we do not
-            #   get to claim every lag event is a quota event.
-            if _transient == "agy_subscriber_lag" and agy_quota_correlated(
-                _task_started_wall, time.time() + 1.0
-            ):
-                logger.warning(
-                    "dispatcher: task=%s reported agy_subscriber_lag but agy's "
-                    "own log shows a preceding 429 — reclassifying as "
-                    "agy_quota_exhausted (non-retriable) (#236)", task.task_id,
-                )
-                _transient = "agy_quota_exhausted"
+            # The provider adapter reads only JSON event fields from this
+            # attempt. Diagnostic prose and echoed task text carry no policy.
+            _provider_failure = provider_failure_from_log(
+                log_path, since_offset=_task_log_start_offset, agent=agent)
+            _failure_kind = failure_kind(_provider_failure)
+            if _provider_failure:
+                q().annotate_error_info(task.task_id, _provider_failure)
             # #202: best-effort provider_session_id capture + compaction
             # detection, scoped to just this task's own output (same
             # since_offset technique as #200, so a previous task's leftover
@@ -7238,7 +6945,7 @@ def create_app(
                                          "timeout_limit_s": (timeout_secs if _timeout_reason == "dispatcher_timeout"
                                                              else _idle_timeout_secs),
                                          **_codex_no_result_details})
-            elif _transient in _PROVIDER_CAPACITY_TAGS:
+            elif _failure_kind == FailureKind.CAPACITY.value:
                 # #581: an external outage, not a task failure. Cool down and
                 # requeue, forever; never the transient budget, never another
                 # provider or model (owner policy: codex exhaustion is HOLD).
@@ -7248,20 +6955,20 @@ def create_app(
                     _delay = _capacity_cooldown_s(_cap_n)
                     _cap = q().defer_provider_capacity(
                         task.task_id, delay_s=_delay,
-                        blocked_after_s=_CAPACITY_BLOCKED_AFTER_S, provider_tag=_transient)
+                        blocked_after_s=_CAPACITY_BLOCKED_AFTER_S, provider_tag=_provider_failure["provider_code"])
                     if _cap is not None and _cap["readmit"]:
-                        _succ = _readmit_provider_capacity(task.task_id, _cap, _delay, _transient)
+                        _succ = _readmit_provider_capacity(task.task_id, _cap, _delay, _provider_failure["provider_code"])
                         logger.warning(
                             "dispatcher: provider_capacity (%s) on task=%s — receipt spent; "
                             "re-admitted as %s, not before +%.0fs",
-                            _transient, task.task_id, _succ, _delay)
+                            _provider_failure["provider_code"], task.task_id, _succ, _delay)
                     if _cap is not None:
                         _blocked_for = time.time() - _cap["since"]
                         (logger.error if _blocked_for >= _CAPACITY_BLOCKED_AFTER_S
                          else logger.warning)(
                             "dispatcher: provider_capacity (%s) on task=%s — requeued, "
                             "not before +%.0fs (refusal %d, blocked %.0fs)%s",
-                            _transient, task.task_id, _delay, _cap["count"], _blocked_for,
+                            _provider_failure["provider_code"], task.task_id, _delay, _cap["count"], _blocked_for,
                             " — provider_capacity_blocked" if _cap["blocked"] else "")
                     _terminal = False
                     return
@@ -7269,12 +6976,12 @@ def create_app(
                     logger.exception(
                         f"dispatcher: capacity requeue failed for task={task.task_id}")
                 _fail_if_active(task.task_id, "provider_capacity_requeue_failed")
-            elif agent == "codex" and _transient == "codex_quota_exhausted":
+            elif agent == "codex" and _failure_kind == FailureKind.PROVIDER_LIMIT.value:
                 failed_at = time.time()
                 cache = _codex_quota_cache()
-                reset_at = _codex_quota_reset_at(
-                    log_path, failed_at=_task_started_wall,
-                    since_offset=_task_log_start_offset)
+                _retry_after = _provider_failure.get("retry_after")
+                reset_at = (failed_at + _retry_after
+                            if isinstance(_retry_after, (int, float)) else None)
                 if q().park_codex_quota(
                     task.task_id, failed_at=failed_at, reset_at=reset_at,
                     account_fingerprint=cache.get("account_fingerprint")):
@@ -7283,14 +6990,14 @@ def create_app(
                     _terminal = False
                     return
                 _fail_if_active(task.task_id, "codex_quota_park_failed")
-            elif _transient in _TRANSIENT_RETRIABLE_TAGS:
+            elif _failure_kind in {FailureKind.TRANSIENT.value, FailureKind.TIMEOUT.value}:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
                 if _n <= _MAX_TRANSIENT_RETRY:
                     try:
                         q().requeue(task.task_id)
                         logger.warning(
-                            f"dispatcher: transient {_transient} on "
+                            f"dispatcher: transient {_provider_failure['provider_code']} on "
                             f"task={task.task_id} — requeued "
                             f"(attempt {_n}/{_MAX_TRANSIENT_RETRY})"
                         )
@@ -7302,25 +7009,33 @@ def create_app(
                         )
                 else:
                     logger.error(
-                        f"dispatcher: transient {_transient} on "
+                        f"dispatcher: transient {_provider_failure['provider_code']} on "
                         f"task={task.task_id} — giving up after "
                         f"{_MAX_TRANSIENT_RETRY} retries"
                     )
-                _fail_if_active(task.task_id, f"transient_{_transient}_max_retries")
-            elif _transient in _TRANSIENT_NONRETRIABLE_TAGS:
+                _fail_if_active(task.task_id, "transient_max_retries",
+                                details=_provider_failure, kind=_failure_kind)
+            elif _failure_kind == FailureKind.PROVIDER_LIMIT.value:
                 # Quota / tier failures — won't recover in minutes, no point
                 # retrying. Surface the cause clearly so operators see why
                 # the task died (#192).
                 logger.error(
-                    f"dispatcher: {_transient} on task={task.task_id} — "
+                    f"dispatcher: {_provider_failure['provider_code']} on task={task.task_id} — "
                     "failing without retry (quota reset / migration required)"
                 )
-                _fail_if_active(task.task_id, _transient)
+                _fail_if_active(task.task_id, _failure_kind,
+                                details=_provider_failure, kind=_failure_kind)
+            elif _failure_kind == FailureKind.CONFIG_ERROR.value:
+                _fail_if_active(task.task_id, "config_error",
+                                status="needs_human" if task.task_type == "test" else "failed",
+                                details=_provider_failure, kind=_failure_kind)
+            elif _failure_kind == FailureKind.AGENT_FAILED.value:
+                _fail_if_active(task.task_id, "provider_error",
+                                details=_provider_failure, kind=_failure_kind)
             elif proc.returncode != 0:
                 if task.task_type == "test":
-                    _config_error = _provider_zero_turn_config_error(agent, _task_log_tail)
                     _silent_exit = not _task_log_tail.strip()
-                    _reason = "config_error" if _config_error else "provider_test_not_run"
+                    _reason = "provider_test_not_run"
                     # A completely silent child crash is an execution failure.
                     # Keep that terminal status for attribution, but mark its
                     # result as not-run so a CLI loop cannot treat it as a test
@@ -8214,7 +7929,7 @@ def create_app(
             if (
                 os.getenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", "1") == "0"
                 and task_type == "implement"
-                and not (isinstance(error_info, dict) and error_info.get("reason"))
+                and not failure_kind(error_info)
             ):
                 logger.info(
                     "_auto_retry_failed_task: skipping retry for %s: agent-reported implement failure; retry would repeat the same work",
@@ -8236,7 +7951,7 @@ def create_app(
                     f"Task {task_id} failed (status={result.status}), "
                     f"but DB retry_attempt={db_retry_attempt} >= MAX_RETRIES={MAX_RETRIES}"
                 )
-                if has_rate_limit_signal(result.summary, result.findings):
+                if failure_kind(result.error_info) == FailureKind.PROVIDER_LIMIT.value:
                     # No cross-provider fallback (#308). Preserve the old
                     # fallback chain's durable exhaustion signal instead of
                     # letting the last same-role retry disappear into a log.
@@ -9476,7 +9191,8 @@ def create_app(
                         _cpack.build_episode(
                             _attr,
                             {"summary": result.summary, "findings": result.findings,
-                             "pr_number": result.pr_number},
+                             "pr_number": result.pr_number,
+                             "error_info": result.error_info},
                             issue=_ep_ctx.get("issue"),
                         ),
                     )
@@ -9567,15 +9283,11 @@ def create_app(
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
             _try_push_discuss(agent)
         else:
-            # Failure handling: rate-limit → reroute via fallback chain (#81),
-            # otherwise auto-retry the same role up to MAX_RETRIES.
+            # Failure handling uses typed evidence for same-role retry or hold.
             # #772: re-running a deterministic script repeats the same verdict.
             _test_verdict = handle_test_result(result) if task_type == "test" else None
             _test_info = result.error_info if isinstance(result.error_info, dict) else {}
-            _script_failures = (_test_info.get("script_test") or {}).get("new_failures") if isinstance(
-                _test_info.get("script_test"), dict) else None
-            if (task_type == "test" and _test_verdict == "failed"
-                    and (result.findings or _script_failures)):
+            if task_type == "test" and _test_verdict == "failed":
                 logger.info(f"POST /tasks/{task_id}/result: actionable test failure; enqueueing fix")
                 _fix_id = _auto_enqueue_fix(task_id, repo=str((ctx or {}).get("repo") or ""))
                 _round = int((ctx or {}).get("fix_round") or 0) + 1

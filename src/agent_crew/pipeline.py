@@ -5,7 +5,7 @@ When a task gets a result submitted, three follow-up flows may fire:
   1. ``auto_enqueue_review``           impl ✓  → enqueue a review task
   2. ``auto_enqueue_test``             review approve → enqueue a test task
   3. ``auto_enqueue_fix``              review request_changes / test failure → fix
-  4. ``auto_fallback_failed_task``     rate-limit ✗ → same-role retry
+  4. ``auto_fallback_failed_task``     compatibility hook (no substitution)
 
 Both transports — HTTP ``submit_result`` and MCP ``submit_result`` — must
 trigger these so the pipeline doesn't stall after the first stage when an
@@ -33,7 +33,6 @@ from typing import Optional
 
 from agent_crew.fallback import (
     default_agent_for_role,
-    has_rate_limit_signal,
 )
 from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
@@ -2840,7 +2839,4 @@ def auto_fallback_failed_task(
     task is held by dispatch while the role's provider has an active cooldown.
     The legacy signature remains for HTTP and MCP callers.
     """
-    if has_rate_limit_signal(result.summary, result.findings):
-        logger.info("auto_fallback: provider substitution disabled for %s (%s)",
-                    task_id, task_type)
     return False

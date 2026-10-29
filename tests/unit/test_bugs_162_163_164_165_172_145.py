@@ -129,7 +129,6 @@ class TestMcpAutoClearSkipped:
         with TestClient(app) as client:
             with patch("agent_crew.server._pane_clear_context", side_effect=clear_calls.append) as mock_clear, \
                  patch("agent_crew.server._pane_alive_for_push", return_value=True), \
-                 patch("agent_crew.server._pane_has_usage_limit", return_value=False), \
                  patch("agent_crew.server._pane_has_task", return_value=False):
                 client.post(
                     "/tasks",
@@ -405,7 +404,6 @@ class TestMcpNoClientAutoFail:
         with TestClient(app):
             with patch("agent_crew.server._pane_dismiss_permission_prompt"), \
                  patch("agent_crew.server._pane_alive_for_push", return_value=True), \
-                 patch("agent_crew.server._pane_has_usage_limit", return_value=False), \
                  patch("agent_crew.server._pane_has_task", return_value=False):
                 result = app.state.watchdog_tick(time.time())
 

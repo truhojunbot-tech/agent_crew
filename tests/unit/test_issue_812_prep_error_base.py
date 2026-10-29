@@ -37,7 +37,6 @@ def _repo(tmp_path):
 def _app(tmp_path, monkeypatch, worker, pushed, *, role="implementer"):
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__DEMO", "off")
-    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda *a, **kw: False)
     monkeypatch.setattr(sv, "_resolve_tmux_pane_target", lambda pane: pane)
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr(sv, "_pane_process_kind", lambda pane: ("agent", "codex"))

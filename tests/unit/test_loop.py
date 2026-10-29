@@ -111,6 +111,7 @@ def test_u_l08_handle_test_result_failed():
         task_id="t-002",
         status="failed",
         summary="3 tests failed",
+        error_info={"kind": "test_failure"},
     )
     assert handle_test_result(result) == "failed"
 

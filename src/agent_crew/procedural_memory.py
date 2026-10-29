@@ -391,11 +391,6 @@ PATTERN_REPEAT_FAILURE = "repeated_failure_signature"
 PATTERN_NONRETRIABLE_RETRY = "retried_nonretriable_failure"
 PATTERN_AC_OMISSION = "review_without_ac"
 
-#: Runtime/provider incidents are not project procedures (#240 non-goal).
-_PROVIDER_FAILURE_RE = re.compile(
-    r"quota|rate.?limit|subscriber|transient|timeout|capacity", re.IGNORECASE)
-
-
 def extract_candidates(episodes: list, *, min_repeats: int = 2) -> list:
     """Propose lessons from repeated evidence, never from one-offs.
 
@@ -415,7 +410,9 @@ def extract_candidates(episodes: list, *, min_repeats: int = 2) -> list:
     for sig, group in sorted(by_sig.items()):
         if len(group) < min_repeats:
             continue
-        provider = bool(_PROVIDER_FAILURE_RE.search(sig))
+        provider = any(e.get("failure_kind") in {
+            "provider_limit", "capacity", "transient", "config_error", "timeout",
+        } for e in group)
         out.append(CandidateLesson(
             lesson_id=_mk_id("lesson", sig),
             title=f"Recurring failure: {sig}",

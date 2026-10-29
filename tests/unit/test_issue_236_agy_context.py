@@ -24,10 +24,8 @@ import pytest
 pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 
 from agent_crew.server import (
-    _detect_transient_error_in_log,
     agy_context_exceeds_cap,
     agy_conversation_size,
-    agy_quota_correlated,
 )
 
 
@@ -152,87 +150,6 @@ def test_cap_disabled_by_zero(agy_home):
 
     over, _ = agy_context_exceeds_cap("/wt/gemini", max_mb=0, home=agy_home)
     assert over is False
-
-
-# ── 3. quota correlation behind the mask ──────────────────────────────
-
-
-def _agy_log(agy_home, name, body, mtime=None):
-    p = agy_home / "antigravity-cli" / "log" / name
-    p.write_text(body)
-    if mtime:
-        os.utime(p, (mtime, mtime))
-    return p
-
-
-_LAG = ("W pubsub.go:78] pubsub: Publish killing slow subscriber \"x\": "
-        "subscriber fell behind updates, stalled for 6s\n")
-_429 = ("I retry.go:44] GenerateFullResponseWithRetry: attempt 1 failed "
-        "(RESOURCE_EXHAUSTED (code 429): Individual quota reached.)\n")
-
-
-def test_quota_is_correlated_when_429_precedes_the_lag(agy_home):
-    """★The 98%-of-the-time shape from #232: 429 first, lag kill after."""
-    now = time.time()
-    _agy_log(agy_home, "cli-1.log", _429 + _LAG, mtime=now)
-
-    assert agy_quota_correlated(now - 60, now + 60, home=agy_home) is True
-
-
-def test_no_correlation_when_the_log_has_no_429(agy_home):
-    """⚠️The ~25% #232 could not attribute. These must stay distinguishable
-    — we do not get to claim every lag event is a quota event."""
-    now = time.time()
-    _agy_log(agy_home, "cli-1.log", _LAG, mtime=now)
-
-    assert agy_quota_correlated(now - 60, now + 60, home=agy_home) is False
-
-
-def test_a_429_after_the_lag_does_not_count(agy_home):
-    """⛔Order matters. A later, unrelated 429 is not this task's cause."""
-    now = time.time()
-    _agy_log(agy_home, "cli-1.log", _LAG + _429, mtime=now)
-
-    assert agy_quota_correlated(now - 60, now + 60, home=agy_home) is False
-
-
-def test_logs_outside_the_task_window_are_ignored(agy_home):
-    """⛔Another task's quota failure must not be attributed to this one."""
-    now = time.time()
-    _agy_log(agy_home, "cli-old.log", _429 + _LAG, mtime=now - 86400)
-
-    assert agy_quota_correlated(now - 60, now + 60, home=agy_home) is False
-
-
-def test_correlation_is_fail_soft_without_agy_home(tmp_path):
-    now = time.time()
-    assert agy_quota_correlated(now - 60, now + 60, home=tmp_path / "nope") is False
-
-
-# ── 4. the classifier keeps the distinction ───────────────────────────
-
-
-def _dispatch_log(tmp_path, body):
-    p = tmp_path / "dispatch_tester.log"
-    p.write_text(body)
-    return str(p)
-
-
-def test_lag_without_correlation_stays_lag(tmp_path):
-    """The retriable path is retained for the genuinely-unattributed case."""
-    log = _dispatch_log(tmp_path,
-        "Error: the connection to the agent was interrupted before the "
-        "response finished: subscriber fell behind updates, stalled for 6s")
-    assert _detect_transient_error_in_log(log, agent="gemini") == "agy_subscriber_lag"
-
-
-def test_surfaced_quota_still_wins_over_lag(tmp_path):
-    """⛔Pre-existing precedence must not regress: when agy DOES surface the
-    quota error, it is the cause regardless of any lag line."""
-    log = _dispatch_log(tmp_path,
-        "Error: Individual quota reached. Please upgrade your subscription.\n"
-        "subscriber fell behind updates, stalled for 6s")
-    assert _detect_transient_error_in_log(log, agent="gemini") == "agy_quota_exhausted"
 
 
 # ── 5. the cap event must mean the cap tripped (review-99ad8ad0) ──────

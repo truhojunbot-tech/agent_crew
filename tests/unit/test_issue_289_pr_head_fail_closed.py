@@ -352,7 +352,6 @@ def _push_fixture(tmp_path, monkeypatch, pr_repo, *, head=None):
     ]}))
     monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
     monkeypatch.setattr(sv, "_resolve_pr_head_branch", lambda *a, **k: head)
-    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda *a, **k: False)
 
     db = str(tmp_path / "push.db")
     push = _Push()
@@ -409,7 +408,6 @@ def test_an_ordinary_prep_failure_still_continues_on_the_push_path(tmp_path,
         {"role": "reviewer", "agent": "claude", "worktree": str(wt)},
     ]}))
     monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
-    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda *a, **k: False)
     monkeypatch.setattr(sv, "_prepare_worktree_for_task",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("git exploded")))
 

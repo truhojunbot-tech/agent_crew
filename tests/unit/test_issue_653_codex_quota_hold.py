@@ -4,15 +4,14 @@ import json
 import os
 import pytest
 import time
-from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
-from agent_crew.server import (_detect_transient_error_in_log,
-                               _codex_quota_reset_at, create_app)
+from agent_crew.failure_kind import provider_failure_from_log
+from agent_crew.server import create_app
 
 
 def _queued(tmp_path, task_id):
@@ -37,39 +36,19 @@ def _marker(queue, task_id):
     return queue.get_task(task_id).error_info["codex_quota_hold"]
 
 
-def _real_codex_quota_stream(reset="3:10 PM"):
-    message = "You" + "\u2019" + "ve hit your " + "usage " + f"limit. Try again at {reset}."
-    return "\n".join((
-        "[codex error] " + message,
-        json.dumps({"type": "error", "message": message}, ensure_ascii=False),
-        json.dumps({"type": "turn.failed", "error": {"message": message}},
-                   ensure_ascii=False),
-    )) + "\n"
+def _real_codex_quota_stream(reset_after=7680):
+    return json.dumps({"type": "error", "code": "CODEX_QUOTA_EXHAUSTED",
+                       "retry_after": reset_after}) + "\n"
 
 
-@pytest.mark.parametrize("line_index", range(3))
-def test_each_real_codex_stream_shape_is_classified(tmp_path, line_index):
+def test_codex_quota_requires_structured_code(tmp_path):
     log = tmp_path / "dispatch.log"
-    log.write_text(_real_codex_quota_stream().splitlines()[line_index] + "\n")
-    assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
-
-
-def test_real_codex_message_is_classified_and_reset_parsed(tmp_path):
-    log = tmp_path / "dispatch.log"
+    log.write_text("[codex error] You've hit your usage limit.\n")
+    assert provider_failure_from_log(str(log), agent="codex") is None
     log.write_text(_real_codex_quota_stream())
-    assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
-    # 2026-10-09 13:02 UTC -> 15:10 UTC on the same day.
-    failed_at = 1791550920.0
-    assert _codex_quota_reset_at(str(log), failed_at=failed_at) == 1791558600.0
-
-
-def test_dated_codex_reset_line_uses_the_stated_calendar_day(tmp_path):
-    log = tmp_path / "dated-dispatch.log"
-    log.write_text(_real_codex_quota_stream("Sep 30th, 2026 4:48 PM"))
-    failed_at = datetime(2026, 9, 24, 13, 2, tzinfo=timezone.utc).timestamp()
-    reset_at = datetime(2026, 9, 30, 16, 48, tzinfo=timezone.utc).timestamp()
-    assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
-    assert _codex_quota_reset_at(str(log), failed_at=failed_at) == reset_at
+    failure = provider_failure_from_log(str(log), agent="codex")
+    assert failure == {"kind": "provider_limit",
+                       "provider_code": "codex_quota_exhausted", "retry_after": 7680}
 
 
 def test_fresher_cache_releases_one_probe_then_rest_without_duplicates(tmp_path, monkeypatch):

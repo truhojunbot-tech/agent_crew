@@ -1,72 +1,17 @@
-"""Agent rate-limit auto-fallback policy (Issue #81).
+"""Legacy fallback-chain configuration and role defaults.
 
-When a task comes back ``status="failed"`` because the agent's provider hit
-its rate limit, single-agent retry just rebroadcasts the same problem. The
-fallback policy reroutes the same task to the next agent in a configurable
-chain (claude → codex → gemini, etc.) and only escalates once the chain is
-exhausted.
-
-This module is deliberately stateless and pure — `server.py` calls these
-functions inside the existing ``submit_result`` handler. Tests can drive
-each function directly without spinning up FastAPI.
+Provider substitution is disabled by the current routing policy. These
+helpers remain for reading existing configuration and resolving role defaults.
 """
 import json
 import os
-import re
 from typing import Any, Optional
-
-# Failover signals: any failure summary that means "this agent can't make
-# forward progress, try a different one." Rate-limit messages are the bulk
-# of these (alpha_engine #756 / #759). Watchdog-timeout summaries (#85)
-# also qualify — a stuck pane after API stream-timeout recovers fastest by
-# routing the task to a fresh agent rather than retrying the same one.
-# Compiled case-insensitively.
-_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
-    r"usage limit",          # codex / openai
-    r"rate[- ]?limit",       # claude / generic
-    r"quota exceeded",       # gemini / google
-    r"5[- ]hour limit",      # claude (rolling-window message)
-    r"max requests",         # generic
-    r"too many requests",    # http 429
-    r"resource[_ ]exhausted",  # google "resource_exhausted"
-    r"insufficient[_ ]quota",  # openai
-    r"stream[ _]idle[ _]timeout",  # claude code "API Stream idle timeout"
-    r"stream[ _]timeout",          # generic streaming-API timeout
-    r"watchdog timeout",           # agent_crew force_fail summary (#85)
-    r"pane idle",                  # alternate watchdog phrasing
-    r"partial response",           # claude code partial-response state
-)
-
-_RATE_LIMIT_RE = re.compile("|".join(_RATE_LIMIT_PATTERNS), re.IGNORECASE)
 
 DEFAULT_CHAINS: dict[str, list[str]] = {
     "implement": ["claude", "codex"],
     "review":    ["codex", "claude"],
     "test":      ["script"],
 }
-
-
-def is_rate_limit_error(text: Optional[str]) -> bool:
-    """Return True if `text` matches any known rate-limit signature."""
-    if not text:
-        return False
-    return _RATE_LIMIT_RE.search(text) is not None
-
-
-def has_rate_limit_signal(summary: Optional[str], findings: Optional[list]) -> bool:
-    """Check whether either the summary or any finding indicates a rate-limit hit."""
-    if is_rate_limit_error(summary):
-        return True
-    if not findings:
-        return False
-    for f in findings:
-        if isinstance(f, str) and is_rate_limit_error(f):
-            return True
-        if isinstance(f, dict):
-            for value in f.values():
-                if isinstance(value, str) and is_rate_limit_error(value):
-                    return True
-    return False
 
 
 def load_fallback_chains(state_path: Optional[str]) -> dict[str, list[str]]:

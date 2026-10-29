@@ -63,7 +63,7 @@ def test_u_i201_transient_retry_counter_caps_and_fails(tmp_db, tmp_path, *, unus
         spawn_count += 1
         stdout = kwargs.get("stdout")
         if stdout is not None:
-            stdout.write(b"Error: timeout waiting for response\n")
+            stdout.write(b'{"status":"ERROR","reason":"TIMEOUT"}\n')
             stdout.flush()
         proc = MagicMock()
         proc.returncode = 1

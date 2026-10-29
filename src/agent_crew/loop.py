@@ -440,22 +440,10 @@ def handle_test_result(result: TaskResult) -> str:
     if result.status == "completed":
         return "passed"
     info = result.error_info if isinstance(result.error_info, dict) else {}
-    if info.get("reason") == "script_test_timeout":
-        return "not_run"
     if result.status == "needs_human":
-        return "needs_human"
-    if info.get("reason") in {"config_error", "provider_test_not_run"}:
-        return "not_run"
-    script = info.get("script_test")
-    if isinstance(script, dict):
-        # Only identified new test failures are a verdict about this PR.
-        # Setup, collection and timeout failures did not judge it.
-        if script.get("reason") == "new_failures" and script.get("new_failures"):
-            return "failed"
-        return "not_run"
-    if result.status != "failed" or (info.get("final") and not result.findings):
-        return "not_run"
-    return "failed"
+        return "not_run" if info.get("kind") == "timeout" else "needs_human"
+    return "failed" if (result.status == "failed"
+                        and info.get("kind") == "test_failure") else "not_run"
 
 
 def _split_text_finding(text: str) -> tuple[str, str]:

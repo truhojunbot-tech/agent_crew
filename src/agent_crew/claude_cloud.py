@@ -860,7 +860,8 @@ def _launch_ref(task: TaskRequest, checkout: str, prior_pr_head: Optional[str]) 
 
 def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
                           reason: str, *, retryable: bool = False,
-                          prompt_text: str = "") -> CloudDispatchOutcome:
+                          prompt_text: str = "",
+                          failure_kind: str = "agent_failed") -> CloudDispatchOutcome:
     """Fail closed without losing the task (acceptance test 3): force_fail
     records why, then the SAME rate-limit-shaped fallback local providers use
     gets a chance to reroute it — never a new fallback policy (acceptance
@@ -873,12 +874,13 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
                                        "cloud_submit_retryable": retryable,
                                        "cloud_cost_finalized_at": ended,
                                        "cloud_usd": None})
-    error_info = None
+    error_info = {"kind": failure_kind}
     if retryable:
-        error_info = {"reason": "cloud_submit_timeout", "retryable": True}
-    elif reason == "cloud_launch_interactive_prompt":
-        error_info = {"reason": reason, "retryable": False,
-                      "prompt_text": prompt_text[:300]}
+        error_info.update({"kind": "timeout", "reason": "cloud_submit_timeout",
+                           "retryable": True})
+    elif prompt_text:
+        error_info.update({"reason": "cloud_launch_interactive_prompt",
+                           "retryable": False, "prompt_text": prompt_text[:300]})
     queue.force_fail(task.task_id, reason, error_info=error_info)
     if queue.get_attribution(task.task_id) is None:
         queue.record_attribution(task_id=task.task_id, project=task.project or "",
@@ -1348,7 +1350,7 @@ def dispatch_cloud_for_role(
         for attempt in range(3):
             remaining = submit_deadline - time.monotonic()
             if remaining <= 0:
-                return None, "cloud_submit_timeout: overall deadline exceeded"
+                return None, "cloud_submit_timeout: overall deadline exceeded", "timeout", False
             try:
                 proc = run(command, cwd=cwd,
                            timeout=min(cloud_submit_timeout_seconds(), remaining))
@@ -1357,7 +1359,7 @@ def dispatch_cloud_for_role(
                 output = exc.stdout or exc.output or b""
                 interactive_prompt = _interactive_prompt_text(output)
                 if interactive_prompt:
-                    return None, "cloud_launch_interactive_prompt"
+                    return None, "cloud_launch_interactive_prompt", "config_error", True
                 if isinstance(output, bytes):
                     output = output.decode("utf-8", errors="replace")
                 recovered = parse_cloud_launch_output(output)
@@ -1368,44 +1370,46 @@ def dispatch_cloud_for_role(
                 queue.patch_context(task.task_id,
                                     {"cloud_submit_timeout_attempts": timeout_attempts})
                 if recovered.dispatched:
-                    return recovered, None
+                    return recovered, None, None, False
                 if attempt == 2 or submit_deadline - time.monotonic() <= 0:
-                    return None, f"cloud_submit_timeout: {exc}"
+                    return None, f"cloud_submit_timeout: {exc}", "timeout", False
                 time.sleep(min(0.5 * (2 ** attempt),
                                max(0, submit_deadline - time.monotonic())))
             except Exception as exc:
-                return None, f"cloud_cli_invocation_error: {exc}"
+                return None, f"cloud_cli_invocation_error: {exc}", "agent_failed", False
         if getattr(proc, "returncode", 1) != 0:
             interactive_prompt = _interactive_prompt_text(proc.stdout or "")
             if interactive_prompt:
-                return None, "cloud_launch_interactive_prompt"
-            return None, f"cloud_cli_exit_{proc.returncode}: {(proc.stdout or '')[:500]}"
+                return None, "cloud_launch_interactive_prompt", "config_error", True
+            return None, f"cloud_cli_exit_{proc.returncode}: {(proc.stdout or '')[:500]}", "agent_failed", False
         result = parse_cloud_launch_output(proc.stdout or "")
         if not result.dispatched:
             interactive_prompt = _interactive_prompt_text(proc.stdout or "")
             if interactive_prompt:
-                return None, "cloud_launch_interactive_prompt"
+                return None, "cloud_launch_interactive_prompt", "config_error", True
             prefix = "cloud_continuation_unavailable" if resuming else "cloud_output_unrecognized"
-            return None, f"{prefix}: {result.error}"
-        return result, None
+            return None, f"{prefix}: {result.error}", "agent_failed", False
+        return result, None, None, False
 
-    launch, launch_error = launch_once(argv, resuming=bool(resume_session_id))
+    launch, launch_error, launch_kind, launch_interactive = launch_once(
+        argv, resuming=bool(resume_session_id))
     resume_error = None
     if (launch_error and resume_session_id
-            and not launch_error.startswith("cloud_submit_timeout:")
-            and launch_error != "cloud_launch_interactive_prompt"):
+            and launch_kind != "timeout" and not launch_interactive):
         resume_error = launch_error
         queue.patch_context(task.task_id, {"cloud_resume_error": resume_error,
                                            "execution_policy": "fresh_cloud_after_resume_failed"})
         fresh_argv = build_launch_argv(prompt, cli_path=cli_path,
                                        base_ref=launch_ref)
-        launch, launch_error = launch_once(fresh_argv, resuming=False)
+        launch, launch_error, launch_kind, launch_interactive = launch_once(
+            fresh_argv, resuming=False)
     if launch_error:
         reason = (f"resume failed: {resume_error}; fresh failed: {launch_error}"
                   if resume_error else launch_error)
         return _fail_closed_dispatch(queue, task, task_type, reason,
-                                     retryable="cloud_submit_timeout:" in reason,
-                                     prompt_text=interactive_prompt)
+                                     retryable=launch_kind == "timeout",
+                                     prompt_text=interactive_prompt if launch_interactive else "",
+                                     failure_kind=launch_kind or "agent_failed")
 
     execution_policy = ("fresh_cloud_after_resume_failed" if resume_error else
                         "fresh_cloud_resume" if resume_session_id else "fresh_cloud")
