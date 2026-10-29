@@ -58,7 +58,7 @@ class TestGetNextTask:
     def test_returns_dict_for_pending_task(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-impl"))
         mcp = build_mcp_server(tmp_db)
-        result = _call_tool(mcp, "get_next_task", role="implementer")
+        result = _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
         assert result is not None
         assert result["task_id"] == "t-impl"
         assert result["task_type"] == "implement"
@@ -67,13 +67,13 @@ class TestGetNextTask:
 
     def test_empty_queue_returns_none(self, tmp_db):
         mcp = build_mcp_server(tmp_db)
-        assert _call_tool(mcp, "get_next_task", role="implementer") is None
+        assert _call_tool(mcp, "get_next_task", role="implementer", agent="codex") is None
 
     def test_role_filter_skips_other_types(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-rev", task_type="review"))
         mcp = build_mcp_server(tmp_db)
         # Asking for an implementer task should not surface the review one.
-        assert _call_tool(mcp, "get_next_task", role="implementer") is None
+        assert _call_tool(mcp, "get_next_task", role="implementer", agent="codex") is None
         # But a reviewer call sees it.
         result = _call_tool(mcp, "get_next_task", role="reviewer")
         assert result is not None
@@ -173,7 +173,7 @@ class TestSubmitResult:
     def test_completed_path_returns_ack(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-ok"))
         mcp = build_mcp_server(tmp_db)
-        _call_tool(mcp, "get_next_task", role="implementer")  # transition to in_progress
+        _call_tool(mcp, "get_next_task", role="implementer", agent="codex")  # transition to in_progress
         ack = _call_tool(mcp, "submit_result", task_id="t-ok",
                          status="completed", summary="done")
         assert ack["acknowledged"] is True
@@ -182,7 +182,7 @@ class TestSubmitResult:
     def test_failed_status_carries_summary(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-fail"))
         mcp = build_mcp_server(tmp_db)
-        _call_tool(mcp, "get_next_task", role="implementer")
+        _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
         ack = _call_tool(mcp, "submit_result", task_id="t-fail",
                          status="failed", summary="boom")
         assert ack["acknowledged"] is True
@@ -190,7 +190,7 @@ class TestSubmitResult:
     def test_invalid_status_returns_error_not_raise(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-bad"))
         mcp = build_mcp_server(tmp_db)
-        _call_tool(mcp, "get_next_task", role="implementer")
+        _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
         ack = _call_tool(mcp, "submit_result", task_id="t-bad",
                          status="weird", summary="?")
         assert ack["acknowledged"] is False
@@ -249,7 +249,7 @@ class TestAuxTools:
     def test_bump_activity(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-bump"))
         mcp = build_mcp_server(tmp_db)
-        _call_tool(mcp, "get_next_task", role="implementer")
+        _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
         ack = _call_tool(mcp, "bump_activity", task_id="t-bump")
         assert ack["acknowledged"] is True
 

@@ -224,7 +224,7 @@ def test_u_581_http_poll_and_mcp_endpoints_honour_capacity(tmp_db):
     with patch.dict(os.environ, {"AGENT_CREW_DELIVERY": "both"}):
         app = create_app(db_path=tmp_db, pane_map=None, watchdog_disabled=True)
         with TestClient(app) as client:
-            assert client.get("/tasks/next?role=implementer").json() is None
+            assert client.get("/tasks/next?role=implementer&agent=codex").json() is None
     from agent_crew.mcp_server import build_mcp_server
     fn = build_mcp_server(tmp_db)._tool_manager._tools["get_next_task"].fn
     assert fn(agent="codex") is None

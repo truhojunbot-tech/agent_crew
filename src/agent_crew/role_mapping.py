@@ -39,7 +39,64 @@ def provider_family(agent: object) -> str:
     for family in ("codex", "gemini"):
         if name.startswith(family):
             return family
+    if name == "agy" or name.startswith(("agy-", "agy_")):
+        return "gemini"  # the gemini tester binary (#236)
     return name
+
+
+#: Which provider families may hold each role (#889). The one policy every
+#: route reads: explicit override, ``implementer_agent``, role assignment, fix
+#: rounds, retries. ``None`` means no family restriction — review independence
+#: is the separate #871 rule. ``claude_cloud`` is in the ``claude`` family.
+ROLE_PROVIDER_POLICY: dict[str, tuple[str, ...] | None] = {
+    "implementer": ("claude", "codex"),
+    "reviewer": None,
+    "tester": ("gemini", "script"),
+}
+TASK_TYPE_TO_ROLE = {"implement": "implementer", "review": "reviewer", "test": "tester"}
+#: The pull routes also accept ``coder`` (an implementer alias) and ``panel``
+#: (discussion work, which no provider family is barred from). Without them an
+#: anonymous discussion pull was refused as if it were restricted work.
+_PULL_ROLE_POLICY: dict[str, tuple[str, ...] | None] = {
+    **ROLE_PROVIDER_POLICY,
+    "coder": ROLE_PROVIDER_POLICY["implementer"],
+    "panel": None,
+}
+
+
+def role_policy() -> dict[str, list[str] | None]:
+    """JSON view of :data:`ROLE_PROVIDER_POLICY` for enqueue-side pre-checks."""
+    return {role: (list(families) if families is not None else None)
+            for role, families in ROLE_PROVIDER_POLICY.items()}
+
+
+def role_policy_refusal(role: object, agent: object) -> str | None:
+    """Reason ``agent`` may not hold ``role``, or ``None`` when allowed."""
+    allowed = ROLE_PROVIDER_POLICY.get(role) if isinstance(role, str) else None
+    if allowed is None or not str(agent or "").strip():
+        return None
+    if provider_family(agent) in allowed:
+        return None
+    return (f"role_policy: {str(agent).strip()!r} (family "
+            f"{provider_family(agent)!r}) may not hold role {role!r}; "
+            f"allowed families: {list(allowed)}")
+
+
+def anonymous_pull_refusal(role: object, agent: object) -> str | None:
+    """Reason a pull by ``agent`` must be refused before it claims (#889).
+
+    A blank agent has no provider family, so :func:`role_policy_refusal` cannot
+    judge it. On a pull route that is a bypass: an unnamed caller would receive
+    restricted work. Only a role with no family restriction may be pulled
+    anonymously; a blank role could match any task type, so it is refused too.
+    """
+    if str(agent or "").strip():
+        return None
+    role = role.strip() if isinstance(role, str) else ""
+    if role and role in _PULL_ROLE_POLICY and _PULL_ROLE_POLICY[role] is None:
+        return None
+    return (f"role_policy: an unnamed agent may not pull role {role or '(any)'!r}; "
+            "name the provider so the role policy can check its family")
 
 
 def validate_explicit_role_agents(mapping: Mapping[str, object]) -> dict[str, str]:

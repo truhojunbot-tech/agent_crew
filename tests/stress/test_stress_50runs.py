@@ -110,7 +110,7 @@ def _run_50_cycles(client: TestClient) -> list[str]:
     # Drain: dequeue → complete each task
     completed_ids: list[str] = []
     for _ in range(TASK_COUNT):
-        resp = client.get("/tasks/next", params={"role": ROLE})
+        resp = client.get("/tasks/next", params={"role": ROLE, "agent": "codex"})
         assert resp.status_code == 200, f"GET /tasks/next failed: {resp.text}"
         task = resp.json()
         assert task is not None, "GET /tasks/next returned null before all tasks drained"

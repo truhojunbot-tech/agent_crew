@@ -42,7 +42,7 @@ def test_i_sv02_full_lifecycle(test_client):
     }
     test_client.post("/tasks", json=payload)
 
-    resp = test_client.get("/tasks/next", params={"role": "coder"})
+    resp = test_client.get("/tasks/next", params={"role": "coder", "agent": "codex"})
     assert resp.status_code == 200
     task = resp.json()
     assert task is not None
@@ -81,7 +81,7 @@ def test_i_sv03_concurrent_dequeue(tmp_db):
         try:
             with TestClient(app) as client:
                 barrier.wait()
-                resp = client.get("/tasks/next", params={"role": "coder"})
+                resp = client.get("/tasks/next", params={"role": "coder", "agent": "codex"})
                 results.append(resp.json())
         except Exception as e:
             errors.append(e)
@@ -131,7 +131,7 @@ def test_i_sv05_cancel_task(test_client):
     resp = test_client.delete("/tasks/sv05-cancel")
     assert resp.status_code == 200
 
-    resp = test_client.get("/tasks/next", params={"role": "coder"})
+    resp = test_client.get("/tasks/next", params={"role": "coder", "agent": "codex"})
     task = resp.json()
     assert task is None or task.get("task_id") != "sv05-cancel"
 

@@ -162,7 +162,7 @@ class TestGetNextTaskParity:
         # HTTP side
         http_client, _, db_a = parity_pair
         _enqueue_task(db_a, "p-impl-1", task_type="implement")
-        http_resp = http_client.get("/tasks/next", params={"role": "implementer"})
+        http_resp = http_client.get("/tasks/next", params={"role": "implementer", "agent": "codex"})
         assert http_resp.status_code == 200
         http_payload = http_resp.json()
 
@@ -170,7 +170,7 @@ class TestGetNextTaskParity:
         db_b = str(tmp_path / "parity_mcp.db")
         _enqueue_task(db_b, "p-impl-1", task_type="implement")
         mcp = build_mcp_server(db_b)
-        mcp_payload = _call_tool(mcp, "get_next_task", role="implementer")
+        mcp_payload = _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
 
         assert _normalize_task_payload(http_payload) == _normalize_task_payload(mcp_payload)
 
@@ -179,7 +179,7 @@ class TestGetNextTaskParity:
 
     def test_empty_queue_both_return_none_or_null(self, parity_pair, tmp_path):
         http_client, _, _ = parity_pair
-        http_resp = http_client.get("/tasks/next", params={"role": "implementer"})
+        http_resp = http_client.get("/tasks/next", params={"role": "implementer", "agent": "codex"})
         # FastAPI returns ``null`` (200) when the handler returned None.
         assert http_resp.status_code == 200
         assert http_resp.json() is None
@@ -188,19 +188,19 @@ class TestGetNextTaskParity:
         # Touch the DB so MCP doesn't fail on missing file.
         TaskQueue(db_b)
         mcp = build_mcp_server(db_b)
-        assert _call_tool(mcp, "get_next_task", role="implementer") is None
+        assert _call_tool(mcp, "get_next_task", role="implementer", agent="codex") is None
 
     def test_role_filter_skips_other_types(self, parity_pair, tmp_path):
         http_client, _, db_a = parity_pair
         _enqueue_task(db_a, "p-rev-1", task_type="review")
-        http_resp = http_client.get("/tasks/next", params={"role": "implementer"})
+        http_resp = http_client.get("/tasks/next", params={"role": "implementer", "agent": "codex"})
         assert http_resp.status_code == 200
         assert http_resp.json() is None
 
         db_b = str(tmp_path / "parity_mcp.db")
         _enqueue_task(db_b, "p-rev-1", task_type="review")
         mcp = build_mcp_server(db_b)
-        assert _call_tool(mcp, "get_next_task", role="implementer") is None
+        assert _call_tool(mcp, "get_next_task", role="implementer", agent="codex") is None
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +218,7 @@ class TestSubmitResultParity:
         check that intentionally documents the current divergence."""
         http_client, _, db_a = parity_pair
         _enqueue_task(db_a, "p-sub-1")
-        http_client.get("/tasks/next", params={"role": "implementer"})
+        http_client.get("/tasks/next", params={"role": "implementer", "agent": "codex"})
         result_payload = {
             "task_id": "p-sub-1",
             "status": "completed",
@@ -233,7 +233,7 @@ class TestSubmitResultParity:
         db_b = str(tmp_path / "parity_mcp.db")
         _enqueue_task(db_b, "p-sub-1")
         mcp = build_mcp_server(db_b)
-        _call_tool(mcp, "get_next_task", role="implementer")
+        _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
         mcp_resp = _call_tool(
             mcp,
             "submit_result",
@@ -264,7 +264,7 @@ class TestSubmitResultParity:
         """#353: neither transport may turn prose-only completion into review."""
         http_client, _, db_a = parity_pair
         _enqueue_task(db_a, "p-cascade-1", context={"worktree_base_sha": "a" * 40})
-        http_client.get("/tasks/next", params={"role": "implementer"})
+        http_client.get("/tasks/next", params={"role": "implementer", "agent": "codex"})
         http_client.post(
             "/tasks/p-cascade-1/result",
             json={
@@ -280,7 +280,7 @@ class TestSubmitResultParity:
         db_b = str(tmp_path / "parity_mcp.db")
         _enqueue_task(db_b, "p-cascade-1", context={"worktree_base_sha": "a" * 40})
         mcp = build_mcp_server(db_b)
-        _call_tool(mcp, "get_next_task", role="implementer")
+        _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
         _call_tool(
             mcp,
             "submit_result",
@@ -311,7 +311,7 @@ class TestSubmitResultParity:
         commit = "b" * 40
         http_client, _, db_a = parity_pair
         _enqueue_task(db_a, "p-artifact-http", branch="feat/work", context=context)
-        http_client.get("/tasks/next", params={"role": "implementer"})
+        http_client.get("/tasks/next", params={"role": "implementer", "agent": "codex"})
         http_client.post("/tasks/p-artifact-http/result", json={
             "task_id": "p-artifact-http", "status": "completed", "summary": "done",
             "branch": "feat/work", "commit": commit,
@@ -320,7 +320,7 @@ class TestSubmitResultParity:
         db_b = str(tmp_path / "parity_mcp_artifact.db")
         _enqueue_task(db_b, "p-artifact-mcp", branch="feat/work", context=context)
         mcp = build_mcp_server(db_b)
-        _call_tool(mcp, "get_next_task", role="implementer")
+        _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
         _call_tool(mcp, "submit_result", task_id="p-artifact-mcp", status="completed",
                    branch="feat/work", commit=commit)
 
@@ -368,7 +368,7 @@ class TestSubmitResultParity:
         try:
             os.chdir(clone)
             mcp = build_mcp_server(db_path)
-            _call_tool(mcp, "get_next_task", role="implementer")
+            _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
             acknowledgement = _call_tool(
                 mcp, "submit_result", task_id="p-mcp-real-artifact",
                 status="completed", summary="pushed", branch=feature_branch,
@@ -388,7 +388,7 @@ class TestSubmitResultParity:
     def test_failed_status_propagates_both_sides(self, parity_pair, tmp_path):
         http_client, _, db_a = parity_pair
         _enqueue_task(db_a, "p-sub-2")
-        http_client.get("/tasks/next", params={"role": "implementer"})
+        http_client.get("/tasks/next", params={"role": "implementer", "agent": "codex"})
         http_client.post(
             "/tasks/p-sub-2/result",
             json={
@@ -404,7 +404,7 @@ class TestSubmitResultParity:
         db_b = str(tmp_path / "parity_mcp.db")
         _enqueue_task(db_b, "p-sub-2")
         mcp = build_mcp_server(db_b)
-        _call_tool(mcp, "get_next_task", role="implementer")
+        _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
         _call_tool(
             mcp,
             "submit_result",

@@ -47,7 +47,7 @@ def test_i_ps02_in_progress_survives_restart(tmp_path):
             "priority": 2,
             "context": {},
         })
-        resp = client.get("/tasks/next", params={"role": "coder"})
+        resp = client.get("/tasks/next", params={"role": "coder", "agent": "codex"})
         assert resp.json() is not None
 
     with TestClient(create_app(db)) as client:
@@ -70,7 +70,7 @@ def test_i_ps03_completed_survives_restart(tmp_path):
             "priority": 2,
             "context": {},
         })
-        client.get("/tasks/next", params={"role": "coder"})
+        client.get("/tasks/next", params={"role": "coder", "agent": "codex"})
         client.post("/tasks/ps03-task/result", json={
             "task_id": "ps03-task",
             "status": "completed",

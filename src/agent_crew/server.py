@@ -98,8 +98,9 @@ from agent_crew import contract_emit as _contract_emit
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import (
-    DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, effective_role_mapping,
-    provider_family,
+    DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE,
+    anonymous_pull_refusal, effective_role_mapping, provider_family, role_policy,
+    role_policy_refusal,
 )
 from agent_crew.risk_tier import risk_declaration as _risk_declaration
 from agent_crew.testing_policy import (
@@ -4127,6 +4128,17 @@ def create_app(
                                  "reviewer_agent": agent})
         return True
 
+    def _refuse_role_policy(task: TaskRequest, agent: str) -> bool:
+        """Leave a task the role policy forbids un-run, as needs_human (#889)."""
+        role = TASK_TYPE_TO_ROLE.get(task.task_type)
+        reason = role_policy_refusal(role, agent)
+        if reason is None:
+            return False
+        logger.error("dispatcher: refusing task=%s — %s", task.task_id, reason)
+        _fail_if_active(task.task_id, reason, status="needs_human",
+                        details={"role": role, "agent": agent})
+        return True
+
     def _failed_no_successor_notice(task_id: str, result: TaskResult,
                                     task_type: str) -> None:
         """Use a durable notice key for each terminal failure, including retries."""
@@ -4781,6 +4793,8 @@ def create_app(
                 continue
             break
 
+        if _refuse_role_policy(task, _target_agent or _DISPATCH_ROLE_TO_AGENT.get(role, "")):
+            return
         if _refuse_self_review(task, _target_agent):
             return
 
@@ -5943,6 +5957,8 @@ def create_app(
             agent = dispatch_agent
         if dispatch_worktree:
             wt = dispatch_worktree
+        if _refuse_role_policy(task, agent):
+            return
         if _refuse_self_review(task, agent):
             return
         if task.task_type == "test" and agent == _script_tester.SCRIPT_TESTER:
@@ -7773,6 +7789,7 @@ def create_app(
     app.state.dispatch_task = _dispatch_task
     app.state.review_implementer_agent = _review_implementer_agent
     app.state.refuse_self_review = _refuse_self_review
+    app.state.refuse_role_policy = _refuse_role_policy
     app.state.try_push_next = _try_push_next
     app.state.active_dispatch_processes = _active_dispatch_processes
     # Exposed so a test can assert no kill is left armed after it finishes —
@@ -8740,6 +8757,11 @@ def create_app(
             out["expected"] = _prov.compare(expect, snap=snap)
         return out
 
+    @app.get("/policy/roles")
+    def get_role_policy():
+        """Which provider families may hold each role (#889), for enqueue pre-checks."""
+        return {"roles": role_policy(), "task_type_to_role": dict(TASK_TYPE_TO_ROLE)}
+
     @app.post("/pane_map/reload")
     def reload_pane_map():
         """Re-read pane_map.json from disk and update routing in-place.
@@ -8763,6 +8785,17 @@ def create_app(
                      (not _dispatcher_enabled and bool(pane_map and pane_map.get(agent)))))
 
         ctx = task.context if isinstance(task.context, dict) else {}
+        # #889: one role policy on every route — explicit override, the
+        # lineage's implementer/tester choice, and the role assignment itself.
+        # The branch name is a label and never selects the agent.
+        role = TASK_TYPE_TO_ROLE.get(task.task_type)
+        checks = [(role, ctx.get("agent_override") or _DISPATCH_ROLE_TO_AGENT.get(role or "")),
+                  ("implementer", ctx.get("implementer_agent")),
+                  ("tester", ctx.get("tester_agent"))]
+        for policy_role, choice in checks:
+            reason = role_policy_refusal(policy_role, choice)
+            if reason is not None:
+                raise HTTPException(status_code=422, detail=reason)
         for field in ("agent_override", "implementer_agent", "reviewer_agent"):
             choice = ctx.get(field)
             if choice is not None and not _agent_can_receive(choice):
@@ -8971,9 +9004,20 @@ def create_app(
                     "Use the MCP get_next_task tool instead of curl-polling this endpoint."
                 ),
             )
+        # #889: an unnamed poller has no provider family to check, so it may
+        # not claim restricted work. Refuse before the claim so the task stays
+        # pending for a named provider.
+        anonymous = anonymous_pull_refusal(role, agent)
+        if anonymous is not None:
+            raise HTTPException(status_code=409, detail=anonymous)
         task = q().dequeue(agent=agent, role=role, claimed_via="http_poll")
         if task is None:
             return None
+        # #889: a pull is a delivery route too. The claim has committed, so a
+        # task this agent may not hold is left needs_human, never handed out.
+        if _refuse_role_policy(task, agent):
+            raise HTTPException(status_code=409, detail=role_policy_refusal(
+                TASK_TYPE_TO_ROLE.get(task.task_type), agent))
         try:
             nonce = q().record_dispatch(task.task_id, channel="api", agent=agent or None,
                                         target=f"http_poll:{agent or 'anonymous'}")

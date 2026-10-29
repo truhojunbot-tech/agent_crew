@@ -181,7 +181,7 @@ def test_http_poll_hands_out_claim_when_dispatch_record_is_locked(tmp_db, monkey
     app = create_app(tmp_db, project="agent_crew", pane_map={}, worktree_map={},
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app, raise_server_exceptions=False) as client:
-        response = client.get("/tasks/next?role=implementer", headers={
+        response = client.get("/tasks/next?role=implementer&agent=codex", headers={
             "X-Agent-Crew-Project": "agent_crew"})
 
     assert response.status_code == 200

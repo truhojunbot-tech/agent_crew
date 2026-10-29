@@ -154,7 +154,7 @@ next task so no task is missed even if a push is delayed:
 get_next_task(agent="<your-agent-name>")
 
 # Or via HTTP fallback:
-curl -s -H "X-Agent-Crew-Project: <project>" http://127.0.0.1:<port>/tasks/next?role=<role>
+curl -s -H "X-Agent-Crew-Project: <project>" "http://127.0.0.1:<port>/tasks/next?role=<role>&agent=<your-agent-name>"
 ```
 
 If the response is `null` / empty, wait 30 seconds and try again.

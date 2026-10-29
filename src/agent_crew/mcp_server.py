@@ -52,7 +52,9 @@ from agent_crew.queue import (
     AdmissionRefused, CompletedReviewRejected, DuplicateReviewResult, InvalidReviewResult,
     LateResultRejected, PausedError as _PausedError, TaskQueue,
 )
-from agent_crew.role_mapping import LEGACY_AGENT_TO_ROLE
+from agent_crew.role_mapping import (
+    LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE, anonymous_pull_refusal, role_policy_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,9 +141,27 @@ def build_mcp_server(
         atomically.
         """
         resolved_role = role or _DEFAULT_ROLE_FOR_AGENT.get(agent, "")
+        # #889: refuse an unnamed restricted pull before it claims anything.
+        anonymous = anonymous_pull_refusal(resolved_role, agent)
+        if anonymous is not None:
+            return {"task_id": None, "dispatch_refused": anonymous}
         task = queue.dequeue(agent=agent, role=resolved_role, claimed_via="mcp")
         if task is None:
             return None
+        # #889: the same role policy the push dispatcher enforces. The claim
+        # has committed, so leave the task needs_human rather than deliver it.
+        role_of_task = TASK_TYPE_TO_ROLE.get(task.task_type)
+        refusal = role_policy_refusal(role_of_task, agent)
+        if refusal is not None:
+            try:
+                queue.submit_result(task.task_id, TaskResult(
+                    task_id=task.task_id, status="needs_human", summary=refusal,
+                    error_info={"reason": refusal, "final": False,
+                                "role": role_of_task, "agent": agent}),
+                    expected_status="in_progress")
+            except Exception:
+                logger.exception("role-policy refusal could not end task=%s", task.task_id)
+            return {"task_id": task.task_id, "dispatch_refused": refusal}
         try:
             nonce = queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
                                           target=f"mcp:{agent or 'anonymous'}")
