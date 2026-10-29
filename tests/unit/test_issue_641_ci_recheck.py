@@ -49,11 +49,13 @@ def _pending_merge(tmp_path, monkeypatch, *, timeout=False):
     queue.enqueue(TaskRequest("impl-641", "implement", "work", branch="fix/641"))
     queue.submit_result("impl-641", TaskResult("impl-641", "completed", "done"))
     queue.enqueue(TaskRequest("review-641", "review", "review", branch="fix/641",
-                              context={"prev_task_id": "impl-641", "pr_number": 641}))
+                              context={"prev_task_id": "impl-641", "pr_number": 641,
+                                       "reviewed_sha": "a" * 40}))
     queue.submit_result("review-641", TaskResult("review-641", "completed", "approved",
                                                   verdict="approve", pr_number=641))
     queue.enqueue(TaskRequest("test-641", "test", "test", branch="fix/641",
-                              context={"prev_task_id": "review-641", "pr_number": 641}))
+                              context={"prev_task_id": "review-641", "pr_number": 641,
+                                       "reviewed_sha": "a" * 40}))
     # This fixture drives result submissions; leave task claims to dedicated
     # dispatcher tests so a pending follow-up is not failed for lack of panes.
     monkeypatch.setattr(TaskQueue, "dequeue", lambda self, *a, **k: None)
@@ -69,7 +71,8 @@ def _pending_merge(tmp_path, monkeypatch, *, timeout=False):
 def _post_result(client, task_id):
     response = client.post(f"/tasks/{task_id}/result", json={
         "task_id": task_id, "status": "completed", "summary": "passed",
-        "pr_number": 641})
+        "pr_number": 641,
+        "error_info": {"script_test": {"outcome": "PASSED", "head_sha": "a" * 40}}})
     assert response.status_code == 200, response.text
 
 
@@ -113,6 +116,7 @@ def test_pending_timeout_preserves_since_and_stays_skipped(tmp_path, monkeypatch
         assert "CI pending timed out" in op["last_error"]
         queue.enqueue(TaskRequest("test-641-again", "test", "test", branch="fix/641",
                                   context={"prev_task_id": "review-641", "pr_number": 641,
+                                           "reviewed_sha": "a" * 40,
                                            "allow_duplicate_review": True}))
         _post_result(client, "test-641-again")
     assert not merged.is_set()
