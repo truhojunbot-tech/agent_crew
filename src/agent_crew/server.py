@@ -2692,7 +2692,8 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
                     path = by_agent.get(agent)
                     if path:
                         result[role] = path
-                    else:
+                    elif agent != _claude_cloud.CLOUD_PROVIDER_NAME:
+                        # #919: a cloud role needs no local worktree.
                         logger.warning(
                             "_load_worktree_map: explicit role %s uses agent %s with no worktree; omitting role",
                             role, agent,
@@ -2712,7 +2713,7 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
                 path = worktrees.get(agent)
                 if path:
                     result[role] = path
-                else:
+                elif agent != _claude_cloud.CLOUD_PROVIDER_NAME:
                     logger.warning(
                         "_load_worktree_map: explicit role %s uses agent %s with no worktree; omitting role",
                         role, agent,
@@ -4158,6 +4159,20 @@ def create_app(
         _coordinator_notice(task_id, "failed_no_successor", detail)
 
     app.state.coordinator_notice = _coordinator_notice
+
+    _cloud_disabled_warned: set[str] = set()
+
+    def _notice_cloud_disabled_role(role: str, task_type: str) -> None:
+        """#919: a role mapped to claude_cloud with cloud dispatch disabled
+        never claims its tasks. Warn and notify once per pending task."""
+        for task in q().list_tasks("pending"):
+            if task.task_type != task_type or task.task_id in _cloud_disabled_warned:
+                continue
+            _cloud_disabled_warned.add(task.task_id)
+            detail = (f"role={role} is mapped to {_claude_cloud.CLOUD_PROVIDER_NAME} but "
+                      "AGENT_CREW_CLOUD_ENABLED is not set on this server; task stays pending")
+            logger.warning("dispatcher: cloud_disabled_role task=%s %s", task.task_id, detail)
+            _coordinator_notice(task.task_id, "cloud_disabled_role", detail)
 
     def _reconcile_cloud_and_notify() -> None:
         outcomes = _claude_cloud.reconcile_all_cloud_tasks(
@@ -7597,6 +7612,17 @@ def create_app(
                         _worker_roles = _AGENT_TO_ROLES.get(worker, [])
                         _cloud_local_fallback = False
                         _cloud_capacity_skip = False
+                        if (worker == _claude_cloud.CLOUD_PROVIDER_NAME and
+                                not _claude_cloud.cloud_dispatch_enabled()):
+                            # #919: no role of a disabled cloud worker may fall
+                            # through to local dispatch (it has no worktree, so
+                            # the task would fail no_worktree). Leave it pending.
+                            for _cloud_role in _worker_roles:
+                                _cloud_type = _ROLE_TO_TYPE.get(_cloud_role)
+                                if _cloud_type:
+                                    await asyncio.to_thread(
+                                        _notice_cloud_disabled_role, _cloud_role, _cloud_type)
+                            continue
                         if (worker == _claude_cloud.CLOUD_PROVIDER_NAME and
                                 "implementer" in _worker_roles):
                             # The adapter owns dequeue and admission.  A cap or
