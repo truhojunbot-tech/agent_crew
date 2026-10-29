@@ -860,16 +860,17 @@ def _launch_ref(task: TaskRequest, checkout: str, prior_pr_head: Optional[str]) 
 
 def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
                           reason: str, *, retryable: bool = False,
-                          prompt_text: str = "") -> CloudDispatchOutcome:
+                          prompt_text: str = "", detail: str = "") -> CloudDispatchOutcome:
     """Fail closed without losing the task (acceptance test 3): force_fail
     records why, then the SAME rate-limit-shaped fallback local providers use
     gets a chance to reroute it — never a new fallback policy (acceptance
     test 8)."""
-    logger.warning("claude_cloud: dispatch failed closed for %s — %s", task.task_id, reason)
+    described = f"{reason}: {detail}" if detail else reason
+    logger.warning("claude_cloud: dispatch failed closed for %s — %s", task.task_id, described)
     context = queue.get_task_context(task.task_id)
     ended = time.time()
     queue.patch_context(task.task_id, {"cloud_ended_at": ended,
-                                       "cloud_terminal_error": reason,
+                                       "cloud_terminal_error": described,
                                        "cloud_submit_retryable": retryable,
                                        "cloud_cost_finalized_at": ended,
                                        "cloud_usd": None})
@@ -879,7 +880,7 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
     elif reason == "cloud_launch_interactive_prompt":
         error_info = {"reason": reason, "retryable": False,
                       "prompt_text": prompt_text[:300]}
-    queue.force_fail(task.task_id, reason, error_info=error_info)
+    queue.force_fail(task.task_id, described, error_info=error_info)
     if queue.get_attribution(task.task_id) is None:
         queue.record_attribution(task_id=task.task_id, project=task.project or "",
                                  agent=CLOUD_PROVIDER_NAME,
@@ -893,7 +894,7 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
     queue.update_attribution_outcome(task.task_id, "failed")
     queue.record_cloud_cost(task.task_id, context.get("cloud_credit_used_before"),
                             None, None, status="UNKNOWN_NO_FRESH_READING", overlaps=[])
-    result = TaskResult(task_id=task.task_id, status="failed", summary=reason[:2000])
+    result = TaskResult(task_id=task.task_id, status="failed", summary=described[:2000])
     fallback_created = False
     try:
         from agent_crew.pipeline import auto_fallback_failed_task
@@ -982,6 +983,32 @@ _LOCAL_ONLY_PATH = re.compile(
     r"(?<![\w/])(?:~/|/home/[^\s/'\"`]+/|/tmp/|/var/tmp/|\.agent_crew/)",
     re.IGNORECASE,
 )
+# #894: a path after a negation in the same sentence is policy prose ("don't
+# write to ~/.local/bin"), not a file the task needs. A negation after the path
+# ("read ~/x, but do not edit it") still counts, so a real requirement fails closed.
+_PREFLIGHT_SENTENCE = re.compile(r"\n|(?<=[.!?;])\s+")
+_PREFLIGHT_NEGATION = re.compile(
+    r"\b(?:don'?t|do not|does not|doesn'?t|never|must not|mustn'?t|should not|"
+    r"shouldn'?t|cannot|can'?t|not|avoid\w*|without|forbid\w*|prohibit\w*)\b|⛔",
+    re.IGNORECASE,
+)
+
+
+def _local_only_path_match(work: str) -> str:
+    """Return the first local-only path the text requires, quoted as written."""
+    for sentence in _PREFLIGHT_SENTENCE.split(work):
+        for match in _LOCAL_ONLY_PATH.finditer(sentence):
+            if _PREFLIGHT_NEGATION.search(sentence, 0, match.start()):
+                continue
+            token = re.match(r"[^\s'\"`]+", sentence[match.start():])
+            return token.group(0).rstrip(".,;:)") if token else match.group(0)
+    return ""
+
+
+def _cloud_preflight_work(task: TaskRequest) -> str:
+    context = task.context if isinstance(task.context, dict) else {}
+    instructions = context.get("instructions")
+    return task.description + "\n" + (instructions if isinstance(instructions, str) else "")
 
 
 def _derived_cloud_branch(task: TaskRequest) -> str:
@@ -1013,10 +1040,7 @@ def _cloud_preflight_reason(task: TaskRequest, repo: str) -> str:
             return "cloud_branch_unpublishable"
     if not repo or not _github._repo_slug(repo):
         return "cloud_repo_unresolved"
-    context = task.context if isinstance(task.context, dict) else {}
-    instructions = context.get("instructions")
-    work = task.description + "\n" + (instructions if isinstance(instructions, str) else "")
-    if _LOCAL_ONLY_PATH.search(work):
+    if _local_only_path_match(_cloud_preflight_work(task)):
         return "cloud_local_files_required"
     return ""
 
@@ -1214,7 +1238,10 @@ def dispatch_cloud_for_role(
     preflight_repo = _resolve_task_repo(task, repo, state_path)
     preflight_reason = _cloud_preflight_reason(task, preflight_repo)
     if preflight_reason:
-        return _fail_closed_dispatch(queue, task, task_type, preflight_reason)
+        detail = ""
+        if preflight_reason == "cloud_local_files_required":
+            detail = f"matched {_local_only_path_match(_cloud_preflight_work(task))!r}"
+        return _fail_closed_dispatch(queue, task, task_type, preflight_reason, detail=detail)
     derived_branch = _derived_cloud_branch(task)
     if derived_branch:
         if not queue.set_claimed_branch(task.task_id, derived_branch):
