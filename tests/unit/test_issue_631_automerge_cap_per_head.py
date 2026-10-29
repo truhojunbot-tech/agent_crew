@@ -60,13 +60,16 @@ def test_new_head_runs_after_three_failures_while_same_head_stays_capped(
                      watchdog_disabled=True, anomaly_disabled=True)
 
     def post_test(client, task_id, review_id):
+        sha = queue.get_task_context(review_id)["reviewed_sha"]
         queue.enqueue(TaskRequest(
             task_id=task_id, task_type="test", description="test", branch="fix/631",
             context={"prev_task_id": review_id, "repo": "owner/repo",
-                     "pr_number": 631, "allow_duplicate_review": True}))
+                     "pr_number": 631, "reviewed_sha": sha,
+                     "allow_duplicate_review": True}))
         response = client.post(f"/tasks/{task_id}/result", json={
             "task_id": task_id, "status": "completed", "summary": "passed",
-            "pr_number": 631})
+            "pr_number": 631,
+            "error_info": {"script_test": {"outcome": "PASSED", "head_sha": sha}}})
         assert response.status_code == 200, response.text
 
     with caplog.at_level(logging.INFO), TestClient(app) as client:

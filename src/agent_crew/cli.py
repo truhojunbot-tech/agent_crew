@@ -3365,7 +3365,6 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
 
         if outcome == "approved":
             click.echo(f"[{iteration}/{max_iter}] ✅ Review approved ({review_elapsed}s)")
-            # Auto-resolve any pending gates before proceeding
             if not no_tester:
                 test_context = {**review_context, **artifact_context}
                 # The tester is independent of the reviewer; preserve both

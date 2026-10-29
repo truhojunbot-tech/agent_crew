@@ -57,12 +57,16 @@ def _post_task(client, task_id, task_type, context, pr_number=91001):
 
 
 def _submit_result(client, task_id, task_type, pr_number=91001):
-    return client.post(f"/tasks/{task_id}/result", json={
+    payload = {
         "task_id": task_id, "status": "completed",
         "summary": "Reviewed the canonical repository identity and found no blocking issues.",
         "verdict": "approve" if task_type == "review" else None,
         "findings": [], "pr_number": pr_number,
-    })
+    }
+    if task_type == "test":
+        payload["error_info"] = {"script_test": {
+            "outcome": "PASSED", "head_sha": "a" * 40}}
+    return client.post(f"/tasks/{task_id}/result", json=payload)
 
 
 def _patch_open_pr(monkeypatch):
@@ -88,7 +92,7 @@ def test_G_unresolved_repo_is_unknown_not_a_process_cwd_guess(monkeypatch):
 
 
 def test_A_merge_uses_worktree_repo_not_dispatcher_cwd(tmp_db, tmp_path, monkeypatch):
-    """A — review/no-tester and completed-test merges use quota-ops, never Alfred."""
+    """A — a completed test merges using quota-ops, never Alfred."""
     from fastapi.testclient import TestClient
 
     calls, state_calls = [], []
@@ -114,8 +118,16 @@ def test_A_merge_uses_worktree_repo_not_dispatcher_cwd(tmp_db, tmp_path, monkeyp
     app = _app(tmp_db, state_path)
     with TestClient(app) as client:
         assert _post_task(client, "review-A", "review", {"pr_number": 91002, "no_tester": True, "prev_task_id": "impl-A"}, 91002).status_code == 200
-        assert _post_task(client, "test-A", "test", {"pr_number": 91003, "prev_task_id": "impl-A"}, 91003).status_code == 200
-    assert state_calls == calls == [TARGET_REPO, TARGET_REPO]
+        queue.merge_task_context("review-A", {"reviewed_sha": "a" * 40})
+        created = client.post("/tasks", json={
+            "task_id": "test-A", "task_type": "test", "description": "test",
+            "branch": "fix/canonical", "priority": 3,
+            "context": {"pr_number": 91002, "prev_task_id": "review-A"}, "project": "",
+        })
+        assert created.status_code == 201, created.text
+        queue.merge_task_context("test-A", {"reviewed_sha": "a" * 40})
+        assert _submit_result(client, "test-A", "test", 91002).status_code == 200
+    assert state_calls == calls == [TARGET_REPO]
 
 
 def test_B_missing_repo_marks_merge_failed_without_github_calls(tmp_db, tmp_path, monkeypatch):
@@ -131,9 +143,7 @@ def test_B_missing_repo_marks_merge_failed_without_github_calls(tmp_db, tmp_path
     with TestClient(_app(tmp_db, state_path)) as client:
         response = _post_task(client, "review-B", "review", {"pr_number": 91004, "no_tester": True}, 91004)
     assert response.status_code == 200
-    receipt = TaskQueue(tmp_db).external_op_get("merge:pr:91004")
-    assert receipt["state"] == "failed"
-    assert "repo identity unresolved" in receipt["last_error"]
+    assert TaskQueue(tmp_db).external_op_get("merge:pr:91004") is None
 
 
 def test_C_repo_survives_implement_review_test_lineage(tmp_db, tmp_path, monkeypatch):
@@ -153,8 +163,8 @@ def test_C_repo_survives_implement_review_test_lineage(tmp_db, tmp_path, monkeyp
     assert test.context["repo"] == TARGET_REPO
 
 
-def test_D_no_tester_merge_uses_explicit_review_repo(tmp_db, tmp_path, monkeypatch):
-    """D — no-tester approval passes the review task's canonical repo to merge."""
+def test_D_no_tester_review_does_not_merge(tmp_db, tmp_path, monkeypatch):
+    """D — a no-tester approval cannot merge without a test PASS."""
     from fastapi.testclient import TestClient
 
     calls = []
@@ -166,7 +176,8 @@ def test_D_no_tester_merge_uses_explicit_review_repo(tmp_db, tmp_path, monkeypat
                                           description="work", branch="fix/canonical"))
     with TestClient(_app(tmp_db, _state_path(tmp_path, []))) as client:
         assert _post_task(client, "review-D", "review", {"pr_number": 91006, "repo": TARGET_REPO, "no_tester": True, "prev_task_id": "impl-D"}, 91006).status_code == 200
-    assert calls == [TARGET_REPO]
+    assert calls == []
+    assert TaskQueue(tmp_db).external_op_get("merge:pr:91006") is None
     assert not [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "test"]
 
 
@@ -234,9 +245,7 @@ def test_I_coordinator_managed_no_tester_requires_independent_status(tmp_db, tmp
     with TestClient(_app(tmp_db, _state_path(tmp_path, []))) as client:
         assert _post_task(client, "review-I", "review", {"pr_number": 91010, "repo": TARGET_REPO, "no_tester": True, "coordinator_managed": True, "prev_task_id": "impl-I"}, 91010).status_code == 200
     assert merged == []
-    receipt = TaskQueue(tmp_db).external_op_get("merge:pr:91010")
-    assert receipt["state"] == "failed"
-    assert "crew/independent-review" in receipt["last_error"]
+    assert TaskQueue(tmp_db).external_op_get("merge:pr:91010") is None
 
 
 def test_J_no_bare_repo_lookup_or_unidentified_pr_state_calls():
