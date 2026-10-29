@@ -178,13 +178,69 @@ def test_role_less_cloud_pull_via_mcp_and_http_routes_claims_nothing(tmp_path, m
     _stale_cloud_impl(queue)
     get_next = build_mcp_server(db)._tool_manager._tools["get_next_task"].fn
     assert get_next(agent="claude_cloud") is None
-    app = server.create_app(db_path=db, state_path=str(state_path),
+    # Review of PR #916 (round 3): the server must serve project demo, or the
+    # request is refused on identity (409) before the claim is ever exercised.
+    monkeypatch.setenv("AGENT_CREW_DELIVERY", "both")
+    app = server.create_app(db_path=db, state_path=str(state_path), project="demo",
                             watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
         resp = client.get("/tasks/next", params={"agent": "claude_cloud"},
                           headers={"X-Agent-Crew-Project": "demo"})
-    assert resp.status_code in (200, 405)
-    if resp.status_code == 200:
-        assert resp.json() is None
+    assert resp.status_code == 200, resp.text
+    assert resp.json() is None
     assert queue.get_task("impl-891-norole").status == "pending"
     assert _claimed_by(db, "impl-891-norole")[0] is None
+
+
+def test_cloud_that_lost_the_reviewer_role_claims_nothing_via_mcp_or_http(tmp_path, monkeypatch):
+    """Review of PR #916 (round 3): after a sweep with implementer=claude and
+    reviewer=codex, a review bound to claude_cloud arrives. claude_cloud may
+    *say* it is the reviewer; the claim must check the role map, not the word."""
+    from agent_crew.mcp_server import build_mcp_server
+
+    state_path = tmp_path / "state.json"
+    _state(state_path, "claude", "codex")
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    monkeypatch.setenv("AGENT_CREW_DELIVERY", "both")
+    app = server.create_app(db_path=db, state_path=str(state_path), project="demo",
+                            watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        assert app.state.reroute_stale_bindings() == []
+        for task_id in ("review-891-stale", "review-891-free"):
+            queue.enqueue(TaskRequest(
+                task_id=task_id, task_type="review", description="review",
+                project="demo",
+                context={"agent_override": "claude_cloud"} if task_id.endswith("stale") else {}))
+        get_next = build_mcp_server(db)._tool_manager._tools["get_next_task"].fn
+        assert get_next(agent="claude_cloud", role="reviewer") is None
+        resp = client.get("/tasks/next", params={"agent": "claude_cloud", "role": "reviewer"},
+                          headers={"X-Agent-Crew-Project": "demo"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json() is None
+        assert queue.dequeue(agent="claude_cloud", role="reviewer",
+                             claimed_via="cloud_push", skip_deferred=True) is None
+    for task_id in ("review-891-stale", "review-891-free"):
+        assert queue.get_task(task_id).status == "pending"
+        assert _claimed_by(db, task_id)[0] is None
+
+
+def test_cloud_that_holds_the_reviewer_role_still_claims_its_review(tmp_path):
+    state_path = tmp_path / "state.json"
+    _state(state_path, "claude", "claude_cloud")
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(
+        task_id="review-891-held", task_type="review", description="review",
+        project="demo", context={"agent_override": "claude_cloud"}))
+    claimed = queue.dequeue(agent="claude_cloud", role="reviewer", claimed_via="mcp")
+    assert claimed is not None and claimed.task_id == "review-891-held"
+
+
+def test_unreadable_state_fails_closed_for_cloud_claim(tmp_path):
+    (tmp_path / "state.json").write_text("{not json")
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(
+        task_id="review-891-corrupt", task_type="review", description="review",
+        project="demo", context={"agent_override": "claude_cloud"}))
+    assert queue.dequeue(agent="claude_cloud", role="reviewer", claimed_via="mcp") is None
+    assert queue.get_task("review-891-corrupt").status == "pending"

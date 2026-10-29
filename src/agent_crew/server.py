@@ -4726,7 +4726,8 @@ def create_app(
             try:
                 _claude_cloud.dispatch_cloud_for_role(
                     q(), role=role, task_type=_ROLE_TO_TYPE.get(role, ""),
-                    state_path=state_path, review_guard_fn=_refuse_self_review)
+                    state_path=state_path, review_guard_fn=_refuse_self_review,
+                    role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
             except Exception:
                 logger.exception(f"_try_push_next: claude_cloud dispatch failed for role={role}")
             return
@@ -7596,14 +7597,16 @@ def create_app(
                             _cloud_implement_outcome = await asyncio.to_thread(
                                 _claude_cloud.dispatch_cloud_for_role, q(),
                                 role="implementer", task_type="implement",
-                                state_path=state_path, review_guard_fn=_refuse_self_review)
+                                state_path=state_path, review_guard_fn=_refuse_self_review,
+                                role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
                             if _cloud_implement_outcome.dispatched or _worker_roles == ["implementer"]:
                                 continue
                             if "reviewer" in _worker_roles and _claude_cloud.cloud_dispatch_enabled():
                                 await asyncio.to_thread(
                                     _claude_cloud.dispatch_cloud_for_role, q(),
                                     role="reviewer", task_type="review",
-                                    state_path=state_path, review_guard_fn=_refuse_self_review)
+                                    state_path=state_path, review_guard_fn=_refuse_self_review,
+                                    role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
                             continue
                         if (_worker_roles == ["reviewer"] and
                                 worker == _claude_cloud.CLOUD_PROVIDER_NAME and
@@ -7615,7 +7618,8 @@ def create_app(
                                 _cloud_outcome = await asyncio.to_thread(
                                     _claude_cloud.dispatch_cloud_for_role, q(),
                                     role="reviewer", task_type="review",
-                                    state_path=state_path, review_guard_fn=_refuse_self_review)
+                                    state_path=state_path, review_guard_fn=_refuse_self_review,
+                                    role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
                                 _skip = _cloud_outcome.skipped_reason or ""
                                 if _skip not in ("daily_cap", "at_capacity") and not _skip.startswith("cli_unsupported:"):
                                     continue
@@ -9055,7 +9059,10 @@ def create_app(
         anonymous = anonymous_pull_refusal(role, agent)
         if anonymous is not None:
             raise HTTPException(status_code=409, detail=anonymous)
-        task = q().dequeue(agent=agent, role=role, claimed_via="http_poll")
+        # #891: the claim checks role ownership against the live role map.
+        _refresh_role_map()
+        task = q().dequeue(agent=agent, role=role, claimed_via="http_poll",
+                           role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
         if task is None:
             return None
         # #889: a pull is a delivery route too. The claim has committed, so a

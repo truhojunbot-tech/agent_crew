@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import datetime, timezone
-from typing import Callable, List, Optional
+from typing import Callable, List, Mapping, Optional
 
 from agent_crew.anomaly import _extract_repo_from_url, auto_detect_expected_repos
 from agent_crew.cea import adapters as _cea_adapters
@@ -42,7 +42,9 @@ from agent_crew.protocol import (
     RESULT_COMMIT_CONTEXT_KEY, normalize_pr_number as _normalize_pr_number,
     validate_review_result,
 )
-from agent_crew.role_mapping import ROLE_BOUND_PROVIDERS
+from agent_crew.role_mapping import (
+    ROLE_BOUND_PROVIDERS, effective_role_mapping, provider_task_types,
+)
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
 from agent_crew.tokenomics_shadow import shadow_recommendation, shadow_recommendation_for_task_id
@@ -2671,6 +2673,31 @@ class TaskQueue:
             self._declared_project = self._read_declared_project()
         return self._declared_project
 
+    def _holds_task_type(self, provider: str, task_type: str,
+                         role_to_agent: Optional[Mapping[str, str]]) -> bool:
+        """Whether ``provider`` holds ``task_type`` under the CURRENT role map (#891).
+
+        ``role_to_agent`` is the caller's live map; otherwise ``state.json``
+        next to the DB is re-read on every claim, the file the dispatcher reads.
+        No state file means no declared map, so nothing to check against (bare
+        test queues). A state file that cannot be read fails closed.
+        """
+        if role_to_agent is None:
+            path = str(self._db_path or "")
+            if not path or path == ":memory:":
+                return True
+            state_path = os.path.join(os.path.dirname(os.path.abspath(path)), "state.json")
+            if not os.path.exists(state_path):
+                return True
+            try:
+                with open(state_path, "r", encoding="utf-8") as fh:
+                    state = json.load(fh)
+                role_to_agent = effective_role_mapping(state)[0]
+            except Exception:
+                logger.warning("#891: unreadable %s; refusing %s claim", state_path, provider)
+                return False
+        return task_type in provider_task_types(provider, role_to_agent)
+
     def _read_declared_project(self) -> str:
         """``state.json``'s ``project``, or ``""``. Never raises — an unreadable
         state file means "not declared", not "admission is down"."""
@@ -5195,7 +5222,7 @@ class TaskQueue:
     def dequeue(
         self, agent: str = "", role: str = "", *, claimed_via: str = "",
         claim_source: str = "", skip_task_ids: Optional[set[str]] = None,
-        skip_deferred: bool = False,
+        skip_deferred: bool = False, role_to_agent: Optional[Mapping[str, str]] = None,
     ) -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
@@ -5262,6 +5289,13 @@ class TaskQueue:
                 role_bound = agent in ROLE_BOUND_PROVIDERS
                 bound_type = _ROLE_TO_TYPE.get(role) if role_bound else None
                 bound_sql = " AND task_type = ?" if bound_type else ""
+                # Review of PR #916 (round 3): the role is the caller's claim,
+                # not a fact. A backend that lost the role since its binding was
+                # written (reviewer handed back to codex) claims nothing as that
+                # role -- neither its own stale binding nor an unbound task.
+                if bound_type and not self._holds_task_type(agent, bound_type, role_to_agent):
+                    conn.execute("ROLLBACK")
+                    return None
             if agent and not (role_bound and bound_type is None):
                 row = conn.execute(
                     f"""
