@@ -991,6 +991,73 @@ def stale_review_task_id(pr_number, head_sha: str) -> str:
     return f"review-{int(pr_number)}-{(head_sha or '')[:12]}"
 
 
+def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, head: str,
+                           ctx, *, project: str) -> Optional[str]:
+    """Enqueue one head-anchored review for a PR whose head moved (#304).
+
+    Shared by the HTTP and MCP result transports (#887): a stale approval
+    suppressed on one transport but not requeued on the other would strand the
+    lineage with no review of the head that is actually open.
+
+    ⛔The task id is derived from the PR and the new head, so two results
+      observing the same move produce ONE review rather than two reviewers
+      on one commit. A head that moves again is a genuinely different review
+      and gets its own id.
+
+    Returns the successor id, or ``None`` if it could not be enqueued. A STOP
+    reopens the parent's outbox and re-raises, so replay restores it.
+    """
+    new_id = stale_review_task_id(pr_number, head)
+    base = ctx if isinstance(ctx, dict) else {}
+    context = {k: v for k, v in base.items()
+               if k in ("pr_number", "repo", "project", "no_tester",
+                        "coordinator_managed", "checklist_layers",
+                        "findings_only")}
+    context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
+                    "expected_head_sha": head, "prev_task_id": review_task_id})
+    inherited_tier = base.get("risk_tier")
+    if (isinstance(inherited_tier, int) and not isinstance(inherited_tier, bool)
+            and 0 <= inherited_tier <= 3):
+        context["risk_tier"] = inherited_tier
+    try:
+        queue.enqueue(TaskRequest(
+            task_id=new_id,
+            task_type="review",
+            description=f"Review PR #{pr_number} at {head[:12]} "
+                        f"(re-dispatched: {review_task_id} reviewed an older head)",
+            branch=base.get("branch") or "main",
+            priority=3,
+            context=context,
+            # s4j: a re-dispatched review is the same project as the review
+            # it supersedes.
+            project=project,
+        ),
+                      ingress="watchdog.stale_review",
+                      _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+        logger.info(
+            f"requeue_review_at_head: enqueued {new_id} for PR #{pr_number} at "
+            f"{head[:12]}, superseding {review_task_id} (#304)")
+        return new_id
+    except TaskAlreadyExistsError:
+        logger.info(
+            f"requeue_review_at_head: {new_id} already exists — another result "
+            f"observed the same head; not duplicating it (#304)")
+        return new_id
+    except PausedError:
+        # #314 §4 P0: STOP race — reopen the parent (review) outbox so a
+        # result-carrying replay after resume recovers this re-dispatch.
+        try:
+            queue.outbox_reopen(review_task_id)
+        except Exception:
+            logger.exception(f"requeue_review_at_head: outbox_reopen({review_task_id}) failed")
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            f"requeue_review_at_head: could not requeue a review for PR "
+            f"#{pr_number} at {head[:12]}")
+        return None
+
+
 def review_fix_max_rounds() -> int:
     """Cap on automated fix rounds. ``0`` disables the transition entirely.
 

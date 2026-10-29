@@ -43,6 +43,7 @@ from agent_crew.pipeline import (
     auto_fallback_failed_task,    hold_mismatched_pr_result,
     artifact_gate_applies, declared_artifact_kind, dispatch_base_absent_hold, no_artifact_result,
     verify_implement_artifact, verify_task_artifact, review_publication_decision,
+    requeue_review_at_head, _successor_project,
 )
 from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
@@ -395,6 +396,12 @@ def build_mcp_server(
                 except Exception:
                     logger.exception("MCP submit_result: could not record the suppressed "
                                      "approval for %s", task_id)
+                if _pub.requeue_head:
+                    # #887: HTTP requeues a review anchored on the new head;
+                    # without it this transport stranded the lineage.
+                    requeue_review_at_head(
+                        queue, task_id, _review_pr, _pub.requeue_head, _ctx,
+                        project=_successor_project(queue, queue.get_task(task_id)))
             else:
                 auto_enqueue_test(queue, task_id)
         elif task_type == "review" and _resolve_verdict(result) == "request_changes":

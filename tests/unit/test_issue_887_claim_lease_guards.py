@@ -101,6 +101,29 @@ def test_live_lease_is_not_reaped(tmp_db, monkeypatch):
     assert queue.get_task_status("mcp-live") == "in_progress"
 
 
+def test_late_heartbeat_then_silence_still_expires(tmp_db, monkeypatch):
+    """Review r0: one heartbeat after the lease ended exempted the row forever."""
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    monkeypatch.setenv("AGENT_CREW_CLAIM_LEASE_S", "10")
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(task_id="mcp-late-hb", task_type="implement",
+                              description="work", branch="main"))
+    _mcp_tool(tmp_db, "get_next_task")(agent="codex", role="implementer")
+    _owner, expires = _lease(tmp_db, "mcp-late-hb")
+    with sqlite3.connect(tmp_db) as conn:
+        conn.execute("UPDATE tasks SET last_heartbeat_at=? WHERE task_id=?",
+                     (expires + 1, "mcp-late-hb"))
+
+    app = _app(tmp_db)
+    with TestClient(app):
+        fresh = app.state.watchdog_tick(now=expires + 60)
+        assert fresh["timed_out"] == [], "a fresh heartbeat still proves liveness"
+        silent = app.state.watchdog_tick(now=expires + 100000)
+    assert silent["timed_out"] == ["mcp-late-hb"]
+    assert queue.get_task_status("mcp-late-hb") == "timed_out"
+
+
 def test_claim_lease_env_override(tmp_db, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     monkeypatch.setenv("AGENT_CREW_CLAIM_LEASE_S", "120")
@@ -170,6 +193,26 @@ def test_mcp_stale_approval_does_not_enqueue_a_tester(tmp_db, monkeypatch):
         "an approval of a head that moved must not spend a tester"
     ctx = q.get_task("review-887").context
     assert ctx.get("review_publication") == "stale"
+
+
+def test_mcp_stale_approval_requeues_one_review_at_the_new_head(tmp_db, monkeypatch):
+    """Review r0: HTTP requeues a head-anchored review; MCP stranded the lineage."""
+    from agent_crew.pipeline import stale_review_task_id
+
+    q, out = _approved_review(tmp_db, monkeypatch, MOVED)
+    assert out.get("acknowledged") is True, out
+    successor = q.get_task(stale_review_task_id(887, MOVED))
+    assert successor is not None, "a stale approval must requeue a new-head review"
+    assert successor.task_type == "review"
+    assert successor.context["expected_head_sha"] == MOVED
+    assert successor.context["superseded_review"] == "review-887"
+
+    # Idempotent: the same moved head never puts two reviewers on one commit.
+    from agent_crew.pipeline import requeue_review_at_head
+    again = requeue_review_at_head(q, "review-887", 887, MOVED,
+                                   q.get_task("review-887").context, project="")
+    assert again == successor.task_id
+    assert len([t for t in q.list_tasks() if t.task_type == "review"]) == 2
 
 
 def test_mcp_current_approval_still_enqueues_a_tester(tmp_db, monkeypatch):
