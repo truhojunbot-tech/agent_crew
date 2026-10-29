@@ -10,7 +10,6 @@ Three behaviours pinned here:
 """
 from fastapi.testclient import TestClient
 
-from agent_crew.fallback import has_rate_limit_signal, is_rate_limit_error
 from agent_crew.queue import TaskQueue
 from agent_crew.server import _format_reminder_message, create_app
 
@@ -44,33 +43,6 @@ class TestReminderMessage:
         assert "9123" in msg
         # Idle seconds rendered as integer (no fractional)
         assert "315s" in msg or "315 s" in msg or "315" in msg
-
-
-# ---------------------------------------------------------------------------
-# Fallback pattern recognition
-# ---------------------------------------------------------------------------
-
-
-class TestFalloverPatternsExtended:
-    def test_watchdog_timeout_summary_matches(self):
-        """The summary the watchdog writes when force-failing a stuck task."""
-        summary = "watchdog timeout: pane idle 920s without sign of activity (threshold 900s)"
-        assert is_rate_limit_error(summary) is True
-        assert has_rate_limit_signal(summary, []) is True
-
-    def test_stream_idle_timeout_matches(self):
-        assert is_rate_limit_error("API Stream idle timeout - partial response received") is True
-
-    def test_partial_response_matches(self):
-        assert is_rate_limit_error("partial response, no recovery") is True
-
-    def test_pane_idle_matches(self):
-        assert is_rate_limit_error("pane idle for far too long") is True
-
-    def test_unrelated_summary_still_excluded(self):
-        # Sanity check — the new patterns shouldn't accidentally widen the net.
-        assert is_rate_limit_error("agent posted PR #42") is False
-        assert is_rate_limit_error("merge conflict on requirements.txt") is False
 
 
 # ---------------------------------------------------------------------------

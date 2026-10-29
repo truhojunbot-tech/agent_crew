@@ -139,7 +139,6 @@ def test_dispatch_records_actual_or_unknown_worktree_base_without_blocking(
     )
     pushed = []
     monkeypatch.setattr("agent_crew.server._prepare_worktree_for_task", lambda *_a, **_k: "")
-    monkeypatch.setattr("agent_crew.server._pane_has_usage_limit", lambda *_a, **_k: False)
     monkeypatch.setattr("agent_crew.server._resolve_tmux_pane_target", lambda pane: pane)
     monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr("agent_crew.server._pane_process_kind", lambda pane: ("agent", "codex"))
@@ -175,7 +174,6 @@ def test_dispatch_records_the_exact_prepared_worktree_base(monkeypatch, tmp_db, 
     monkeypatch.setattr(
         "agent_crew.server._prepare_worktree_for_task", lambda *_a, **_k: SHA_DEFAULT,
     )
-    monkeypatch.setattr("agent_crew.server._pane_has_usage_limit", lambda *_a, **_k: False)
     app = create_app(
         tmp_db, state_path=str(state), pane_map={"implementer": "%91"},
         push_fn=lambda *_args: None, watchdog_disabled=True,
@@ -244,7 +242,6 @@ def test_implement_dispatch_ignores_prior_pr_branch_head(
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"roles": [{"role": "implementer", "agent": "codex",
                                           "worktree": str(worker)}]}))
-    monkeypatch.setattr("agent_crew.server._pane_has_usage_limit", lambda *_a, **_k: False)
     app = create_app(tmp_db, state_path=str(state), pane_map={"implementer": "%91"},
                      push_fn=lambda *_args: None, watchdog_disabled=True)
     with TestClient(app) as client:

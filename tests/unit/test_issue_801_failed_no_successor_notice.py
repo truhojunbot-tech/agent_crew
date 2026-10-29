@@ -32,10 +32,12 @@ def _harness(tmp_path, monkeypatch, *, task_type="test", retry_attempt=0):
     return app, queue, notices
 
 
-def _fail(client, *, summary="provider exited", reason="exit_1", final=True):
+def _fail(client, *, summary="provider exited", reason="exit_1", final=True,
+          kind=None):
     return client.post("/tasks/root-801/result", json={
         "task_id": "root-801", "status": "failed", "summary": summary,
-        "findings": [], "error_info": {"reason": reason, "final": final},
+        "findings": [], "error_info": {"reason": reason, "final": final,
+                                      **({"kind": kind} if kind else {})},
     })
 
 
@@ -112,7 +114,8 @@ def test_rate_limit_exhaustion_keeps_escalation_gate(tmp_path, monkeypatch):
     app, queue, notices = _harness(tmp_path, monkeypatch, task_type="implement",
                                    retry_attempt=2)
     with TestClient(app) as client:
-        response = _fail(client, summary="provider 429 rate limit")
+        response = _fail(client, summary="provider 429 rate limit",
+                         kind="provider_limit")
         assert response.status_code == 200, response.text
     assert queue.get_task("retry-root-801-a3") is None
     assert any(g.id == "escalation-root-801-provider-limit" for g in queue.list_gates())

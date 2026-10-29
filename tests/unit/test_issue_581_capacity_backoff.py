@@ -23,17 +23,15 @@ import pytest
 pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 from fastapi.testclient import TestClient
 
+from agent_crew.failure_kind import provider_failure_from_log
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import PROVIDER_CAPACITY, TaskQueue
 from agent_crew.server import (
-    _PROVIDER_CAPACITY_TAGS,
-    _TRANSIENT_RETRIABLE_TAGS,
     _capacity_cooldown_s,
-    _detect_transient_error_in_log,
     create_app,
 )
 
-_CAPACITY_LOG = b"ERROR: Selected model is at capacity. Please try a different model.\n"
+_CAPACITY_LOG = b'{"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}\n'
 
 
 def _state(tmp_path) -> str:
@@ -57,9 +55,17 @@ def _events(db, task_id, name):
 def test_u_581_codex_capacity_is_provider_capacity_not_transient(tmp_path):
     log = tmp_path / "log"
     log.write_bytes(_CAPACITY_LOG)
-    tag = _detect_transient_error_in_log(str(log), agent="codex")
-    assert tag in _PROVIDER_CAPACITY_TAGS
-    assert tag not in _TRANSIENT_RETRIABLE_TAGS   # cannot reach the transient budget
+    failure = provider_failure_from_log(str(log), agent="codex")
+    assert failure["kind"] == "capacity"
+    assert failure["retry_after"] == 120
+
+
+def test_u_581_capacity_words_outside_provider_error_do_not_classify(tmp_path):
+    log = tmp_path / "log"
+    log.write_text("Selected model is at capacity\n" + json.dumps({
+        "type": "item.completed", "item": {"type": "command_execution",
+                                            "aggregated_output": "Selected model is at capacity"}}) + "\n")
+    assert provider_failure_from_log(str(log), agent="codex") is None
 
 
 def test_u_581_cooldown_doubles_caps_at_15_min_with_jitter(monkeypatch):
@@ -158,7 +164,7 @@ def test_u_581_transient_budget_still_applies_to_other_tags(tmp_db, tmp_path, *,
 
     async def fake_subprocess(*args, **kwargs):
         spawns.append(1)
-        kwargs["stdout"].write(b"Error: timeout waiting for response\n")
+        kwargs["stdout"].write(b'{"status":"ERROR","reason":"TIMEOUT"}\n')
         kwargs["stdout"].flush()
         proc = MagicMock(returncode=1, kill=MagicMock())
         proc.wait = AsyncMock(return_value=1)

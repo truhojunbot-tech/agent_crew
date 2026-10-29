@@ -67,7 +67,7 @@ class _RecordingPush:
         ("implement", None, None, True),
         ("implement", None, "1", True),
         ("implement", None, "0", False),
-        ("implement", {"reason": "infrastructure_failure"}, "0", True),
+        ("implement", {"kind": "transient", "reason": "infrastructure_failure"}, "0", True),
         ("review", None, "0", True),
         ("test", None, "0", True),
     ],

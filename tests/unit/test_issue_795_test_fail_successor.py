@@ -50,13 +50,13 @@ def _post(client, status="failed", findings=None, error_info=None):
     return client.post("/tasks/test-795/result", json={
         "task_id": "test-795", "status": status, "summary": "test outcome",
         "findings": findings or [], "pr_number": 794,
-        "error_info": error_info or {},
+        "error_info": error_info if error_info is not None else {"kind": "test_failure"},
     })
 
 
 def _failed_script_result(client):
     return _post(client, error_info={
-        "reason": "script_test_new_failures", "final": True,
+        "kind": "test_failure", "reason": "script_test_new_failures", "final": True,
         "script_test": {"outcome": "FAILED", "reason": "new_failures",
                         "new_failures": ["tests/test_x.py::test_x"]},
     })
@@ -107,7 +107,8 @@ def test_failed_tester_result_creates_one_fix_on_both_transports(
         mcp = build_mcp_server(queue.db_path)
         response = mcp._tool_manager._tools["submit_result"].fn(
             task_id="test-795", status="failed", summary="test outcome",
-            findings=[finding], pr_number=794)
+            findings=[finding], pr_number=794,
+            error_info={"kind": "test_failure"})
         assert response["acknowledged"] is True, response
     fixes = [task for task in queue.list_tasks()
              if task.task_id == fix_task_id("test-795", 1)]
@@ -122,7 +123,7 @@ def test_mcp_script_new_failures_without_findings_create_fix(tmp_path, monkeypat
     response = mcp._tool_manager._tools["submit_result"].fn(
         task_id="test-795", status="failed", summary="script test FAILED",
         pr_number=794, error_info={
-            "reason": "script_test_new_failures", "final": True,
+            "kind": "test_failure", "reason": "script_test_new_failures", "final": True,
             "script_test": {"reason": "new_failures",
                             "new_failures": ["tests/test_x.py::test_x"]},
         })
@@ -146,7 +147,8 @@ def test_fix_cap_sends_one_notice_without_successor(tmp_path, monkeypatch, trans
         mcp = build_mcp_server(queue.db_path)
         response = mcp._tool_manager._tools["submit_result"].fn(
             task_id="test-795", status="failed", summary="test outcome",
-            findings=["tests/test_y.py::test_y failed"], pr_number=794)
+            findings=["tests/test_y.py::test_y failed"], pr_number=794,
+            error_info={"kind": "test_failure"})
         assert response["acknowledged"] is True, response
     assert queue.get_task(fix_task_id("test-795", 1)) is None
     assert len(notices) == 1 and "test_failed_no_successor" in notices[0]

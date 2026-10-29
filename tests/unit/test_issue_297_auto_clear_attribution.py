@@ -89,7 +89,6 @@ def _run(tmp_path, monkeypatch, *, tokens=BIG, post_clear_tokens=None, task_type
 
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda p: True)
-    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda p: False)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda p: None)
     monkeypatch.setattr(sv.subprocess, "run", fake_run)
     monkeypatch.setattr(sv.time, "sleep", lambda *_a: None)
@@ -330,7 +329,6 @@ def _failing_send(tmp_path, monkeypatch, *, task_type="implement", context=None,
 
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda p: True)
-    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda p: False)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda p: None)
     monkeypatch.setattr(sv.subprocess, "run", fake_run)
     monkeypatch.setattr(sv.time, "sleep", lambda *_a: None)

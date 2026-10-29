@@ -414,12 +414,8 @@ def build_mcp_server(
             # avoid, only "use what the task context already names."
             auto_enqueue_fix(queue, task_id, repo=(_task_ctx or {}).get("repo") or "",
                              require_repo_default=True)
-        info = result.error_info if isinstance(result.error_info, dict) else {}
-        script = info.get("script_test")
-        script_failures = script.get("new_failures") if isinstance(script, dict) else None
         actionable_test_failure = (task_type == "test"
-                                   and handle_test_result(result) == "failed"
-                                   and bool(result.findings or script_failures))
+                                   and handle_test_result(result) == "failed")
         if actionable_test_failure:
             fix_id = auto_enqueue_fix(queue, task_id, repo=(_task_ctx or {}).get("repo") or "",
                                       require_repo_default=True)

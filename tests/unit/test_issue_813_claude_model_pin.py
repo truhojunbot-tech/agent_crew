@@ -47,7 +47,9 @@ def _harness(tmp_path, monkeypatch, unused_tcp_port):
 
         return Process()
 
-    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    # These tests claim and dispatch explicitly; a background dispatcher can
+    # race the test's dequeue and claim its task first.
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setenv("AGENT_CREW_CLAUDE_CONTEXT_SCOPE", "worktree")
     monkeypatch.setattr(sv.asyncio, "create_subprocess_exec", fake_exec)

@@ -124,12 +124,7 @@ class TestUsageLimitOnFallbackAgentPaneReroutes:
         """
         app, push_calls = _make_app(tmp_db)
 
-        # Mark Codex's implementer pane as usage-limited.
-        def pane_has_usage_limit(pane_id: str) -> bool:
-            return pane_id == "%C"
-
         with TestClient(app) as client, \
-             patch("agent_crew.server._pane_has_usage_limit", pane_has_usage_limit), \
              patch("agent_crew.server._resolve_tmux_pane_target", side_effect=lambda pane: pane), \
              patch("agent_crew.server._pane_alive_for_push", return_value=True), \
              patch("agent_crew.server._pane_process_kind", return_value=("agent", "codex")):
@@ -141,13 +136,11 @@ class TestUsageLimitOnFallbackAgentPaneReroutes:
             }
             client.post("/tasks", json=fallback_payload)
 
-        # The same-role task stays pending for Codex after the limit clears.
+        # Pane text cannot hold a task; only typed quota evidence can.
         rows = TaskQueue(tmp_db).list_all_with_status()
         fb_task = next((r for r in rows if r["task_id"] == "fb-t1"), None)
         assert fb_task is not None
-        assert fb_task["status"] == "pending", (
-            "Codex work should be held when its pane is usage-limited"
-        )
+        assert fb_task["status"] == "in_progress"
 
         # No cross-provider implementer substitution is permitted.
         gemini_tasks = [
@@ -156,14 +149,13 @@ class TestUsageLimitOnFallbackAgentPaneReroutes:
             and r["context"].get("agent_override") == "gemini"
         ]
         assert gemini_tasks == []
-        assert push_calls == []
+        assert len(push_calls) == 1
 
     def test_codex_push_proceeds_when_pane_healthy(self, tmp_db):
         """Regression: when codex pane is healthy, fallback task is pushed normally."""
         app, push_calls = _make_app(tmp_db)
 
         with TestClient(app) as client, \
-             patch("agent_crew.server._pane_has_usage_limit", return_value=False), \
              patch("agent_crew.server._resolve_tmux_pane_target", side_effect=lambda pane: pane), \
              patch("agent_crew.server._pane_alive_for_push", return_value=True), \
              patch("agent_crew.server._pane_process_kind", return_value=("agent", "codex")):

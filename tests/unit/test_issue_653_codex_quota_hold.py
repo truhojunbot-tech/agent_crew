@@ -11,8 +11,8 @@ from fastapi.testclient import TestClient
 
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
-from agent_crew.server import (_detect_transient_error_in_log,
-                               _codex_quota_reset_at, create_app)
+from agent_crew.failure_kind import provider_failure_from_log
+from agent_crew.server import create_app
 
 
 def _queued(tmp_path, task_id):
@@ -38,7 +38,7 @@ def _marker(queue, task_id):
 
 
 def _real_codex_quota_stream(reset="3:10 PM"):
-    message = "You" + "\u2019" + "ve hit your " + "usage " + f"limit. Try again at {reset}."
+    message = f"You’ve hit your usage limit. Try again at {reset}."
     return "\n".join((
         "[codex error] " + message,
         json.dumps({"type": "error", "message": message}, ensure_ascii=False),
@@ -47,29 +47,36 @@ def _real_codex_quota_stream(reset="3:10 PM"):
     )) + "\n"
 
 
-@pytest.mark.parametrize("line_index", range(3))
-def test_each_real_codex_stream_shape_is_classified(tmp_path, line_index):
+@pytest.mark.parametrize("event_line", [1, 2])
+def test_codex_quota_requires_provider_error_event(tmp_path, event_line):
     log = tmp_path / "dispatch.log"
-    log.write_text(_real_codex_quota_stream().splitlines()[line_index] + "\n")
-    assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
+    lines = _real_codex_quota_stream().splitlines()
+    log.write_text(lines[0] + "\n")
+    assert provider_failure_from_log(str(log), agent="codex") is None
+    failed_at = datetime(2026, 10, 9, 13, 2, tzinfo=timezone.utc).timestamp()
+    log.write_text(lines[event_line] + "\n")
+    failure = provider_failure_from_log(str(log), agent="codex", failed_at=failed_at)
+    assert failure == {"kind": "provider_limit",
+                       "provider_code": "codex_quota_exhausted", "retry_after": 7680}
 
 
-def test_real_codex_message_is_classified_and_reset_parsed(tmp_path):
+def test_codex_quota_dated_reset_is_parsed_from_provider_error(tmp_path):
     log = tmp_path / "dispatch.log"
-    log.write_text(_real_codex_quota_stream())
-    assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
-    # 2026-10-09 13:02 UTC -> 15:10 UTC on the same day.
-    failed_at = 1791550920.0
-    assert _codex_quota_reset_at(str(log), failed_at=failed_at) == 1791558600.0
-
-
-def test_dated_codex_reset_line_uses_the_stated_calendar_day(tmp_path):
-    log = tmp_path / "dated-dispatch.log"
     log.write_text(_real_codex_quota_stream("Sep 30th, 2026 4:48 PM"))
     failed_at = datetime(2026, 9, 24, 13, 2, tzinfo=timezone.utc).timestamp()
     reset_at = datetime(2026, 9, 30, 16, 48, tzinfo=timezone.utc).timestamp()
-    assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
-    assert _codex_quota_reset_at(str(log), failed_at=failed_at) == reset_at
+    failure = provider_failure_from_log(str(log), agent="codex", failed_at=failed_at)
+    assert failure["kind"] == "provider_limit"
+    assert failure["retry_after"] == reset_at - failed_at
+
+
+def test_codex_quota_real_event_without_reset_still_holds(tmp_path):
+    log = tmp_path / "dispatch.log"
+    log.write_text(json.dumps({"type": "turn.failed", "error": {
+        "message": "You've hit your usage limit."}}) + "\n")
+    failure = provider_failure_from_log(str(log), agent="codex")
+    assert failure == {"kind": "provider_limit",
+                       "provider_code": "codex_quota_exhausted", "retry_after": None}
 
 
 def test_fresher_cache_releases_one_probe_then_rest_without_duplicates(tmp_path, monkeypatch):

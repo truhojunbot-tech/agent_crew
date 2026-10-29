@@ -646,7 +646,7 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 8
+QUEUE_SCHEMA_VERSION = 9
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
@@ -1095,6 +1095,7 @@ CREATE TABLE IF NOT EXISTS runtime_state_events (
     direction   TEXT NOT NULL,
     who         TEXT NOT NULL,
     reason      TEXT,
+    trigger_kind TEXT,
     decision_id TEXT,
     incident    TEXT,
     note        TEXT,
@@ -1621,6 +1622,9 @@ class TaskQueue:
                 raise
             pass
         conn.execute(_DDL_RUNTIME_STATE_EVENTS)
+        if "trigger_kind" not in {row[1] for row in conn.execute(
+                "PRAGMA table_info(runtime_state_events)")}:
+            conn.execute("ALTER TABLE runtime_state_events ADD COLUMN trigger_kind TEXT")
         conn.execute(_DDL_RUNTIME_STATE_EVENTS_INDEX)
         for _stmt in _DDL_RUNTIME_STATE_EVENTS_TRIGGERS:
             conn.execute(_stmt)
@@ -2047,18 +2051,21 @@ class TaskQueue:
     def _last_draining_entry(self, conn) -> tuple[Optional[str], bool]:
         """Who put the runtime into DRAINING last, and whether a quarantine trigger did it."""
         row = conn.execute(
-            "SELECT who, reason FROM runtime_state_events WHERE to_state='DRAINING' "
+            "SELECT who, trigger_kind FROM runtime_state_events WHERE to_state='DRAINING' "
             "ORDER BY id DESC LIMIT 1").fetchone()
         if row is None:
             return None, False
         who = row["who"] if isinstance(row, sqlite3.Row) else row[0]
-        reason = (row["reason"] if isinstance(row, sqlite3.Row) else row[1]) or ""
-        return who, ("quarantine" in reason.lower() or who == "runtime")
+        trigger_kind = row["trigger_kind"] if isinstance(row, sqlite3.Row) else row[1]
+        # Existing databases have NULL in this additive column. Unknown
+        # provenance cannot authorize a self-undrain after migration.
+        return who, trigger_kind != "manual"
 
     def transition_runtime_state(self, to_state: str, *, who: str, reason: Optional[str] = None,
                                  decision_id: Optional[str] = None, incident: Optional[str] = None,
                                  note: Optional[str] = None,
-                                 evidence: Optional[str] = None) -> dict:
+                                 evidence: Optional[str] = None,
+                                 trigger_kind: Optional[str] = None) -> dict:
         """Move the runtime to ``to_state`` and record the transition (P6).
 
         One ``BEGIN IMMEDIATE`` covers read, authority check, row write and event
@@ -2073,6 +2080,11 @@ class TaskQueue:
         to_state = (to_state or "").strip().upper()
         if to_state not in RUNTIME_STATES:
             raise ValueError(f"unknown runtime state {to_state!r}; expected one of {RUNTIME_STATES}")
+        if trigger_kind not in (None, "manual", "quarantine") or (
+                trigger_kind and to_state != "DRAINING"):
+            raise ValueError("trigger_kind must be 'manual' or 'quarantine' on DRAINING")
+        if to_state == "DRAINING" and trigger_kind is None:
+            trigger_kind = "quarantine" if who == "runtime" else "manual"
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -2100,10 +2112,10 @@ class TaskQueue:
                          else "loosen")
             conn.execute(
                 "INSERT INTO runtime_state_events (epoch, from_state, to_state, direction, who, "
-                "reason, decision_id, incident, note, evidence, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (new_epoch, frm, to_state, direction, who, reason, decision_id, kept_incident,
-                 note, evidence, time.time()))
+                "reason, trigger_kind, decision_id, incident, note, evidence, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (new_epoch, frm, to_state, direction, who, reason, trigger_kind,
+                 decision_id, kept_incident, note, evidence, time.time()))
             conn.execute("COMMIT")
             return {"state": to_state, "from_state": frm, "epoch": new_epoch,
                     "direction": direction, "paused": bool(paused), "reason": reason,
@@ -2123,7 +2135,7 @@ class TaskQueue:
         try:
             rows = conn.execute(
                 "SELECT id, epoch, from_state, to_state, direction, who, reason, decision_id, "
-                "incident, note, evidence, created_at FROM runtime_state_events "
+                "incident, note, evidence, trigger_kind, created_at FROM runtime_state_events "
                 "ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
             return [dict(r) for r in rows]
         finally:

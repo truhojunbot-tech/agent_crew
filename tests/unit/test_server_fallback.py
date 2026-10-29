@@ -29,7 +29,8 @@ def _task_payload(task_id="t1", task_type="implement", description="do work"):
     }
 
 
-def _result(task_id, status="failed", summary="rate limit reached", findings=None):
+def _result(task_id, status="failed", summary="rate limit reached", findings=None,
+            error_info=None):
     return {
         "task_id": task_id,
         "status": status,
@@ -37,6 +38,7 @@ def _result(task_id, status="failed", summary="rate limit reached", findings=Non
         "verdict": None,
         "findings": findings or [],
         "pr_number": None,
+        "error_info": error_info or {},
     }
 
 
@@ -169,7 +171,8 @@ def test_rate_limit_retry_exhaustion_records_one_escalation(tmp_db):
         assert client.post("/tasks", json=_task_payload(task_id)).status_code == 201
         for attempt in range(3):
             response = client.post(f"/tasks/{task_id}/result",
-                                   json=_result(task_id, summary="rate limit reached"))
+                                   json=_result(task_id, summary="rate limit reached",
+                                                error_info={"kind": "provider_limit"}))
             assert response.status_code == 200, (attempt, task_id, response.text)
             if attempt < 2:
                 task_id = f"retry-{task_id}-a{attempt + 1}"

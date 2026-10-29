@@ -531,19 +531,22 @@ def record_to_result(task_id: str, record: Mapping, pr_number=None) -> TaskResul
         return TaskResult(task_id, "needs_human",
                           f"{SKIPPED_NO_TEST_COMMAND}: no test command configured; "
                           "PR left for the coordinator gate (not auto-passed)",
-                          pr_number=pr_number, error_info=info)
+                          pr_number=pr_number,
+                          error_info={**info, "kind": "config_error"})
     if outcome == SETUP_ERROR:
         # The suite never ran: neither a pass nor a PR failure to fix.
         return TaskResult(task_id, "needs_human",
                           f"script test {SETUP_ERROR}: {record.get('detail', '')[:300]}; "
                           "PR left for the coordinator gate",
-                          pr_number=pr_number, error_info=info)
+                          pr_number=pr_number,
+                          error_info={**info, "kind": "config_error"})
     if outcome == INCOMPLETE:
         return TaskResult(task_id, "needs_human",
                           f"script test {INCOMPLETE}: {record.get('reason')}; "
                           "PR left for the coordinator gate",
                           pr_number=pr_number,
-                          error_info={**info, "reason": record.get("reason")})
+                          error_info={**info, "kind": "timeout",
+                                      "reason": record.get("reason")})
     reason = record.get("reason") or "failed"
     new = record.get("new_failures") or []
     summary = f"script test {FAILED} ({reason}): {_counts_text(record.get('counts') or {})}"
@@ -554,7 +557,8 @@ def record_to_result(task_id: str, record: Mapping, pr_number=None) -> TaskResul
         summary += f"; flaky: {', '.join(flaky[:20])}"
     return TaskResult(task_id, "failed", summary, findings=[f"new failure: {i}" for i in new],
                       pr_number=pr_number,
-                      error_info={**info, "reason": f"script_test_{reason}", "final": True})
+                      error_info={**info, "kind": "test_failure" if new else "agent_failed",
+                                  "reason": f"script_test_{reason}", "final": True})
 
 
 def head_has_workflows(repo: str, head_sha: str) -> bool:
