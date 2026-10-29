@@ -7613,6 +7613,17 @@ def create_app(
                         _cloud_local_fallback = False
                         _cloud_capacity_skip = False
                         if (worker == _claude_cloud.CLOUD_PROVIDER_NAME and
+                                not _claude_cloud.cloud_dispatch_enabled()):
+                            # #919: no role of a disabled cloud worker may fall
+                            # through to local dispatch (it has no worktree, so
+                            # the task would fail no_worktree). Leave it pending.
+                            for _cloud_role in _worker_roles:
+                                _cloud_type = _ROLE_TO_TYPE.get(_cloud_role)
+                                if _cloud_type:
+                                    await asyncio.to_thread(
+                                        _notice_cloud_disabled_role, _cloud_role, _cloud_type)
+                            continue
+                        if (worker == _claude_cloud.CLOUD_PROVIDER_NAME and
                                 "implementer" in _worker_roles):
                             # The adapter owns dequeue and admission.  A cap or
                             # capacity skip must leave the task pending for this
@@ -7622,9 +7633,6 @@ def create_app(
                                 role="implementer", task_type="implement",
                                 state_path=state_path, review_guard_fn=_refuse_self_review,
                                 role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
-                            if _cloud_implement_outcome.skipped_reason == "disabled":
-                                await asyncio.to_thread(
-                                    _notice_cloud_disabled_role, "implementer", "implement")
                             if _cloud_implement_outcome.dispatched or _worker_roles == ["implementer"]:
                                 continue
                             if "reviewer" in _worker_roles and _claude_cloud.cloud_dispatch_enabled():
