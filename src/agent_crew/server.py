@@ -219,6 +219,11 @@ def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
             except Exception:
                 logger.exception("coordinator notice release failed task=%s kind=%s",
                                  task_id, kind)
+#: #892: POST /tasks enqueue attempts on "database is locked" before a 503.
+#: Each attempt already waits out the connection's 10 s busy_timeout.
+_ENQUEUE_LOCK_ATTEMPTS = 3
+_ENQUEUE_LOCK_RETRY_AFTER = "2"
+
 _DEFAULT_GEMINI_MODEL = "Gemini 3.8 Flash (Medium)"
 
 
@@ -8914,7 +8919,30 @@ def create_app(
         _validate_task_admission_request(task)
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         try:
-            task_id = q().enqueue(task, ingress="http.tasks")
+            # #892: a lock that outlasts busy_timeout rolled the INSERT back, so
+            # a bounded retry cannot double-enqueue. A lock that outlasts the
+            # retries is a 503 the caller can act on, never a bare 500.
+            for attempt in range(_ENQUEUE_LOCK_ATTEMPTS):
+                try:
+                    task_id = q().enqueue(task, ingress="http.tasks")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "database is locked" not in str(exc).lower():
+                        raise
+                    if attempt == _ENQUEUE_LOCK_ATTEMPTS - 1:
+                        logger.error("POST /tasks: database still locked after %d attempts "
+                                     "task_id=%s", _ENQUEUE_LOCK_ATTEMPTS, task.task_id)
+                        raise HTTPException(
+                            status_code=503,
+                            detail={"error": "tasks database is locked",
+                                    "reason": "database_locked",
+                                    "task_id": task.task_id, "retryable": True},
+                            headers={"Retry-After": _ENQUEUE_LOCK_RETRY_AFTER},
+                        )
+                    logger.warning("POST /tasks: database is locked, retrying "
+                                   "(attempt %d/%d) task_id=%s",
+                                   attempt + 1, _ENQUEUE_LOCK_ATTEMPTS, task.task_id)
+                    time.sleep(0.05 * (2 ** attempt))
         except InvalidRiskTierError as e:
             raise HTTPException(status_code=422, detail=str(e))
         except TaskAlreadyExistsError as e:
