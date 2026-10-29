@@ -56,6 +56,7 @@ from agent_crew import tokenomics_canary as _tokenomics_canary
 #   is what made this file a second decision implementation; the static rule in
 #   tests/unit/test_sev0_cea_guard_count.py fails if the import comes back.
 from agent_crew.cea import cascade_contract as _cascade
+from agent_crew.cea import callsites as _cea_callsites
 
 logger = logging.getLogger(__name__)
 
@@ -608,6 +609,36 @@ def verify_review_artifact(task: TaskRequest, result: TaskResult) -> tuple[bool,
     return True, f"review verdict {result.verdict}"
 
 
+#: T5, ADR §11.1 row 10 / fixture CXC-6a.
+DISPATCH_BASE_ABSENT_DETAIL = (
+    "dispatch base absent: this implement task declares no artifact contract "
+    "and carries no worktree_base_sha or reviewed_sha, so its completion "
+    "cannot be verified")
+
+
+def dispatch_base_absent_hold(task: Optional[TaskRequest], result: TaskResult) -> Optional[str]:
+    """The T5 "dispatch base absent" rule, shared by HTTP and MCP (#887).
+
+    Returns the hold detail when the result must be held, else ``None``. An
+    implement completion with no declared contract and no dispatch base has
+    nothing to be checked against: a FAIL, never a pass. Held only under the
+    project's enforce mode; under shadow/off it is logged and the result stands.
+    """
+    context = task.context if task is not None and isinstance(task.context, dict) else {}
+    if (task is None or task.task_type != "implement" or result.status != "completed"
+            or declared_artifact_kind(task) is not None
+            or context.get("worktree_base_sha") or context.get("reviewed_sha")
+            or "rebase_onto" in context):
+        return None
+    if _cea_callsites.enforcing(project=getattr(task, "project", None) or None):
+        logger.warning("artifact gate FAILED for %s — %s", task.task_id,
+                       DISPATCH_BASE_ABSENT_DETAIL)
+        return DISPATCH_BASE_ABSENT_DETAIL
+    logger.info("artifact gate would FAIL under enforce for %s — %s (shadow: result stands)",
+                task.task_id, DISPATCH_BASE_ABSENT_DETAIL)
+    return None
+
+
 def no_artifact_result(result: TaskResult, detail: str) -> TaskResult:
     """Preserve the worker report while making the absent artifact terminal.
 
@@ -958,6 +989,73 @@ def stale_review_task_id(pr_number, head_sha: str) -> str:
     back to the commit it was created for.
     """
     return f"review-{int(pr_number)}-{(head_sha or '')[:12]}"
+
+
+def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, head: str,
+                           ctx, *, project: str) -> Optional[str]:
+    """Enqueue one head-anchored review for a PR whose head moved (#304).
+
+    Shared by the HTTP and MCP result transports (#887): a stale approval
+    suppressed on one transport but not requeued on the other would strand the
+    lineage with no review of the head that is actually open.
+
+    ⛔The task id is derived from the PR and the new head, so two results
+      observing the same move produce ONE review rather than two reviewers
+      on one commit. A head that moves again is a genuinely different review
+      and gets its own id.
+
+    Returns the successor id, or ``None`` if it could not be enqueued. A STOP
+    reopens the parent's outbox and re-raises, so replay restores it.
+    """
+    new_id = stale_review_task_id(pr_number, head)
+    base = ctx if isinstance(ctx, dict) else {}
+    context = {k: v for k, v in base.items()
+               if k in ("pr_number", "repo", "project", "no_tester",
+                        "coordinator_managed", "checklist_layers",
+                        "findings_only")}
+    context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
+                    "expected_head_sha": head, "prev_task_id": review_task_id})
+    inherited_tier = base.get("risk_tier")
+    if (isinstance(inherited_tier, int) and not isinstance(inherited_tier, bool)
+            and 0 <= inherited_tier <= 3):
+        context["risk_tier"] = inherited_tier
+    try:
+        queue.enqueue(TaskRequest(
+            task_id=new_id,
+            task_type="review",
+            description=f"Review PR #{pr_number} at {head[:12]} "
+                        f"(re-dispatched: {review_task_id} reviewed an older head)",
+            branch=base.get("branch") or "main",
+            priority=3,
+            context=context,
+            # s4j: a re-dispatched review is the same project as the review
+            # it supersedes.
+            project=project,
+        ),
+                      ingress="watchdog.stale_review",
+                      _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+        logger.info(
+            f"requeue_review_at_head: enqueued {new_id} for PR #{pr_number} at "
+            f"{head[:12]}, superseding {review_task_id} (#304)")
+        return new_id
+    except TaskAlreadyExistsError:
+        logger.info(
+            f"requeue_review_at_head: {new_id} already exists — another result "
+            f"observed the same head; not duplicating it (#304)")
+        return new_id
+    except PausedError:
+        # #314 §4 P0: STOP race — reopen the parent (review) outbox so a
+        # result-carrying replay after resume recovers this re-dispatch.
+        try:
+            queue.outbox_reopen(review_task_id)
+        except Exception:
+            logger.exception(f"requeue_review_at_head: outbox_reopen({review_task_id}) failed")
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            f"requeue_review_at_head: could not requeue a review for PR "
+            f"#{pr_number} at {head[:12]}")
+        return None
 
 
 def review_fix_max_rounds() -> int:

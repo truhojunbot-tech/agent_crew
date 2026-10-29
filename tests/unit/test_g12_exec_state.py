@@ -408,7 +408,8 @@ def test_push_path_records_claim_push_and_dispatch(tmp_db, tmp_path):
     assert execution["dispatch_channel"] == "tmux_pane"
     assert execution["dispatch_target"] == "%101"
     assert execution["lease_owner"] == "pane:%101"
-    assert execution["lease_expires_at"] is None       # no deadline on a pane task
+    # #887: a pane claim carries the claim lease as the orphan backstop.
+    assert execution["lease_expires_at"] > execution["dispatched_at"]
     # `dispatched` precedes `pushed`: record_dispatch mints the nonce that has to
     # be *inside* the pushed message, so the dispatch is recorded before the pane
     # ever sees it, and set_push_at follows the push (server.py _try_push_*).

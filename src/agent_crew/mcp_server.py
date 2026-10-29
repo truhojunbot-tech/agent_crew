@@ -41,8 +41,9 @@ from agent_crew.pipeline import (
     auto_enqueue_test,
     fix_task_id,
     auto_fallback_failed_task,    hold_mismatched_pr_result,
-    artifact_gate_applies, declared_artifact_kind, no_artifact_result,
-    verify_implement_artifact, verify_task_artifact,
+    artifact_gate_applies, declared_artifact_kind, dispatch_base_absent_hold, no_artifact_result,
+    verify_implement_artifact, verify_task_artifact, review_publication_decision,
+    requeue_review_at_head, _successor_project,
 )
 from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
@@ -50,7 +51,7 @@ from agent_crew.protocol import (
 from agent_crew.memory_capture import capture_result_best_effort
 from agent_crew.queue import (
     AdmissionRefused, CompletedReviewRejected, DuplicateReviewResult, InvalidReviewResult,
-    LateResultRejected, PausedError as _PausedError, TaskQueue,
+    LateResultRejected, PausedError as _PausedError, TaskQueue, claim_lease_seconds,
 )
 from agent_crew.role_mapping import (
     LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE, anonymous_pull_refusal, role_policy_refusal,
@@ -164,7 +165,9 @@ def build_mcp_server(
             return {"task_id": task.task_id, "dispatch_refused": refusal}
         try:
             nonce = queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
-                                          target=f"mcp:{agent or 'anonymous'}")
+                                          target=f"mcp:{agent or 'anonymous'}",
+                                          lease_owner=f"mcp:{agent or 'anonymous'}",
+                                          lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             return {"task_id": task.task_id, "dispatch_refused": str(exc)}
         return _task_to_dict(task, nonce=nonce)
@@ -177,7 +180,9 @@ def build_mcp_server(
             return None
         try:
             nonce = queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
-                                          target=f"mcp:{agent or 'anonymous'}")
+                                          target=f"mcp:{agent or 'anonymous'}",
+                                          lease_owner=f"mcp:{agent or 'anonymous'}",
+                                          lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             return {"task_id": task.task_id, "dispatch_refused": str(exc)}
         return _task_to_dict(task, nonce=nonce)
@@ -250,14 +255,12 @@ def build_mcp_server(
             _runtime_paused = queue.get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
             _runtime_paused = True
-        _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
         _artifact_verified = None
-        if (not _runtime_paused and _task is not None
-                and _task.task_type == "implement" and result.status == "completed"
-                and declared_artifact_kind(_task) is None
-                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
-                         or "rebase_onto" in _artifact_context)):
-            logger.info("MCP submit_result: artifact gate not applied — dispatch base absent (task=%s)", task_id)
+        # #887: the same T5 rule as HTTP, from the one shared helper.
+        _no_base = None if _runtime_paused else dispatch_base_absent_hold(_task, result)
+        if _no_base is not None:
+            _artifact_held = _no_base
+            result = no_artifact_result(result, _no_base)
         if not _runtime_paused and artifact_gate_applies(_task, result):
             # MCP is a per-worker subprocess launched from that worker's
             # checkout. Unlike HTTP it has no in-process worktree map; its cwd
@@ -374,7 +377,33 @@ def build_mcp_server(
             auto_enqueue_review(queue, task_id, pr_number=result.pr_number,
                                 result=result)
         elif task_type == "review" and _resolve_verdict(result) == "approve":
-            auto_enqueue_test(queue, task_id)
+            # #887: the #304 head gate HTTP applies before acting on an
+            # approval. A verdict about a head that has moved neither spends a
+            # tester nor reaches a merge.
+            _ctx = _task_ctx if isinstance(_task_ctx, dict) else {}
+            _review_pr = result.pr_number or _ctx.get("pr_number")
+            _pub = review_publication_decision(
+                _ctx, _review_pr, repo=_ctx.get("repo") or "",
+                repo_cwd=os.getcwd()) if _review_pr else None
+            if _pub is not None and not _pub.publish:
+                logger.warning("MCP submit_result: approval NOT acted on for %s — %s (#304)",
+                               task_id, _pub.reason)
+                try:
+                    queue.patch_context(task_id, {
+                        "review_publication": _pub.status,
+                        "review_publication_reason": _pub.reason,
+                    })
+                except Exception:
+                    logger.exception("MCP submit_result: could not record the suppressed "
+                                     "approval for %s", task_id)
+                if _pub.requeue_head:
+                    # #887: HTTP requeues a review anchored on the new head;
+                    # without it this transport stranded the lineage.
+                    requeue_review_at_head(
+                        queue, task_id, _review_pr, _pub.requeue_head, _ctx,
+                        project=_successor_project(queue, queue.get_task(task_id)))
+            else:
+                auto_enqueue_test(queue, task_id)
         elif task_type == "review" and _resolve_verdict(result) == "request_changes":
             # #244: the rejection path must cascade on this transport too,
             # otherwise an MCP-only crew stalls on every request_changes.

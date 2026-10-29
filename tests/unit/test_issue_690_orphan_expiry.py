@@ -60,7 +60,7 @@ def test_expired_orphan_times_out_once_and_frees_slot(tmp_db, monkeypatch, caplo
 
 @pytest.mark.parametrize(("expiry", "heartbeat", "now"), [
     (5000.0, None, 4000.0),     # live lease
-    (1000.0, 1100.0, 4000.0),   # worker heartbeated after expiry
+    (1000.0, 3000.0, 4000.0),   # worker heartbeated after expiry, still fresh (#887)
     (1000.0, None, 2500.0),     # within the default grace period
 ])
 def test_live_lease_heartbeat_or_grace_prevents_expiry(

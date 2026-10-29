@@ -55,6 +55,7 @@ from agent_crew import tokenomics_canary as _canary
 from agent_crew.github import get_repo, _repo_slug
 from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.pipeline import (
+    requeue_review_at_head as _pipeline_requeue_review_at_head,
     auto_enqueue_fix as _pipeline_auto_enqueue_fix,
     auto_enqueue_review as _pipeline_auto_enqueue_review,
     auto_enqueue_test as _pipeline_auto_enqueue_test,
@@ -66,7 +67,7 @@ from agent_crew.pipeline import (
     MISSING_IMPLEMENT_REF_DETAIL,
     artifact_gate_applies,
     declared_artifact_kind,
-    no_artifact_result,
+    no_artifact_result, dispatch_base_absent_hold,
     verify_task_artifact,
     resume_tier3_gate as _resume_tier3_gate,
     review_publication_decision,
@@ -87,7 +88,7 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               TaskAlreadyExistsError,
                               TaskQueue, WorkIntentTargetConflict, QUEUE_SCHEMA_VERSION,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
-                              validate_http_root_risk,
+                              validate_http_root_risk, claim_lease_seconds,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE,
                               RequestSqliteTiming, request_sqlite_timing)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
@@ -95,7 +96,6 @@ from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_L
 from agent_crew import claude_cloud as _claude_cloud
 from agent_crew import script_tester as _script_tester
 from agent_crew import contract_emit as _contract_emit
-from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import (
     DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE,
@@ -4986,7 +4986,8 @@ def create_app(
         try:
             _nonce = q().record_dispatch(
                 task.task_id, channel="tmux_pane", agent=_target_agent or None,
-                target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}")
+                target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}",
+                lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             logger.warning("_try_push_next: dispatch refused for %s — %s", task.task_id, exc)
             return
@@ -5092,7 +5093,8 @@ def create_app(
         try:
             _nonce = q().record_dispatch(task.task_id, channel="tmux_pane", agent=agent,
                                          target=guarded_pane_id,
-                                         lease_owner=f"pane:{guarded_pane_id}")
+                                         lease_owner=f"pane:{guarded_pane_id}",
+                                         lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             logger.warning("_try_push_discuss: dispatch refused for %s — %s", task.task_id, exc)
             return
@@ -5211,9 +5213,15 @@ def create_app(
         expired_orphans: set[str] = set()
         for row in rows:
             lease_end = row.get("lease_expires_at")
-            if (lease_end is None or not math.isfinite(lease_end) or
-                    now <= lease_end + orphan_grace or
-                    (row.get("last_heartbeat_at") or 0.0) > lease_end):
+            if lease_end is None or not math.isfinite(lease_end):
+                continue
+            # #887: a heartbeat proves liveness only while it is fresh. The
+            # lease is not renewed, so a heartbeat after it moves the deadline
+            # to heartbeat+grace — never exempts the row forever.
+            last_heartbeat = row.get("last_heartbeat_at") or 0.0
+            if not math.isfinite(last_heartbeat):
+                last_heartbeat = 0.0
+            if now <= max(lease_end, last_heartbeat) + orphan_grace:
                 continue
             task_id = row["task_id"]
             active = active_dispatches.get(task_id)
@@ -7911,61 +7919,13 @@ def create_app(
     def _requeue_review_at_head(review_task_id: str, pr_number, head: str, ctx) -> None:
         """Enqueue one head-anchored review for a PR whose head moved (#304).
 
-        ⛔The task id is derived from the PR and the new head, so two results
-          observing the same move produce ONE review rather than two reviewers
-          on one commit — the same claim-by-primary-key mechanism as #244's fix
-          ids. A head that moves again is a genuinely different review and gets
-          its own id.
+        The body is shared with the MCP transport (#887); only the project
+        fallback to this dispatcher's identity is server-specific.
         """
-        new_id = stale_review_task_id(pr_number, head)
-        base = ctx if isinstance(ctx, dict) else {}
-        context = {k: v for k, v in base.items()
-                   if k in ("pr_number", "repo", "project", "no_tester",
-                            "coordinator_managed", "checklist_layers",
-                            "findings_only")}
-        context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
-                        "expected_head_sha": head, "prev_task_id": review_task_id})
-        inherited_tier = base.get("risk_tier")
-        if (isinstance(inherited_tier, int) and not isinstance(inherited_tier, bool)
-                and 0 <= inherited_tier <= 3):
-            context["risk_tier"] = inherited_tier
-        try:
-            q().enqueue(TaskRequest(
-                task_id=new_id,
-                task_type="review",
-                description=f"Review PR #{pr_number} at {head[:12]} "
-                            f"(re-dispatched: {review_task_id} reviewed an older head)",
-                branch=base.get("branch") or "main",
-                priority=3,
-                context=context,
-                # s4j: a re-dispatched review is the same project as the review
-                # it supersedes. Naming none admitted project-less and the
-                # engine raised the frozen-contract violation inside the
-                # watchdog. `_server_identity` is the same fallback /health
-                # already reports this dispatcher under (#248).
-                project=_successor_project_for(review_task_id, base),
-            ),
-                        ingress="watchdog.stale_review",
-                        _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
-            logger.info(
-                f"_requeue_review_at_head: enqueued {new_id} for PR #{pr_number} at "
-                f"{head[:12]}, superseding {review_task_id} (#304)")
-        except TaskAlreadyExistsError:
-            logger.info(
-                f"_requeue_review_at_head: {new_id} already exists — another result "
-                f"observed the same head; not duplicating it (#304)")
-        except _PausedError:
-            # #314 §4 P0: STOP race — 다른 successor helper와 동일하게 부모(review) outbox를
-            # reopen해 재개 후 result-carrying replay로 이 stale-review 재dispatch를 복구하고 전파.
-            try:
-                q().outbox_reopen(review_task_id)
-            except Exception:
-                logger.exception(f"_requeue_review_at_head: outbox_reopen({review_task_id}) 실패")
-            raise
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                f"_requeue_review_at_head: could not requeue a review for PR "
-                f"#{pr_number} at {head[:12]}")
+        _pipeline_requeue_review_at_head(
+            q(), review_task_id, pr_number, head, ctx,
+            project=_successor_project_for(
+                review_task_id, ctx if isinstance(ctx, dict) else {}))
 
     def _auto_enqueue_fix(review_task_id: str, repo: str = "") -> Optional[str]:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
@@ -9048,7 +9008,9 @@ def create_app(
                 TASK_TYPE_TO_ROLE.get(task.task_type), agent))
         try:
             nonce = q().record_dispatch(task.task_id, channel="api", agent=agent or None,
-                                        target=f"http_poll:{agent or 'anonymous'}")
+                                        target=f"http_poll:{agent or 'anonymous'}",
+                                        lease_owner=f"http_poll:{agent or 'anonymous'}",
+                                        lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             # The claim already committed; the dispatch did not. Say so rather
             # than hand out a task the gate refused.
@@ -9221,22 +9183,12 @@ def create_app(
         #   `shadow`/`off` this is recorded and the result stands, because the
         #   whole point of shadow is to measure how many live tasks this would
         #   have caught before it catches any.
-        if (not _runtime_paused and not _REPLAYING.get() and _task is not None
-                and _task.task_type == "implement" and result.status == "completed"
-                and declared_artifact_kind(_task) is None
-                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
-                         or "rebase_onto" in _artifact_context)):
-            _no_base = ("dispatch base absent: this implement task declares no "
-                        "artifact contract and carries no worktree_base_sha or "
-                        "reviewed_sha, so its completion cannot be verified")
-            if _cea_callsites.enforcing(project=getattr(_task, "project", None) or None):
-                logger.warning("POST /tasks/%s/result: artifact gate FAILED — %s",
-                               task_id, _no_base)
-                _artifact_held = _no_base
-                result = no_artifact_result(result, _no_base)
-            else:
-                logger.info("POST /tasks/%s/result: artifact gate would FAIL under "
-                            "enforce — %s (shadow: result stands)", task_id, _no_base)
+        # #887: one helper for both transports — MCP walked around this rule.
+        _no_base = (None if _runtime_paused or _REPLAYING.get()
+                    else dispatch_base_absent_hold(_task, result))
+        if _no_base is not None:
+            _artifact_held = _no_base
+            result = no_artifact_result(result, _no_base)
         # #374: the check follows the task's declared contract; undeclared
         # tasks keep #353's commit rule exactly (artifact_gate_applies).
         if (not _runtime_paused and not _REPLAYING.get()
