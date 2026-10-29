@@ -1922,6 +1922,13 @@ def auto_enqueue_fix(
                 # A failed test has no reviewer comment to publish. The server
                 # sends its coordinator notice when no fix was created.
                 return None
+            # #914: the PR comment needs a PR and is skipped on replay; the
+            # durable marker and notice do not. A canary hold is a HUMAN_GATE
+            # that may still release the fix, so it is not a terminal refusal.
+            if not canary_fired:
+                _record_successor_refused(
+                    queue, review_task_id, "fix_rounds_exhausted",
+                    f"round={fix_round} max={max_rounds}", coordinator_notify_fn)
             # #314 §4 P0: replay 중에는 exhaustion PR comment를 게시하지 않는다(중복 방지).
             if suppress_side_effects:
                 logger.debug(f"auto_enqueue_fix: replay 중 — fix-budget exhaustion comment skip "
@@ -2454,6 +2461,10 @@ def auto_enqueue_review(
                 f"auto_enqueue_review: skipping — impl task {impl_task_id} has "
                 f"no branch and no pr_number; reviewer has nothing to find (#161)"
             )
+            _record_successor_refused(
+                queue, impl_task_id, "no_branch_no_pr",
+                "implementer reported neither a branch nor a PR",
+                coordinator_notify_fn)
             return None
 
         # Build a freshness directive that is unambiguous about reviewing
