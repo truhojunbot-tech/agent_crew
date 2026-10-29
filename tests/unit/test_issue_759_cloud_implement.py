@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+import pytest
+
 from agent_crew import claude_cloud as cloud
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
@@ -286,3 +288,10 @@ def test_cloud_fix_defers_when_launch_head_cannot_be_verified(tmp_path, monkeypa
     assert outcome.skipped_reason == "cloud_pr_head_unavailable"
     assert queue.get_task("fix-unavailable").status == "pending"
     assert queue.get_task_context("fix-unavailable")["push_not_before"] > time.time()
+
+
+@pytest.fixture(autouse=True)
+def _branch_has_no_pr(monkeypatch):
+    # #910: the pre-launch PR lookup is strict, so an unstubbed (unauthenticated)
+    # `gh` defers the launch instead of reading as "no PR". Tests override this.
+    monkeypatch.setattr(cloud._github, "pr_number_for_branch", lambda *a, **kw: None)

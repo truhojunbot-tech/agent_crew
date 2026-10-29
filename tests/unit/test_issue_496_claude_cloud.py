@@ -551,3 +551,10 @@ def test_parse_terminal_outcome_takes_the_last_line():
 
 def test_parse_terminal_outcome_none_when_absent():
     assert cc.parse_terminal_outcome("just some prose, no verdict") is None
+
+
+@pytest.fixture(autouse=True)
+def _branch_has_no_pr(monkeypatch):
+    # #910: the pre-launch PR lookup is strict, so an unstubbed (unauthenticated)
+    # `gh` defers the launch instead of reading as "no PR". Tests override this.
+    monkeypatch.setattr(cc._github, "pr_number_for_branch", lambda *a, **kw: None)

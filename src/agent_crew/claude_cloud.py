@@ -1148,6 +1148,26 @@ def dispatch_cloud_for_role(
     fix_round = context.get("fix_round")
     prior_pr_head = None
     prior_branch_message = None
+    if role == "implementer" and not (existing_pr or fix_round) and task.branch \
+            and preflight_repo:
+        # #910: a continuation (rebase_onto, hand-posted fix, crew run on an
+        # existing branch) can carry neither pr_number nor fix_round while its
+        # branch already has a PR. Without a launch head, reconcile took that
+        # PR for this session's output and completed the task at launch.
+        try:
+            # strict: the default form returns None on gh failure too, which
+            # would read "unknown" as "no PR" and launch without a head.
+            existing_pr = _github.pr_number_for_branch(task.branch, repo=preflight_repo,
+                                                       strict=True)
+        except Exception:
+            # Launching without knowing whether a PR exists recreates the
+            # false completion this lookup exists to prevent; defer instead.
+            logger.exception("claude_cloud: pre-launch PR lookup failed for %s; leaving pending",
+                             task.task_id)
+            queue.patch_context(task.task_id, {"push_not_before": time.time() + 30})
+            queue.requeue(task.task_id)
+            return CloudDispatchOutcome(False, task_id=task.task_id,
+                                        skipped_reason="cloud_pr_lookup_unavailable")
     if role == "implementer" and (existing_pr or fix_round):
         task_repo = preflight_repo
         if not task_repo:
@@ -1728,6 +1748,11 @@ def reconcile_cloud_dispatch(
                     "claude_cloud: auto_enqueue_review did not confirm a review for %s "
                     "(pr=%s) — leaving in_progress to retry on the next pass",
                     task.task_id, pr_number)
+                # #910: a discovery whose review successor cannot be created
+                # must not stay silent; the coordinator hears it once.
+                from agent_crew.server import coordinator_notice_once
+                coordinator_notice_once(queue, task.task_id, "cloud_review_enqueue_failed",
+                                        f"pr={pr_number} branch={branch} head={head_sha}")
                 return CloudReconciliationOutcome(
                     task.task_id, "still_dispatched", pr_number=pr_number,
                     detail="review not yet confirmed for discovered PR; will retry")

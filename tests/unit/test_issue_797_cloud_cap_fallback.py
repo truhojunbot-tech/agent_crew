@@ -142,3 +142,10 @@ def test_cloud_retry_attribution_carries_retry_of(tmp_path, monkeypatch):
     attribution = queue.get_attribution("fix-pr")
     assert attribution["retry_of"] == "original"
     assert attribution["fallback_of"] == "prior-failure"
+
+
+@pytest.fixture(autouse=True)
+def _branch_has_no_pr(monkeypatch):
+    # #910: the pre-launch PR lookup is strict, so an unstubbed (unauthenticated)
+    # `gh` defers the launch instead of reading as "no PR". Tests override this.
+    monkeypatch.setattr(cloud._github, "pr_number_for_branch", lambda *a, **kw: None)

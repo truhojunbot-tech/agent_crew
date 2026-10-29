@@ -3,6 +3,8 @@
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from agent_crew import claude_cloud as cloud
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
@@ -210,3 +212,10 @@ def test_default_submit_timeout_is_configurable(monkeypatch):
                         seen.append(kwargs) or SimpleNamespace(returncode=0, stdout=""))
     cloud._default_run(["claude", "--cloud"])
     assert seen[0]["timeout"] == 120
+
+
+@pytest.fixture(autouse=True)
+def _branch_has_no_pr(monkeypatch):
+    # #910: the pre-launch PR lookup is strict, so an unstubbed (unauthenticated)
+    # `gh` defers the launch instead of reading as "no PR". Tests override this.
+    monkeypatch.setattr(cloud._github, "pr_number_for_branch", lambda *a, **kw: None)

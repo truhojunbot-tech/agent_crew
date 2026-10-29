@@ -457,8 +457,13 @@ def branch_has_pr(branch: str, repo: Optional[str] = None) -> bool:
         return True
 
 
+class PRLookupError(RuntimeError):
+    """A strict PR lookup could not establish whether a PR exists."""
+
+
 def pr_number_for_branch(branch: str, repo: Optional[str] = None,
-                          timeout: float = 15.0, *, state: str = "all") -> Optional[int]:
+                          timeout: float = 15.0, *, state: str = "all",
+                          strict: bool = False) -> Optional[int]:
     """Like `branch_has_pr`, but returns the PR number instead of a bool.
 
     #496: a `claude_cloud` dispatch has no local callback to this
@@ -468,13 +473,25 @@ def pr_number_for_branch(branch: str, repo: Optional[str] = None,
     this fails CLOSED (returns ``None``) on any error: "unknown" must never
     be read as "PR exists", the way it can be for a skip-a-futile-retry
     decision.
+
+    #910: with ``strict=True`` ``None`` means only "gh answered, no PR";
+    anything that prevents an answer raises `PRLookupError`, because a
+    caller deciding whether a PR already exists must not read "unknown" as
+    "no PR" either.
     """
-    if not branch or not check_gh_installed():
+    def _unknown(reason: str) -> None:
+        if strict:
+            raise PRLookupError(f"pr lookup for {branch!r} failed: {reason}")
         return None
+
+    if not branch:
+        return None
+    if not check_gh_installed():
+        return _unknown("gh not installed")
     if not repo:
         repo = get_repo()
     if not repo:
-        return None
+        return _unknown("repo unresolved")
     try:
         result = subprocess.run(
             ["gh", "pr", "list", "--repo", repo, "--head", branch,
@@ -482,14 +499,24 @@ def pr_number_for_branch(branch: str, repo: Optional[str] = None,
             capture_output=True, text=True, timeout=timeout,
         )
         if result.returncode != 0:
-            return None
-        rows = json.loads(result.stdout or "[]")
+            return _unknown(f"gh exit {result.returncode}: {(result.stderr or '').strip()[:200]}")
+        if not (result.stdout or "").strip():
+            # A zero exit with no output is not "gh answered []": "no PR" is
+            # only ever the JSON empty list.
+            return _unknown("empty gh output")
+        rows = json.loads(result.stdout)
+        if not isinstance(rows, list):
+            return _unknown("unexpected gh output")
         if not rows:
             return None
         number = rows[0].get("number")
-        return int(number) if isinstance(number, int) else None
-    except Exception:
-        return None
+        if isinstance(number, int) and not isinstance(number, bool):
+            return int(number)
+        return _unknown("PR row without a number")
+    except PRLookupError:
+        raise
+    except Exception as exc:
+        return _unknown(f"{type(exc).__name__}: {exc}")
 
 
 def branch_head_commit_message(branch: str, repo: Optional[str] = None,
