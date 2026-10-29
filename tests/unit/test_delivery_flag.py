@@ -202,6 +202,7 @@ class TestNoTesterFlag:
         )
         with patch("agent_crew.server.review_publication_decision",
                    return_value=SimpleNamespace(publish=True, status="current", reason="")), \
+             patch("agent_crew.github.post_review_comment", return_value=True), \
              patch("agent_crew.github.pr_state", return_value="open"):
             with TestClient(app) as client:
                 client.post("/tasks", json=_review_task_payload("r-test", no_tester=False))

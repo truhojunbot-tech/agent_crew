@@ -377,6 +377,7 @@ def _enqueue_review(client, review_id, context=None):
 def open_review_pr(monkeypatch):
     monkeypatch.setattr("agent_crew.github.pr_state", lambda *a, **k: "open")
     monkeypatch.setattr("agent_crew.github.pr_head_sha", lambda *a, **k: "a" * 40)
+    monkeypatch.setattr("agent_crew.github.post_review_comment", lambda *a, **k: True)
     monkeypatch.setattr("agent_crew.server.review_publication_decision",
                         lambda *a, **k: SimpleNamespace(publish=True, status="current", reason=""))
 
