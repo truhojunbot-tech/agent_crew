@@ -7951,6 +7951,28 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def list_tasks_with_context_key_prefix(self, prefix: str) -> List[TaskRequest]:
+        """Tasks whose stored context JSON has a key starting with ``prefix``,
+        in ``list_tasks`` order.
+
+        A substring prefilter, so it may return a few extra rows (a value that
+        happens to contain the quoted prefix); callers still check the keys they
+        need. What it never does is load and sort every row: on a periodic tick,
+        ``list_tasks()`` sorted the whole table through a temp file each time and
+        held the read lock for seconds (#830).
+        """
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE context LIKE ? ESCAPE '\\' "
+                "ORDER BY priority ASC, created_at ASC",
+                (f'%"{escaped}%',),
+            ).fetchall()
+            return [self._task_from_row(r) for r in rows]
+        finally:
+            conn.close()
+
     def create_gate(self, gate: GateRequest) -> str:
         conn = self._connect()
         try:

@@ -1431,7 +1431,9 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
 def reconcile_shadow_reviews(queue: TaskQueue, *, pr_comments_fn=None) -> None:
     """Record comparison verdicts in task context; never submit a result."""
     comments_for_pr = pr_comments_fn or _github.pr_comments
-    for task in queue.list_tasks():
+    # Every branch below needs a ``cloud_shadow_*`` key; see #830 for why the
+    # periodic sweep must not read the whole table.
+    for task in queue.list_tasks_with_context_key_prefix("cloud_shadow_"):
         context = task.context if isinstance(task.context, dict) else {}
         _reclassify_legacy_cloud_cost(queue, task, shadow=True)
         if context.get("cloud_shadow_cost_pending_at") and not context.get(
@@ -1814,7 +1816,8 @@ def reconcile_all_cloud_tasks(queue: TaskQueue, *, repo: Optional[str] = None,
         if outcome.action not in ("still_dispatched", "unknown_outcome"):
             _record_reconciled_cloud_cost(queue, task)
         outcomes.append(outcome)
-    for task in queue.list_tasks():
+    # Both checks below need a ``cloud_*`` key (#830: no full-table read per tick).
+    for task in queue.list_tasks_with_context_key_prefix("cloud_"):
         context = task.context if isinstance(task.context, dict) else {}
         _reclassify_legacy_cloud_cost(queue, task)
         if (context.get("cloud_cost_pending_at") and not context.get("cloud_cost_finalized_at")
