@@ -5115,7 +5115,7 @@ class TaskQueue:
 
     def reroute_stale_provider_bindings(self, provider: str,
                                         held_task_types: tuple[str, ...]) -> list[str]:
-        """Drop ``agent_override=provider`` from pending tasks whose type the
+        """Clear ``agent_override=provider`` from pending tasks whose type the
         provider no longer holds, so the current role holder claims them (#891).
         """
         held = tuple(held_task_types)
