@@ -15,6 +15,8 @@ These tests pin both paths so a future refactor can't accidentally
 drop one.
 """
 from agent_crew.protocol import TaskRequest
+import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 
 
 def _make_task(task_id="t1", task_type="implement", description="do work"):

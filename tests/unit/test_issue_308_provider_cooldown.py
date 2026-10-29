@@ -5,6 +5,7 @@ import json
 import time
 
 import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 from fastapi.testclient import TestClient
 
 from agent_crew.cea.input_providers.budget import QuotaBudgetProvider

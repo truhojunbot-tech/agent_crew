@@ -12,6 +12,18 @@ from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 
+@pytest.fixture
+def legacy_gemini_tester_policy(monkeypatch):
+    """Exercise historic provider-tester mechanics without changing #924 policy.
+
+    These tests cover dispatch, attribution and error handling that also serve
+    other provider roles. Production role assignment remains script-only for
+    general test tasks; #924 tests assert that policy without this fixture.
+    """
+    from agent_crew import role_mapping
+    monkeypatch.setitem(role_mapping.ROLE_PROVIDER_POLICY, "tester", ("gemini", "script"))
+
+
 def pytest_configure(config):
     """Prove to the CEA engine that this interpreter is a test harness.
 

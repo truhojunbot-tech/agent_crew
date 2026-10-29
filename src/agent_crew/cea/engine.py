@@ -165,7 +165,7 @@ REVIEW_FLOOR: dict[str, dict[str, bool]] = {
   trusting the snapshot to be well-formed.
 """
 
-DEFAULT_ROLE_AGENTS = {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}
+DEFAULT_ROLE_AGENTS = {"implementer": "claude", "reviewer": "codex", "tester": "script"}
 
 _WORK_CLASS_ROLE = {
     "implement": "implementer", "fix": "implementer", "merge": "implementer",

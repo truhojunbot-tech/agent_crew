@@ -5246,6 +5246,7 @@ class TaskQueue:
         self, agent: str = "", role: str = "", *, claimed_via: str = "",
         claim_source: str = "", skip_task_ids: Optional[set[str]] = None,
         skip_deferred: bool = False, role_to_agent: Optional[Mapping[str, str]] = None,
+        override_task_type: Optional[str] = None,
     ) -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
@@ -5273,6 +5274,8 @@ class TaskQueue:
         Pane refusals remain specific to push delivery.
         ``claim_source`` is server-owned provenance for recovery. Skipped IDs
         let push delivery pass a busy queue head during this scheduling pass.
+        ``override_task_type`` limits the override-only claim for checkout
+        workers without a default role.
         """
         _now = time.time()
         if skip_deferred:
@@ -5312,6 +5315,8 @@ class TaskQueue:
                 role_bound = agent in ROLE_BOUND_PROVIDERS
                 bound_type = _ROLE_TO_TYPE.get(role) if role_bound else None
                 bound_sql = " AND task_type = ?" if bound_type else ""
+                if override_task_type:
+                    bound_sql += " AND task_type = ?"
                 # Review of PR #916 (round 3): the role is the caller's claim,
                 # not a fact. A backend that lost the role since its binding was
                 # written (reviewer handed back to codex) claims nothing as that
@@ -5329,7 +5334,8 @@ class TaskQueue:
                     ORDER BY priority ASC, created_at ASC
                     LIMIT 1
                     """,
-                    (agent, *((bound_type,) if bound_type else ()), *skipped),
+                    (agent, *((bound_type,) if bound_type else ()),
+                     *((override_task_type,) if override_task_type else ()), *skipped),
                 ).fetchone()
 
             if row is None and role:

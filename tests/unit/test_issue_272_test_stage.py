@@ -24,6 +24,7 @@ import sys
 import textwrap
 
 import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 
 from agent_crew import testing_policy as tp
 

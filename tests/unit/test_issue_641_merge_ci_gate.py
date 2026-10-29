@@ -45,6 +45,8 @@ def test_head_checks_pending_none_and_error(monkeypatch):
     assert github.head_checks_state("o/r", sha) == ("pending", "unit")
     data["check_runs"] = []
     assert github.head_checks_state("o/r", sha) == ("none", "")
+    data["check_runs"] = [{"name": "skip", "status": "completed", "conclusion": "skipped"}]
+    assert github.head_checks_state("o/r", sha) == ("none", "")
     monkeypatch.setattr(github.subprocess, "run",
                         lambda args, **kwargs: subprocess.CompletedProcess(args, 1, "", "oops"))
     assert github.head_checks_state("o/r", sha)[0] == "error"

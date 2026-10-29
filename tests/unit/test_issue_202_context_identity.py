@@ -19,6 +19,9 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
+import pytest
+
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 
 from agent_crew.context_identity import detect_context_compaction, extract_claude_session_id
 from agent_crew.queue import TaskQueue

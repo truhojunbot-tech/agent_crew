@@ -30,7 +30,7 @@ def test_load_worktree_map_derives_roles(tmp_path):
     wm = _load_worktree_map(str(state_file))
     assert wm["implementer"] == "/wt/codex"
     assert wm["reviewer"] == "/wt/claude"
-    assert wm["tester"] == "/wt/gemini"
+    assert "tester" not in wm  # script tester has no provider worktree
 
 
 def test_load_worktree_map_missing_file():

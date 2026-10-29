@@ -47,7 +47,7 @@ def test_dry_run_lists_every_state_shape_without_writing(crew_home, capsys):
                        "legacy_roles": ("gemini", "script"),
                        "default": ("script", "script"),
                        "already_script": ("script", "script"),
-                       "provider_opt_in": ("gemini", "gemini")}
+                       "provider_opt_in": ("gemini", "script")}
     assert report["sha256"] and len(report["sha256"]) == 64
     assert {name: (home / name / "state.json").read_bytes() for name in cases} == before
 
@@ -57,12 +57,12 @@ def test_apply_requires_matching_dry_run_hash_and_preserves_other_state(crew_hom
     plan = migrate_script_tester.plan_migration(home)
     with pytest.raises(ValueError, match="report hash"):
         migrate_script_tester.apply_migration(home, "bad-hash")
-    assert migrate_script_tester.apply_migration(home, plan["sha256"]) == 3
+    assert migrate_script_tester.apply_migration(home, plan["sha256"]) == 4
     for name, original in cases.items():
         state = json.loads((home / name / "state.json").read_text())
         mapping, _ = effective_role_mapping(state, project=name)
-        wanted = "gemini" if name == "provider_opt_in" else "script"
-        assert mapping["tester"] == wanted
+        # #924: even historical provider opt-ins resolve to the script gate.
+        assert mapping["tester"] == "script"
         assert state.get("roles") == original.get("roles")
         assert state.get("port") == original.get("port")
         assert "test_timeout_s" not in state

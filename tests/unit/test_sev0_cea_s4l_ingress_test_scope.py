@@ -29,6 +29,7 @@ import logging
 import os
 
 import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 
 from agent_crew import testing_policy as tp
 from agent_crew.cea import store as cea_store

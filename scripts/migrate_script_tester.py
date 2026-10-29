@@ -3,9 +3,9 @@
 
 Default is read-only. Review the JSON report for every project, then use its
 sha256 with --apply --accept-report-sha256. A state change after the report
-invalidates the hash. To retain a provider tester intentionally, set
-``tester_provider_opt_in: true`` next to its explicit ``role_agents.tester``
-before producing the report. This tool never restarts a dispatcher.
+invalidates the hash. General test tasks use the script tester even when an
+older state file opted into a provider tester (#924). This tool never restarts
+a dispatcher.
 
 Usage: PYTHONPATH=src python3 scripts/migrate_script_tester.py \
        [--crew-home ~/.agent_crew] [--apply --accept-report-sha256 HASH]
@@ -47,9 +47,19 @@ def plan_migration(crew_home: Path, *, test_timeout_s: float | None = None,
     for path in sorted(crew_home.glob("*/state.json")):
         raw, state = _read(path)
         mapping, source = effective_role_mapping(state, project=path.parent.name)
+        # The runtime now coerces legacy provider testers to script. Inventory
+        # the stored value so a dry-run still reports state that needs cleanup.
         old = mapping["tester"]
+        explicit = state.get("role_agents")
+        if isinstance(explicit, dict) and isinstance(explicit.get("tester"), str):
+            old = explicit["tester"]
+        elif isinstance(state.get("roles"), list):
+            for entry in state["roles"]:
+                if (isinstance(entry, dict) and entry.get("role") == "tester"
+                        and isinstance(entry.get("agent"), str)):
+                    old = entry["agent"]
         opt_in = state.get("tester_provider_opt_in") is True
-        new = old if opt_in else "script"
+        new = "script"
         old_timeout = state.get("test_timeout_s")
         old_command = state.get("test_command")
         new_timeout = old_timeout if test_timeout_s is None else test_timeout_s

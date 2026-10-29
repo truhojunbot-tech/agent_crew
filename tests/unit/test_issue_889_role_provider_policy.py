@@ -14,7 +14,7 @@ from agent_crew.role_mapping import (
     role_policy_refusal,
 )
 
-ROLES = {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}
+ROLES = {"implementer": "codex", "reviewer": "claude", "tester": "script"}
 
 
 @pytest.mark.parametrize("agent", ["gemini", "gemini_cli", "agy", " Gemini-2 ", "script"])
@@ -27,7 +27,7 @@ def test_policy_allows_implementers(agent):
     assert role_policy_refusal("implementer", agent) is None
 
 
-@pytest.mark.parametrize("agent", ["gemini", "agy", "script"])
+@pytest.mark.parametrize("agent", ["script"])
 def test_policy_allows_testers(agent):
     assert role_policy_refusal("tester", agent) is None
 
@@ -91,10 +91,12 @@ def test_branch_prefix_does_not_route(tmp_path):
     assert agent == "codex"
 
 
-def test_enqueue_accepts_gemini_test_and_codex_implement(tmp_path):
+def test_enqueue_refuses_gemini_test_and_accepts_script_test_and_codex_implement(tmp_path):
     with TestClient(_app(tmp_path)) as client:
-        assert _post(client, "test-889", "test",
-                     {"agent_override": "gemini"}).status_code == 201
+        assert _post(client, "test-gemini-889", "test",
+                     {"agent_override": "gemini"}).status_code == 422
+        assert _post(client, "test-script-889", "test",
+                     {"agent_override": "script"}).status_code == 201
         assert _post(client, "impl-889", "implement",
                      {"agent_override": "codex"}).status_code == 201
 

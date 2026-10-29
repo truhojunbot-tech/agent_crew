@@ -26,21 +26,21 @@ def test_roles_set_persists_unique_mapping_and_dispatches_in_its_provider_worktr
     ]})
     result = CliRunner().invoke(crew, [
         "roles", "set", "demo",
-        "implementer=codex", "reviewer=claude", "tester=gemini",
+        "implementer=codex", "reviewer=claude", "tester=script",
         "--base", str(tmp_path),
     ])
 
     assert result.exit_code == 0, result.output
     persisted = json.loads(state_path.read_text())
     assert persisted["role_agents"] == {
-        "implementer": "codex", "reviewer": "claude", "tester": "gemini",
+        "implementer": "codex", "reviewer": "claude", "tester": "script",
     }
     assert "Restart the server" in result.output
     assert _load_role_to_agent_with_source(str(state_path)) == (
         persisted["role_agents"], "explicit project config",
     )
     assert _load_worktree_map(str(state_path)) == {
-        "implementer": "/wt/codex", "reviewer": "/wt/claude", "tester": "/wt/gemini",
+        "implementer": "/wt/codex", "reviewer": "/wt/claude",
     }
     app = create_app(db_path=str(tmp_path / "tasks.db"), state_path=str(state_path),
                      watchdog_disabled=True, anomaly_disabled=True)
@@ -55,11 +55,11 @@ def test_explicit_agent_without_worktree_is_omitted_not_assigned_another_provide
             {"role": "reviewer", "agent": "codex", "worktree": "/wt/codex"},
             {"role": "tester", "agent": "gemini", "worktree": "/wt/gemini"},
         ],
-        "role_agents": {"implementer": "codx", "reviewer": "claude", "tester": "gemini"},
+        "role_agents": {"implementer": "codx", "reviewer": "claude", "tester": "script"},
     })
 
     assert _load_worktree_map(str(state_path)) == {
-        "reviewer": "/wt/claude", "tester": "/wt/gemini",
+        "reviewer": "/wt/claude",
     }
 
 
@@ -78,7 +78,7 @@ def test_malformed_explicit_mapping_warns_and_preserves_legacy_resolution(caplog
 
 def test_roles_show_labels_all_sources_and_set_requires_an_existing_project(tmp_path):
     _write_state(tmp_path, "explicit", {"role_agents": {
-        "implementer": "codex", "reviewer": "claude", "tester": "gemini"}})
+        "implementer": "codex", "reviewer": "claude", "tester": "script"}})
     _write_state(tmp_path, "legacy", {"roles": [
         {"role": "reviewer", "agent": "claude", "worktree": "/wt/claude"}]})
     _write_state(tmp_path, "default", {})

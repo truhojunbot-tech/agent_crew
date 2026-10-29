@@ -12,6 +12,8 @@ Fix: only pop the counter on a terminal outcome (``_terminal`` flag, set to
 False right before the requeue-success ``return``).
 """
 import json
+import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 import os
 import time
 from unittest.mock import AsyncMock, MagicMock, patch

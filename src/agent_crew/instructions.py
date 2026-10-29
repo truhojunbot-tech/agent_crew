@@ -3,7 +3,7 @@ import os
 from agent_crew.prompts.task_loop import build_task_loop_prompt
 from agent_crew.testing_policy import load_scope, render_scope, render_implementer_scope
 from agent_crew.port_validation import require_project_port
-from agent_crew.role_mapping import LEGACY_AGENT_TO_ROLE
+from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
 # Per-role instruction file paths inside each worktree (Issue #110 fix).
 #
@@ -45,9 +45,9 @@ _AGENT_CREW_BLOCK_END = "<!-- agent_crew:end -->"
 # Default agent name per role — used when a caller passes role but not the
 # agent identifier. The agent name is what appears inside the task-loop
 # prompt's `[agent: NAME]` tag and the `get_next_task(agent=...)` arg.
-# Instruction files are per pane (GEMINI.md is gemini's), so this follows the
-# legacy pane layout, not the default provider (#772: tester = script).
-_DEFAULT_AGENT_FOR_ROLE: dict = {role: agent for agent, role in LEGACY_AGENT_TO_ROLE.items()}
+# Explicit pane instructions pass their agent; an omitted agent uses the
+# current role default.
+_DEFAULT_AGENT_FOR_ROLE: dict = dict(DEFAULT_ROLE_TO_AGENT)
 
 _COMMON = """\
 # Agent Crew — <project>
@@ -508,7 +508,7 @@ stored as `failed` with `reason: no_artifact`.
 
 ### ⛔ Delegating review / test to the next role — DO NOT use `crew run`
 
-When you need the reviewer (claude) or tester (gemini) to take over after your
+When you need the reviewer (claude) or script tester to take over after your
 implementation, **do not** call `crew run "Review PR ..."`. `crew run` is a
 top-level loop client and forces `task_type=implement` regardless of the
 prompt — the review pane only picks tasks with `task_type=review`, so your
@@ -628,7 +628,7 @@ Before you POST the result, verify:
 
 ### ⛔ Delegating test to the next role — DO NOT use `crew run`
 
-After you `approve`, if the loop needs the tester (gemini) to verify the PR
+After you `approve`, if the loop needs the script tester to verify the PR
 on a clean checkout, **do not** call `crew run "Test PR ..."`. `crew run`
 forces `task_type=implement` and the tester pane only picks `task_type=test`.
 
