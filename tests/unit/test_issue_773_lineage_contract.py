@@ -79,7 +79,7 @@ def test_http_refuses_override_with_no_running_role(tmp_db, tmp_path, monkeypatc
     with TestClient(app) as client:
         response = client.post("/tasks", json={"task_id": "unclaimable-773", "task_type": "review",
                      "description": "review", "branch": "agent/work",
-                     "context": {"agent_override": "claude"}})
+                     "context": {"agent_override": "claude", "pr_number": 773}})
     assert response.status_code == 422
     assert "claude_cloud" in response.text and "codex" in response.text
     assert TaskQueue(tmp_db).get_task("unclaimable-773") is None

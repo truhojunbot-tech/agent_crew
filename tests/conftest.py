@@ -44,10 +44,9 @@ def pinned_review_test_task(task, *, pr_number=935, reviewed_sha=None):
 
 
 @pytest.fixture
-def pinned_task_transport(monkeypatch):
-    """Migrate legacy task HTTP fixtures to the pinned PR and project contract."""
+def project_task_transport(monkeypatch):
+    """Give legacy HTTP fixtures their test server's project identity."""
     original_request = TestClient.request
-    original_post = TestClient.post
     identities = {}
 
     def request(client, method, url, *args, **kwargs):
@@ -62,12 +61,19 @@ def pinned_task_transport(monkeypatch):
                     kwargs["headers"] = headers
         return original_request(client, method, url, *args, **kwargs)
 
+    monkeypatch.setattr(TestClient, "request", request)
+
+
+@pytest.fixture
+def pinned_task_transport(monkeypatch, project_task_transport):
+    """Migrate legacy task HTTP fixtures to the pinned PR contract."""
+    original_post = TestClient.post
+
     def post(client, url, *args, **kwargs):
         if url == "/tasks" and isinstance(kwargs.get("json"), dict):
             kwargs["json"] = pinned_review_test_task(kwargs["json"], reviewed_sha="a" * 40)
         return original_post(client, url, *args, **kwargs)
 
-    monkeypatch.setattr(TestClient, "request", request)
     monkeypatch.setattr(TestClient, "post", post)
 
 

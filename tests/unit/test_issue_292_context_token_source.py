@@ -32,6 +32,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("pinned_task_transport")
+
 from agent_crew import server as sv
 
 

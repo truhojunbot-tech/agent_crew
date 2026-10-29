@@ -476,7 +476,8 @@ def test_a_bool_is_rejected_by_the_result_type(value):
 
 
 @pytest.mark.parametrize("value", BOOLS)
-def test_http_a_bool_pr_number_is_never_stored_as_a_pr(tmp_db, monkeypatch, value, github_writes):
+def test_http_a_bool_pr_number_is_never_stored_as_a_pr(tmp_db, monkeypatch, value, github_writes,
+                                                        project_task_transport):
     """★★The regression the review asked for, end to end.
 
     Reproduced before the fix, with `context.pr_number = 268`:
@@ -490,8 +491,8 @@ def test_http_a_bool_pr_number_is_never_stored_as_a_pr(tmp_db, monkeypatch, valu
         assert _submit(c, "review-bool", pr_number=value).status_code == 422
         stored = c.get("/tasks/review-bool").json()
 
-    assert stored["pr_number"] in (None, 0, ""), \
-        f"a bool was recorded as PR #{stored['pr_number']}"
+    assert stored["pr_number"] == REQUESTED, \
+        "a rejected result must leave the review's requested PR intact"
     assert stored["pr_number"] != 1, "`true` was stored as PR #1"
     assert stored["status"] == "in_progress", "a rejected request still wrote a result"
 

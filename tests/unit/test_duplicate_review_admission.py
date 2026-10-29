@@ -135,7 +135,8 @@ def test_dispatch_pin_refuses_completed_judgement(queue, kind):
     assert queue.get_task_status(late.task_id) == "blocked"
 
 
-def test_unpinned_http_review_is_rejected_before_push(tmp_path, monkeypatch):
+def test_unpinned_http_review_is_rejected_before_push(tmp_path, monkeypatch,
+                                                      project_task_transport):
     from agent_crew import server
 
     db = str(tmp_path / "push.db")
@@ -154,7 +155,7 @@ def test_unpinned_http_review_is_rejected_before_push(tmp_path, monkeypatch):
         watchdog_disabled=True, anomaly_disabled=True,
     )
     with TestClient(app) as client:
-        response = client.post("/tasks", json=dataclasses.asdict(task("late", sha=None)))
+        response = client.post("/tasks", json=dataclasses.asdict(task("late", pr=None, sha=None)))
         assert response.status_code == 422, response.text
     assert q.get_task("late") is None
     assert pushes == []
@@ -360,7 +361,7 @@ def test_implement_tasks_unaffected(queue):
     queue.enqueue(task("second", kind="implement"))
 
 
-def test_http_refusal_names_existing_task(tmp_path):
+def test_http_refusal_names_existing_task(tmp_path, project_task_transport):
     db = str(tmp_path / "api.db")
     with TestClient(create_app(db_path=db, watchdog_disabled=True,
                                anomaly_disabled=True, push_fn=lambda *a, **k: None)) as client:

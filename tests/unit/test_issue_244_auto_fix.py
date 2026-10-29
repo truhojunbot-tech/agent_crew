@@ -18,8 +18,11 @@ bound and the refusals:
 """
 
 import uuid
+from types import SimpleNamespace
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("pinned_task_transport")
 
 from agent_crew.pipeline import (
     DEFAULT_REVIEW_FIX_MAX_ROUNDS,
@@ -362,13 +365,23 @@ def _post_review_result(client, review_id, **kw):
 
 
 def _enqueue_review(client, review_id, context=None):
+    review_context = {"repo": "owner/repo", "cloud_review_comment_confirmed": True,
+                      **(context or {})}
     return client.post("/tasks", json={
         "task_id": review_id, "task_type": "review", "description": "review",
-        "branch": BRANCH, "priority": 3, "context": context or {},
+        "branch": BRANCH, "priority": 3, "context": review_context,
         "project": ""})
 
 
-def test_http_request_changes_result_enqueues_and_pushes_a_fix(tmp_db):
+@pytest.fixture
+def open_review_pr(monkeypatch):
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda *a, **k: "open")
+    monkeypatch.setattr("agent_crew.github.pr_head_sha", lambda *a, **k: "a" * 40)
+    monkeypatch.setattr("agent_crew.server.review_publication_decision",
+                        lambda *a, **k: SimpleNamespace(publish=True, status="current", reason=""))
+
+
+def test_http_request_changes_result_enqueues_and_pushes_a_fix(tmp_db, open_review_pr):
     """★★End to end through the real handler — the layer #244 reported.
 
     The cascade functions could be perfect and the feature still absent if the
@@ -389,7 +402,7 @@ def test_http_request_changes_result_enqueues_and_pushes_a_fix(tmp_db):
                for pane, text in push.calls)
 
 
-def test_http_coordinator_managed_review_enqueues_fix(tmp_db):
+def test_http_coordinator_managed_review_enqueues_fix(tmp_db, open_review_pr):
     """alfred#51 §7.2 / CX-4b applies to the HTTP result cascade too."""
     from fastapi.testclient import TestClient
 
@@ -402,7 +415,7 @@ def test_http_coordinator_managed_review_enqueues_fix(tmp_db):
                 if t.task_type == "implement"]) == 1
 
 
-def test_http_approved_review_still_goes_to_test_not_fix(tmp_db):
+def test_http_approved_review_still_goes_to_test_not_fix(tmp_db, open_review_pr):
     """The new branch must not shadow the approve path."""
     from fastapi.testclient import TestClient
 
@@ -417,7 +430,7 @@ def test_http_approved_review_still_goes_to_test_not_fix(tmp_db):
     assert "implement" not in types
 
 
-def test_http_result_submission_survives_a_broken_cascade(tmp_db, monkeypatch):
+def test_http_result_submission_survives_a_broken_cascade(tmp_db, monkeypatch, open_review_pr):
     """⛔Auto-enqueue must never fail a result submission — an agent that
     cannot POST its result is a task the dispatcher will later mark failed."""
     from fastapi.testclient import TestClient
@@ -580,7 +593,7 @@ def test_concurrent_submissions_produce_exactly_one_fix(q, tmp_db):
     assert len([t for t in q.list_tasks() if t.task_type == "implement"]) == 1
 
 
-def test_http_duplicate_result_post_enqueues_one_fix(tmp_db):
+def test_http_duplicate_result_post_enqueues_one_fix(tmp_db, open_review_pr):
     """★★End to end: the same POST twice, as the reporter described it.
 
     The second identical POST is acknowledged without re-running the cascade.
