@@ -997,7 +997,9 @@ def _prepare_worktree_for_task(
 
     A survivable implementer prep error uses a verified caller base or the
     worktree HEAD. Reviewers and testers cannot substitute the worktree HEAD
-    for the PR revision. The delivery paths refuse to launch without a base.
+    for the PR revision; they may only use their own recorded pin, verified
+    as the detached HEAD (#824). The delivery paths refuse to launch without a
+    base.
     """
     try:
         prepared = _prepare_worktree_for_task_inner(
@@ -1043,6 +1045,25 @@ def _prepare_worktree_for_task(
             if head:
                 context["prep_error_base_source"] = "head"
             return head
+        # #824: a reviewer/tester that already carries its pin (the approving
+        # review's `reviewed_sha`, or a requeue's `expected_head_sha`) does not
+        # need the failed fetch — the commit is usually already in the shared
+        # object store. Detach at exactly that commit; anything less returns
+        # "" and the delivery paths refuse, as before. Returning "" here while a
+        # pin existed recorded `reviewed_sha: null` over it, and the tester
+        # refused a task block that no longer named its revision.
+        pin = (_object_id_or_empty(context.get("expected_head_sha"))
+               or _object_id_or_empty(context.get("reviewed_sha")))
+        if pin:
+            try:
+                if (_branch_ref(worktree_path, pin).lower() == pin.lower()
+                        and _checkout_detached(worktree_path, [pin],
+                                               what=f"{role} {task_id} pin after prep error")
+                        and _worktree_head(worktree_path).lower() == pin.lower()):
+                    context["prep_error_base_source"] = "caller"
+                    return pin
+            except Exception:
+                logger.exception("_prepare_worktree_for_task: pin recovery failed")
         return ""
 
 
