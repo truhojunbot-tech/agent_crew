@@ -114,7 +114,7 @@ def provider_task_types(provider: str, role_to_agent: Mapping[str, str]) -> tupl
 
 
 def validate_explicit_role_agents(mapping: Mapping[str, object]) -> dict[str, str]:
-    """Validate a complete explicit mapping without imposing provider policy."""
+    """Validate a complete explicit mapping and its tester provider policy."""
     if set(mapping) != set(ROLE_ORDER):
         raise ValueError("role_agents must set implementer, reviewer, and tester exactly once")
     result = {}
@@ -140,7 +140,18 @@ def effective_role_mapping(
         try:
             if not isinstance(explicit, Mapping):
                 raise ValueError("role_agents must be an object")
-            return validate_explicit_role_agents(explicit), EXPLICIT_SOURCE
+            normalized = dict(explicit)
+            tester = normalized.get("tester")
+            refusal = role_policy_refusal("tester", tester)
+            if refusal:
+                normalized["tester"] = DEFAULT_ROLE_TO_AGENT["tester"]
+            mapping = validate_explicit_role_agents(normalized)
+            if refusal:
+                logger.warning(
+                    "project %s has refused explicit tester %r (%s); using script tester",
+                    project, tester, refusal,
+                )
+            return mapping, EXPLICIT_SOURCE
         except ValueError as exc:
             logger.warning(
                 "project %s has invalid role_agents (%s); retaining legacy/default mapping",

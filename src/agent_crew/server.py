@@ -5999,6 +5999,8 @@ def create_app(
         """
         _ctx = task.context if isinstance(task.context, dict) else {}
         _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
+        if _override and _refuse_role_policy(task, _override):
+            return
         agent, wt = _resolve_dispatch_target(task, role)
         if dispatch_agent is not None:
             agent = dispatch_agent
