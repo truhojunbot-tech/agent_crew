@@ -123,9 +123,11 @@ def test_setup_default_roles_and_existing_state_unchanged(
 
     state_path = os.path.join(base_dir, "testproj", "state.json")
     state = _read_state(base_dir, "testproj")
-    expected = {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}
-    assert state["agents"] == ["codex", "claude", "gemini"]
-    assert {entry["role"]: entry["agent"] for entry in state["roles"]} == expected
+    expected = {"implementer": "codex", "reviewer": "claude", "tester": "script"}
+    assert state["agents"] == ["codex", "claude"]
+    assert {entry["role"]: entry["agent"] for entry in state["roles"]} == {
+        "implementer": "codex", "reviewer": "claude"
+    }
     assert state["role_agents"] == expected
     assert "Role: implementer" in open(
         os.path.join(state["worktrees"]["codex"], "AGENTS.md")

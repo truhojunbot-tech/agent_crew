@@ -8,6 +8,8 @@ so gemini refused a task block that no longer named its revision.
 """
 
 import json
+import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 import subprocess
 
 from fastapi.testclient import TestClient

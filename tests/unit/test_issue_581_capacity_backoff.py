@@ -20,6 +20,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 from fastapi.testclient import TestClient
 
 from agent_crew.protocol import TaskRequest, TaskResult
@@ -462,7 +463,7 @@ def test_u_581_capacity_successor_can_replace_its_active_review_target(
         context=admitted({"pr_number": 581, "reviewed_sha": "a" * 40}),
     )
     q.enqueue(parent)
-    claimed = q.dequeue(agent="codex" if task_type == "review" else "gemini",
+    claimed = q.dequeue(agent="codex" if task_type == "review" else "script",
                         role="reviewer" if task_type == "review" else "tester")
     assert claimed is not None and claimed.task_id == parent.task_id
     ctx = successor_context(q.get_task_context(parent.task_id))

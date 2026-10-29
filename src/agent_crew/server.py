@@ -2692,8 +2692,9 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
                     path = by_agent.get(agent)
                     if path:
                         result[role] = path
-                    elif agent != _claude_cloud.CLOUD_PROVIDER_NAME:
-                        # #919: a cloud role needs no local worktree.
+                    elif agent not in (_claude_cloud.CLOUD_PROVIDER_NAME,
+                                       _script_tester.SCRIPT_TESTER):
+                        # Cloud and script roles need no local worktree.
                         logger.warning(
                             "_load_worktree_map: explicit role %s uses agent %s with no worktree; omitting role",
                             role, agent,
@@ -2714,7 +2715,8 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
                 path = worktrees.get(agent)
                 if path:
                     result[role] = path
-                elif agent != _claude_cloud.CLOUD_PROVIDER_NAME:
+                elif agent not in (_claude_cloud.CLOUD_PROVIDER_NAME,
+                                   _script_tester.SCRIPT_TESTER):
                     logger.warning(
                         "_load_worktree_map: explicit role %s uses agent %s with no worktree; omitting role",
                         role, agent,
@@ -5939,6 +5941,7 @@ def create_app(
         _ctx = task.context if isinstance(task.context, dict) else {}
         _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
         if _override and _override != agent:
+            wt_override = _DISPATCH_DISCUSS_WORKTREES.get(_override)
             for _r, _a in _DISPATCH_ROLE_TO_AGENT.items():
                 if _a == _override:
                     _wt_candidate = worktree_map.get(_r)
@@ -7537,6 +7540,11 @@ def create_app(
                 by_agent.setdefault(agent, []).append(role)
                 if agent and agent not in workers:
                     workers.append(agent)
+            # Providers with a configured checkout can receive an explicit
+            # review override even when they hold no default role (#188/#924).
+            for agent in _DISPATCH_DISCUSS_WORKTREES:
+                if agent and agent not in workers:
+                    workers.append(agent)
             # Discuss can use an agent with no assigned task role.
             discuss_workers = list(dict.fromkeys(
                 [worker for worker in workers if worker != _script_tester.SCRIPT_TESTER]
@@ -7685,6 +7693,20 @@ def create_app(
                                                skip_task_ids=_shadow_skip_ids)
                             if task is not None:
                                 break
+                        if task is None and not _worker_roles:
+                            # Checkout-only workers can take explicit review
+                            # overrides. Local code agents can also take a
+                            # cloud-cap implement fallback; Gemini remains
+                            # excluded from general implement/test work.
+                            _override_types = (["implement", "review"]
+                                               if provider_family(worker) in ("codex", "claude")
+                                               else ["review"])
+                            for _override_type in _override_types:
+                                task = q().dequeue(agent=worker, claimed_via="dispatcher",
+                                                   claim_source="dispatcher",
+                                                   override_task_type=_override_type)
+                                if task is not None:
+                                    break
                         if task is None:
                             continue
                         # 프로토콜·결과 처리는 task_type 이 정한다.
@@ -8799,6 +8821,7 @@ def create_app(
         def _agent_can_receive(agent: object) -> bool:
             return (isinstance(agent, str) and
                     (agent in _DISPATCH_ROLE_TO_AGENT.values() or
+                     agent in _DISPATCH_DISCUSS_WORKTREES or
                      (not _dispatcher_enabled and bool(pane_map and pane_map.get(agent)))))
 
         ctx = task.context if isinstance(task.context, dict) else {}

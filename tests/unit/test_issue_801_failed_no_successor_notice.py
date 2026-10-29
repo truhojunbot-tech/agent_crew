@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 import time
 from unittest.mock import AsyncMock, MagicMock
 

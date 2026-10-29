@@ -32,9 +32,9 @@ class TestGenerateEmbedsTaskLoop:
         assert "You are claude" in out
         assert "review" in out
 
-    def test_tester_default_agent_is_gemini(self):
+    def test_tester_default_agent_is_script(self):
         out = instructions.generate("tester", "myproj", 8100)
-        assert "You are gemini" in out
+        assert "You are script" in out
 
     def test_explicit_agent_overrides_default(self):
         out = instructions.generate("implementer", "myproj", 8100, agent="custom-bot")

@@ -1053,12 +1053,16 @@ def _local_implementer(task: TaskRequest, state_path: Optional[str]) -> str:
     # The role mapping selects cloud, while the retained implementer checkout
     # identifies the local provider. The provider must also have a dispatcher
     # seat, otherwise agent_override would strand the task again.
-    workers = set(mapping.values()) - {CLOUD_PROVIDER_NAME, "script"}
+    worktrees = state.get("worktrees")
+    if not isinstance(worktrees, dict):
+        worktrees = {}
+    workers = (set(mapping.values()) | set(worktrees)) - {
+        CLOUD_PROVIDER_NAME, "script"
+    }
     candidates = [row.get("agent") for row in state.get("roles", [])
                   if isinstance(row, dict) and row.get("role") == "implementer"
                   and row.get("worktree")]
-    worktrees = state.get("worktrees") or {}
-    if isinstance(worktrees, dict) and worktrees.get("codex"):
+    if worktrees.get("codex"):
         candidates.append("codex")
     # A provider that is only the independent review seat cannot implement
     # this task. In particular, never turn a cloud cap into a Claude review

@@ -27,6 +27,7 @@ import os
 import re
 
 import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 
 from agent_crew import server as sv
 from agent_crew.protocol import TaskRequest

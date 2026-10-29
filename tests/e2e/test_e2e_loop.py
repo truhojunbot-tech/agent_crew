@@ -24,7 +24,7 @@ from agent_crew.cli import crew
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
-pytestmark = pytest.mark.e2e
+pytestmark = [pytest.mark.e2e, pytest.mark.usefixtures("legacy_gemini_tester_policy")]
 
 _STUB_SCRIPT = str(pathlib.Path(__file__).parent / "stubs" / "stub_agent.py")
 

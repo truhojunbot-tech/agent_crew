@@ -21,6 +21,7 @@ import os
 import time
 
 import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 
 from agent_crew.server import (
     _detect_transient_error_in_log,

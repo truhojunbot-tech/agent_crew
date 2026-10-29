@@ -98,7 +98,7 @@ def test_legacy_schema_claude_cloud_role_has_no_worktree_map_warning(tmp_path, c
                                                 "reviewer": "codex", "tester": "gemini"},
                                 "worktrees": {"codex": "/wt/codex", "gemini": "/wt/gemini"}}))
     caplog.set_level(logging.WARNING, logger="agent_crew.server")
-    assert _load_worktree_map(str(path)) == {"reviewer": "/wt/codex", "tester": "/wt/gemini"}
+    assert _load_worktree_map(str(path)) == {"reviewer": "/wt/codex"}
     assert not [r for r in caplog.records if "no worktree; omitting role" in r.getMessage()]
 
 

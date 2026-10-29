@@ -18,7 +18,7 @@ def _state(tmp_path, *, local=True):
                "worktree": str(tmp_path / "claude")}] if local else [])
     path.write_text(json.dumps({"project": "agent_crew", "role_agents": {
         "implementer": "claude_cloud", "reviewer": "claude" if local else "claude_cloud",
-        "tester": "codex" if local else "script"}, "roles": roles,
+        "tester": "script"}, "roles": roles,
         "worktrees": {"codex": str(tmp_path / "codex"),
                       "claude": str(tmp_path / "claude")} if local else {}}))
     return str(path)
@@ -101,8 +101,12 @@ def test_cap_does_not_route_to_reviewer_seat(tmp_path, monkeypatch, reviewer):
                                   state_path=str(state))
     task = queue.get_task("fix-pr")
     assert task.status == "pending"
-    assert task.context.get("agent_override") not in ("claude", "codex")
-    assert len(notices) == 1
+    if reviewer == "claude":
+        assert task.context.get("agent_override") == "codex"
+        assert notices == []
+    else:
+        assert task.context.get("agent_override") not in ("claude", "codex")
+        assert len(notices) == 1
 
 
 def test_cap_respects_task_reviewer_override(tmp_path, monkeypatch):

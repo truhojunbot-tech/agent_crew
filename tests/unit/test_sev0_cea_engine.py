@@ -515,7 +515,7 @@ def test_a_snapshot_cannot_reduce_the_review_floor(conn):
     snap = FakeSnapshot(review_test_matrix={"implement": {"reviewer": False, "tester": False}})
     auth = engine(snapshots=snap).authorize(conn, intent(), caller())
     assert auth.receipt["required_reviewer"] == "codex"
-    assert auth.receipt["required_tester"] == "gemini"
+    assert auth.receipt["required_tester"] == "script"
 
 
 def test_the_snapshot_can_tighten_the_floor(conn):

@@ -148,7 +148,7 @@ class TestWriteTester:
         assert path == os.path.abspath(str(wt / "GEMINI.md"))
         body = open(path).read()
         assert "<!-- agent_crew:begin -->" in body
-        assert "You are gemini" in body
+        assert "You are script" in body
         # Tester role section must communicate the verify-only constraint
         # somewhere — covered indirectly by the body containing
         # task_type=test branch instructions.

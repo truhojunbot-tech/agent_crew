@@ -5,6 +5,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 from fastapi.testclient import TestClient
 
 from agent_crew.queue import TaskQueue
