@@ -5082,6 +5082,33 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def reroute_stale_provider_bindings(self, provider: str,
+                                        held_task_types: tuple[str, ...]) -> list[str]:
+        """Drop ``agent_override=provider`` from pending tasks whose type the
+        provider no longer holds, so the current role holder claims them (#891).
+        """
+        held = tuple(held_task_types)
+        held_sql = f" AND task_type NOT IN ({','.join('?' for _ in held)})" if held else ""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            ids = [row[0] for row in conn.execute(
+                "SELECT task_id FROM tasks WHERE status = 'pending'"
+                " AND json_extract(context, '$.agent_override') = ?" + held_sql,
+                (provider, *held))]
+            for task_id in ids:
+                conn.execute(
+                    "UPDATE tasks SET context = json_set(json_remove(context, '$.agent_override'),"
+                    " '$.rerouted_from_provider', ?) WHERE task_id = ? AND status = 'pending'",
+                    (provider, task_id))
+            conn.execute("COMMIT")
+            return ids
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     def patch_context(self, task_id: str, extra: dict) -> None:
         """Merge ``extra`` into the existing context of a pending task."""
         conn = self._connect()
