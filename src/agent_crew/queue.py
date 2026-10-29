@@ -567,6 +567,11 @@ logger = logging.getLogger(__name__)
 #: at capacity"). Infra waste, not a task outcome.
 PROVIDER_CAPACITY = "provider_capacity"
 
+#: #896 deferral reason for a worktree prep that hit a transient git failure.
+#: Like provider capacity, its ``push_not_before`` binds every claimant.
+PREP_TRANSIENT = "prep_transient"
+_CLAIMANT_DEFERRALS = ("codex_capacity", PREP_TRANSIENT)
+
 
 def _unknown_risk_declaration() -> dict:
     return {
@@ -4875,7 +4880,8 @@ class TaskQueue:
     #: :meth:`requeue_through_gate` is the §8 bypass the registry exists to
     #: expose.
     REQUEUE_MUTATION_METHODS = ("requeue", "requeue_dispatcher_claim",
-                                "defer_push_delivery", "reset_stale_to_pending")
+                                "defer_push_delivery", "defer_prep_retry",
+                                "reset_stale_to_pending")
 
     def requeue_through_gate(self, conn, task_id: str, *, path: str,
                              reason: str = "") -> tuple[bool, object]:
@@ -5196,7 +5202,8 @@ class TaskQueue:
                           + repr(_now))
         else:
             _defer_sql = (" AND NOT (COALESCE(json_extract(context, '$.push_refusal_reason'), '')"
-                          " = 'codex_capacity' AND COALESCE(json_extract(context,"
+                          " IN ('codex_capacity', '" + PREP_TRANSIENT + "')"
+                          " AND COALESCE(json_extract(context,"
                           " '$.push_not_before'), 0) > " + repr(_now) + ")")
         # #311/#314 STOP 전파: 런타임 STOP 활성이면 어떤 task도 claim/start하지 않는다.
         # 이 한 지점이 tmux push(_try_push_next)와 MCP GET /tasks/next를 모두 덮어
@@ -6945,6 +6952,61 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def defer_prep_retry(self, task_id: str, *, delay_s: float, prep_error: str) -> bool:
+        """Requeue a task whose worktree prep failed transiently, once (#896).
+
+        A git ``TimeoutExpired`` under host load is infrastructure, not a
+        broken task. In one transaction this counts the attempt
+        (``prep_retry_count``), sets ``push_not_before`` with reason
+        ``prep_transient`` (honoured by every dequeue) and requeues through the
+        §8 gate. Returns False if the task was not in_progress or the gate kept
+        it — the caller then ends it as before.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status FROM tasks WHERE task_id = ?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] != "in_progress":
+                conn.execute("ROLLBACK")
+                return False
+            requeued, _gate = self.requeue_through_gate(
+                conn, task_id, path="queue.defer_prep_retry",
+                reason=f"{PREP_TRANSIENT}: {prep_error}")
+            if not requeued:
+                conn.execute("COMMIT")   # keep the refusal's runtime event
+                return False
+            if (_gate is not None and _gate.outcome is _CeaOutcome.RE_ADMIT
+                    and _gate.enforced):
+                # ⛔The receipt would be SUPERSEDED and a pending row on it could
+                #   never be claimed again. Leave the task in_progress; the
+                #   caller ends it in needs_human exactly as before #896.
+                conn.execute("ROLLBACK")
+                return False
+            # ⛔Re-read: requeue_through_gate patched the context (§8 answer).
+            ctx = json.loads(conn.execute("SELECT context FROM tasks WHERE task_id = ?",
+                                          (task_id,)).fetchone()["context"] or "{}")
+            now = time.time()
+            ctx.update({"prep_retry_count": int(ctx.get("prep_retry_count") or 0) + 1,
+                        "prep_retry_error": prep_error,
+                        "push_not_before": now + delay_s,
+                        "push_refusal_reason": PREP_TRANSIENT})
+            conn.execute(
+                "UPDATE tasks SET context = ?, status = 'pending', claim_source = '' "
+                "WHERE task_id = ? AND status = 'in_progress'",
+                (json.dumps(ctx), task_id))
+            self._record_end_on(conn, task_id, now, "requeued", posted=False,
+                                not_before=now + delay_s, waste_reason=PREP_TRANSIENT,
+                                waste_class="infra", prep_error=prep_error)
+            conn.execute("COMMIT")
+            return True
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     def defer_provider_capacity(self, task_id: str, *, delay_s: float, blocked_after_s: float,
                                 provider_tag: str = "codex_capacity") -> Optional[dict]:
         """Requeue a task its provider refused for capacity, not before ``delay_s`` (#581).
@@ -7242,12 +7304,15 @@ class TaskQueue:
             conn.close()
 
     def cancel(self, task_id: str, *, reason: str = CANCEL_REASON_ATTEMPT,
-               expected_status: Optional[str] = None) -> bool:
+               expected_status: Optional[str] = None,
+               stale_before: Optional[float] = None) -> bool:
         return self.cancel_with_binding(task_id, reason=reason,
-                                        expected_status=expected_status)[0]
+                                        expected_status=expected_status,
+                                        stale_before=stale_before)[0]
 
     def cancel_with_binding(self, task_id: str, *, reason: str = CANCEL_REASON_ATTEMPT,
                             expected_status: Optional[str] = None,
+                            stale_before: Optional[float] = None,
                             ) -> tuple[bool, Optional[str], str]:
         """Cancel a task. Dependent tasks (prev_task_id points to task_id) are marked
         'orphaned' rather than cancelled — operators can manually cancel them if desired.
@@ -7263,6 +7328,11 @@ class TaskQueue:
         given, makes this a CAS: the cancel is skipped if the row moved on since
         the caller selected it, so a task that finished between a stale-lease
         scan and its expiry is not cancelled retroactively.
+
+        ``stale_before``, when given, extends that CAS to liveness: the cancel
+        is skipped unless both ``last_activity_at`` and ``last_heartbeat_at``
+        are still older than it. A worker that heartbeats between a stale scan
+        and the expiry is alive, not stale (#885 r0 review).
 
         ⛔Cancellation applies to *active* rows only. A row already in
           :data:`TERMINAL_TASK_STATUSES` is refused — no status write, no receipt
@@ -7284,7 +7354,8 @@ class TaskQueue:
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT status, receipt_id, dispatch_pane_id FROM tasks WHERE task_id = ?",
+                "SELECT status, receipt_id, dispatch_pane_id, last_activity_at, "
+                "last_heartbeat_at FROM tasks WHERE task_id = ?",
                 (task_id,)).fetchone()
             if row is None:
                 conn.execute("ROLLBACK")
@@ -7292,6 +7363,11 @@ class TaskQueue:
             status = row["status"]
             pane = row["dispatch_pane_id"] or ""
             if expected_status is not None and status != expected_status:
+                conn.execute("ROLLBACK")
+                return False, status, pane
+            if stale_before is not None and (
+                    (row["last_activity_at"] or 0) >= stale_before
+                    or (row["last_heartbeat_at"] or 0) >= stale_before):
                 conn.execute("ROLLBACK")
                 return False, status, pane
             if status in TERMINAL_TASK_STATUSES:
@@ -7351,7 +7427,11 @@ class TaskQueue:
     def expire_stale(self, older_than_seconds: float = 600.0, *,
                      on_cancelled: Optional[Callable[[str], None]] = None,
                      dry_run: bool = False) -> List[str]:
-        """Preview or cancel in_progress tasks whose last_activity_at is stale.
+        """Preview or cancel in_progress tasks with no recent activity.
+
+        A task is stale only when both ``last_activity_at`` and
+        ``last_heartbeat_at`` are older than the cutoff: dispatcher workers
+        report liveness through heartbeats alone (#885).
 
         ``dry_run=True`` returns the selected IDs without changing any row.
         The caller may scope a subsequent cancellation to these IDs.
@@ -7373,8 +7453,9 @@ class TaskQueue:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT task_id FROM tasks WHERE status = 'in_progress' AND last_activity_at < ?",
-                (cutoff,),
+                "SELECT task_id FROM tasks WHERE status = 'in_progress' "
+                "AND last_activity_at < ? AND COALESCE(last_heartbeat_at, 0) < ?",
+                (cutoff, cutoff),
             ).fetchall()
             candidates = [r["task_id"] for r in rows]
         finally:
@@ -7384,10 +7465,11 @@ class TaskQueue:
         cancelled: List[str] = []
         for task_id in candidates:
             try:
-                # CAS on in_progress: a task that posted its result between the
-                # scan and here is finished, not stale.
+                # CAS on in_progress and on staleness: a task that posted its
+                # result, or heartbeated, between the scan and here is not stale.
                 if not self.cancel(task_id, reason=CANCEL_REASON_STALE_LEASE,
-                                   expected_status="in_progress"):
+                                   expected_status="in_progress",
+                                   stale_before=cutoff):
                     continue
             except Exception:
                 logger.exception("expire_stale: cancel failed task_id=%s", task_id)
@@ -7436,6 +7518,10 @@ class TaskQueue:
     def reset_stale_to_pending(self, older_than_seconds: float = 600.0) -> List[str]:
         """Reset in_progress tasks idle > ``older_than_seconds`` back to pending.
 
+        Idle means neither ``last_activity_at`` nor ``last_heartbeat_at`` moved
+        within the window. A reset ends the claim and lease and writes a
+        ``requeued`` event, like :meth:`requeue` (#885).
+
         Unlike ``expire_stale`` (which cancels them), this returns the tasks to
         the queue so they can be picked up again. Used by ``crew recover
         --reset-stale`` (#155).
@@ -7445,8 +7531,9 @@ class TaskQueue:
         try:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT task_id FROM tasks WHERE status = 'in_progress' AND last_activity_at < ?",
-                (cutoff,),
+                "SELECT task_id FROM tasks WHERE status = 'in_progress' "
+                "AND last_activity_at < ? AND COALESCE(last_heartbeat_at, 0) < ?",
+                (cutoff, cutoff),
             ).fetchall()
             # §8 again, and per row: one stale task whose receipt cannot be
             # re-admitted must not keep the others in_progress, and must not be
@@ -7458,13 +7545,16 @@ class TaskQueue:
                     reason=f"idle > {older_than_seconds:.0f}s")
                 if requeued:
                     task_ids.append(r["task_id"])
-            if task_ids:
-                placeholders = ",".join("?" * len(task_ids))
+            now = time.time()
+            for task_id in task_ids:
                 conn.execute(
-                    f"UPDATE tasks SET status = 'pending', last_activity_at = ? "
-                    f"WHERE task_id IN ({placeholders})",
-                    [time.time()] + task_ids,
+                    "UPDATE tasks SET status = 'pending', claim_source = '', "
+                    "last_activity_at = ? WHERE task_id = ?",
+                    (now, task_id),
                 )
+                # Same end-of-claim record as requeue(): clear the lease and
+                # log the requeue (#885).
+                self._record_end_on(conn, task_id, now, "requeued", posted=False)
             conn.execute("COMMIT")
             return task_ids
         except Exception:
@@ -7683,7 +7773,7 @@ class TaskQueue:
                     ctx = json.loads(row["context"]) if row["context"] else {}
                 except Exception:
                     continue
-                if ((skip_deferred or ctx.get("push_refusal_reason") == "codex_capacity")
+                if ((skip_deferred or ctx.get("push_refusal_reason") in _CLAIMANT_DEFERRALS)
                         and float(ctx.get("push_not_before") or 0) > time.time()):
                     continue            # Pane push or provider-capacity backoff — see dequeue()
                 if ctx.get("agent") == agent:
@@ -7857,6 +7947,28 @@ class TaskQueue:
                 rows = conn.execute(
                     "SELECT * FROM tasks ORDER BY priority ASC, created_at ASC"
                 ).fetchall()
+            return [self._task_from_row(r) for r in rows]
+        finally:
+            conn.close()
+
+    def list_tasks_with_context_key_prefix(self, prefix: str) -> List[TaskRequest]:
+        """Tasks whose stored context JSON has a key starting with ``prefix``,
+        in ``list_tasks`` order.
+
+        A substring prefilter, so it may return a few extra rows (a value that
+        happens to contain the quoted prefix); callers still check the keys they
+        need. What it never does is load and sort every row: on a periodic tick,
+        ``list_tasks()`` sorted the whole table through a temp file each time and
+        held the read lock for seconds (#830).
+        """
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE context LIKE ? ESCAPE '\\' "
+                "ORDER BY priority ASC, created_at ASC",
+                (f'%"{escaped}%',),
+            ).fetchall()
             return [self._task_from_row(r) for r in rows]
         finally:
             conn.close()

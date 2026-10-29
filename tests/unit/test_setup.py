@@ -370,9 +370,11 @@ def test_u_se22_start_agents_no_warn_when_cli_detected():
 # U-SE23: start_agents_in_panes sends a kickoff prompt after CLI boots
 def _kickoff_from_buffer(mock_run):
     loads = [call for call in mock_run.call_args_list
-             if call.args[0] == ["tmux", "load-buffer", "-"]]
+             if call.args[0][:3] == ["tmux", "load-buffer", "-b"]
+             and call.args[0][-1] == "-"]
     assert len(loads) == 1, "kickoff was not loaded into tmux"
-    assert any(call.args[0] == ["tmux", "paste-buffer", "-p", "-d", "-t", "crew:0.0"]
+    buf = loads[0].args[0][3]
+    assert any(call.args[0] == ["tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", "crew:0.0"]
                for call in mock_run.call_args_list), "kickoff was not pasted to the pane"
     return loads[0].kwargs["input"]
 

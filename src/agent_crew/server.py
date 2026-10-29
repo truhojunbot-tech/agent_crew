@@ -24,7 +24,7 @@ from typing import Callable, Literal, Optional
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
-from agent_crew import instructions
+from agent_crew import instructions, pane_submit
 from agent_crew.cea.input_providers.budget import QuotaBudgetProvider
 from agent_crew.port_validation import require_project_port
 from agent_crew import claude_transcript as _claude_transcript
@@ -1045,6 +1045,13 @@ def _prepare_worktree_for_task(
                 context["prep_error_base_source"] = "head"
             return head
         return ""
+
+
+#: #896: prep failures that are infrastructure, not the task. Retried
+#: ``AGENT_CREW_PREP_TRANSIENT_RETRIES`` times (default 1) after a backoff.
+_PREP_TRANSIENT_ERRORS = frozenset({"TimeoutExpired"})
+_PREP_TRANSIENT_RETRIES = int(os.environ.get("AGENT_CREW_PREP_TRANSIENT_RETRIES", "1"))
+_PREP_RETRY_BACKOFF_S = float(os.environ.get("AGENT_CREW_PREP_RETRY_BACKOFF_S", "60"))
 
 
 def _worktree_head(worktree_path: str) -> str:
@@ -3150,16 +3157,18 @@ def _pane_clear_context(pane_id: str, *, task_id: str = "", project: str = "",
     provider runs with cleared state while the economics stay attached to a
     context whose recorded policy still says `resume`.
 
-    A successful send is only ``attempted`` until a subsequent measurement from
-    the same source drops below the threshold. A non-zero return is
-    ``send_failed``. The return value is the observed outcome.
+    A verified submit (#888) is only ``attempted`` until a subsequent
+    measurement from the same source drops below the threshold. tmux refusing
+    the text is ``send_failed``; ``/clear`` still in the input line after the
+    bounded Enter retries is ``unsubmitted``. The return value is the observed
+    outcome.
     """
-    r = subprocess.run(["tmux", "send-keys", "-t", pane_id, "/clear", "Enter"],
-                       capture_output=True, text=True)
-    sent = getattr(r, "returncode", 1) == 0
+    submitted = pane_submit.submit(pane_id, "/clear", paste=False, settle=0.2,
+                                   label="/clear")
+    sent = submitted == "submitted"
     import time as _time
     _time.sleep(2.0)
-    outcome = "attempted" if sent else "send_failed"
+    outcome = "attempted" if sent else submitted
     post_tokens, post_source = None, "unknown"
     if sent and context_tokens is not None and token_source:
         try:
@@ -3262,8 +3271,20 @@ def _pane_has_task(pane_id: str) -> bool:
         ["tmux", "capture-pane", "-p", "-t", pane_id],
         capture_output=True, text=True,
     )
-    out = r.stdout
+    return _screen_has_task(r.stdout)
+
+
+def _screen_has_task(out: str) -> bool:
     return ("=== AGENT_CREW TASK ===" in out) or ("[Pasted text" in out)
+
+
+def _task_pending(screen: str) -> bool:
+    """Push predicate (#888): look only at the input box when it is visible,
+    so the transcript echo of a submitted task is not read as still pending.
+    Without a visible prompt marker, fall back to the whole screen."""
+    if pane_submit.has_prompt(screen):
+        return _screen_has_task(pane_submit.input_region(screen))
+    return _screen_has_task(screen)
 
 
 # Backoff schedule (seconds) for the per-attempt wait after Enter. The first
@@ -3276,51 +3297,24 @@ _PUSH_RETRY_DELAYS = (0.3, 0.5, 1.0, 2.0)
 def _default_push(pane_id: str, text: str) -> None:
     """Send task via tmux bracketed paste, then retry Enter until submitted.
 
-    Bracketed-paste mode delivers the entire blob atomically. After paste we
-    wait for the TUI to finish consuming it, then send Enter. Some Claude UI
+    Bracketed-paste mode delivers the entire blob atomically. Some Claude UI
     states (post-task footer animations, cache writes between back-to-back
-    tasks — issue #74) drop the first Enter without submitting; we re-send
-    Enter with backoff up to len(_PUSH_RETRY_DELAYS) times.
+    tasks — issue #74) drop the first Enter without submitting; the verified
+    submit (#888) re-sends Enter with backoff up to len(_PUSH_RETRY_DELAYS)
+    times, holding the pane's lock so no other writer interleaves.
     """
     logger.debug(f"_default_push called: pane_id={pane_id}")
     task_id = text.split("\n")[1].split(": ")[1] if "task_id:" in text else "unknown"
     logger.info(f"PUSH START: task_id={task_id}, pane_id={pane_id}")
-
-    r1 = subprocess.run(
-        ["tmux", "load-buffer", "-"],
-        input=text,
-        text=True,
-        capture_output=True,
-    )
-    logger.debug(f"load-buffer result: rc={r1.returncode}, stderr={r1.stderr[:100] if r1.stderr else 'ok'}")
-
-    r2 = subprocess.run(
-        ["tmux", "paste-buffer", "-p", "-d", "-t", pane_id],
-        capture_output=True,
-    )
-    logger.debug(f"paste-buffer result: rc={r2.returncode}, stderr={r2.stderr[:100] if r2.stderr else 'ok'}")
-
-    # Give the TUI time to process the bracketed-paste sequence.
-    time.sleep(0.5)
-
-    for attempt, wait_after in enumerate(_PUSH_RETRY_DELAYS, start=1):
-        subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
-        time.sleep(wait_after)
-        if not _pane_has_task(pane_id):
-            logger.info(
-                f"PUSH SUCCESS: task_id={task_id} pushed to {pane_id} "
-                f"(attempt {attempt}/{len(_PUSH_RETRY_DELAYS)})"
-            )
-            return
-        logger.warning(
-            f"PUSH retry: attempt {attempt}/{len(_PUSH_RETRY_DELAYS)} for "
-            f"task_id={task_id} — composer still holding input"
+    outcome = pane_submit.submit(pane_id, text, pending=_task_pending,
+                                 delays=_PUSH_RETRY_DELAYS, label=f"task {task_id}")
+    if outcome == "submitted":
+        logger.info(f"PUSH SUCCESS: task_id={task_id} pushed to {pane_id}")
+    else:
+        logger.error(
+            f"PUSH FAILED: task_id={task_id} {outcome} after "
+            f"{len(_PUSH_RETRY_DELAYS)} Enter attempts on {pane_id}"
         )
-
-    logger.error(
-        f"PUSH FAILED: task_id={task_id} still pending after "
-        f"{len(_PUSH_RETRY_DELAYS)} Enter attempts on {pane_id}"
-    )
 
 
 def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, project: str = "", mcp_mode: bool = False, task_type: str = "") -> str:
@@ -4738,6 +4732,20 @@ def create_app(
             if "agent_override" in task_context:
                 agent_override = task_context["agent_override"]
                 override_pane_id = pane_map.get(agent_override)
+                _override_norm = str(agent_override or "").strip().lower()
+                if (override_pane_id and worktree_map and _override_norm
+                        and _resolve_dispatch_target(task, role)[0] != _override_norm):
+                    # #861 review: the override has a pane but no role, so no
+                    # worktree is its own and the resolver falls back to
+                    # `worktree_map[role]` — another agent's tree. Preparing it
+                    # would move that agent's checkout under its feet.
+                    logger.warning(
+                        f"_try_push_next: agent_override {agent_override} has no worktree of its own "
+                        f"(role map {_DISPATCH_ROLE_TO_AGENT}) — requeueing {task.task_id} "
+                        f"instead of preparing {role}'s worktree")
+                    q().requeue(task.task_id)
+                    skipped.add(task.task_id)
+                    continue
                 if override_pane_id:
                     logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
                     pane_id = override_pane_id
@@ -4769,15 +4777,36 @@ def create_app(
         if _refuse_self_review(task, _target_agent):
             return
 
+        # #861: the worktree follows the pane, i.e. the same resolution the
+        # dispatcher uses. `worktree_map[role]` belongs to the role's default
+        # agent; with `agent_override` that is another provider's worktree,
+        # which the busy check above (keyed by THIS pane) never looked at — so
+        # an override implement task re-checked-out a running review's tree.
+        _push_worktree = (_resolve_dispatch_target(task, role)[1] or "") if worktree_map else ""
+
         # #140/#141: prepare worktree branch before task delivery.
         if worktree_map and not _WORKTREE_SYNC_DISABLED:
-            wt_path = worktree_map.get(role)
+            wt_path = _push_worktree
             if wt_path:
                 try:
                     _reviewed_sha = _prepare_worktree_for_task(
                         wt_path, task.task_id, task.branch or "", role,
                         task_context=task.context if isinstance(task.context, dict) else {},
                     )
+                    # #896: a transient prep error is retried before anything
+                    # is recorded or delivered — including an implementer whose
+                    # prep fell back to a caller/HEAD SHA, which is not the base
+                    # this task asked for. Not recording it also keeps a HEAD
+                    # fallback from being re-read as a "caller" base next time.
+                    if _retry_transient_prep(task):
+                        return
+                    # #896: retries spent — a caller/HEAD fallback is not the
+                    # base this task asked for, so it is not delivered on.
+                    if _transient_prep_exhausted(task):
+                        _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                        status="needs_human",
+                                        details=_prep_failure_details(task))
+                        return
                     # #253: persist it on the task BEFORE the push, so it also
                     # reaches the agent in the task block — a reviewer that can
                     # see which commit it was given can say so in its result,
@@ -4790,7 +4819,8 @@ def create_app(
                         return
                     if (task.context or {}).get("prep_error") and not _reviewed_sha:
                         _fail_if_active(task.task_id, "prepared_base_not_recorded",
-                                        status="needs_human")
+                                        status="needs_human",
+                                        details=_prep_failure_details(task))
                         return
                     if _reviewed_sha:
                         _restore_task_wip(q(), task, wt_path)
@@ -4840,7 +4870,6 @@ def create_app(
         ):
             return
 
-        _push_worktree = worktree_map.get(role) if worktree_map else ""
         _push_project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
         if _push_worktree and not _ensure_role_protocol(
             role, _push_worktree, _push_project,
@@ -5709,6 +5738,43 @@ def create_app(
     # instead of just inferrable (#202 acceptance criterion).
     _seen_context_keys_this_process: set[str] = set()
 
+    def _retry_transient_prep(task: TaskRequest) -> bool:
+        """Requeue a transient prep failure once before it needs a human (#896).
+
+        A git timeout under host load (alpha_engine 10-28: load 27-37, a fetch
+        taking 36.5 s) is infrastructure, not a broken task. The first one
+        backs off and retries; once retries are spent the caller ends it in
+        needs_human (`_transient_prep_exhausted`) — even for an implementer
+        whose prep returned a caller/HEAD fallback, which may be an unrelated
+        stale commit. Any other prep error keeps the pre-#896 handling (#812).
+        Callers ask this BEFORE recording a base.
+        """
+        ctx = task.context or {}
+        prep_error = ctx.get("prep_error")
+        if prep_error not in _PREP_TRANSIENT_ERRORS:
+            return False
+        if int(ctx.get("prep_retry_count") or 0) >= _PREP_TRANSIENT_RETRIES:
+            return False
+        try:
+            requeued = q().defer_prep_retry(task.task_id, delay_s=_PREP_RETRY_BACKOFF_S,
+                                            prep_error=str(prep_error))
+        except Exception:
+            logger.exception("prep retry: requeue failed task_id=%s", task.task_id)
+            return False
+        if requeued:
+            logger.warning("prep retry: %s hit %s — requeued, not before %.0fs",
+                           task.task_id, prep_error, _PREP_RETRY_BACKOFF_S)
+        return requeued
+
+    def _transient_prep_exhausted(task: TaskRequest) -> bool:
+        """A transient prep error that `_retry_transient_prep` did not requeue (#896)."""
+        return (task.context or {}).get("prep_error") in _PREP_TRANSIENT_ERRORS
+
+    def _prep_failure_details(task: TaskRequest) -> dict:
+        ctx = task.context or {}
+        return {"prep_error": ctx.get("prep_error"),
+                "prep_retry_count": int(ctx.get("prep_retry_count") or 0)}
+
     def _fail_if_active(task_id: str, reason: str, *, status: str = "failed",
                         details: Optional[dict] = None) -> bool:
         """End a task only when it is still in_progress (agent may have submitted first).
@@ -6206,6 +6272,18 @@ def create_app(
                     task_context=task.context if isinstance(task.context, dict) else {},
                     task_type=task.task_type,
                 )
+                # #896: retry a transient prep error before recording or
+                # delivering anything, whatever fallback SHA prep returned.
+                if _retry_transient_prep(task):
+                    _lock_stack.close()
+                    return
+                # #896: retries spent — needs_human even with a fallback SHA.
+                if _transient_prep_exhausted(task):
+                    _lock_stack.close()
+                    _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                    status="needs_human",
+                                    details=_prep_failure_details(task))
+                    return
                 # #253/#358: record the exact prepared commit, or explicit
                 # unknown, before prompt construction.  A prep failure still
                 # dispatches, but can no longer masquerade as an unrecorded
@@ -6219,7 +6297,8 @@ def create_app(
                 if (task.context or {}).get("prep_error") and not _reviewed_sha:
                     _lock_stack.close()
                     _fail_if_active(task.task_id, "prepared_base_not_recorded",
-                                    status="needs_human")
+                                    status="needs_human",
+                                    details=_prep_failure_details(task))
                     return
                 if _reviewed_sha:
                     await asyncio.to_thread(_restore_task_wip, q(), task, wt)
@@ -7951,6 +8030,12 @@ def create_app(
             logger.warning("auto rebase: PR #%s no longer points at %s", pr_number, source)
             return None
 
+        # #908: the target tip the test could not squash onto is the floor the
+        # rebase result is held to, so later merges on base do not void it.
+        floor = str(script.get("base_sha") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", floor):
+            floor = ""
+
         rebase_id = f"rebase-pr{pr_number}-{source}"
         existing = q().get_task(rebase_id)
         if existing is not None:
@@ -7960,7 +8045,7 @@ def create_app(
         context = {"prev_task_id": test_task_id, "auto_rebase_of": test_task_id,
                    "artifact_kind": "rebase",
                    "rebase_onto": base, "rebase_source_sha": source,
-                   "base_branch": base, "pr_number": pr_number,
+                   "rebase_onto_sha": floor or None, "base_branch": base, "pr_number": pr_number,
                    "repo": repo, "issue": issue, "issue_number": issue,
                    "risk_tier": tier}
         for key in ("implementer_agent", "reviewer_agent", "coordinator_managed",

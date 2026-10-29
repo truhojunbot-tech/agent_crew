@@ -9,7 +9,7 @@ import time
 
 _logger = logging.getLogger(__name__)
 
-from agent_crew import instructions, session
+from agent_crew import instructions, pane_submit, session
 from agent_crew.port_validation import require_project_port
 from agent_crew.role_mapping import LEGACY_AGENT_TO_ROLE
 
@@ -84,12 +84,6 @@ def start_agents_in_panes(
     like ``%42``). When omitted, falls back to ``<session>:0.<i>`` which
     assumes a fresh session where pane 0 is the first agent.
     """
-    def _send_literal_text(target: str, text: str) -> None:
-        subprocess.run(
-            ["tmux", "send-keys", "-l", "-t", target, text],
-            capture_output=True,
-        )
-
     def _send_enter(target: str) -> None:
         subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], capture_output=True)
 
@@ -113,8 +107,11 @@ def start_agents_in_panes(
         time.sleep(0.3)
         subprocess.run(["tmux", "send-keys", "-t", target, "q", "Enter"], capture_output=True)
         time.sleep(0.3)
-        _send_literal_text(target, cmd)
-        _send_enter(target)
+        # #888: a shell command is verified too — it is pending while the
+        # screen still ends with it (#142: it can land in a chat box instead).
+        pane_submit.submit(target, cmd, paste=False, settle=0.2,
+                           pending=pane_submit.shell_line_pending(cmd),
+                           label=f"{agent} launch")
         if agent == "codex":
             # codex shows a two-step trust dialog after launch:
             # 1) "1. Yes / 2. No" — cursor already on 1, Enter accepts
@@ -161,29 +158,11 @@ def start_agents_in_panes(
             f"When a task arrives, branch on task_type, do the work, "
             f"then call submit_result. Loop indefinitely."
         )
-        # Use load-buffer + paste-buffer for reliable delivery of long text.
-        # tmux send-keys -l can silently drop characters when the pane is
-        # processing startup output at the same time.
-        r_load = subprocess.run(
-            ["tmux", "load-buffer", "-"],
-            input=kickoff,
-            text=True,
-            capture_output=True,
-        )
-        if r_load.returncode != 0:
-            _logger.warning(
-                "start_agents_in_panes: load-buffer failed for %s (%s): %s",
-                target, agent, r_load.stderr,
-            )
-            _send_literal_text(target, kickoff)
-        else:
-            subprocess.run(
-                ["tmux", "paste-buffer", "-p", "-d", "-t", target],
-                capture_output=True,
-            )
-        time.sleep(0.5)
-        _send_enter(target)
-        time.sleep(0.5)
+        # Bracketed paste (load-buffer + paste-buffer): tmux send-keys -l can
+        # silently drop characters while the pane is processing startup
+        # output. Verified submit (#888): Enter is retried until the kickoff
+        # has left the input line.
+        pane_submit.submit(target, kickoff, label=f"{agent} kickoff")
 
 
 def start_log_viewers_in_panes(
@@ -225,8 +204,9 @@ def start_log_viewers_in_panes(
             f" instead of running an agent CLI here directly; relaunching in 1s'; "
             f"sleep 1; done"
         )
-        subprocess.run(["tmux", "send-keys", "-l", "-t", target, cmd], capture_output=True)
-        subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], capture_output=True)
+        pane_submit.submit(target, cmd, paste=False, settle=0.2,
+                           pending=pane_submit.shell_line_pending(cmd),
+                           label=f"{role} log viewer")
         _logger.info("start_log_viewers_in_panes: %s watching %s (respawn-supervised)", target, log_path)
 
 

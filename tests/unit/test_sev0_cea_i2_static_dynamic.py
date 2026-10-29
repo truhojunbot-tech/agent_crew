@@ -341,7 +341,7 @@ from tests.unit.sev0_cea_acceptance_helpers import (  # noqa: E402
 PENDING_WRITERS = {
     "queue.py": {"enqueue (INSERT)", "requeue", "requeue_dispatcher_claim",
                  "reset_stale_to_pending", "defer_push_delivery",
-                 "defer_provider_capacity"},
+                 "defer_provider_capacity", "defer_prep_retry"},
 }
 #: callers of those writers that are themselves "paths back" (server/cli).
 REQUEUE_CALLERS = {"server.py": {"_requeue_orphans", "requeue"}, "cli.py": {"recover"}}
@@ -365,9 +365,10 @@ def test_static_every_literal_pending_write_is_inventoried():
     ``reset_stale_to_pending`` (queue.py:4723, same gate per row before UPDATE).
     ``defer_push_delivery`` is the bound-parameter writer. #581 added
     ``defer_provider_capacity`` (same gate before its UPDATE). #653 adds
-    ``resume_codex_quota`` (same gate before its UPDATE)."""
+    ``resume_codex_quota`` (same gate before its UPDATE). #896 adds
+    ``defer_prep_retry`` (same gate before its UPDATE)."""
     writes = _pending_writes()
-    assert set(writes) == {"queue.py"} and len(writes["queue.py"]) == 5, writes
+    assert set(writes) == {"queue.py"} and len(writes["queue.py"]) == 6, writes
 
 
 def test_dispatcher_claim_requeue_moves_receipt_before_pending(tmp_path):
@@ -434,7 +435,8 @@ def test_static_requeue_callers_are_inventoried():
         if n and rel != "queue.py":
             calls[rel] = n
     # #759 requeues an unverified cloud fix; #797 requeues capped claims through the CEA gate for local fallback or notice.
-    assert calls == {"claude_cloud.py": 4, "cli.py": 1, "server.py": 17}, calls
+    # #861 requeues an agent_override push whose agent has no worktree of its own.
+    assert calls == {"claude_cloud.py": 4, "cli.py": 1, "server.py": 18}, calls
 
 
 def _claimed(tmp_path, name, mode, *, config=None):

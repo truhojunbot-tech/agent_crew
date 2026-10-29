@@ -53,7 +53,11 @@ def _app(tmp_path, monkeypatch, worker, pushed, *, role="implementer"):
 
 
 def _timeout(*args, **kwargs):
-    raise subprocess.TimeoutExpired(["git", "fetch", "origin"], 60)
+    # A survivable, non-transient prep error. A TimeoutExpired is retried and,
+    # once retries are spent, ends in needs_human without any fallback base
+    # (#896, test_issue_896_prep_timeout_retry.py) — so the #812 fallback is
+    # only reachable through errors like this one.
+    raise subprocess.CalledProcessError(128, ["git", "fetch", "origin"])
 
 
 def test_fetch_timeout_uses_head_and_descendant_completion_passes(
@@ -72,7 +76,7 @@ def test_fetch_timeout_uses_head_and_descendant_completion_passes(
         context = queue.get_task_context("impl-812-head")
         assert context["worktree_base_sha"] == base
         assert context["worktree_base_status"] == "head_after_prep_error"
-        assert context["prep_error"] == "TimeoutExpired"
+        assert context["prep_error"] == "CalledProcessError"
         assert pushed
 
         _git(worker, "checkout", "-b", "feature")
@@ -112,7 +116,7 @@ def test_caller_base_precedes_head_after_prep_error(tmp_path, monkeypatch):
     context = queue.get_task_context("impl-812-caller")
     assert context["worktree_base_sha"] == base
     assert context["worktree_base_status"] == "caller_after_prep_error"
-    assert context["prep_error"] == "TimeoutExpired"
+    assert context["prep_error"] == "CalledProcessError"
     assert pushed
 
 
@@ -193,7 +197,7 @@ def test_unreadable_head_after_prep_error_stops_before_provider(tmp_path, monkey
     assert queue.get_task_status("impl-812-unreadable") == "needs_human"
     context = queue.get_task_context("impl-812-unreadable")
     assert context["worktree_base_sha"] is None
-    assert context["prep_error"] == "TimeoutExpired"
+    assert context["prep_error"] == "CalledProcessError"
     assert queue.get_result("impl-812-unreadable").status == "needs_human"
     assert queue.get_result("impl-812-unreadable").error_info["reason"] == "prepared_base_not_recorded"
 
@@ -270,7 +274,7 @@ def test_dispatcher_unreadable_head_never_spawns_provider(tmp_path, monkeypatch)
 
     assert spawned == []
     assert queue.get_task_status("impl-812-dispatch") == "needs_human"
-    assert queue.get_task_context("impl-812-dispatch")["prep_error"] == "TimeoutExpired"
+    assert queue.get_task_context("impl-812-dispatch")["prep_error"] == "CalledProcessError"
 
 
 def test_empty_second_prep_keeps_error_and_never_readopts_stale_head(
@@ -301,13 +305,13 @@ def test_empty_second_prep_keeps_error_and_never_readopts_stale_head(
         second = sv._prepare_worktree_for_task(str(worker), task.task_id, "feature",
                                                 "implementer", task_context=task.context)
         assert second == ""
-        assert task.context["prep_error"] == "TimeoutExpired"
+        assert task.context["prep_error"] == "CalledProcessError"
         assert app.state.record_prepared_base(task, "implementer", second, "test")
 
     context = queue.get_task_context(task.task_id)
     assert context["worktree_base_sha"] is None
     assert context["worktree_base_status"] == "unknown"
-    assert context["prep_error"] == "TimeoutExpired"
+    assert context["prep_error"] == "CalledProcessError"
     assert context.get("prep_error_base_source") is None
 
 
@@ -338,7 +342,7 @@ def test_dispatcher_stops_when_empty_reprep_follows_prep_error(tmp_path, monkeyp
     context = queue.get_task_context("impl-812-reprep-stop")
     assert context["worktree_base_sha"] is None
     assert context["worktree_base_status"] == "unknown"
-    assert context["prep_error"] == "TimeoutExpired"
+    assert context["prep_error"] == "CalledProcessError"
     assert queue.get_task_status("impl-812-reprep-stop") == "needs_human"
     assert queue.get_result("impl-812-reprep-stop").error_info["reason"] == "prepared_base_not_recorded"
 
