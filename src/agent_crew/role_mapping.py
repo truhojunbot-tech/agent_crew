@@ -99,6 +99,21 @@ def anonymous_pull_refusal(role: object, agent: object) -> str | None:
             "name the provider so the role policy can check its family")
 
 
+#: Role-mapped backends with no checkout of their own. A task bound to one is
+#: dispatchable only while that backend still holds the task's role (#891).
+ROLE_BOUND_PROVIDERS = ("claude_cloud",)
+
+
+def provider_task_types(provider: str, role_to_agent: Mapping[str, str]) -> tuple[str, ...]:
+    """Task types ``provider`` holds under the CURRENT role map (#891).
+
+    A binding stored on a task (``agent_override``) is only as current as the
+    role map it was written under; claim and dispatch re-read the map here.
+    """
+    return tuple(sorted(task_type for task_type, role in TASK_TYPE_TO_ROLE.items()
+                        if role_to_agent.get(role) == provider))
+
+
 def validate_explicit_role_agents(mapping: Mapping[str, object]) -> dict[str, str]:
     """Validate a complete explicit mapping without imposing provider policy."""
     if set(mapping) != set(ROLE_ORDER):

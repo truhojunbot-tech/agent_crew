@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import datetime, timezone
-from typing import Callable, List, Optional
+from typing import Callable, List, Mapping, Optional
 
 from agent_crew.anomaly import _extract_repo_from_url, auto_detect_expected_repos
 from agent_crew.cea import adapters as _cea_adapters
@@ -41,6 +41,9 @@ from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY, normalize_pr_number as _normalize_pr_number,
     validate_review_result,
+)
+from agent_crew.role_mapping import (
+    ROLE_BOUND_PROVIDERS, effective_role_mapping, provider_task_types,
 )
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
@@ -2690,6 +2693,34 @@ class TaskQueue:
             self._declared_project = self._read_declared_project()
         return self._declared_project
 
+    def _holds_task_type(self, provider: str, task_type: str,
+                         role_to_agent: Optional[Mapping[str, str]]) -> bool:
+        """Whether ``provider`` holds ``task_type`` under the CURRENT role map (#891).
+
+        ``state.json`` next to the DB -- the file the dispatcher reads -- is
+        re-read on every claim. ``role_to_agent`` is the caller's snapshot and
+        can only narrow that answer, never widen it: the role map may have
+        changed between the snapshot and this claim (review of PR #916 round 4).
+        No state file means no declared map, so the snapshot (if any) is all
+        there is (bare test queues). A state file that cannot be read fails closed.
+        """
+        if role_to_agent is not None and task_type not in provider_task_types(provider, role_to_agent):
+            return False
+        path = str(self._db_path or "")
+        if not path or path == ":memory:":
+            return True
+        state_path = os.path.join(os.path.dirname(os.path.abspath(path)), "state.json")
+        if not os.path.exists(state_path):
+            return True
+        try:
+            with open(state_path, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+            current = effective_role_mapping(state)[0]
+        except Exception:
+            logger.warning("#891: unreadable %s; refusing %s claim", state_path, provider)
+            return False
+        return task_type in provider_task_types(provider, current)
+
     def _read_declared_project(self) -> str:
         """``state.json``'s ``project``, or ``""``. Never raises — an unreadable
         state file means "not declared", not "admission is down"."""
@@ -5102,6 +5133,33 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def reroute_stale_provider_bindings(self, provider: str,
+                                        held_task_types: tuple[str, ...]) -> list[str]:
+        """Clear ``agent_override=provider`` from pending tasks whose type the
+        provider no longer holds, so the current role holder claims them (#891).
+        """
+        held = tuple(held_task_types)
+        held_sql = f" AND task_type NOT IN ({','.join('?' for _ in held)})" if held else ""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            ids = [row[0] for row in conn.execute(
+                "SELECT task_id FROM tasks WHERE status = 'pending'"
+                " AND json_extract(context, '$.agent_override') = ?" + held_sql,
+                (provider, *held))]
+            for task_id in ids:
+                conn.execute(
+                    "UPDATE tasks SET context = json_set(json_remove(context, '$.agent_override'),"
+                    " '$.rerouted_from_provider', ?) WHERE task_id = ? AND status = 'pending'",
+                    (provider, task_id))
+            conn.execute("COMMIT")
+            return ids
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     def patch_context(self, task_id: str, extra: dict) -> None:
         """Merge ``extra`` into the existing context of a pending task."""
         conn = self._connect()
@@ -5187,7 +5245,7 @@ class TaskQueue:
     def dequeue(
         self, agent: str = "", role: str = "", *, claimed_via: str = "",
         claim_source: str = "", skip_task_ids: Optional[set[str]] = None,
-        skip_deferred: bool = False,
+        skip_deferred: bool = False, role_to_agent: Optional[Mapping[str, str]] = None,
     ) -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
@@ -5245,16 +5303,33 @@ class TaskQueue:
             skip_sql = f" AND task_id NOT IN ({','.join('?' for _ in skipped)})" if skipped else ""
             if agent:
                 # Stage 1 — explicit override claim for this agent.
+                # #891: a role-bound backend has no checkout of its own, so its
+                # binding only counts for the role it is claiming as right now.
+                # Checked here, inside the claim transaction: a stale binding
+                # enqueued after the dispatcher's reroute sweep is still refused.
+                # Fail closed: with no (known) role there is nothing to check the
+                # binding against, so a role-less pull claims no bound task.
+                role_bound = agent in ROLE_BOUND_PROVIDERS
+                bound_type = _ROLE_TO_TYPE.get(role) if role_bound else None
+                bound_sql = " AND task_type = ?" if bound_type else ""
+                # Review of PR #916 (round 3): the role is the caller's claim,
+                # not a fact. A backend that lost the role since its binding was
+                # written (reviewer handed back to codex) claims nothing as that
+                # role -- neither its own stale binding nor an unbound task.
+                if bound_type and not self._holds_task_type(agent, bound_type, role_to_agent):
+                    conn.execute("ROLLBACK")
+                    return None
+            if agent and not (role_bound and bound_type is None):
                 row = conn.execute(
                     f"""
                     SELECT * FROM tasks
                     WHERE status = 'pending'
                       AND json_extract(context, '$.agent_override') = ?
-                      {_defer_sql} {skip_sql}
+                      {bound_sql} {_defer_sql} {skip_sql}
                     ORDER BY priority ASC, created_at ASC
                     LIMIT 1
                     """,
-                    (agent, *skipped),
+                    (agent, *((bound_type,) if bound_type else ()), *skipped),
                 ).fetchone()
 
             if row is None and role:

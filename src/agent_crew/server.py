@@ -98,9 +98,9 @@ from agent_crew import script_tester as _script_tester
 from agent_crew import contract_emit as _contract_emit
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import (
-    DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE,
-    anonymous_pull_refusal, effective_role_mapping, provider_family, role_policy,
-    role_policy_refusal,
+    DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, ROLE_BOUND_PROVIDERS,
+    TASK_TYPE_TO_ROLE, anonymous_pull_refusal, effective_role_mapping, provider_family,
+    provider_task_types, role_policy, role_policy_refusal,
 )
 from agent_crew.risk_tier import risk_declaration as _risk_declaration
 from agent_crew.testing_policy import (
@@ -4718,6 +4718,7 @@ def create_app(
         # branch only fires when an operator has explicitly opted a role
         # into claude_cloud (role_mapping.py); by default no role resolves to
         # it, so existing local dispatch is unchanged.
+        _reroute_stale_bindings()
         if _DISPATCH_ROLE_TO_AGENT.get(role, "") == _claude_cloud.CLOUD_PROVIDER_NAME:
             if _dispatcher_enabled:
                 # The headless loop owns cloud selection and shadow launches.
@@ -4725,7 +4726,8 @@ def create_app(
             try:
                 _claude_cloud.dispatch_cloud_for_role(
                     q(), role=role, task_type=_ROLE_TO_TYPE.get(role, ""),
-                    state_path=state_path, review_guard_fn=_refuse_self_review)
+                    state_path=state_path, review_guard_fn=_refuse_self_review,
+                    role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
             except Exception:
                 logger.exception(f"_try_push_next: claude_cloud dispatch failed for role={role}")
             return
@@ -5660,6 +5662,21 @@ def create_app(
         logger.info("dispatcher: state changed; effective role map: %s", mapping)
 
     _DISPATCH_DISCUSS_WORKTREES = _load_discuss_worktrees(state_path)
+
+    def _reroute_stale_bindings() -> list[str]:
+        """#891: re-resolve role-bound providers from the CURRENT role map
+        before any claim. A pending task bound to a backend that has since lost
+        the task's role goes back to that role's current holder."""
+        _refresh_role_map()
+        moved: list[str] = []
+        for provider in ROLE_BOUND_PROVIDERS:
+            moved += q().reroute_stale_provider_bindings(
+                provider, provider_task_types(provider, _DISPATCH_ROLE_TO_AGENT))
+        if moved:
+            logger.warning("dispatcher: rerouted %s off a provider that no longer holds "
+                           "their role (role map: %s)", moved, _DISPATCH_ROLE_TO_AGENT)
+        return moved
+
 
     # #772: the test stage is a deterministic script, not a provider call.
     # One run at a time per server: suites share the repo's object store and
@@ -7518,7 +7535,7 @@ def create_app(
             while True:
                 await asyncio.sleep(interval)
                 try:
-                    _refresh_role_map()
+                    _reroute_stale_bindings()
                     _AGENT_TO_ROLES, _workers, _discuss_workers = _worker_role_map()
                     try:
                         _resume_codex_quota_holds()
@@ -7588,14 +7605,16 @@ def create_app(
                             _cloud_implement_outcome = await asyncio.to_thread(
                                 _claude_cloud.dispatch_cloud_for_role, q(),
                                 role="implementer", task_type="implement",
-                                state_path=state_path, review_guard_fn=_refuse_self_review)
+                                state_path=state_path, review_guard_fn=_refuse_self_review,
+                                role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
                             if _cloud_implement_outcome.dispatched or _worker_roles == ["implementer"]:
                                 continue
                             if "reviewer" in _worker_roles and _claude_cloud.cloud_dispatch_enabled():
                                 await asyncio.to_thread(
                                     _claude_cloud.dispatch_cloud_for_role, q(),
                                     role="reviewer", task_type="review",
-                                    state_path=state_path, review_guard_fn=_refuse_self_review)
+                                    state_path=state_path, review_guard_fn=_refuse_self_review,
+                                    role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
                             continue
                         if (_worker_roles == ["reviewer"] and
                                 worker == _claude_cloud.CLOUD_PROVIDER_NAME and
@@ -7607,7 +7626,8 @@ def create_app(
                                 _cloud_outcome = await asyncio.to_thread(
                                     _claude_cloud.dispatch_cloud_for_role, q(),
                                     role="reviewer", task_type="review",
-                                    state_path=state_path, review_guard_fn=_refuse_self_review)
+                                    state_path=state_path, review_guard_fn=_refuse_self_review,
+                                    role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
                                 _skip = _cloud_outcome.skipped_reason or ""
                                 if _skip not in ("daily_cap", "at_capacity") and not _skip.startswith("cli_unsupported:"):
                                     continue
@@ -7797,6 +7817,7 @@ def create_app(
     # Exposed for integration tests and operational introspection of the exact
     # provider/worktree decision the dispatcher will use.
     app.state.resolve_dispatch_target = _resolve_dispatch_target
+    app.state.reroute_stale_bindings = _reroute_stale_bindings
     # The dispatcher loop calls through this attribute, so a test can hold a
     # dispatch open and observe slot/lease decisions (#875).
     app.state.dispatch_task = _dispatch_task
@@ -8998,7 +9019,10 @@ def create_app(
         anonymous = anonymous_pull_refusal(role, agent)
         if anonymous is not None:
             raise HTTPException(status_code=409, detail=anonymous)
-        task = q().dequeue(agent=agent, role=role, claimed_via="http_poll")
+        # #891: the claim checks role ownership against the live role map.
+        _refresh_role_map()
+        task = q().dequeue(agent=agent, role=role, claimed_via="http_poll",
+                           role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
         if task is None:
             return None
         # #889: a pull is a delivery route too. The claim has committed, so a

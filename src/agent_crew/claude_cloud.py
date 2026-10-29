@@ -1070,10 +1070,12 @@ def _local_implementer(task: TaskRequest, state_path: Optional[str]) -> str:
 
 
 def _route_capped_implement(queue: TaskQueue, *, state_path: Optional[str],
-                            metric: str, count: float, limit: float) -> None:
+                            metric: str, count: float, limit: float,
+                            role_to_agent: Optional[dict[str, str]] = None) -> None:
     """Claim once through admission, then route the same row off cloud."""
     task = queue.dequeue(agent=CLOUD_PROVIDER_NAME, role="implementer",
-                         claimed_via="cloud_push", skip_deferred=True)
+                         claimed_via="cloud_push", skip_deferred=True,
+                         role_to_agent=role_to_agent)
     if task is None:
         return
     reason = {"reason": "cloud_daily_cap", "metric": metric,
@@ -1135,8 +1137,13 @@ def dispatch_cloud_for_role(
     cli_path: Optional[str] = None,
     state_path: Optional[str] = None,
     review_guard_fn: Optional[Callable[[TaskRequest, str], bool]] = None,
+    role_to_agent: Optional[dict[str, str]] = None,
 ) -> CloudDispatchOutcome:
     """Hand at most one pending task for ``role`` to a Cloud session.
+
+    ``role_to_agent`` is the caller's live role map, checked again at claim
+    (#891). The server passes it; a direct caller that omits it is asserting
+    that cloud holds ``role`` -- calling this adapter is that selection.
 
     Mirrors ``server._try_push_next``'s gate ordering exactly — dequeue
     (STOP/pause, already enforced there) then ``record_dispatch`` (CEA
@@ -1146,6 +1153,8 @@ def dispatch_cloud_for_role(
     """
     if not cloud_dispatch_enabled():
         return CloudDispatchOutcome(False, skipped_reason="disabled")
+    if role_to_agent is None:
+        role_to_agent = {role: CLOUD_PROVIDER_NAME}
 
     if task_type == "review" and not _claimable_cloud_reviews(queue):
         return CloudDispatchOutcome(False, skipped_reason="no_task")
@@ -1169,14 +1178,16 @@ def dispatch_cloud_for_role(
         if daily_cap is not None:
             count = queue.count_cloud_implements_started_since(day_start)
             if count >= daily_cap:
-                _route_capped_implement(queue, state_path=state_path, metric="launches",
+                _route_capped_implement(queue, state_path=state_path, role_to_agent=role_to_agent,
+                                        metric="launches",
                                         count=count, limit=daily_cap)
                 return CloudDispatchOutcome(False, skipped_reason="daily_cap")
         usd_cap = cloud_max_usd_per_day()
         if usd_cap is not None:
             spent = queue.cloud_implement_usd_since(day_start)
             if spent >= usd_cap:
-                _route_capped_implement(queue, state_path=state_path, metric="usd",
+                _route_capped_implement(queue, state_path=state_path, role_to_agent=role_to_agent,
+                                        metric="usd",
                                         count=spent, limit=usd_cap)
                 return CloudDispatchOutcome(False, skipped_reason="usd_cap")
             # An active session has no final credit delta. Reserve the remaining
@@ -1202,7 +1213,7 @@ def dispatch_cloud_for_role(
         return CloudDispatchOutcome(False, skipped_reason=f"cli_unsupported:{capability.reason}")
 
     task = queue.dequeue(agent=CLOUD_PROVIDER_NAME, role=role,
-                         claimed_via="cloud_push", skip_deferred=True,
+                         claimed_via="cloud_push", skip_deferred=True, role_to_agent=role_to_agent,
                          skip_task_ids=cloud_review_skip_ids(queue) if task_type == "review" else None)
     if task is None:
         return CloudDispatchOutcome(False, skipped_reason="no_task")
