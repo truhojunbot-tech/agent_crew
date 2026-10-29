@@ -29,7 +29,7 @@ from agent_crew.role_mapping import (
 )
 
 _DEFAULT_BASE = os.path.expanduser("~/.agent_crew")
-_DEFAULT_AGENTS = "codex,claude,gemini"
+_DEFAULT_AGENTS = "codex,claude"
 logger = logging.getLogger(__name__)
 
 
@@ -1067,7 +1067,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
 
     Examples:
 
-      crew setup myproj                        # default: codex,claude,gemini
+      crew setup myproj                        # default: codex,claude; script tester
 
       crew setup myproj --agents codex         # single-agent task
 
@@ -1394,6 +1394,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
         }
         if len(agent_list) == 1:
             new_role_agents = {role: agent_list[0] for role in _ROLES}
+        new_role_agents["tester"] = "script"
         if set(new_role_agents) == set(_ROLES):
             state_to_write["role_agents"] = new_role_agents
     elif "role_agents" in existing_state:
@@ -3614,11 +3615,11 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
     import time
 
     # Agents default: project's installed agents (from state) in project mode,
-    # or the global default (codex,claude,gemini) in standalone mode.
+    # or the global default (codex,claude) in standalone mode.
     if agents.strip():
         agent_list = [a.strip() for a in agents.split(",") if a.strip()]
     elif project_state and project_state.get("agents"):
-        agent_list = list(project_state["agents"])
+        agent_list = [a for a in project_state["agents"] if a not in ("gemini", "agy")]
     else:
         agent_list = [a.strip() for a in _DEFAULT_AGENTS.split(",") if a.strip()]
 

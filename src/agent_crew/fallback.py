@@ -40,9 +40,9 @@ _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
 _RATE_LIMIT_RE = re.compile("|".join(_RATE_LIMIT_PATTERNS), re.IGNORECASE)
 
 DEFAULT_CHAINS: dict[str, list[str]] = {
-    "implement": ["claude", "codex", "gemini"],
-    "review":    ["codex",  "claude", "gemini"],
-    "test":      ["gemini", "codex",  "claude"],
+    "implement": ["claude", "codex"],
+    "review":    ["codex", "claude"],
+    "test":      ["script"],
 }
 
 
@@ -93,6 +93,8 @@ def load_fallback_chains(state_path: Optional[str]) -> dict[str, list[str]]:
         if not isinstance(agents, list):
             continue
         cleaned = [a for a in agents if isinstance(a, str) and a]
+        if task_type == "test":
+            cleaned = [a for a in cleaned if a == "script"]
         if cleaned:
             chains[task_type] = cleaned
     return chains
@@ -124,6 +126,8 @@ def next_agent(
     else:
         candidates = chain
     for agent in candidates:
+        if task_type == "test" and agent != "script":
+            continue
         if agent not in excluded_set:
             return agent
     return None

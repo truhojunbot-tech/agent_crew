@@ -2699,7 +2699,8 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
                             role, agent,
                         )
             else:
-                result = by_role
+                result = {role: path for role, path in by_role.items()
+                          if role != "tester" or mapping["tester"] != _script_tester.SCRIPT_TESTER}
             logger.info(f"_load_worktree_map: state_path={state_path!r} (roles) → worktree_map={result}")
             return result
         # Legacy schema: agent-keyed worktrees + default role mapping.
@@ -2721,7 +2722,8 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
         else:
             for agent, path in worktrees.items():
                 role = _DEFAULT_AGENT_TO_ROLE.get(agent)
-                if role and path:
+                if role and path and not (role == "tester" and
+                                          mapping["tester"] == _script_tester.SCRIPT_TESTER):
                     result[role] = path
         logger.info(f"_load_worktree_map: state_path={state_path!r} (legacy) → worktree_map={result}")
         return result
@@ -7536,7 +7538,8 @@ def create_app(
             # Discuss can use an agent with no assigned task role.
             discuss_workers = list(dict.fromkeys(
                 [worker for worker in workers if worker != _script_tester.SCRIPT_TESTER]
-                + ["claude", "codex", "gemini"]))
+                + [agent for agent in _DISPATCH_DISCUSS_WORKTREES
+                   if agent in ("claude", "codex", "gemini", "agy")]))
             return by_agent, workers, discuss_workers
 
         # ⭐dispatcher 가 **실제로 들고 있는 lease**. orphan 판정의 권위다 —

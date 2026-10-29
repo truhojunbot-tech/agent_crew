@@ -57,6 +57,7 @@ def test_missing_repo_is_explicit_setup_error_without_gh(monkeypatch):
 
 
 def test_manual_test_task_derives_repo_from_its_project_checkout(tmp_path, monkeypatch):
+    monkeypatch.setattr(script_tester, "head_has_workflows", lambda *args: False)
     checkout = tmp_path / "project"
     checkout.mkdir()
     subprocess.run(["git", "init", "-q", str(checkout)], check=True)
@@ -86,6 +87,7 @@ def test_manual_test_task_derives_repo_from_its_project_checkout(tmp_path, monke
 
 
 def test_known_base_branch_needs_no_gh_repo_lookup(monkeypatch):
+    monkeypatch.setattr(script_tester, "head_has_workflows", lambda *args: False)
     monkeypatch.setattr(script_tester, "pr_base_branch",
                         lambda *args, **kwargs: pytest.fail("gh lookup was called"))
     monkeypatch.setattr(script_tester, "resolve_refs", lambda *args, **kwargs: ("base", "head"))

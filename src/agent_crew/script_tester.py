@@ -557,6 +557,17 @@ def record_to_result(task_id: str, record: Mapping, pr_number=None) -> TaskResul
                       error_info={**info, "reason": f"script_test_{reason}", "final": True})
 
 
+def head_has_workflows(repo: str, head_sha: str) -> bool:
+    """Check the tested commit, not the checkout's current branch, for CI workflows."""
+    result = subprocess.run(
+        ["git", "-C", repo, "ls-tree", "-r", "--name-only", head_sha,
+         "--", ".github/workflows"],
+        capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise RuntimeError(f"workflow lookup failed: {result.stderr.strip()[:200]}")
+    return any(path.endswith((".yml", ".yaml")) for path in result.stdout.splitlines())
+
+
 def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: str,
                       runner: Callable = run_command) -> TaskResult:
     """Run one ``test`` task by script. Never raises; never calls a provider."""
@@ -581,6 +592,17 @@ def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: s
         record = run_script_test(repo, base_sha=base_sha, head_sha=head_sha, state=state,
                                  cache_dir=cache_dir, runner=runner)
         record["base_branch"] = base_branch
+        if record.get("outcome") == PASSED and head_has_workflows(repo, head_sha):
+            from agent_crew.github import get_repo, head_checks_state
+            gh_repo = ctx.get("repo") or get_repo(cwd=repo)
+            if not gh_repo:
+                raise RuntimeError("missing context.repo for CI checks lookup")
+            ci_state, ci_detail = head_checks_state(gh_repo, head_sha)
+            record.update(ci_state=ci_state, ci_detail=ci_detail)
+            if ci_state == "red":
+                record.update(outcome=FAILED, reason="ci_red")
+            elif ci_state != "green":
+                record.update(outcome=INCOMPLETE, reason=f"ci_{ci_state}")
     except Exception as exc:  # noqa: BLE001 — the stage reports, never crashes
         logger.exception("script test setup failed for %s", task.task_id)
         record = {"executor": SCRIPT_TESTER, "provider_calls": 0,

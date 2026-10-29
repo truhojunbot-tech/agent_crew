@@ -656,7 +656,8 @@ def head_checks_state(repo: str, sha: str) -> tuple[str, str]:
             return "red", ", ".join(red[:5])
         if pending:
             return "pending", ", ".join(pending[:5])
-        return ("green" if check_runs or any(
+        return ("green" if any(run.get("conclusion") != "skipped"
+                               for run in latest_runs.values()) or any(
             s.get("context") != "crew/independent-review" for s in latest_statuses)
             else "none"), ""
     except Exception as exc:

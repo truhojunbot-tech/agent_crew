@@ -146,13 +146,13 @@ class TestLoadFallbackChains:
 class TestNextAgent:
     def test_progresses_through_chain(self):
         assert next_agent("implement", "claude", []) == "codex"
-        assert next_agent("implement", "codex", []) == "gemini"
+        assert next_agent("implement", "codex", []) is None
 
     def test_chain_exhausted_returns_none(self):
-        assert next_agent("implement", "gemini", []) is None
+        assert next_agent("implement", "codex", []) is None
 
     def test_excluded_agents_skipped(self):
-        assert next_agent("implement", "claude", ["codex"]) == "gemini"
+        assert next_agent("implement", "claude", ["codex"]) is None
 
     def test_unknown_current_starts_from_head(self):
         assert next_agent("implement", None, []) == "claude"

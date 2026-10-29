@@ -60,8 +60,8 @@ def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(
         "worktrees": worktrees,
     }
     if explicit_tester:
-        state["role_agents"] = {"implementer": "codex", "reviewer": "claude",
-                                "tester": "gemini"}
+            state["role_agents"] = {"implementer": "codex", "reviewer": "claude",
+                                    "tester": "script"}
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps(state))
 
@@ -98,6 +98,7 @@ def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app = create_app(
                     db_path=tmp_db,
+                        project="test_project",
                     pane_map={},
                     port=unused_tcp_port,
                     state_path=str(state_file),
@@ -106,7 +107,8 @@ def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(
                 )
                 with TestClient(app) as client:
                     for agent in ("claude", "codex", "gemini"):
-                        resp = client.post("/tasks", json=_discuss_payload(f"t_{agent}", agent))
+                        resp = client.post("/tasks", json=_discuss_payload(f"t_{agent}", agent),
+                                           headers={"X-Agent-Crew-Project": "test_project"})
                         assert resp.status_code == 201
 
                     # Worktree preparation runs in a worker thread, so a fixed
