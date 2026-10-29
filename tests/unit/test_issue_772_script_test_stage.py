@@ -7,7 +7,6 @@ import sqlite3
 import subprocess
 import sys
 import time
-import urllib.error
 from unittest.mock import patch
 
 import pytest
@@ -847,14 +846,38 @@ COMMIT = "c" * 40
 
 
 class _LoopQueue:
-    def __init__(self, results):
-        self.results = iter(results)
+    def __init__(self, results, *, duplicate_review=False):
+        self.results = list(results)
+        self.index = 0
+        self.rows = []
+        self.duplicate_review = duplicate_review
+
+    def list_tasks(self):
+        return list(self.rows)
 
     def get_result(self, task_id):
-        return next(self.results)
+        result = self.results[self.index]
+        self.index += 1
+        if self.index < len(self.results):
+            successor = self.results[self.index]
+            task_type = ("review" if result.task_id.startswith("impl-")
+                         and successor.task_id.startswith("review-") else
+                         "test" if result.task_id.startswith("review-")
+                         and successor.task_id.startswith("test-") else "")
+            if task_type:
+                self.rows.append(TaskRequest(
+                    task_id=successor.task_id, task_type=task_type,
+                    description="server successor", branch="main",
+                    context={"prev_task_id": task_id}))
+                if task_type == "review" and self.duplicate_review:
+                    self.rows.append(TaskRequest(
+                        task_id="review-duplicate", task_type="review",
+                        description="duplicate", branch="main",
+                        context={"prev_task_id": task_id}))
+        return result
 
 
-def _crew_run(monkeypatch, tmp_path, results, *, review_raises=None, tester=False):
+def _crew_run(monkeypatch, tmp_path, results, *, duplicate_review=False, tester=False):
     import agent_crew.loop as loop
     from agent_crew.cli import crew
 
@@ -864,21 +887,15 @@ def _crew_run(monkeypatch, tmp_path, results, *, review_raises=None, tester=Fals
         dispatched.append("implement")
         return f"impl-{dispatched.count('implement')}"
 
-    def enqueue_review(queue, task, branch, prev_task_id=None, context=None, port=0):
-        dispatched.append("review")
-        if review_raises is not None:
-            raise review_raises
-        return "review-1"
-
-    def enqueue_test(queue, task, branch, prev_task_id="", context=None, port=0):
-        dispatched.append("test")
-        return "test-review-1"
-
-    monkeypatch.setattr("agent_crew.queue.TaskQueue", lambda db: _LoopQueue(results))
+    queue = _LoopQueue(results, duplicate_review=duplicate_review)
+    monkeypatch.setattr("agent_crew.queue.TaskQueue", lambda db: queue)
     monkeypatch.setattr(loop, "enqueue_implement", enqueue_implement)
-    monkeypatch.setattr(loop, "enqueue_review", enqueue_review)
-    monkeypatch.setattr(loop, "enqueue_test", enqueue_test)
-    args = ["run", "work", "--db", str(tmp_path / "tasks.db"), "--max-iter", "2"]
+    monkeypatch.setattr(loop, "enqueue_review", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("CLI enqueued review")))
+    monkeypatch.setattr(loop, "enqueue_test", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("CLI enqueued test")))
+    args = ["run", "work", "--db", str(tmp_path / "tasks.db"), "--max-iter", "2",
+            "--timeout", "1"]
     if not tester:
         args.append("--no-tester")
     return CliRunner().invoke(crew, args), dispatched
@@ -889,19 +906,21 @@ def _impl_done():
     return TaskResult("impl-1", "completed", "done", branch="main", commit=COMMIT)
 
 
-def test_run_loop_409_on_enqueue_review_exits_cleanly(monkeypatch, tmp_path):
-    conflict = urllib.error.HTTPError("http://127.0.0.1:8101/tasks", 409, "Conflict", {}, None)
-    out, dispatched = _crew_run(monkeypatch, tmp_path, [_impl_done()], review_raises=conflict)
-    assert out.exception is None, out.output
-    assert out.exit_code == 0
-    assert "409 Conflict" in out.output and "Stopping the run loop" in out.output
-    assert dispatched == ["implement", "review"]
+def test_run_loop_missing_server_review_stops_without_enqueuing(monkeypatch, tmp_path):
+    out, dispatched = _crew_run(monkeypatch, tmp_path, [_impl_done()])
+    assert out.exit_code != 0
+    assert "Server did not create a review successor" in out.output
+    assert dispatched == ["implement"]
 
 
-def test_run_loop_other_http_errors_still_raise(monkeypatch, tmp_path):
-    boom = urllib.error.HTTPError("http://127.0.0.1:8101/tasks", 500, "boom", {}, None)
-    out, _ = _crew_run(monkeypatch, tmp_path, [_impl_done()], review_raises=boom)
-    assert isinstance(out.exception, urllib.error.HTTPError)
+def test_run_loop_ambiguous_server_reviews_stops_without_enqueuing(monkeypatch, tmp_path):
+    out, dispatched = _crew_run(
+        monkeypatch, tmp_path, [_impl_done(),
+                                TaskResult("review-1", "completed", "ok", verdict="approve")],
+        duplicate_review=True)
+    assert out.exit_code != 0
+    assert "Multiple review successors" in out.output
+    assert dispatched == ["implement"]
 
 
 def test_run_loop_skipped_test_stage_stops_without_reimplement(monkeypatch, tmp_path):
@@ -916,7 +935,7 @@ def test_run_loop_skipped_test_stage_stops_without_reimplement(monkeypatch, tmp_
     assert out.exception is None, out.output
     assert "SKIPPED_NO_TEST_COMMAND" in out.output
     assert "left for the coordinator gate" in out.output
-    assert dispatched == ["implement", "review", "test"]
+    assert dispatched == ["implement"]
 
 
 @pytest.mark.parametrize("test_result", [
@@ -940,4 +959,4 @@ def test_run_loop_unjudged_test_stage_stops_without_reimplement(monkeypatch, tmp
     assert out.exception is None, out.output
     assert "test stage not_run" in out.output
     assert "coordinator gate" in out.output
-    assert dispatched == ["implement", "review", "test"]
+    assert dispatched == ["implement"]

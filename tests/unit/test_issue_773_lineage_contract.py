@@ -313,20 +313,34 @@ def test_cli_test_failure_retry_preserves_full_lineage(tmp_db, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)
     monkeypatch.setattr("agent_crew.cli._writable_queue", lambda *args, **kwargs: queue)
+    monkeypatch.setattr("agent_crew.github.pr_head_sha", lambda *args, **kwargs: "a" * 40)
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda *args, **kwargs: "open")
+    stored_result = queue.get_result
 
     def result_for(task_id):
+        existing = stored_result(task_id)
+        if existing is not None:
+            return existing
         if task_id.startswith("review-"):
-            return TaskResult(task_id, "completed", "approved", verdict="approve",
-                              findings=[], pr_number=773)
+            result = TaskResult(task_id, "completed", "approved", verdict="approve",
+                                findings=[], pr_number=773)
+            queue.submit_result(task_id, result)
+            assert auto_enqueue_test(queue, task_id, pr_state_fn=lambda _: "open")
+            return result
         if task_id.startswith("test-"):
-            return TaskResult(task_id, "failed", "one new failing test",
-                              findings=["new failure: tests/test_new.py::test_one"],
-                              error_info={"kind": "test_failure",
-                                          "script_test": {"outcome": "FAILED",
-                                                          "reason": "new_failures",
-                                                          "new_failures": ["tests/test_new.py::test_one"]}})
-        return TaskResult(task_id, "completed", "done", branch=INTENT["branch"],
-                          commit="a" * 40, pr_number=773)
+            result = TaskResult(task_id, "failed", "one new failing test",
+                                findings=["new failure: tests/test_new.py::test_one"],
+                                error_info={"kind": "test_failure",
+                                            "script_test": {"outcome": "FAILED",
+                                                            "reason": "new_failures",
+                                                            "new_failures": ["tests/test_new.py::test_one"]}})
+            queue.submit_result(task_id, result)
+            return result
+        result = TaskResult(task_id, "completed", "done", branch=INTENT["branch"],
+                            commit="a" * 40, pr_number=773)
+        queue.submit_result(task_id, result)
+        assert auto_enqueue_review(queue, task_id, 773, pr_state_fn=lambda _: "open")
+        return result
 
     monkeypatch.setattr(queue, "get_result", result_for)
     out = CliRunner().invoke(crew, ["run", "work", "--db", tmp_db, "--max-iter", "1",

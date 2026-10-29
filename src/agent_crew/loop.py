@@ -183,6 +183,34 @@ def _existing_successor_id(queue, task_type: str, prev_task_id: str,
     return None
 
 
+def wait_for_pipeline_successor(queue, task_type: str, prev_task_id: str,
+                                timeout: float) -> str:
+    """Follow a server-created successor without writing another task row."""
+    deadline = time.monotonic() + timeout
+    while True:
+        matches = [
+            task for task in queue.list_tasks()
+            if task.task_type == task_type
+            and isinstance(task.context, dict)
+            and task.context.get("prev_task_id") == prev_task_id
+        ]
+        live = [task for task in matches
+                if task.status not in _DEAD_REVIEW_STATUSES]
+        if len(live) > 1:
+            raise click.ClickException(
+                f"Multiple {task_type} successors for {prev_task_id!r}; "
+                "refusing to choose one")
+        if live:
+            return live[0].task_id
+        if len(matches) == 1:
+            return matches[0].task_id
+        if time.monotonic() >= deadline:
+            raise click.ClickException(
+                f"Server did not create a {task_type} successor for "
+                f"{prev_task_id!r} within {timeout:g}s")
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+
+
 def _patch_adopted_review_context(queue, task_id: str,
                                   context: dict | None) -> None:
     if context:

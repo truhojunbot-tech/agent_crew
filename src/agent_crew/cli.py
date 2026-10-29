@@ -2770,12 +2770,9 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
         _adapter_project,
         build_feedback,
         enqueue_implement,
-        enqueue_review,
-        enqueue_test,
+        wait_for_pipeline_successor,
         handle_review_result,
         INVALID_REVIEW_RESULT,
-        next_review_action,
-        REVIEW_RETRY_MAX,
         handle_test_result,
     )
     from agent_crew import github
@@ -3266,95 +3263,36 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             return
         click.echo(f"[{iteration}/{max_iter}] ✅ Implementation done ({impl_elapsed}s)")
 
-        # The queue records the declaration after admitting the root. Reuse
-        # that exact evidence for CLI-created review, test and fix successors.
+        review_id = wait_for_pipeline_successor(
+            queue, "review", impl_id, min(wait_timeout, 60))
+        click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
+        review_start = time.time()
+        review_result = _wait(review_id)
+        review_elapsed = int(time.time() - review_start)
+        # Compare the next implementation with the branch head this review
+        # was pinned to, rather than an unreviewed implementer report.
+        reviewed_head = impl_commit
         try:
-            root_declaration = queue.get_task_context(impl_id).get("risk_declaration")
-            if isinstance(root_declaration, dict):
-                risk_context["risk_declaration"] = root_declaration
+            reviewed_head = queue.get_task_context(review_id).get("reviewed_sha") or reviewed_head
         except (AttributeError, KeyError):
             pass
+        if reviewed_head:
+            _previous_reviewed_head = (impl_branch or branch, reviewed_head)
 
-        review_context = {**_CM, **risk_context, **issue_context, **run_branch_context,
-                          "lineage_root_task_id": lineage_root_id}
-        try:
-            impl_round = queue.get_task_context(impl_id).get("fix_round")
-            if impl_round is not None:
-                review_context["fix_round"] = impl_round
-        except (AttributeError, KeyError):
-            pass
-        if repo:
-            review_context["repo"] = repo
-        if reviewer:
-            review_context["agent_override"] = reviewer
-            review_context["reviewer_agent"] = reviewer
-        if implementer:
-            review_context["implementer_agent"] = implementer
-        if no_tester:
-            review_context["no_tester"] = True
-        if _loop_pr_number:
-            review_context["pr_number"] = _loop_pr_number
-        if impl_commit:
-            review_context["reviewed_sha"] = impl_commit
-        # #302: a review that fails to RUN is a dispatch failure, not a
-        # verdict — retry it, bounded, the way any transient failure is retried.
-        # #301 stopped outright here; retrying covers the transient case, and
-        # the cap keeps the structural case (a branch this repo does not have)
-        # from spinning the same loop with review tasks.
-        _review_attempts = 0
-        while True:
-            review_id = enqueue_review(
-                queue, task, impl_branch or branch,
-                prev_task_id=impl_id, context=review_context, port=_run_port,
-            )
-            click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
-            review_start = time.time()
-            review_result = _wait(review_id)
-            review_elapsed = int(time.time() - review_start)
-            # Compare the next implementation with the branch head this review
-            # was pinned to, rather than an unreviewed implementer report.
-            reviewed_head = review_context.get("reviewed_sha", "")
-            try:
-                reviewed_head = queue.get_task_context(review_id).get("reviewed_sha") or reviewed_head
-            except (AttributeError, KeyError):
-                pass
-            if reviewed_head:
-                _previous_reviewed_head = (impl_branch or branch, reviewed_head)
-
-            # pass no_tester=True here — test enqueue is handled manually below
-            outcome = handle_review_result(
-                review_result,
-                iteration=iteration,
-                max_iter=max_iter,
-                no_tester=True,
-                queue=queue,
-            )
-            _action = next_review_action(outcome, _review_attempts)
-            if _action != "retry":
-                break
-            _review_attempts += 1
-            click.echo(
-                f"[{iteration}/{max_iter}] ⚠️ Review task did not run "
-                f"(status={getattr(review_result, 'status', '?')}) — retrying "
-                f"({_review_attempts}/{REVIEW_RETRY_MAX})."
-            )
+        outcome = handle_review_result(
+            review_result, iteration=iteration, max_iter=max_iter,
+            no_tester=True, queue=queue,
+        )
 
         if outcome == "escalate":
             click.echo(f"[{iteration}/{max_iter}] ❌ Escalated after {max_iter} iterations.")
             return
 
-        # #301/#302: the retry budget is spent and the reviewer still never ran,
-        # so it has asked for nothing. Enqueueing an implement round here spends
-        # a full invocation on feedback that is an empty header — the loop this
-        # stops was measured at five dispatches in fifteen minutes against an
-        # unchanged deliverable.
         if outcome == "review_failed":
             click.echo(
-                f"[{iteration}/{max_iter}] ❌ Review task did not run after "
-                f"{REVIEW_RETRY_MAX} retries (status="
-                f"{getattr(review_result, 'status', '?')}). Stopping: a review "
-                f"that did not run has not requested changes. Fix the cause and "
-                f"re-dispatch the review."
+                f"[{iteration}/{max_iter}] ❌ Review task did not run "
+                f"(status={getattr(review_result, 'status', '?')}); "
+                "server owns retry/fallback/cascade. Stopping loop."
             )
             return
 
@@ -3368,16 +3306,8 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
         if outcome == "approved":
             click.echo(f"[{iteration}/{max_iter}] ✅ Review approved ({review_elapsed}s)")
             if not no_tester:
-                test_context = {**review_context, **artifact_context}
-                # The tester is independent of the reviewer; preserve both
-                # named role choices without routing the test to the reviewer.
-                test_context.pop("agent_override", None)
-                if reviewed_head:
-                    test_context["reviewed_sha"] = reviewed_head
-                if _loop_pr_number:
-                    test_context["pr_number"] = _loop_pr_number
-                test_id = enqueue_test(queue, task, branch, prev_task_id=review_id,
-                                       context=test_context, port=_run_port)
+                test_id = wait_for_pipeline_successor(
+                    queue, "test", review_id, min(wait_timeout, 60))
                 click.echo(f"[{iteration}/{max_iter}] Testing... ({test_id})")
                 test_start = time.time()
                 test_result = _wait(test_id)
@@ -3827,11 +3757,9 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
         from agent_crew.loop import (
             DEFAULT_MAX_ITER,
             build_feedback,
-            enqueue_review,
+            wait_for_pipeline_successor,
             handle_review_result,
             INVALID_REVIEW_RESULT,
-            next_review_action,
-            REVIEW_RETRY_MAX,
         )
 
         max_iter = DEFAULT_MAX_ITER
@@ -3849,39 +3777,27 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
                 time.sleep(0.1)
             if _wait_result is None:
                 raise click.ClickException(f"task {impl_id!r} timed out after {wait_timeout}s")
-
-            # #302: retry a review that failed to RUN, bounded — same rule as
-            # the main loop above.
-            _review_attempts = 0
-            review_context = {"risk_tier": risk_tier}
-            impl_pr = normalize_pr_number(getattr(_wait_result, "pr_number", None))
-            if impl_pr is not None:
-                review_context["pr_number"] = impl_pr
-            while True:
-                review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id,
-                                           context=review_context, port=_run_port)
-                review_result = None
-                deadline = time.time() + wait_timeout
-                while time.time() < deadline:
-                    review_result = queue.get_result(review_id)
-                    if review_result is not None:
-                        break
-                    time.sleep(0.1)
-                if review_result is None:
-                    raise click.ClickException(f"task {review_id!r} timed out after {wait_timeout}s")
-
-                outcome = handle_review_result(
-                    review_result, iteration=iteration, max_iter=max_iter,
-                    no_tester=True, queue=queue,
-                )
-                if next_review_action(outcome, _review_attempts) != "retry":
-                    break
-                _review_attempts += 1
+            if _wait_result.status != "completed":
                 click.echo(
-                    f"Review task did not run "
-                    f"(status={getattr(review_result, 'status', '?')}) — retrying "
-                    f"({_review_attempts}/{REVIEW_RETRY_MAX})."
-                )
+                    f"Implement task {impl_id} ended {_wait_result.status}; "
+                    "server owns retry/fallback/cascade. Stopping loop.")
+                return
+
+            review_id = wait_for_pipeline_successor(
+                queue, "review", impl_id, min(wait_timeout, 60))
+            review_result = None
+            deadline = time.time() + wait_timeout
+            while time.time() < deadline:
+                review_result = queue.get_result(review_id)
+                if review_result is not None:
+                    break
+                time.sleep(0.1)
+            if review_result is None:
+                raise click.ClickException(f"task {review_id!r} timed out after {wait_timeout}s")
+            outcome = handle_review_result(
+                review_result, iteration=iteration, max_iter=max_iter,
+                no_tester=True, queue=queue,
+            )
             if outcome == "escalate":
                 click.echo(f"Escalated after {max_iter} iterations.")
                 return
@@ -3892,9 +3808,9 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
             # #301/#302: retries exhausted and it still never ran.
             if outcome == "review_failed":
                 click.echo(
-                    f"Review task did not run after {REVIEW_RETRY_MAX} retries "
-                    f"(status={getattr(review_result, 'status', '?')}). Stopping "
-                    f"rather than re-implementing against empty feedback."
+                    "Review task did not run "
+                    f"(status={getattr(review_result, 'status', '?')}); "
+                    "server owns retry/fallback/cascade. Stopping loop."
                 )
                 return
 

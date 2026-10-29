@@ -41,7 +41,7 @@ def test_then_run_passes_env_tier_to_implement(tmp_path, monkeypatch):
     assert contexts == [{"risk_tier": 2}]
 
 
-def test_then_run_passes_implement_pr_to_review(tmp_path, monkeypatch):
+def test_then_run_follows_server_review_by_parent(tmp_path, monkeypatch):
     import agent_crew.discussion as discussion
     import agent_crew.loop as loop
     from agent_crew.queue import TaskQueue
@@ -51,15 +51,17 @@ def test_then_run_passes_implement_pr_to_review(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "enqueue_implement", lambda *a, **k: "impl-935")
     monkeypatch.setattr(TaskQueue, "get_result", lambda *a: SimpleNamespace(
         status="completed", pr_number=938, branch="fix/935", commit="a" * 40))
-    contexts = []
+    lookups = []
 
-    def capture(*args, **kwargs):
-        contexts.append(kwargs["context"])
-        raise RuntimeError("captured before review dispatch")
+    def capture(queue, task_type, prev_task_id, timeout):
+        lookups.append((task_type, prev_task_id))
+        raise RuntimeError("captured before server successor lookup")
 
-    monkeypatch.setattr(loop, "enqueue_review", capture)
+    monkeypatch.setattr(loop, "wait_for_pipeline_successor", capture)
+    monkeypatch.setattr(loop, "enqueue_review", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("discuss must not enqueue a review")))
     result = CliRunner().invoke(crew, ["discuss", "topic", "--then-run",
                                        "--db", str(tmp_path / "tasks.db"),
                                        "--agents", "claude"])
     assert isinstance(result.exception, RuntimeError)
-    assert contexts == [{"risk_tier": 2, "pr_number": 938}]
+    assert lookups == [("review", "impl-935")]

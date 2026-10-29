@@ -109,7 +109,7 @@ def test_enqueue_report_contract_is_verified_by_server(tmp_path):
     assert first.exit_code == second.exit_code == 0
 
     app = create_app(str(db), pane_map={}, worktree_map={}, watchdog_disabled=True,
-                     anomaly_disabled=True)
+                     anomaly_disabled=True, identity_required=False)
     with TestClient(app) as client:
         valid = client.post("/tasks/impl-valid/result", json={
             "task_id": "impl-valid", "status": "completed", "summary": "measurement done",
@@ -168,8 +168,9 @@ def test_run_retry_keeps_artifact_kind(monkeypatch, tmp_path, retry_path):
 
     monkeypatch.setattr("agent_crew.cli._writable_queue", lambda *_a, **_kw: Queue())
     monkeypatch.setattr(loop, "enqueue_implement", enqueue_implement)
-    monkeypatch.setattr(loop, "enqueue_review", lambda *_a, **_kw: "review-1")
-    monkeypatch.setattr(loop, "enqueue_test", lambda *_a, **_kw: "test-1")
+    monkeypatch.setattr(loop, "wait_for_pipeline_successor",
+                        lambda _q, stage, _parent, _timeout: (
+                            "review-1" if stage == "review" else "test-1"))
     result = CliRunner().invoke(crew, [
         "run", "read-only report", "--db", str(tmp_path / "tasks.db"),
         "--branch", "fix/report", "--max-iter", "2", "--artifact-kind", "report",
