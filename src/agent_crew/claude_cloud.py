@@ -994,7 +994,7 @@ _PREFLIGHT_CLAUSE = re.compile(r"(?<=[.!?;:,])\s+")
 _PREFLIGHT_BULLET = re.compile(r"\s*(?:[-*+•]|\d+[.)])\s+")
 _PREFLIGHT_NEGATION = (
     r"(?:\b(?:don'?t|do not|does not|doesn'?t|never|must not|mustn'?t|should not|"
-    r"shouldn'?t|cannot|can'?t|not|avoid\w*|without|forbid\w*|prohibit\w*)\b|⛔)"
+    r"shouldn'?t|cannot|can'?t|not|avoid\w*|forbid\w*|prohibit\w*)\b|⛔)"
 )
 _PREFLIGHT_ACCESS = re.compile(
     r"\b(?:read\w*|writ\w*|touch\w*|edit\w*|modif\w*|us(?:e|es|ed|ing)|access\w*|"
@@ -1003,10 +1003,9 @@ _PREFLIGHT_ACCESS = re.compile(
     r"look\w*|inspect\w*)\b",
     re.IGNORECASE,
 )
-_PREFLIGHT_CONJUNCTION = r"(?:and|or|then|but|yet|however|instead|though|although|except)\b"
-# A negation governs a verb when at most two non-conjunction words separate them.
+# A negation governs the access verb directly; "ever" may intervene.
 _PREFLIGHT_NEGATED_HEAD = re.compile(
-    _PREFLIGHT_NEGATION + r"(?:\s+(?!" + _PREFLIGHT_CONJUNCTION + r")\w+){0,2}?\s*$",
+    _PREFLIGHT_NEGATION + r"(?:\s+ever)?\s*$",
     re.IGNORECASE,
 )
 _PREFLIGHT_CONTRAST = re.compile(
@@ -1014,8 +1013,9 @@ _PREFLIGHT_CONTRAST = re.compile(
 
 
 def _preflight_path_negated(prefix: str) -> bool:
-    if re.search(_PREFLIGHT_NEGATION + r"\s*$", prefix, re.IGNORECASE):
-        return True  # "avoid ~/x", "⛔ ~/x"
+    if re.search(r"(?:" + _PREFLIGHT_NEGATION + r"|\bwithout\b)\s*$", prefix,
+                 re.IGNORECASE):
+        return True  # "avoid ~/x", "without ~/x", "⛔ ~/x"
     verbs = list(_PREFLIGHT_ACCESS.finditer(prefix))
     if not verbs:
         return False

@@ -18,6 +18,7 @@ def _task(description):
     "Implement #894.\n- Never touch /tmp/ or ~/.agent_crew/ state",
     "Do not read /home/truhojun/alfred/secrets.md; everything is in the repo.",
     "Fix it and avoid ~/ paths entirely.",
+    "Work without ~/alfred/plan.md.",
     "Do not read or write ~/.agent_crew/state.json",
     "Do not ever write anything to ~/.local/bin",
     # Review of PR #918 round 3: a negated heading scopes its bullets.
@@ -49,6 +50,10 @@ def test_policy_prose_is_not_a_local_file_requirement(description):
     "Do not edit these files:\n- ~/.agent_crew/state.json\nUse this file:\n- ~/alfred/plan.md",
     "Do not edit these files:\n- ~/.agent_crew/state.json\nThen read ~/alfred/plan.md",
     "Do not edit these files:\n- read ~/alfred/plan.md instead",
+    "Do not forget to read ~/alfred/plan.md",
+    "Don't hesitate to open ~/alfred/plan.md",
+    "Never commit without reading ~/alfred/plan.md",
+    "Without reading ~/alfred/plan.md you cannot finish; read it.",
 ])
 def test_real_local_requirement_still_fails_closed(description):
     assert cloud._cloud_preflight_reason(_task(description), "owner/agent_crew") \
