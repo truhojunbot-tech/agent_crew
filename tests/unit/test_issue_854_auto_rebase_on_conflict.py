@@ -101,7 +101,7 @@ def test_terminal_or_unknown_pr_does_not_enqueue_rebase(harness, monkeypatch, pr
 
     assert response.status_code == 200, response.text
     assert _rebase_rounds(queue) == []
-    assert len(notices) == 1 and "failed_no_successor" in notices[0]
+    assert len(notices) == 1 and "lineage_end" in notices[0]
 
 
 @pytest.mark.parametrize("current_head", [HEAD_2, ""])
@@ -113,7 +113,7 @@ def test_moved_or_unreadable_pr_head_does_not_enqueue_rebase(harness, current_he
 
     assert response.status_code == 200, response.text
     assert _rebase_rounds(queue) == []
-    assert len(notices) == 1 and "failed_no_successor" in notices[0]
+    assert len(notices) == 1 and "lineage_end" in notices[0]
 
 
 def test_second_conflict_on_rebase_lineage_notifies_without_new_round(harness):
@@ -141,7 +141,7 @@ def test_second_conflict_on_rebase_lineage_notifies_without_new_round(harness):
     assert response.status_code == 200, response.text
     assert len(_rebase_rounds(queue)) == 1
     assert len(notices) == 1
-    assert "failed_no_successor" in notices[0]
+    assert "lineage_end" in notices[0]
 
 
 def test_kill_switch_preserves_old_terminal_notice(harness, monkeypatch):
@@ -152,7 +152,7 @@ def test_kill_switch_preserves_old_terminal_notice(harness, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert _rebase_rounds(queue) == []
-    assert len(notices) == 1 and "failed_no_successor" in notices[0]
+    assert len(notices) == 1 and "lineage_end" in notices[0]
 
 
 def test_other_not_run_reason_is_unchanged(harness):
@@ -162,7 +162,7 @@ def test_other_not_run_reason_is_unchanged(harness):
 
     assert response.status_code == 200, response.text
     assert _rebase_rounds(queue) == []
-    assert len(notices) == 1 and "failed_no_successor" in notices[0]
+    assert len(notices) == 1 and "lineage_end" in notices[0]
 
 
 def test_rebase_round_commit_passes_existing_artifact_verifier(tmp_path):
