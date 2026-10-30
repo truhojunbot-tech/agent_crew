@@ -1165,19 +1165,13 @@ def _restore_task_wip(queue: TaskQueue, task: TaskRequest, worktree_path: str) -
     current = queue.get_task(task.task_id) or task
     info = current.error_info if isinstance(current.error_info, dict) else {}
     sha = info.get("wip_stash")
-    if not sha and re.fullmatch(r"retry-.+-a\d+", task.task_id):
-        context = current.context if isinstance(current.context, dict) else {}
-        source_ids = (context.get("retry_of"), context.get("prev_task_id"),
-                      context.get("original_task_id"),
-                      re.fullmatch(r"retry-(.+)-a\d+", task.task_id).group(1))
-        for source_id in source_ids:
-            if not isinstance(source_id, str) or source_id == task.task_id:
-                continue
-            source = queue.get_task(source_id)
-            source_info = source.error_info if source and isinstance(source.error_info, dict) else {}
-            sha = source_info.get("wip_stash")
-            if sha and source_info.get("wip_restored") != sha:
-                break
+    context = current.context if isinstance(current.context, dict) else {}
+    source_id = context.get("retry_of")
+    if not sha and isinstance(source_id, str) and source_id != task.task_id:
+        source = queue.get_task(source_id)
+        source_info = source.error_info if source and isinstance(source.error_info, dict) else {}
+        sha = source_info.get("wip_stash")
+        if source_info.get("wip_restored") == sha:
             sha = None
     if not sha:
         return ""
@@ -5930,7 +5924,7 @@ def create_app(
                 _codex_planned = codex_session_for_cwd(wt)
             if (_codex_mode == "renew_rehydrate"
                     and task.task_type == "implement"
-                    and not (_ctx.get("fix_round") or str(task.task_id).startswith("fix-"))
+                    and not _ctx.get("fix_round")
                     and not _force_context_reset and _codex_planned):
                 _renew_previous_session = _codex_planned
                 _force_context_reset = True
@@ -6100,7 +6094,7 @@ def create_app(
         # pipeline.auto_fallback_failed_task respectively when they enqueue
         # a follow-up task (#202 — reconstructable without re-deriving from
         # each task's own context dict).
-        _retry_of = _ctx.get("original_task_id", "") if "retry_attempt" in _ctx else ""
+        _retry_of = _ctx.get("retry_of", "")
         _fallback_of = _ctx.get("fallback_from_task_id", "") if isinstance(_ctx, dict) else ""
 
         # Prepare worktree: stash local changes, fetch origin, checkout right branch.
@@ -6582,6 +6576,7 @@ def create_app(
                 )
                 _gate = _cpack.is_sufficient(
                     _gate_pack, task_type=task.task_type,
+                    fix_round=(_ctx.get("fix_round") if type(_ctx.get("fix_round")) is int else 0),
                     retry_of=str(_retry_of or _ctx.get("retry_of") or "") if isinstance(_ctx, dict) else "",
                 )
                 _block = _gate_pack.to_prompt_block(inject_gate=_gate)
@@ -7927,7 +7922,8 @@ def create_app(
         for key in (RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY):
             ctx.pop(key, None)
         root = str(ctx.get("provider_capacity_root") or task_id)
-        ctx.update({"original_task_id": task_id, "provider_capacity_root": root,
+        ctx.update({"original_task_id": task_id, "retry_of": task_id,
+                    "provider_capacity_root": root,
                     "push_not_before": time.time() + delay_s,
                     "push_refusal_reason": tag,
                     "provider_capacity_count": cap["count"],
@@ -8087,6 +8083,7 @@ def create_app(
             retry_context.pop(RESULT_COMMIT_CONTEXT_KEY, None)
             retry_context["retry_attempt"] = db_retry_attempt + 1
             retry_context["original_task_id"] = task_id
+            retry_context["retry_of"] = task_id
 
             # #314 §4 P0-1: 결정론 successor id — retry attempt로 구분(replay가 같은 attempt→같은 id).
             retry_req = TaskRequest(

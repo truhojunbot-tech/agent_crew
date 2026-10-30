@@ -240,7 +240,13 @@ class GateRequest:
     message: str
     status: str = "pending"
     created_at: float = field(default_factory=time.time)
+    kind: str = ""
+    target_task_id: str = ""
 
     def __post_init__(self):
         if self.type not in _VALID_GATE_TYPES:
             raise ValueError(f"Invalid type: {self.type!r}. Must be one of {_VALID_GATE_TYPES}")
+        if self.kind and self.kind not in {"review", "test"}:
+            raise ValueError(f"Invalid pipeline gate kind: {self.kind!r}")
+        if self.kind in {"review", "test"} and not self.target_task_id:
+            raise ValueError("pipeline gate requires target_task_id")

@@ -157,6 +157,7 @@ class RetrievalQuery:
     keywords: list = field(default_factory=list)
     limit: int = 40
     retry_of: str = ""
+    fix_round: int = 0
 
 
 @dataclass
@@ -286,7 +287,8 @@ class InjectGate:
     missing_signals: list = field(default_factory=list)
 
 
-def is_sufficient(pack: ContextPack, *, task_type: str = "", retry_of: str = "") -> InjectGate:
+def is_sufficient(pack: ContextPack, *, task_type: str = "", retry_of: str = "",
+                  fix_round: int = 0) -> InjectGate:
     """Describe missing context for a fresh session; never block injection."""
     signals = []
     types = {item.artifact_type for item in pack.items}
@@ -297,7 +299,7 @@ def is_sufficient(pack: ContextPack, *, task_type: str = "", retry_of: str = "")
     if TYPE_AC not in types and not no_ac:
         signals.append("AC artifact missing — acceptance bar unknown; "
                        "annotate no_ac=true in IssueProvider if issue has none")
-    if ("fix" in (task_type or "").lower() or pack.task_id.startswith("fix-")) and TYPE_REVIEW not in types:
+    if type(fix_round) is int and fix_round > 0 and TYPE_REVIEW not in types:
         signals.append("fix round requires linked_review — prior findings unknown; "
                        "reviewer may re-raise same issues")
     if retry_of and not any(item.artifact_type == TYPE_EPISODE and
@@ -563,7 +565,7 @@ class ForgeProvider(RetrievalProvider):
             "situation": {
                 "project": query.repo.split("/")[-1] if query.repo else "*",
                 "task_type": query.task_type or "implement",
-                "fix_round": query.task_id.startswith("fix-"),
+                "fix_round": query.fix_round > 0,
             },
         }
         if not _FORGE_HTTP_SLOT.acquire(blocking=False):
@@ -1305,6 +1307,7 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
         issue_number=issue, issue_title=title, issue_body=body, branch=branch,
         keywords=keywords_from(title, body),
         retry_of=str(ctx.get("retry_of") or ""),
+        fix_round=(ctx.get("fix_round") if type(ctx.get("fix_round")) is int else 0),
     )
     providers = [IssueProvider(), LexicalRepoProvider()]
     memory_db = os.getenv("AGENT_CREW_SHADOW_MEMORY_DB", "").strip()

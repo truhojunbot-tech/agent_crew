@@ -383,7 +383,8 @@ def test_tier3_resume_uses_server_project_for_legacy_approved_review(q, tmp_path
     with sqlite3.connect(q._db_path) as conn:
         conn.execute("UPDATE tasks SET project='' WHERE task_id=?", (review,))
     gate_id = f"risk-tier3-test-{review}"
-    q.create_gate(GateRequest(gate_id, "approval", "approve test"))
+    q.create_gate(GateRequest(gate_id, "approval", "approve test",
+                              kind="test", target_task_id=review))
     monkeypatch.setattr("agent_crew.pipeline.pr_is_actionable",
                         lambda *args, **kwargs: (True, "open"))
     with TestClient(create_app(q._db_path, project="agent_crew",
@@ -402,7 +403,8 @@ def test_tier3_resume_passes_server_project_to_review_successor(q):
     with sqlite3.connect(q._db_path) as conn:
         conn.execute("UPDATE tasks SET project='' WHERE task_id=?", (ROOT,))
     gate_id = f"risk-tier3-{ROOT}"
-    q.create_gate(GateRequest(gate_id, "approval", "approve review"))
+    q.create_gate(GateRequest(gate_id, "approval", "approve review",
+                              kind="review", target_task_id=ROOT))
     q.resolve_gate(gate_id, approved=True)
 
     review_id = resume_tier3_gate(q, gate_id, server_project="agent_crew",

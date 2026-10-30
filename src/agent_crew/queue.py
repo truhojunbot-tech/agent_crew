@@ -313,12 +313,6 @@ _CEA_LINEAGE_PARENT_KEYS = (
 # JSON clients can name any context key but cannot manufacture this value.  The
 # two successor constructors below the server boundary pass it explicitly.
 _CEA_SYSTEM_SUCCESSOR_PROVENANCE = object()
-# The successor ids minted by the deterministic-id rule (#314 §4 P0-1) embed
-# their parent verbatim: ``retry-<parent>-a<n>`` / ``fallback-<parent>-d<n>``.
-# ``$``-anchoring makes the non-greedy group take the *whole* parent id, so a
-# retry of a retry unwraps one layer per pass rather than stopping at the first
-# inner ``-a<n>``.
-_CEA_SUCCESSOR_ID_RE = re.compile(r"^(?:retry|fallback)-(.+?)-[ad]\d+$")
 _CEA_LINEAGE_MAX_DEPTH = 16
 
 
@@ -349,10 +343,8 @@ def _cea_lineage_root_task_id(task_id: str, ctx: dict) -> str:
     (:func:`_cea_lineage_parent_from_ctx`). Without such a key this returns
     ``task_id`` unchanged, whatever the id looks like.
 
-    The walk is bounded (:data:`_CEA_LINEAGE_MAX_DEPTH`) and cycle-safe (a
-    ``seen`` set): a hand-written context claiming ``original_task_id`` is the
-    task itself, or two ids naming each other, must terminate — admission runs
-    on the enqueue path and may not hang there.
+    Creators carry the root explicitly. An untrusted caller cannot gain
+    successor status by choosing a suggestive identifier.
     """
     if not task_id:
         return task_id
@@ -367,21 +359,8 @@ def _cea_lineage_root_task_id(task_id: str, ctx: dict) -> str:
     parent = _cea_lineage_parent_from_ctx(ctx)
     if not parent:
         return task_id
-    seen = {task_id}
-    current = task_id
-    # Past that first validated hop the context has nothing more to say — it
-    # describes one hop only — so the chain above the parent is read off the
-    # deterministic id, which is the record of the chain and the reason it was
-    # made deterministic. Bounded (:data:`_CEA_LINEAGE_MAX_DEPTH`) and
-    # cycle-safe (``seen``): admission runs on the enqueue path and may not hang.
-    for _ in range(_CEA_LINEAGE_MAX_DEPTH):
-        if not parent or parent in seen:
-            break
-        seen.add(parent)
-        current = parent
-        match = _CEA_SUCCESSOR_ID_RE.match(current)
-        parent = match.group(1) if match else ""
-    return current
+    root = str(ctx.get("lineage_root_task_id") or ctx.get("provider_capacity_root") or parent).strip()
+    return root if root and root != task_id else parent
 
 
 def _cea_is_lineage_successor(task: TaskRequest, ctx: dict) -> bool:
@@ -646,15 +625,23 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 9
+QUEUE_SCHEMA_VERSION = 10
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
     id         TEXT PRIMARY KEY,
     type       TEXT NOT NULL,
     message    TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT '',
+    target_task_id TEXT NOT NULL DEFAULT '',
     status     TEXT NOT NULL DEFAULT 'pending',
     created_at REAL NOT NULL
+)
+"""
+
+_DDL_TASK_METADATA_MIGRATIONS = """
+CREATE TABLE IF NOT EXISTS task_metadata_migrations (
+    name TEXT PRIMARY KEY
 )
 """
 
@@ -1589,6 +1576,13 @@ class TaskQueue:
     def _initialize_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
+        conn.execute(_DDL_TASK_METADATA_MIGRATIONS)
+        gate_columns = {row[1] for row in conn.execute("PRAGMA table_info(gates)")}
+        if "kind" not in gate_columns:
+            conn.execute("ALTER TABLE gates ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
+        if "target_task_id" not in gate_columns:
+            conn.execute("ALTER TABLE gates ADD COLUMN target_task_id TEXT NOT NULL DEFAULT ''")
+        self._backfill_legacy_task_metadata(conn)
         conn.execute(_DDL_TOKENOMICS_SHADOW)
         for _stmt in (_DDL_MIGRATE_SHADOW_COLUMNS + _DDL_MIGRATE_CANARY_COLUMNS
                       + _DDL_MIGRATE_SHADOW_EVIDENCE_UPDATED_AT):
@@ -1723,6 +1717,56 @@ class TaskQueue:
         for idx_stmt in _DDL_INDEXES.strip().split('\n'):
             if idx_stmt.strip():
                 conn.execute(idx_stmt)
+
+    @staticmethod
+    def _backfill_legacy_task_metadata(conn: sqlite3.Connection) -> None:
+        """Idempotently translate old generated IDs into durable fields (#929)."""
+        marker = "opaque_task_ids_v1"
+        if conn.execute("SELECT 1 FROM task_metadata_migrations WHERE name = ?",
+                        (marker,)).fetchone():
+            return
+        for row in conn.execute("SELECT task_id, context FROM tasks"):
+            try:
+                context = json.loads(row["context"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(context, dict):
+                continue
+            task_id = row["task_id"]
+            changed = False
+            fix = re.fullmatch(r"fix-.+-r([1-9][0-9]*)", task_id)
+            retry = re.fullmatch(r"retry-(.+)-a[1-9][0-9]*", task_id)
+            if fix and not context.get("fix_round"):
+                context["fix_round"] = int(fix.group(1))
+                changed = True
+            if retry and not context.get("retry_of"):
+                context["retry_of"] = context.get("original_task_id") or retry.group(1)
+                changed = True
+            if retry and not context.get("lineage_root_task_id"):
+                root = str(context.get("provider_capacity_root") or retry.group(1))
+                for _ in range(_CEA_LINEAGE_MAX_DEPTH):
+                    ancestor = re.fullmatch(r"(?:retry|fallback)-(.+)-[ad][1-9][0-9]*", root)
+                    if ancestor is None:
+                        break
+                    root = ancestor.group(1)
+                context["lineage_root_task_id"] = root
+                changed = True
+            if changed:
+                conn.execute("UPDATE tasks SET context = ? WHERE task_id = ?",
+                             (json.dumps(context), task_id))
+        for row in conn.execute("SELECT id, kind, target_task_id FROM gates"):
+            if row["kind"] and row["target_task_id"]:
+                continue
+            gate_id = row["id"]
+            if gate_id.startswith("risk-tier3-test-"):
+                kind, target = "test", gate_id[len("risk-tier3-test-"):]
+            elif gate_id.startswith("risk-tier3-"):
+                kind, target = "review", gate_id[len("risk-tier3-"):]
+            else:
+                continue
+            conn.execute("UPDATE gates SET kind = ?, target_task_id = ? WHERE id = ?",
+                         (kind, target, gate_id))
+        conn.execute("INSERT INTO task_metadata_migrations (name) VALUES (?)", (marker,))
 
     def _connect(self) -> sqlite3.Connection:
         # sqlite3's timeout parameter installs a 10,000 ms busy_timeout on
@@ -3486,6 +3530,7 @@ class TaskQueue:
                 successor_context = dict(context)
                 successor_context.pop("owner_conflict", None)
                 successor_context["original_task_id"] = task_id
+                successor_context["retry_of"] = task_id
                 successor_context["prev_task_id"] = task_id
                 successor = TaskRequest(
                     task_id=successor_id, task_type=task.task_type,
@@ -4499,6 +4544,15 @@ class TaskQueue:
             task, refusal = self._project_from_queue_identity(task)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
+            if _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
+                if (ingress == "cascade.fix" and context.get("artifact_kind") != "rebase"
+                        and (type(context.get("fix_round")) is not int
+                             or context["fix_round"] < 1)):
+                    raise ValueError("fix successor requires fix_round")
+                if ingress == "retry.failed_task" and not (
+                        isinstance(context.get("retry_of"), str)
+                        and context["retry_of"].strip()):
+                    raise ValueError("retry successor requires retry_of")
             # The row column and legacy context consumers must see the same
             # PR. Accept either input spelling, then use one normalized value
             # for admission, duplicate detection, and persistence.
@@ -8118,8 +8172,10 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute(
-                "INSERT INTO gates (id, type, message, status, created_at) VALUES (?, ?, ?, ?, ?)",
-                (gate.id, gate.type, gate.message, "pending", gate.created_at),
+                "INSERT INTO gates (id, type, message, kind, target_task_id, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (gate.id, gate.type, gate.message, gate.kind, gate.target_task_id,
+                 "pending", gate.created_at),
             )
             conn.commit()
         finally:
@@ -8164,6 +8220,8 @@ class TaskQueue:
                     id=r["id"],
                     type=r["type"],
                     message=r["message"],
+                    kind=r["kind"],
+                    target_task_id=r["target_task_id"],
                     status=r["status"],
                     created_at=r["created_at"],
                 )

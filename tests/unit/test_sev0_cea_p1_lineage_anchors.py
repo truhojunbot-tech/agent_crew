@@ -41,10 +41,12 @@ def anchors(t: TaskRequest) -> tuple[str, ...]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def retry_successor(parent: TaskRequest, attempt: int = 1) -> TaskRequest:
-    """Exactly what ``server._auto_retry_failed_task`` builds (server.py ~5295)."""
+    """Carry both the immediate parent and the explicit lineage root."""
     ctx = dict(parent.context)
     ctx["retry_attempt"] = attempt
     ctx["original_task_id"] = parent.task_id
+    ctx["retry_of"] = parent.task_id
+    ctx["lineage_root_task_id"] = parent.context.get("lineage_root_task_id") or parent.task_id
     return TaskRequest(task_id=f"retry-{parent.task_id}-a{attempt}",
                        task_type=parent.task_type, description=parent.description,
                        branch=parent.branch, priority=parent.priority + 1,
@@ -63,8 +65,7 @@ def test_a_retry_anchors_on_the_parent_not_on_its_own_minted_id():
 
 
 def test_a_retry_of_a_retry_still_hashes_as_the_original():
-    """The chain is deeper than one hop: the context names the immediate parent
-    only, so the walk has to keep unwrapping the deterministic id (#314 §4)."""
+    """The explicit root survives a second retry without parsing either id."""
     parent = task("impl-1a2b3c4d")
     first = retry_successor(parent, attempt=1)
     second = retry_successor(first, attempt=2)
@@ -89,6 +90,7 @@ def fallback_successor(parent: TaskRequest, *, successor="gemini", depth=1) -> T
     ctx["fallback_from_task_id"] = parent.task_id
     ctx["fallback_chain_depth"] = depth
     ctx["original_task_id"] = parent.context.get("original_task_id") or parent.task_id
+    ctx["lineage_root_task_id"] = parent.context.get("lineage_root_task_id") or parent.task_id
     return TaskRequest(task_id=f"fallback-{parent.task_id}-d{depth}",
                        task_type=parent.task_type, description=parent.description,
                        branch=parent.branch, priority=parent.priority,
