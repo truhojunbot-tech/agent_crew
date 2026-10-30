@@ -156,19 +156,18 @@ def test_the_predicate_requires_the_constraint_kind_as_well_as_the_column():
         assert not _is_duplicate_task_id(sqlite3.IntegrityError(other)), other
 
 
-def test_the_duplicate_guard_and_the_issue_backfill_coexist(tmp_db):
-    """⛔Merge guard. #273 and #276 both landed in `enqueue`, adjacent enough
-    to conflict: #276 builds the context ahead of the INSERT, #273 narrows the
-    IntegrityError handling after it. A resolution that kept only one side
-    would still pass every other test in this file, because each half is
-    tested in isolation. This asserts they are both there, in one call."""
+def test_the_duplicate_guard_and_declared_issue_alias_coexist(tmp_db):
+    """Duplicate admission still works when a declared issue alias is stored."""
     q = TaskQueue(tmp_db)
-    q.enqueue(_task("impl-both-features", description="Implement #276: coexist"))
-    assert q.get_task_context("impl-both-features")["issue"] == 276   # #276
+    context = {"risk_tier": 1, "issue_number": 276}
+    q.enqueue(_task("impl-both-features", description="Implement #276: coexist",
+                    context=context))
+    assert q.get_task_context("impl-both-features")["issue"] == 276
 
-    with pytest.raises(TaskAlreadyExistsError):                        # #273
-        q.enqueue(_task("impl-both-features", description="Implement #276: coexist"))
-    with pytest.raises(sqlite3.IntegrityError):                        # #273 review
+    with pytest.raises(TaskAlreadyExistsError):
+        q.enqueue(_task("impl-both-features", description="Implement #276: coexist",
+                        context=context))
+    with pytest.raises(sqlite3.IntegrityError):
         q.enqueue(_task("impl-fresh", description="Implement #276: coexist", branch=None))
 
 
