@@ -51,7 +51,8 @@ def q(tmp_db):
 def _review(q, *, verdict="request_changes", findings=(FINDING,), pr_number=PR,
             context=None, summary="request_changes: fix the cap"):
     rid = f"review-{uuid.uuid4().hex[:8]}"
-    ctx = {"prev_task_id": "impl-1", "pr_number": pr_number, "repo": "owner/repo"}
+    ctx = {"prev_task_id": "impl-1", "pr_number": pr_number,
+           "repo": "owner/repo", "risk_tier": 1}
     ctx.update(context or {})
     q.enqueue(TaskRequest(task_id=rid, task_type="review", description="review",
                           branch=BRANCH, context=ctx))

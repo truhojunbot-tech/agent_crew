@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_crew.queue import TaskQueue
+from agent_crew.queue import TaskQueue, _CEA_LINEAGE_PARENT_KEYS
 from agent_crew.protocol import TaskRequest, normalize_pr_number
 from agent_crew.server import create_app
 
@@ -148,7 +148,12 @@ def _tier_legacy_task_posts(monkeypatch, request):
 
     def enqueue(queue, task, *args, **kwargs):
         if isinstance(task, TaskRequest) and isinstance(task.context, dict):
-            if "risk_tier" not in task.context and "risk_declaration" not in task.context:
+            lineage_keys = ("prev_task_id", "lineage_root_task_id",
+                            *_CEA_LINEAGE_PARENT_KEYS)
+            test_authored_root = ("_successor_provenance" not in kwargs
+                                  and not any(key in task.context for key in lineage_keys))
+            if (test_authored_root and "risk_tier" not in task.context
+                    and "risk_declaration" not in task.context):
                 task = replace(task, context={**task.context, "risk_tier": 1})
         return original_enqueue(queue, task, *args, **kwargs)
 
