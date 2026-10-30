@@ -220,7 +220,7 @@ def test_both_cli_loops_stop_instead_of_re_implementing():
     #   before one could run (review of PR #303).
     stop_guards = source.count('outcome == "review_failed"')
     invalid_guards = source.count('outcome == INVALID_REVIEW_RESULT')
-    retry_calls = source.count("next_review_action(")
+    successor_follows = source.count("wait_for_pipeline_successor(")
 
     assert stop_guards == 2, (
         f"each review loop must stop on a review that did not run; "
@@ -228,11 +228,12 @@ def test_both_cli_loops_stop_instead_of_re_implementing():
     assert invalid_guards == 2, (
         f"each review loop must stop before enqueuing a fix for an invalid review; "
         f"found {invalid_guards} guard(s)")
-    # #302: and each must RETRY before it stops, or the retry budget is dead
-    # code that no loop ever consults.
-    assert retry_calls == 2, (
-        f"each review loop must consult the retry decision; "
-        f"found {retry_calls} call(s)")
+    # #935: the server owns review retries. Both CLI loops follow its row;
+    # neither creates a second review or retries a failed review itself.
+    assert successor_follows >= 2
+    assert "next_review_action(" not in source
+    assert "enqueue_review(" not in source
+    assert "enqueue_test(" not in source
 
 
 def test_the_new_outcome_is_not_silently_one_of_the_old_ones():

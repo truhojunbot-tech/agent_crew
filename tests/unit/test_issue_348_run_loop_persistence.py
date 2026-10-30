@@ -18,7 +18,7 @@ COMMIT = "a" * 40
 
 def _app(db_path):
     return create_app(db_path=db_path, pane_map={}, watchdog_disabled=True,
-                      anomaly_disabled=True)
+                      anomaly_disabled=True, identity_required=False)
 
 
 def _submit_http(db_path, task_id="impl-348", stop=False, **overrides):
@@ -144,37 +144,60 @@ def test_mcp_submit_persists_result_refs_fail_soft(tmp_path, monkeypatch):
 
 class _LoopQueue:
     def __init__(self, results):
-        self.results = iter(results)
+        self.results = list(results)
+        self.index = 0
+        self.rows = []
+
+    def list_tasks(self):
+        return list(self.rows)
 
     def get_result(self, task_id):
-        return next(self.results)
+        result = self.results[self.index]
+        assert result.task_id == task_id
+        self.index += 1
+        if (result.task_id.startswith("impl-") and result.status == "completed"
+                and self.index < len(self.results)):
+            successor = self.results[self.index]
+            if successor.task_id.startswith("review-") and not any(
+                    row.task_type == "review"
+                    and row.context.get("prev_task_id") == result.task_id
+                    and row.status not in {"failed", "timed_out", "blocked"}
+                    for row in self.rows):
+                self.rows.append(TaskRequest(
+                    task_id=successor.task_id, task_type="review",
+                    description="server review", branch=result.branch or "main",
+                    context={"prev_task_id": result.task_id,
+                             "reviewed_sha": result.commit or ""}))
+        return result
 
 
 def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main", existing_tasks=None,
-              queue_override=None, timeout=None, project=""):
+              queue_override=None, timeout=1, project=""):
     import agent_crew.loop as loop
 
     queue = queue_override or _LoopQueue(results)
     if existing_tasks is not None:
-        queue.list_tasks = lambda: existing_tasks
+        if isinstance(queue, _LoopQueue):
+            queue.rows = list(existing_tasks)
+        else:
+            queue.list_tasks = lambda: existing_tasks
     dispatched = []
 
     def enqueue_implement(queue, task, branch, context=None, port=0):
         dispatched.append(("implement", branch, context or {}))
         return f"impl-{len([x for x in dispatched if x[0] == 'implement'])}"
 
-    def enqueue_review(queue, task, branch, prev_task_id=None, context=None, port=0):
-        for existing in existing_tasks or []:
-            if (existing.task_type == "review"
-                    and existing.context.get("prev_task_id") == prev_task_id
-                    and existing.status not in {"failed", "timed_out", "blocked"}):
-                return existing.task_id
-        dispatched.append(("review", branch, context or {}))
-        return f"review-{len([x for x in dispatched if x[0] == 'review'])}"
-
     monkeypatch.setattr("agent_crew.queue.TaskQueue", lambda db: queue)
     monkeypatch.setattr(loop, "enqueue_implement", enqueue_implement)
-    monkeypatch.setattr(loop, "enqueue_review", enqueue_review)
+    monkeypatch.setattr(loop, "enqueue_review", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("CLI must not enqueue a review")))
+    monkeypatch.setattr(loop, "enqueue_test", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("CLI must not enqueue a test")))
+    monkeypatch.setattr("agent_crew.cli._await_review_fix", lambda queue, review_id, **_kw: [
+        TaskRequest(task_id=queue.results[queue.index].task_id, task_type="implement",
+                    description="server fix", branch="main",
+                    context={"prev_task_id": review_id})
+    ])
     runner = CliRunner()
     args = [
         "run", "implement persistence", "--db", str(tmp_path / "tasks.db"),
@@ -216,13 +239,12 @@ def test_run_adopts_identical_first_implement(tmp_path, monkeypatch, status):
         monkeypatch, tmp_path, results, existing_tasks=[_inflight_impl(status=status)])
 
     assert invocation.exit_code == 0, invocation.output
-    assert [kind for kind, *_ in dispatched] == ["review"]
+    assert dispatched == []
     assert "(task already in flight, adopted impl-existing)" in invocation.output
 
 
-def test_run_adopts_server_review_and_test_that_win_enqueue_race(tmp_path, monkeypatch):
-    """The server can enqueue each successor after the CLI's lookup (#610)."""
-    from agent_crew.queue import DuplicateReviewError
+def test_run_follows_server_review_and_test(tmp_path, monkeypatch):
+    """The server creates both successor rows as results are submitted."""
 
     class RacingQueue:
         project_identity = ""
@@ -236,14 +258,6 @@ def test_run_adopts_server_review_and_test_that_win_enqueue_race(tmp_path, monke
 
         def enqueue(self, request, **_kwargs):
             self.enqueued.append(request.task_type)
-            if request.task_type in {"review", "test"}:
-                server_id = f"server-{request.task_type}"
-                self.tasks[server_id] = TaskRequest(
-                    task_id=server_id, task_type=request.task_type,
-                    description=request.description, branch=request.branch,
-                    context=request.context, status="completed",
-                )
-                raise DuplicateReviewError(server_id)
             self.tasks[request.task_id] = request
             return request.task_id
 
@@ -252,9 +266,17 @@ def test_run_adopts_server_review_and_test_that_win_enqueue_race(tmp_path, monke
 
         def get_result(self, task_id):
             if task_id.startswith("impl-"):
+                self.tasks["server-review"] = TaskRequest(
+                    task_id="server-review", task_type="review",
+                    description="server review", branch="main",
+                    context={"prev_task_id": task_id, "reviewed_sha": COMMIT})
                 return TaskResult(task_id=task_id, status="completed", summary="done",
                                   branch="main", commit=COMMIT)
             if task_id == "server-review":
+                self.tasks["server-test"] = TaskRequest(
+                    task_id="server-test", task_type="test",
+                    description="server test", branch="main",
+                    context={"prev_task_id": task_id, "reviewed_sha": COMMIT})
                 return TaskResult(task_id=task_id, status="completed", summary="approved",
                                   verdict="approve", findings=[])
             if task_id == "server-test":
@@ -274,7 +296,7 @@ def test_run_adopts_server_review_and_test_that_win_enqueue_race(tmp_path, monke
     ])
 
     assert result.exit_code == 0, result.output
-    assert queue.enqueued == ["implement", "review", "test"]
+    assert queue.enqueued == ["implement"]
     assert len([t for t in queue.list_tasks() if t.task_type == "review"]) == 1
     assert len([t for t in queue.list_tasks() if t.task_type == "test"]) == 1
     assert "Loop complete" in result.output
@@ -290,7 +312,6 @@ def test_run_reuses_open_pr_without_creating_another(tmp_path, monkeypatch):
     ])
     monkeypatch.setattr("agent_crew.queue.TaskQueue", lambda _db: queue)
     monkeypatch.setattr(loop, "enqueue_implement", lambda *_args, **_kwargs: "impl-1")
-    monkeypatch.setattr(loop, "enqueue_review", lambda *_args, **_kwargs: "review-1")
     monkeypatch.setattr("agent_crew.github.check_gh_installed", lambda: True)
     monkeypatch.setattr("agent_crew.github.pr_number_for_branch", lambda *_args, **_kwargs: 609)
     monkeypatch.setattr("agent_crew.github.pr_state", lambda *_args, **_kwargs: "open")
@@ -327,7 +348,7 @@ def test_run_enqueues_when_existing_implement_is_not_a_match(
         monkeypatch, tmp_path, results, existing_tasks=[existing])
 
     assert invocation.exit_code == 0, invocation.output
-    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+    assert [kind for kind, *_ in dispatched] == ["implement"]
 
 
 def test_run_refuses_ambiguous_inflight_implements(tmp_path, monkeypatch):
@@ -364,7 +385,7 @@ def test_run_does_not_sync_worktree_when_adopting_running_task(tmp_path, monkeyp
         existing_tasks=[_inflight_impl(status="in_progress", project="sandbox")])
 
     assert invocation.exit_code == 0, invocation.output
-    assert [kind for kind, *_ in dispatched] == ["review"]
+    assert dispatched == []
     assert len(sync_calls) == 1  # normal post-completion sync remains
 
 
@@ -392,7 +413,7 @@ def test_run_syncs_worktree_before_waiting_for_adopted_pending_task(tmp_path, mo
         existing_tasks=[_inflight_impl(status="pending", project="sandbox")])
 
     assert invocation.exit_code == 0, invocation.output
-    assert [kind for kind, *_ in dispatched] == ["review"]
+    assert dispatched == []
     assert len(sync_calls) == 2  # pre-run sync plus normal post-completion sync
 
 
@@ -424,6 +445,13 @@ class _WaitQueue:
     def get_task_status(self, task_id):
         return self.status
 
+    def list_tasks(self):
+        if self.finish_at is not None and self.clock.now >= self.finish_at:
+            return [TaskRequest(task_id="review-1", task_type="review",
+                                description="server review", branch="main",
+                                context={"prev_task_id": "impl-1"})]
+        return []
+
 
 def test_run_waits_for_server_running_without_pane_after_wrapper_deadline(tmp_path, monkeypatch,
                                                                           unused_tcp_port):
@@ -448,7 +476,7 @@ def test_run_waits_for_server_running_without_pane_after_wrapper_deadline(tmp_pa
                                        timeout=1, project="sandbox")
 
     assert invocation.exit_code == 0, invocation.output
-    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+    assert [kind for kind, *_ in dispatched] == ["implement"]
     assert "server still running" in invocation.output
     assert not [args for args in posts if getattr(args[0], "full_url", "").endswith(
         "/tasks/impl-1/result")]
@@ -498,7 +526,62 @@ def test_run_loop_adopts_persisted_server_review(tmp_path, monkeypatch):
     assert f"Reviewing... ({review_id})" in invocation.output
 
 
-def test_run_loop_enqueues_review_when_no_persisted_successor(tmp_path, monkeypatch):
+def test_run_loop_follows_review_created_after_implement_result(tmp_path, monkeypatch):
+    """The server may commit its successor just after the CLI sees the result."""
+    review_id = "review-impl-1-r0"
+
+    class DelayedCascadeQueue(_LoopQueue):
+        def __init__(self):
+            super().__init__([
+                TaskResult(task_id="impl-1", status="completed", summary="done"),
+                TaskResult(task_id=review_id, status="completed", summary="approved",
+                           verdict="approve", findings=[]),
+            ])
+            self.lookups = 0
+            self.review_rows = []
+
+        def get_result(self, task_id):
+            result = self.results[self.index]
+            self.index += 1
+            return result
+
+        def list_tasks(self):
+            self.lookups += 1
+            if self.lookups == 3 and not self.review_rows:
+                self.review_rows.append(TaskRequest(
+                    task_id=review_id, task_type="review", description="review",
+                    branch="main", context={"prev_task_id": "impl-1"}))
+            return list(self.review_rows)
+
+    queue = DelayedCascadeQueue()
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, [], queue_override=queue, timeout=1)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert [row.task_id for row in queue.review_rows] == [review_id]
+    assert f"Reviewing... ({review_id})" in invocation.output
+
+
+def test_run_loop_never_creates_missing_server_review(tmp_path, monkeypatch):
+    class NoCascadeQueue(_LoopQueue):
+        def get_result(self, task_id):
+            result = self.results[self.index]
+            self.index += 1
+            return result
+
+    queue = NoCascadeQueue([
+        TaskResult(task_id="impl-1", status="completed", summary="done")])
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, [], queue_override=queue, timeout=1)
+
+    assert invocation.exit_code != 0
+    assert "Server did not create a review successor" in invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert not [row for row in queue.list_tasks() if row.task_type == "review"]
+
+
+def test_run_loop_follows_review_created_with_implement_result(tmp_path, monkeypatch):
     results = [
         TaskResult(task_id="impl-1", status="completed", summary="done"),
         TaskResult(task_id="review-1", status="completed", summary="approved",
@@ -507,7 +590,7 @@ def test_run_loop_enqueues_review_when_no_persisted_successor(tmp_path, monkeypa
     invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, existing_tasks=[])
 
     assert invocation.exit_code == 0, invocation.output
-    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+    assert [kind for kind, *_ in dispatched] == ["implement"]
 
 
 def test_run_loop_ignores_dead_persisted_review(tmp_path, monkeypatch):
@@ -521,7 +604,7 @@ def test_run_loop_ignores_dead_persisted_review(tmp_path, monkeypatch):
     invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, existing_tasks=existing)
 
     assert invocation.exit_code == 0, invocation.output
-    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+    assert [kind for kind, *_ in dispatched] == ["implement"]
     assert "Reviewing... (review-1)" in invocation.output
 
 
@@ -559,13 +642,9 @@ def test_run_loop_reviews_and_reimplements_on_reported_ref(tmp_path, monkeypatch
 
     assert invocation.exit_code == 0, invocation.output
     assert dispatched[0][2]["crew_run_branch"] is False
-    assert dispatched[1] == ("review", "fix/348-result", {
-        "coordinator_managed": True, "risk_tier": 1, "base_branch": "main",
-        "crew_run_branch": False, "lineage_root_task_id": "impl-1",
-        "no_tester": True, "pr_number": 348,
-        "reviewed_sha": COMMIT,
-    })
-    assert dispatched[2][0:2] == ("implement", "fix/348-result")
+    assert len(dispatched) == 1  # the server owns the fix as well
+    assert "Reviewing... (review-1)" in invocation.output
+    assert "Reviewing... (review-2)" in invocation.output
 
 
 def test_run_loop_stops_when_implementer_reports_same_commit_twice(tmp_path, monkeypatch):
@@ -581,7 +660,7 @@ def test_run_loop_stops_when_implementer_reports_same_commit_twice(tmp_path, mon
 
     assert invocation.exit_code == 0, invocation.output
     assert "implementer changes not persisting (same commit reported twice)" in invocation.output
-    assert [kind for kind, *_ in dispatched] == ["implement", "review", "implement"]
+    assert [kind for kind, *_ in dispatched] == ["implement"]
 
 
 def test_run_loop_carries_last_nonempty_branch_when_next_result_omits_one(tmp_path, monkeypatch):
@@ -597,7 +676,7 @@ def test_run_loop_carries_last_nonempty_branch_when_next_result_omits_one(tmp_pa
     invocation, dispatched = _run_loop(monkeypatch, tmp_path, results)
 
     assert invocation.exit_code == 0, invocation.output
-    assert dispatched[3][0:2] == ("review", "fix/348-result")
+    assert "Reviewing... (review-2)" in invocation.output
 
 
 def test_run_branch_propagates_to_implementer_and_reviewer(tmp_path, monkeypatch):
@@ -613,8 +692,8 @@ def test_run_branch_propagates_to_implementer_and_reviewer(tmp_path, monkeypatch
     assert dispatched[0][0:2] == ("implement", branch)
     assert dispatched[0][2]["base_branch"] == "main"
     assert dispatched[0][2]["crew_run_branch"] is True
-    assert dispatched[1][0:2] == ("review", branch)
-    assert dispatched[1][2]["reviewed_sha"] == COMMIT
+    assert len(dispatched) == 1
+    assert "Reviewing... (review-1)" in invocation.output
 
 
 def test_new_commit_on_same_branch_does_not_trigger_identical_guard(tmp_path, monkeypatch):
@@ -634,9 +713,8 @@ def test_new_commit_on_same_branch_does_not_trigger_identical_guard(tmp_path, mo
 
     assert invocation.exit_code == 0, invocation.output
     assert "same commit reported twice" not in invocation.output
-    assert dispatched[2][2]["base_branch"] == "main"
-    assert dispatched[2][2]["crew_run_branch"] is True
-    assert dispatched[3][2]["reviewed_sha"] == next_commit
+    assert len(dispatched) == 1
+    assert "Reviewing... (review-2)" in invocation.output
 
 
 def test_run_branch_refuses_result_from_another_branch(tmp_path, monkeypatch):

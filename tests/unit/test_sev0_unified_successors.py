@@ -14,6 +14,8 @@ def test_crew_run_adopts_server_fix_after_request_changes(tmp_db, monkeypatch):
     """One review verdict produces exactly one implement successor."""
     from agent_crew import pipeline
 
+    monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **k: False)
+    monkeypatch.setattr(pipeline, "review_is_current", lambda *a, **k: (True, ""))
     original = TaskQueue.get_result
     seen = set()
 
@@ -25,8 +27,12 @@ def test_crew_run_adopts_server_fix_after_request_changes(tmp_db, monkeypatch):
             return stored
         task = next(t for t in queue.list_tasks() if t.task_id == task_id)
         if task.task_type == "implement":
-            queue.submit_result(task_id, TaskResult(
-                task_id=task_id, status="completed", summary="implemented"))
+            impl_result = TaskResult(
+                task_id=task_id, status="completed", summary="implemented",
+                branch=task.branch, commit="a" * 40, pr_number=42)
+            queue.submit_result(task_id, impl_result)
+            pipeline.auto_enqueue_review(queue, task_id, pr_number=42,
+                                         result=impl_result)
         elif task.task_type == "review" and task_id not in seen:
             seen.add(task_id)
             queue.submit_result(task_id, TaskResult(

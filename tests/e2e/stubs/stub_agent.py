@@ -77,6 +77,10 @@ def submit_result(task_id):
         "findings": (["The implementation needs changes before approval."]
                      if ROLE == "reviewer" and VERDICT == "request_changes" else []),
     }
+    if ROLE in {"coder", "implementer"} and os.environ.get("STUB_PR_NUMBER"):
+        result.update(pr_number=int(os.environ["STUB_PR_NUMBER"]),
+                      branch=task.get("branch") or "main",
+                      commit=("b" if task_id.startswith("fix-") else "a") * 40)
     body = json.dumps(result).encode()
     url = f"{BASE_URL}/tasks/{task_id}/result"
     req = urllib.request.Request(

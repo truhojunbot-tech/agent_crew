@@ -47,7 +47,21 @@ def live_server(tmp_path, monkeypatch):
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({"role_agents": {
         "implementer": "codex", "reviewer": "claude", "tester": "gemini"}}))
-    app = create_app(db_path, state_path=str(state_path))
+    # The stub agent uses a local pull protocol. Keep this isolated server's
+    # identity aligned with the CLI task, and simulate an open PR for cascade.
+    monkeypatch.setattr("agent_crew.pipeline._skip_terminal_pr", lambda *a, **k: False)
+    def current_head(*_args, **_kwargs):
+        queue = TaskQueue(db_path)
+        if any(task.task_id.startswith("fix-") and task.status == "completed"
+               for task in queue.list_tasks()):
+            return "b" * 40
+        return "a" * 40
+
+    monkeypatch.setattr("agent_crew.github.pr_head_sha", current_head)
+    monkeypatch.setattr("agent_crew.github.post_review_comment", lambda **k: True)
+    monkeypatch.setattr("agent_crew.github.pr_has_comment_containing", lambda *a, **k: False)
+    app = create_app(db_path, state_path=str(state_path), project=tmp_path.name,
+                     identity_required=False)
 
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
     server = uvicorn.Server(config)
@@ -84,6 +98,10 @@ def _stub(port: int, role: str, verdict: str | None = None, status: str = "compl
     }
     if verdict:
         env["STUB_VERDICT"] = verdict
+    if role == "coder":
+        env["STUB_PR_NUMBER"] = "42"
+    if role == "tester":
+        env["STUB_AGENT"] = "gemini"
     return subprocess.run(
         [sys.executable, _STUB_SCRIPT],
         env=env,
@@ -110,7 +128,7 @@ def _wait_for_pending_stage(db_path: str, task_type: str, *, prev_task_id: str =
 def _start_cli(args: list[str]):
     """Invoke CLI in a daemon thread. Returns (thread, result_holder)."""
     if args and args[0] == "run":
-        args = [*args, "--risk-tier", "1"]
+        args = [*args, "--risk-tier", "1", "--repo", "owner/repo"]
     runner = CliRunner()
     holder: list = [None]
 
