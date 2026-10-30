@@ -51,7 +51,7 @@ def test_exhausted_provider_tester_notifies_once_and_says_not_run(tmp_path, monk
     assert queue.get_task("retry-root-801-a3") is None
     assert len(notices) == 1
     assert all(part in notices[0] for part in (
-        "failed_no_successor", "root-801", "exit_1", "gemini exit_1",
+        "lineage_end", "root-801", "exit_1", "gemini exit_1",
         "test not run (provider)"))
 
 
@@ -63,7 +63,7 @@ def test_no_retry_terminal_failure_notifies_once(tmp_path, monkeypatch):
         assert response.status_code == 200, response.text
     assert queue.get_task("retry-root-801-a1") is None
     assert len(notices) == 1
-    assert "failed_no_successor" in notices[0]
+    assert "lineage_end" in notices[0]
     assert "agent stopped" in notices[0]
 
 
@@ -74,7 +74,7 @@ def test_notice_does_not_depend_on_coordinator_provenance(tmp_path, monkeypatch)
         response = _fail(client, summary="provider exit_1")
         assert response.status_code == 200, response.text
     assert len(notices) == 1
-    assert "failed_no_successor" in notices[0]
+    assert "lineage_end" in notices[0]
 
 
 def test_distinct_terminal_tasks_in_one_lineage_each_notify_once(tmp_path, monkeypatch):
@@ -95,7 +95,7 @@ def test_distinct_terminal_tasks_in_one_lineage_each_notify_once(tmp_path, monke
         assert response.status_code == 200, response.text
         assert len(notices) == 2
         # Replaying the same failed task must reuse its durable notice claim.
-        app.state.coordinator_notice("retry-root-801-a2", "failed_no_successor",
+        app.state.coordinator_notice("retry-root-801-a2", "lineage_end",
                                      "failed_task=retry-root-801-a2 reason=exit_1")
     assert len(notices) == 2
     assert "first exit_1" in notices[0]
@@ -168,5 +168,5 @@ def test_dispatcher_failed_provider_without_result_notifies_once(
             time.sleep(0.02)
     assert queue.get_task_status("test-dispatch-801") == "failed"
     assert len(notices) == 1
-    assert "failed_no_successor" in notices[0]
+    assert "lineage_end" in notices[0]
     assert "test not run (provider)" in notices[0]

@@ -358,16 +358,18 @@ def build_mcp_server(
         #   refused successor unrecoverable. Two copies of a safety rule mask
         #   each other's absence; one copy, tested, does not.
         try:
-            _cascade_stage(queue, task_id, task_type, result, _task_ctx)
+            continuation = _cascade_stage(queue, task_id, task_type, result, _task_ctx)
         except _PausedError as exc:
             logger.warning(f"[PAUSE-SUPPRESSED] mcp cascade refused: {exc} (parent={task_id})")
             return {"acknowledged": True, "task_id": task_id, "task_type": task_type,
                     "suppressed_by_pause": True, "cascade_suppressed": True,
                     "detail": "runtime STOP: execution-producing mutation atomically refused"}
 
+        from agent_crew.server import notify_lineage_end
+        notify_lineage_end(queue, task_id, continuation=continuation)
         return {"acknowledged": True, "task_id": task_id, "task_type": task_type}
 
-    def _cascade_stage(queue, task_id, task_type, result, _task_ctx):
+    def _cascade_stage(queue, task_id, task_type, result, _task_ctx) -> bool:
         """The stage cascade itself, so the STOP handling above wraps all of it."""
         if task_type == "implement" and result.status == "completed":
             # #305 (review of PR #307): forward the result. Without it this
@@ -421,11 +423,10 @@ def build_mcp_server(
                                       require_repo_default=True)
             round_number = int((_task_ctx or {}).get("fix_round") or 0) + 1
             if not fix_id and queue.get_task(fix_task_id(task_id, round_number)) is None:
-                from agent_crew.server import coordinator_notice_once
-                coordinator_notice_once(queue, task_id, "test_failed_no_successor",
-                                        result.summary)
+                logger.info("MCP test failure %s has no fix successor", task_id)
         elif result.status == "failed":
-            auto_fallback_failed_task(queue, task_id, result, task_type)
+            return bool(auto_fallback_failed_task(queue, task_id, result, task_type))
+        return False
 
     @mcp.tool()
     def bump_activity(task_id: str) -> dict[str, Any]:

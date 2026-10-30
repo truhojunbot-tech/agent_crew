@@ -151,7 +151,8 @@ def test_fix_cap_sends_one_notice_without_successor(tmp_path, monkeypatch, trans
             error_info={"kind": "test_failure"})
         assert response["acknowledged"] is True, response
     assert queue.get_task(fix_task_id("test-795", 1)) is None
-    assert len(notices) == 1 and "test_failed_no_successor" in notices[0]
+    assert len(notices) == 1
+    assert "lineage_end" in notices[0]
 
 
 def test_not_run_does_not_create_fix_or_notice(tmp_path, monkeypatch):

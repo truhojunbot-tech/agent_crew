@@ -39,6 +39,20 @@ def test_fallback_lookup_filters_by_original_and_prefix(tmp_db):
     assert queue.list_fallback_tasks_for_original("missing") == []
 
 
+def test_has_successor_checks_both_lineage_edges(tmp_db):
+    queue = TaskQueue(tmp_db)
+    assert not queue.has_successor("root")
+    queue.enqueue(TaskRequest("review-child", "implement", "change", branch="feature",
+                              context={"prev_task_id": "root"}))
+    queue.enqueue(TaskRequest("retry-child", "implement", "change", branch="feature"))
+    with sqlite3.connect(tmp_db) as conn:
+        conn.execute("UPDATE tasks SET context=? WHERE task_id='retry-child'",
+                     (json.dumps({"original_task_id": "retry-root"}),))
+    assert queue.has_successor("root")
+    assert queue.has_successor("retry-root")
+    assert not queue.has_successor("unrelated")
+
+
 def test_get_task_http_keeps_fields_and_404_without_list_scan(tmp_db, monkeypatch):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("impl-http", "implement", "change", branch="feature"))

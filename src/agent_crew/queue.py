@@ -8013,6 +8013,20 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def has_successor(self, task_id: str) -> bool:
+        """Check direct lineage edges without loading the task table."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM tasks WHERE json_valid(context) AND "
+                "(json_extract(context, '$.prev_task_id') = ? OR "
+                "json_extract(context, '$.original_task_id') = ?) LIMIT 1",
+                (task_id, task_id),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
     def latest_completed_review_for_pr(self, pr_number: int) -> Optional[TaskRequest]:
         """Read only the latest completed review for a PR, tolerating legacy rows.
 

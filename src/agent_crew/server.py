@@ -170,7 +170,8 @@ def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
         if task is None and intent is None:
             return
         ctx = task.context if task is not None and isinstance(task.context, dict) else {}
-        safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:300]
+        detail_limit = 800 if kind == "lineage_end" else 300
+        safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:detail_limit]
         message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
                    f"branch={task.branch if task else ''} repo={intent['repo'] if intent else ctx.get('repo') or ''} "
                    f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
@@ -3305,6 +3306,58 @@ def worker_environment(server_env, worktree: str) -> dict[str, str]:
     return child
 
 
+def notify_lineage_end(queue: TaskQueue, task_id: str, *,
+                       continuation: bool = False, notify_fn=None) -> None:
+    """Notify once after the cascade has had its chance to create a successor."""
+    if continuation:
+        return
+    task = queue.get_task(task_id)
+    if task is None or task.status not in ("completed", "needs_human", "failed", "cancelled"):
+        return
+    # A retry or a previously inserted successor still continues the lineage.
+    if queue.has_successor(task_id):
+        return
+    ctx = task.context if isinstance(task.context, dict) else {}
+    # #914 already claimed a durable notice for this refused successor.
+    # Sending lineage_end as well would wake the coordinator twice for one end.
+    if str(ctx.get("lineage_terminal_reason") or "").startswith("successor_refused:"):
+        return
+    root = str(ctx.get("lineage_root_task_id") or task_id)
+    root_task = queue.get_task(root) if root != task_id else task
+    if root == task_id:
+        seen = {task_id}
+        current = task
+        while True:
+            parent_id = (current.context or {}).get("prev_task_id")
+            if not isinstance(parent_id, str) or parent_id in seen:
+                break
+            parent = queue.get_task(parent_id)
+            if parent is None:
+                root = parent_id
+                break
+            seen.add(parent_id)
+            root = parent_id
+            current = parent
+        root_task = current
+    info = task.error_info if isinstance(task.error_info, dict) else {}
+    root_ctx = (root_task.context if root_task is not None
+                and isinstance(root_task.context, dict) else {})
+    provider_not_run = (task.task_type == "test" and task.status == "failed"
+                        and info.get("final")
+                        and handle_test_result(TaskResult(
+                            task_id=task_id, status="failed", summary=task.summary,
+                            error_info=info)) == "not_run")
+    issue = (ctx.get("issue") or ctx.get("issue_number")
+             or root_ctx.get("issue") or root_ctx.get("issue_number") or "")
+    detail = (f"task_id={task_id} task_type={task.task_type} status={task.status} "
+              f"pr_number={task.pr_number or ctx.get('pr_number') or ''} "
+              f"lineage_head={root} issue={issue} "
+              f"reason={info.get('reason') or ''} "
+              f"{'test not run (provider) ' if provider_not_run else ''}"
+              f"summary={(task.summary or '')[:300]}")
+    coordinator_notice_once(queue, task_id, "lineage_end", detail, notify_fn)
+
+
 def create_app(
     db_path: str,
     pane_map: Optional[dict] = None,
@@ -3903,17 +3956,9 @@ def create_app(
                         details={"role": role, "agent": agent})
         return True
 
-    def _failed_no_successor_notice(task_id: str, result: TaskResult,
-                                    task_type: str) -> None:
-        """Use a durable notice key for each terminal failure, including retries."""
-        info = result.error_info if isinstance(result.error_info, dict) else {}
-        reason = str(info.get("reason") or "failed")
-        provider_not_run = (task_type == "test" and info.get("final")
-                            and handle_test_result(result) == "not_run")
-        detail = (f"failed_task={task_id} reason={reason} "
-                  f"{'test not run (provider); ' if provider_not_run else ''}"
-                  f"last_summary={result.summary or ''}")
-        _coordinator_notice(task_id, "failed_no_successor", detail)
+    def _lineage_end_notice(task_id: str, *, continuation: bool = False) -> None:
+        notify_lineage_end(q(), task_id, continuation=continuation,
+                           notify_fn=coordinator_notify_fn)
 
     app.state.coordinator_notice = _coordinator_notice
 
@@ -5592,12 +5637,12 @@ def create_app(
                     # Revoke the old attempt before the dispatch coroutine can
                     # release its execution slot for a successor (#773).
                     _stop_worker_for_ended_task(task_id, reason=reason)
-                    _coordinator_notice(task_id, reason, summary)
+                    if status == "needs_human":
+                        _lineage_end_notice(task_id)
+                    else:
+                        _coordinator_notice(task_id, reason, summary)
                 elif status == "failed":
-                    failed_task = q().get_task(task_id)
-                    if failed_task is not None:
-                        _failed_no_successor_notice(task_id, terminal_result,
-                                                    failed_task.task_type)
+                    _lineage_end_notice(task_id)
                 capture_result_best_effort(db_path, task_id, TaskResult(
                     task_id=task_id, status=status, summary=summary))
                 _attr = q().get_attribution(task_id)
@@ -9122,13 +9167,6 @@ def create_app(
                         task_id,
                     )
             logger.info(f"POST /tasks/{task_id}/result: marked done, task_type={task_type}")
-            if (task_type == "test" and result.status == "needs_human"
-                    and isinstance(result.error_info, dict)
-                    and result.error_info.get("reason") in {
-                        "config_error", "script_test_timeout", "script_test_rerun_limit",
-                        "script_test_rerun_unavailable", "script_test_rerun_unjudged",
-                    }):
-                _coordinator_notice(task_id, result.error_info["reason"], result.summary)
             if _prior in _LATE_RESULT_STATUSES and result.status != _prior:
                 logger.warning(
                     f"POST /tasks/{task_id}/result: LATE RESULT — this task was "
@@ -9247,6 +9285,7 @@ def create_app(
             except Exception:
                 logger.exception(
                     f"POST /tasks/{task_id}/result: pr-mismatch event failed")
+            _lineage_end_notice(task_id)
             return {"status": "ok", "held": "pr_number_mismatch",
                     "requested_pr": _requested, "reported_pr": _reported}
         # #314 §3/§4 STOP: result는 이미 persist(marked done)돼 lineage/audit 보존됨.
@@ -9301,7 +9340,9 @@ def create_app(
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
             _try_push_discuss(agent)
+            _lineage_end_notice(task_id)
         else:
+            _lineage_continues_without_task = False
             # Failure handling uses typed evidence for same-role retry or hold.
             # #772: re-running a deterministic script repeats the same verdict.
             _test_verdict = handle_test_result(result) if task_type == "test" else None
@@ -9317,7 +9358,7 @@ def create_app(
                         logger.exception("test fix lookup failed for %s", task_id)
                         _existing_fix = None
                     if _existing_fix is None:
-                        _coordinator_notice(task_id, "test_failed_no_successor", result.summary)
+                        logger.info("test failure %s has no fix successor", task_id)
             elif result.status == "failed" and _script_tester.is_script_test_result(result):
                 if (_test_info.get("reason") == "script_test_merge_conflict"
                         and _auto_enqueue_conflict_rebase(task_id, result)):
@@ -9325,12 +9366,12 @@ def create_app(
                                 task_id)
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: script test failed; no retry")
-                    _failed_no_successor_notice(task_id, result, task_type)
             elif result.status == "failed":
                 logger.info(f"POST /tasks/{task_id}/result: task failed with status=failed, evaluating fallback/retry")
-                if not _auto_fallback_failed_task(task_id, result, task_type):
-                    if not _auto_retry_failed_task(task_id, result, task_type):
-                        _failed_no_successor_notice(task_id, result, task_type)
+                if _auto_fallback_failed_task(task_id, result, task_type):
+                    _lineage_continues_without_task = True  # May be an escalation gate.
+                elif _auto_retry_failed_task(task_id, result, task_type):
+                    _lineage_continues_without_task = True
             # Auto-transition: impl task completed → auto-enqueue review task.
             # Pass through the PR number from the impl result so the reviewer
             # task description nails down which PR head to diff (#86).
@@ -9516,6 +9557,7 @@ def create_app(
                     _test_repo = _task_ctx.get("repo") or ""
                     _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt,
                                    review_task_id=_task_ctx.get("prev_task_id") or "")
+            _lineage_end_notice(task_id, continuation=_lineage_continues_without_task)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")
@@ -9675,6 +9717,7 @@ def create_app(
         outcome.pop("cancelled", None)
         outcome["worker_termination"] = _stop_worker_for_ended_task(
             task_id, reason=_CANCEL_REASON_ATTEMPT)
+        _lineage_end_notice(task_id)
         return outcome
 
     @app.post("/tasks/{task_id}/recover", status_code=200)

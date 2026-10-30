@@ -254,8 +254,9 @@ def cancel_app(tmp_db, monkeypatch):
       defused before the `monkeypatch` fixture (torn down after this one)
       restores the real syscall.
     """
-    monkeypatch.setenv("AGENT_CREW_CANCEL_KILL_GRACE", "0.05")
-    app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
+    monkeypatch.setenv("AGENT_CREW_CANCEL_KILL_GRACE", "0.5")
+    app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True,
+                     coordinator_notify_fn=lambda _: True)
     app.state.killpg_calls = []
     monkeypatch.setattr("agent_crew.server.os.killpg",
                         lambda pid, sig: app.state.killpg_calls.append((pid, sig)))
