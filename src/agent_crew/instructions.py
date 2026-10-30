@@ -1,9 +1,48 @@
 import os
+import logging
+import subprocess
 
 from agent_crew.prompts.task_loop import build_task_loop_prompt
 from agent_crew.testing_policy import load_scope, render_scope, render_implementer_scope
 from agent_crew.port_validation import require_project_port
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
+from agent_crew.worktree_default_branch import remote_default_branch
+
+logger = logging.getLogger(__name__)
+
+
+def _base_role_addendum(worktree_path: str, role: str, base_branch: str = "") -> str | None:
+    """Read role rules from the fetched base, never from the PR checkout."""
+    try:
+        base = base_branch or remote_default_branch(worktree_path)
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("Could not resolve default base branch in %s", worktree_path)
+        return None
+    if not base:
+        return None
+    ref = f"refs/remotes/origin/{base}"
+    try:
+        fetched = subprocess.run(
+            ["git", "-C", worktree_path, "fetch", "origin",
+             f"+refs/heads/{base}:{ref}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if fetched.returncode != 0:
+            logger.warning("Could not fetch base ref %s in %s; using last fetched ref",
+                           ref, worktree_path)
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("Could not fetch base ref %s in %s; using last fetched ref",
+                       ref, worktree_path)
+    try:
+        shown = subprocess.run(
+            ["git", "-C", worktree_path, "show",
+             f"{ref}:.agent_crew/{role}.md"],
+            capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("Could not read role addendum from %s in %s", ref, worktree_path)
+        return None
+    return shown.stdout.decode("utf-8") if shown.returncode == 0 else None
 
 # Per-role instruction file paths inside each worktree (Issue #110 fix).
 #
@@ -850,7 +889,8 @@ targeted run also times out, report it as incomplete too.
 
 
 def generate(role: str, project: str, port: int, agent: str = "",
-             delivery: str | None = None, worktree_path: str = "") -> str:
+             delivery: str | None = None, worktree_path: str = "",
+             base_branch: str = "") -> str:
     """Render the role's instruction file.
 
     ``agent`` is the canonical agent identifier (``claude``/``codex``/``gemini``)
@@ -898,10 +938,8 @@ def generate(role: str, project: str, port: int, agent: str = "",
         f'-H "X-Agent-Crew-Project: {project}" \\\n  -H "Content-Type: application/json"',
     )
     if worktree_path and role in ROLE_FILES:
-        addendum_path = os.path.join(worktree_path, ".agent_crew", f"{role}.md")
-        if os.path.isfile(addendum_path):
-            with open(addendum_path, encoding="utf-8", newline="") as f:
-                addendum = f.read()
+        addendum = _base_role_addendum(worktree_path, role, base_branch)
+        if addendum is not None:
             content += "\n\n## Project role addendum\n\n" + addendum
     return content
 
@@ -938,6 +976,7 @@ def write(
     port_file: str,
     agent: str = "",
     delivery: str | None = None,
+    base_branch: str = "",
 ) -> str:
     if role not in ROLE_FILES:
         raise ValueError(f"Unknown role: {role!r}. Must be one of {list(ROLE_FILES)}")
@@ -945,7 +984,7 @@ def write(
         port = require_project_port(int(f.read().strip()), project)
     filename = AGENT_FILES.get(agent, ROLE_FILES[role])
     new_block = generate(role, project, port, agent=agent, delivery=delivery,
-                         worktree_path=worktree_path)
+                         worktree_path=worktree_path, base_branch=base_branch)
     path = os.path.join(worktree_path, filename)
     parent = os.path.dirname(path)
     if parent:
