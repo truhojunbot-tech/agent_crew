@@ -59,7 +59,8 @@ def test_i_lo01_approve_first_review(task_queue, test_client):
     impl_id = enqueue_implement(task_queue, DESC, BRANCH)
     _submit(test_client, impl_id, summary="Login implemented")
 
-    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id)
+    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id,
+                               context={"risk_tier": 1})
     _submit(test_client, review_id, summary="LGTM", verdict="approve")
 
     outcome = handle_review_result(
@@ -86,7 +87,7 @@ def test_i_lo02_request_changes_then_approve(task_queue, test_client):
     impl_id = enqueue_implement(task_queue, DESC, BRANCH)
     _submit(test_client, impl_id, summary="First attempt")
 
-    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id)
+    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id, context={"risk_tier": 1})
     _submit(test_client, review_id, summary="Needs work", verdict="request_changes",
             findings=["code_quality: missing error handling"])
 
@@ -100,7 +101,7 @@ def test_i_lo02_request_changes_then_approve(task_queue, test_client):
     impl_id2 = enqueue_implement(task_queue, DESC, BRANCH)
     _submit(test_client, impl_id2, summary="Fixed")
 
-    review_id2 = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id2)
+    review_id2 = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id2, context={"risk_tier": 1})
     _submit(test_client, review_id2, summary="LGTM", verdict="approve")
 
     outcome2 = handle_review_result(
@@ -115,7 +116,7 @@ def test_i_lo03_max_iterations_escalate(task_queue, test_client):
     _submit(test_client, prev_id, summary="Attempt")
 
     for i in range(1, DEFAULT_MAX_ITER + 1):
-        review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=prev_id)
+        review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=prev_id, context={"risk_tier": 1})
         # #376: escalation requires a real rejection, not a verdict with no finding.
         findings = ["code_quality: the login error path still needs a fix"]
         _submit(test_client, review_id, summary="Still needs work", verdict="request_changes",
@@ -133,7 +134,9 @@ def test_i_lo03_max_iterations_escalate(task_queue, test_client):
         else:
             assert outcome == "escalate"
             # gate auto-created by handle_review_result — verify via HTTP
-            resp = test_client.get("/gates/pending")
+            resp = test_client.get("/gates/pending", headers={
+                "X-Agent-Crew-Project": task_queue.queue_project})
+            assert resp.status_code == 200, resp.text
             pending = resp.json()
             assert any("escalation" in g.get("type", "") for g in pending)
 
@@ -144,7 +147,7 @@ def test_i_lo04_no_tester(task_queue, test_client):
     # Use queue directly to bypass server auto-enqueue
     task_queue.submit_result(impl_id, _make_result(impl_id, status="completed"))
 
-    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id)
+    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id, context={"risk_tier": 1})
     # Use queue directly to avoid triggering server auto-enqueue test
     task_queue.submit_result(review_id, _make_result(review_id, status="completed", verdict="approve"))
 
@@ -159,7 +162,7 @@ def test_i_lo05_test_failure_reimplements(task_queue, test_client):
     impl_id = enqueue_implement(task_queue, DESC, BRANCH)
     _submit(test_client, impl_id, summary="Done")
 
-    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id)
+    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id, context={"risk_tier": 1})
     _submit(test_client, review_id, summary="LGTM", verdict="approve")
 
     handle_review_result(_make_result(review_id, verdict="approve"),
@@ -186,7 +189,7 @@ def test_i_lo06_reviewer_rejects_happy_path(task_queue, test_client):
     impl_id = enqueue_implement(task_queue, DESC, BRANCH)
     _submit(test_client, impl_id, summary="Done")
 
-    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id)
+    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id, context={"risk_tier": 1})
     _submit(test_client, review_id, summary="Missing edge cases",
             verdict="request_changes",
             findings=["test_quality: only happy path covered, add edge cases"])
@@ -207,7 +210,7 @@ def test_i_lo07_edge_cases_added_approve(task_queue, test_client):
     impl_id = enqueue_implement(task_queue, DESC, BRANCH)
     _submit(test_client, impl_id, summary="First attempt")
 
-    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id)
+    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id, context={"risk_tier": 1})
     feedback_findings = ["test_quality: missing edge cases"]
     _submit(test_client, review_id, verdict="request_changes", findings=feedback_findings)
 
@@ -220,7 +223,7 @@ def test_i_lo07_edge_cases_added_approve(task_queue, test_client):
     _submit(test_client, impl_id2, summary="Added edge cases")
 
     # second review approves
-    review_id2 = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id2)
+    review_id2 = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id2, context={"risk_tier": 1})
     _submit(test_client, review_id2, summary="Edge cases covered, LGTM", verdict="approve")
 
     outcome = handle_review_result(
@@ -234,7 +237,7 @@ def test_i_lo08_business_gap_in_context(task_queue, test_client):
     impl_id = enqueue_implement(task_queue, DESC, BRANCH)
     _submit(test_client, impl_id, summary="Done")
 
-    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id)
+    review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id, context={"risk_tier": 1})
     gap_findings = ["business_gap: no audit logging for auth events"]
     _submit(test_client, review_id, verdict="request_changes", findings=gap_findings)
 

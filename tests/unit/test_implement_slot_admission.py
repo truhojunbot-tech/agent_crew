@@ -103,7 +103,7 @@ def test_caller_cannot_claim_fix_exemption(queue):
     _add(q, "first")
     request = task("claimed-fix", project="crew")
     request.task_type = "implement"
-    request.context = {"prev_task_id": "first", "fix_round": 1}
+    request.context = {"prev_task_id": "first", "fix_round": 1, "risk_tier": 1}
     with pytest.raises(AdmissionRefused) as exc:
         q.enqueue(request, ingress="cascade.fix")
     assert receipt_by_id(q, exc.value.receipt_id)["reason"]["code"] == "IMPLEMENT_SLOT_BUSY"

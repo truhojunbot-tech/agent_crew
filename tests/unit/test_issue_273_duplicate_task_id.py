@@ -60,7 +60,7 @@ def test_project_can_no_longer_reach_the_insert_as_null(tmp_db):
 
 def _task(task_id="t-1", **kw):
     task = TaskRequest(task_id=task_id, task_type="review", description="d",
-                       branch="b", priority=3, context={}, project="")
+                       branch="b", priority=3, context={"risk_tier": 1}, project="")
     for key, value in kw.items():
         # The dataclass validates; a library caller reaching the DB with a bad
         # value is exactly the case the wide catch mishandled, so build it.

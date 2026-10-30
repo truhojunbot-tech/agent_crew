@@ -139,7 +139,7 @@ def test_u_c17_discuss_timeout_preserves_partial_synthesis(tmp_path):
 
     # Pre-stage: one agent "already responded", the other never will.
     task_ids = enqueue_panel_tasks(
-        queue, ["analyst", "critic"], "AI strategy", {"round": 1}, port=0
+        queue, ["analyst", "critic"], "AI strategy", {"round": 1, "risk_tier": 1}, port=0
     )
     # Mark analyst's task as completed with a real summary.
     queue.submit_result(task_ids[0], TaskResult(

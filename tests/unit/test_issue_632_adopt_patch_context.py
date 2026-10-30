@@ -18,7 +18,7 @@ def test_race_adoption_patches_cli_review_context(tmp_path, monkeypatch, transpo
     queue.enqueue(TaskRequest(
         task_id=server_id, task_type="review", description="server review",
         branch="fix/632", project="agent_crew",
-        context={"prev_task_id": "impl-632", "reviewed_sha": "a" * 40,
+        context={"risk_tier": 1, "prev_task_id": "impl-632", "reviewed_sha": "a" * 40,
                  "pr_number": 632, "agent_override": "server-default"}))
     # The server wins after the CLI's initial lookup, before its enqueue.
     list_tasks = queue.list_tasks
@@ -32,7 +32,7 @@ def test_race_adoption_patches_cli_review_context(tmp_path, monkeypatch, transpo
         return list_tasks()
 
     monkeypatch.setattr(queue, "list_tasks", stale_once)
-    cli_context = {"reviewed_sha": "a" * 40, "pr_number": 632,
+    cli_context = {"risk_tier": 1, "reviewed_sha": "a" * 40, "pr_number": 632,
                    "no_tester": True, "agent_override": "claude"}
     if transport == "http":
         body = io.BytesIO(

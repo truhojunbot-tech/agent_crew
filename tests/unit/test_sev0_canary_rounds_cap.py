@@ -50,7 +50,7 @@ def _review(q, task_id="review-canary-rounds", *, root=ROOT, fix_round=1,
             verdict="request_changes", refresh_contract=True):
     q.enqueue(TaskRequest(task_id=task_id, task_type="review", description="review",
                           branch="canary-branch",
-                          context={"prev_task_id": root, "fix_round": fix_round,
+                          context={"risk_tier": 1, "prev_task_id": root, "fix_round": fix_round,
                                    "pr_number": 51}))
     q.submit_result(task_id, TaskResult(
         task_id=task_id, status="completed", summary="fix it", verdict=verdict,

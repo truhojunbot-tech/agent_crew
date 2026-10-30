@@ -48,7 +48,7 @@ def _pr_is_open(monkeypatch):
 def _review(q, *, reviewed_sha=OLD, pr_number=PR, verdict="request_changes",
             findings=(FINDING,), allow_duplicate_review=False):
     rid = f"review-{uuid.uuid4().hex[:8]}"
-    ctx = {"prev_task_id": "impl-1", "pr_number": pr_number}
+    ctx = {"prev_task_id": "impl-1", "pr_number": pr_number, "risk_tier": 1}
     if reviewed_sha:
         ctx["reviewed_sha"] = reviewed_sha
     if allow_duplicate_review:

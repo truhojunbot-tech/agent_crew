@@ -122,7 +122,7 @@ def test_a_real_dispatch_writes_the_event(tmp_path, monkeypatch, *, unused_tcp_p
         q.enqueue(TaskRequest(
             task_id="disp-tel", task_type="implement", description="do it",
             branch="main",
-            context={"issue": 42, "repo": "org/repo", "issue_title": "t",
+            context={"risk_tier": 1, "issue": 42, "repo": "org/repo", "issue_title": "t",
                      "issue_body": "## Acceptance criteria\n- [ ] works\n"}))
         task = q.dequeue(role="implementer")
         assert task is not None
@@ -391,7 +391,7 @@ def _shadow_dispatch(tmp_path, monkeypatch, port, *, live=False, shadow=False, b
         q = TaskQueue(db)
         q.enqueue(TaskRequest(
             task_id="shadow-t", task_type="implement", description="do it", branch="main",
-            context={"issue": 42, "repo": "org/repo", "issue_title": "widget",
+            context={"risk_tier": 1, "issue": 42, "repo": "org/repo", "issue_title": "widget",
                      "issue_body": "## Acceptance criteria\n- [ ] works\n"},
         ))
         task = q.dequeue(role="implementer")

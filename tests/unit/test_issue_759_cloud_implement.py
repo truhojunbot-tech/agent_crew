@@ -176,7 +176,7 @@ def test_cloud_fix_waits_for_new_pr_head_before_re_review(tmp_path, monkeypatch)
     queue.enqueue(TaskRequest(
         task_id="fix-review-impl-r0-r1", task_type="implement",
         description="Fix PR #759 on the same branch", branch="agent/existing-pr",
-        project="agent_crew", context={"repo": "owner/repo", "pr_number": 759,
+        project="agent_crew", context={"risk_tier": 1, "repo": "owner/repo", "pr_number": 759,
                                        "fix_round": 1, "prev_task_id": "review-impl-r0"},
     ))
     monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
