@@ -46,9 +46,9 @@ def test_A_standalone_completion_has_one_structured_end_notice(harness):
     assert len(notices) == 1
     assert all(s in notices[0] for s in ("kind=lineage_end", "task_id=research-943",
                                          "task_type=discuss", "status=completed",
-                                         "lineage_head=research-943", "issue=943", "summary="))
-    assert "x" * 300 in notices[0]
-    assert "x" * 301 not in notices[0]
+                                         "lineage_head=research-943", "issue=943"))
+    assert "summary=" not in notices[0]
+    assert "x" * 300 not in notices[0]
 
 
 def test_B_successor_suppresses_parent_and_merged_leaf_carries_pr(harness, monkeypatch):
@@ -121,7 +121,55 @@ def test_F_exhausted_provider_failure_uses_lineage_end_once(harness):
                        error_info={"reason": "exit_1", "final": True}).status_code == 200
     assert len(notices) == 1
     assert "kind=lineage_end" in notices[0]
-    assert "test not run (provider)" in notices[0]
+    assert "test_not_run_provider=true" in notices[0]
+
+
+def test_C3_unknown_reason_and_summary_do_not_reach_notice_sink(harness, monkeypatch):
+    app, queue, notices = harness
+    secret = "SENTINEL_SECRET_943C3"
+    _task(queue, "leaf-secret-943")
+    monkeypatch.setenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", "0")
+    with TestClient(app) as client:
+        response = _result(client, "leaf-secret-943", "failed",
+                           summary=f"provider wrote {secret}",
+                           error_info={"reason": f"unexpected {secret}", "final": True})
+    assert response.status_code == 200, response.text
+    assert len(notices) == 1
+    delivered = notices[0]  # harness captures the actual notify sink argument
+    assert secret not in delivered
+    assert "reason_code=other" in delivered
+    assert "summary=" not in delivered
+    fields = dict(part.split("=", 1) for part in delivered.split()
+                  if "=" in part)
+    assert set(fields) == {"kind", "task_id", "lineage_head", "task_type",
+                           "status", "pr_number", "issue", "reason_code",
+                           "test_not_run_provider"}
+
+
+def test_C3_known_reason_code_passes_through(harness):
+    app, queue, notices = harness
+    _task(queue, "known-reason-943")
+    with TestClient(app) as client:
+        response = _result(client, "known-reason-943", "failed",
+                           error_info={"reason": "no_artifact", "final": True})
+    assert response.status_code == 200, response.text
+    assert len(notices) == 1
+    assert "reason_code=no_artifact" in notices[0]
+
+
+def test_C3_formatter_rejects_invalid_identity_and_untyped_values():
+    from agent_crew.server import _lineage_end_detail
+    detail = _lineage_end_detail(
+        task_id="unsafe id\nSENTINEL_SECRET_943C3", lineage_head="root id with spaces",
+        task_type="not-a-task-type", status="made_up", pr_number="not a PR",
+        issue="private path /tmp/secret", reason="secret reason",
+        provider_not_run=False)
+    assert "SENTINEL_SECRET_943C3" not in detail
+    assert "secret reason" not in detail
+    assert "task_id=invalid" in detail and "lineage_head=invalid" in detail
+    assert "task_type=invalid" in detail and "status=invalid" in detail
+    assert "pr_number= issue=" in detail
+    assert "reason_code=other" in detail
 
 
 def test_refused_review_fix_has_only_the_existing_successor_refused_notice(

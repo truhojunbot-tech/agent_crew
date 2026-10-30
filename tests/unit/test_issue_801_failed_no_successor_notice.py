@@ -51,8 +51,9 @@ def test_exhausted_provider_tester_notifies_once_and_says_not_run(tmp_path, monk
     assert queue.get_task("retry-root-801-a3") is None
     assert len(notices) == 1
     assert all(part in notices[0] for part in (
-        "lineage_end", "root-801", "exit_1", "gemini exit_1",
-        "test not run (provider)"))
+        "lineage_end", "root-801", "reason_code=other",
+        "test_not_run_provider=true"))
+    assert "gemini exit_1" not in notices[0]
 
 
 def test_no_retry_terminal_failure_notifies_once(tmp_path, monkeypatch):
@@ -64,7 +65,7 @@ def test_no_retry_terminal_failure_notifies_once(tmp_path, monkeypatch):
     assert queue.get_task("retry-root-801-a1") is None
     assert len(notices) == 1
     assert "lineage_end" in notices[0]
-    assert "agent stopped" in notices[0]
+    assert "agent stopped" not in notices[0]
 
 
 def test_notice_does_not_depend_on_coordinator_provenance(tmp_path, monkeypatch):
@@ -98,8 +99,9 @@ def test_distinct_terminal_tasks_in_one_lineage_each_notify_once(tmp_path, monke
         app.state.coordinator_notice("retry-root-801-a2", "lineage_end",
                                      "failed_task=retry-root-801-a2 reason=exit_1")
     assert len(notices) == 2
-    assert "first exit_1" in notices[0]
-    assert "second exit_1" in notices[1]
+    assert "task_id=root-801" in notices[0]
+    assert "task_id=retry-root-801-a2" in notices[1]
+    assert all("exit_1" not in notice for notice in notices)
 
 
 def test_implement_retry_with_budget_has_no_notice(tmp_path, monkeypatch):
@@ -169,4 +171,4 @@ def test_dispatcher_failed_provider_without_result_notifies_once(
     assert queue.get_task_status("test-dispatch-801") == "failed"
     assert len(notices) == 1
     assert "lineage_end" in notices[0]
-    assert "test not run (provider)" in notices[0]
+    assert "test_not_run_provider=true" in notices[0]

@@ -173,9 +173,14 @@ def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
         ctx = task.context if task is not None and isinstance(task.context, dict) else {}
         detail_limit = 800 if kind == "lineage_end" else 300
         safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:detail_limit]
-        message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
-                   f"branch={task.branch if task else ''} repo={intent['repo'] if intent else ctx.get('repo') or ''} "
-                   f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
+        if kind == "lineage_end":
+            # C3: the generic envelope contains repo/branch/session values from
+            # task context. A lineage end has its own typed, allowlisted body.
+            message = f"agent_crew coordinator notice: kind=lineage_end {safe_detail}"
+        else:
+            message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
+                       f"branch={task.branch if task else ''} repo={intent['repo'] if intent else ctx.get('repo') or ''} "
+                       f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
         if not queue.claim_coordinator_notice(task_id, kind):
             return
         claimed = True
@@ -3301,6 +3306,45 @@ def worker_environment(server_env, worktree: str) -> dict[str, str]:
     return child
 
 
+_LINEAGE_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
+# Fixed terminal reason codes written by the dispatcher, cloud worker, script
+# tester, and artifact gate. Dynamic provider messages and exit codes are other.
+_LINEAGE_REASON_CODES = frozenset({
+    "agent_failed", "capacity", "config_error", "provider_limit", "timeout",
+    "test_failure", "transient", "no_artifact", "watchdog_timeout",
+    "watchdog_script_test_timeout", "orphan_lease_expired",
+    "worktree_prep_refused", "worktree_unhealthy", "pr_head_unresolved",
+    "worktree_base_unresolved", "prepared_base_not_recorded",
+    "wip_restore_conflict", "missing_role_protocol", "no_worktree",
+    "pane_target_unresolvable", "pane_not_owned", "dispatch_exception",
+    "dispatcher_exception", "script_test_exception", "transient_max_retries",
+    "provider_capacity_requeue_failed", "codex_quota_park_failed",
+    "provider_error", "provider_test_not_run", "no_result_submitted",
+    "cloud_submit_timeout", "cloud_launch_interactive_prompt",
+    "codex_quota_exhausted", "script_test_timeout",
+    "script_test_rerun_unjudged", "script_test_new_failures", "script_test_ci_red",
+})
+
+
+def _lineage_end_detail(*, task_id, lineage_head, task_type, status,
+                        pr_number, issue, reason, provider_not_run: bool) -> str:
+    """Render the sole allowlist of values permitted in a lineage-end notice."""
+    def valid_id(value) -> str:
+        return value if isinstance(value, str) and _LINEAGE_TASK_ID_RE.fullmatch(value) else "invalid"
+
+    pr = normalize_pr_number(pr_number)
+    issue_number = issue if isinstance(issue, int) and not isinstance(issue, bool) and issue > 0 else None
+    reason_code = ("none" if reason in (None, "") else
+                   reason if isinstance(reason, str) and reason in _LINEAGE_REASON_CODES
+                   else "other")
+    return (f"task_id={valid_id(task_id)} lineage_head={valid_id(lineage_head)} "
+            f"task_type={task_type if task_type in {'implement', 'review', 'test', 'discuss'} else 'invalid'} "
+            f"status={status if status in {'completed', 'needs_human', 'failed', 'cancelled'} else 'invalid'} "
+            f"pr_number={pr or ''} issue={issue_number or ''} "
+            f"reason_code={reason_code} "
+            f"test_not_run_provider={str(bool(provider_not_run)).lower()}")
+
+
 def notify_lineage_end(queue: TaskQueue, task_id: str, *,
                        continuation: bool = False, notify_fn=None) -> None:
     """Notify once after the cascade has had its chance to create a successor."""
@@ -3344,12 +3388,10 @@ def notify_lineage_end(queue: TaskQueue, task_id: str, *,
                             error_info=info)) == "not_run")
     issue = (ctx.get("issue") or ctx.get("issue_number")
              or root_ctx.get("issue") or root_ctx.get("issue_number") or "")
-    detail = (f"task_id={task_id} task_type={task.task_type} status={task.status} "
-              f"pr_number={task.pr_number or ctx.get('pr_number') or ''} "
-              f"lineage_head={root} issue={issue} "
-              f"reason={info.get('reason') or ''} "
-              f"{'test not run (provider) ' if provider_not_run else ''}"
-              f"summary={(task.summary or '')[:300]}")
+    detail = _lineage_end_detail(
+        task_id=task_id, lineage_head=root, task_type=task.task_type,
+        status=task.status, pr_number=task.pr_number or ctx.get("pr_number"),
+        issue=issue, reason=info.get("reason"), provider_not_run=provider_not_run)
     coordinator_notice_once(queue, task_id, "lineage_end", detail, notify_fn)
 
 
