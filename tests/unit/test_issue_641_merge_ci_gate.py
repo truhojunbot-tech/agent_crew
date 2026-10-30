@@ -3,6 +3,8 @@
 import json
 import subprocess
 
+import pytest
+
 from agent_crew import github
 
 
@@ -50,3 +52,51 @@ def test_head_checks_pending_none_and_error(monkeypatch):
     monkeypatch.setattr(github.subprocess, "run",
                         lambda args, **kwargs: subprocess.CompletedProcess(args, 1, "", "oops"))
     assert github.head_checks_state("o/r", sha)[0] == "error"
+
+
+@pytest.mark.parametrize("case,job,other_run,expected", [
+    ("never_started", {"runner_name": "", "runner_id": None, "steps": []},
+     None, "infra_unavailable"),
+    ("real_failure", {"runner_name": "runner-1", "runner_id": 9,
+                      "steps": [{"name": "test", "conclusion": "failure"}]},
+     None, "red"),
+    ("mixed", {"runner_name": "", "runner_id": None, "steps": []},
+     {"id": 72, "name": "unit", "status": "completed", "conclusion": "failure",
+      "app": {"slug": "github-actions"}}, "red"),
+    ("lookup_error", None, None, "red"),
+    ("non_actions", None, None, "red"),
+])
+def test_failed_action_that_never_started_has_its_own_state(
+        monkeypatch, case, job, other_run, expected):
+    sha = "c" * 40
+    run = {"id": 71, "name": "enforce", "status": "completed",
+           "conclusion": "failure", "html_url": "https://github.com/o/r/actions/runs/71",
+           "app": {"slug": "circleci" if case == "non_actions" else "github-actions"}}
+    calls = []
+    monkeypatch.setattr(github, "check_gh_installed", lambda: True)
+
+    def api(args, **kwargs):
+        calls.append(args[2])
+        path = args[2]
+        if "/check-runs" in path:
+            return subprocess.CompletedProcess(args, 0, json.dumps({
+                "check_runs": [run] + ([other_run] if other_run else [])}), "")
+        if path.endswith("/status"):
+            return subprocess.CompletedProcess(args, 0, '{"statuses": []}', "")
+        if case == "lookup_error":
+            return subprocess.CompletedProcess(args, 1, "", "unavailable")
+        if path.endswith("/actions/jobs/72"):
+            return subprocess.CompletedProcess(args, 0, json.dumps({
+                "runner_name": "runner-2", "runner_id": 12,
+                "steps": [{"name": "test", "conclusion": "failure"}]}), "")
+        return subprocess.CompletedProcess(args, 0, json.dumps(job), "")
+
+    monkeypatch.setattr(github.subprocess, "run", api)
+    state, detail = github.head_checks_state("o/r", sha)
+    assert state == expected
+    if expected == "infra_unavailable":
+        assert "enforce" in detail and "https://github.com/o/r/actions/runs/71" in detail
+    if case == "non_actions":
+        assert not any("/actions/jobs/" in path for path in calls)
+    else:
+        assert "repos/o/r/actions/jobs/71" in calls
