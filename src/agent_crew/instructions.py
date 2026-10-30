@@ -897,6 +897,12 @@ def generate(role: str, project: str, port: int, agent: str = "",
         '-H "Content-Type: application/json"',
         f'-H "X-Agent-Crew-Project: {project}" \\\n  -H "Content-Type: application/json"',
     )
+    if worktree_path and role in ROLE_FILES:
+        addendum_path = os.path.join(worktree_path, ".agent_crew", f"{role}.md")
+        if os.path.isfile(addendum_path):
+            with open(addendum_path, encoding="utf-8", newline="") as f:
+                addendum = f.read()
+            content += "\n\n## Project role addendum\n\n" + addendum
     return content
 
 
@@ -953,12 +959,12 @@ def write(
         existing = ""
         if os.path.exists(path):
             try:
-                with open(path) as f:
+                with open(path, encoding="utf-8", newline="") as f:
                     existing = f.read()
             except OSError:
                 existing = ""
         content = _merge_agent_crew_block(existing, new_block)
 
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(content)
     return os.path.abspath(path)
