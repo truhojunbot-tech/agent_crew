@@ -431,6 +431,26 @@ def test_unjudged_rerun_is_incomplete_and_notifies_once(project, server, monkeyp
     assert (pushes, spawns, merges) == ([], [], [])
 
 
+def test_ci_never_started_is_incomplete_with_no_successor(project, server, monkeypatch):
+    from agent_crew import github
+
+    repo, head = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert True\n"})
+    notices = []
+    build, pushes, spawns, merges = server
+    app, queue = build(repo, {"test_command": PYTEST}, notices=notices)
+    monkeypatch.setattr(script_tester, "head_has_workflows", lambda *a: True)
+    monkeypatch.setattr(github, "head_checks_state", lambda *a: (
+        "infra_unavailable", "enforce https://github.com/o/r/actions/runs/71"))
+
+    done = _run_through_push_path(app, queue, _task(head))
+    assert done.status == "needs_human"
+    assert done.error_info["script_test"]["outcome"] == "INCOMPLETE"
+    assert done.error_info["script_test"]["reason"] == "ci_infra_unavailable"
+    assert [task.task_id for task in queue.list_tasks()] == [done.task_id]
+    assert (pushes, spawns, merges) == ([], [], [])
+    assert len(notices) == 1 and "reason_code=ci_infra_unavailable" in notices[0]
+
+
 def test_collection_abort_shared_with_base_is_not_a_pass(project, tmp_path):
     broken = {"tests/test_a.py": "def test_one():\n    assert True\n",
               "tests/test_bad.py": "import does_not_exist\n"}

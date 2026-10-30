@@ -3324,6 +3324,7 @@ _LINEAGE_REASON_CODES = frozenset({
     "cloud_submit_timeout", "cloud_launch_interactive_prompt",
     "codex_quota_exhausted", "script_test_timeout",
     "script_test_rerun_unjudged", "script_test_new_failures", "script_test_ci_red",
+    "ci_infra_unavailable", "script_test_ci_infra_unavailable",
 })
 
 
@@ -8322,7 +8323,7 @@ def create_app(
             logger.info("_auto_merge_pr: PR #%s merge left to coordinator", pr_number)
             return
         ci_state, ci_detail = head_checks_state(_merge_repo, head)
-        if ci_state in ("red", "error"):
+        if ci_state in ("red", "error", "infra_unavailable"):
             reason = f"CI {ci_state}: {ci_detail}"
             fail(reason)
             logger.warning("_auto_merge_pr: PR #%s %s — merge refused", pr_number, reason)

@@ -220,6 +220,17 @@ def test_red_ci_refuses_merge_and_records_error(tmp_path, monkeypatch, checker):
     assert "merge" not in calls
 
 
+def test_ci_infra_unavailable_refuses_merge(tmp_path, monkeypatch, checker):
+    queue, calls = _submit_test(
+        tmp_path, monkeypatch, title="add widget", change_type="modify",
+        ci_state=[("infra_unavailable", "enforce: https://example.test/run")],
+    )
+    assert "merge" not in calls
+    op = queue.external_op_get("merge:pr:615")
+    assert op["state"] == "failed"
+    assert "CI infra_unavailable" in op["last_error"]
+
+
 def test_pending_ci_then_green_merges_on_later_result(tmp_path, monkeypatch, checker):
     states = [("pending", "unit"), ("green", "")]
     queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",

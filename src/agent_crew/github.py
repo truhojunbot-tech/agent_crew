@@ -593,8 +593,34 @@ def independent_review_succeeded(pr_number: int, repo: str) -> bool:
         return False
 
 
+def _actions_job_never_started(repo: str, run: dict) -> tuple[bool, str]:
+    """Confirm a failed Actions check had no runner and no steps.
+
+    A missing or unreadable job is a normal failed check, never an exemption.
+    """
+    app = run.get("app")
+    if (run.get("conclusion") != "failure"
+            or not isinstance(app, dict) or app.get("slug") != "github-actions"
+            or type(run.get("id")) is not int):
+        return False, ""
+    try:
+        job = subprocess.run(
+            ["gh", "api", f"repos/{repo}/actions/jobs/{run['id']}"],
+            capture_output=True, text=True, timeout=20)
+        if job.returncode:
+            return False, ""
+        data = json.loads(job.stdout or "{}")
+        if (not isinstance(data, dict) or data.get("runner_name") not in (None, "")
+                or data.get("runner_id") not in (None, 0, "")
+                or data.get("steps") != []):
+            return False, ""
+        return True, str(data.get("html_url") or run.get("html_url") or "")
+    except Exception:
+        return False, ""
+
+
 def head_checks_state(repo: str, sha: str) -> tuple[str, str]:
-    """Return (green|red|pending|none|error, detail) for a PR head's CI.
+    """Return (green|red|infra_unavailable|pending|none|error, detail) for CI.
 
     Check runs and commit statuses are separate GitHub APIs. Ignore skipped
     runs and the crew review status, which is verified independently.
@@ -639,13 +665,18 @@ def head_checks_state(repo: str, sha: str) -> tuple[str, str]:
         for status in latest_statuses:
             latest_by_context.setdefault(str(status.get("context") or "commit status"), status)
         red = []
+        infra_unavailable = []
         pending = []
         for run in latest_runs.values():
             if run.get("conclusion") == "skipped":
                 continue
             name = str(run.get("name") or "check run")
             if run.get("conclusion") in ("failure", "cancelled", "timed_out"):
-                red.append(name)
+                never_started, url = _actions_job_never_started(repo, run)
+                if never_started:
+                    infra_unavailable.append(f"{name} ({url})" if url else name)
+                else:
+                    red.append(name)
             elif (run.get("status") != "completed" or
                   run.get("conclusion") not in ("success", "neutral")):
                 pending.append(name)
@@ -659,6 +690,8 @@ def head_checks_state(repo: str, sha: str) -> tuple[str, str]:
                 pending.append(name)
         if red:
             return "red", ", ".join(red[:5])
+        if infra_unavailable:
+            return "infra_unavailable", ", ".join(infra_unavailable[:5])
         if pending:
             return "pending", ", ".join(pending[:5])
         return ("green" if any(run.get("conclusion") != "skipped"
