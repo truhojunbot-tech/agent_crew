@@ -8603,7 +8603,9 @@ def create_app(
         cloud_implement = (task.task_type == "implement" and task.branch and
                            (ctx.get("agent_override") or _DISPATCH_ROLE_TO_AGENT.get("implementer"))
                            == _claude_cloud.CLOUD_PROVIDER_NAME)
-        repo = (_repo_slug(str(ctx.get("repo") or "")) or get_repo()) if (
+        worktree = _any_worktree_path()
+        repo = (_repo_slug(str(ctx.get("repo") or ""))
+                or (_repo_slug(get_repo(cwd=worktree)) if worktree else "")) if (
             ctx.get("artifact_kind") == "rebase" or is_rebase_directive or cloud_implement
         ) else ""
         def _open_pr() -> Optional[int]:
