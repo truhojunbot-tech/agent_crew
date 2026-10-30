@@ -61,11 +61,12 @@ def test_review_prompt_names_observed_comment_channel_and_finding_rules(queue):
     assert "path:line" in prompt
     assert "No other keys or text" in prompt
     assert "line number" in prompt
-    with pytest.raises(ValueError, match="missing or has extra text"):
-        cloud.parse_cloud_review_comment(
-            _comment() + "\n- Tests run: 35 passed",
-            task_id="review-712", reviewed_sha=SHA, pr_number=PR,
-        )
+    result = cloud.parse_cloud_review_comment(
+        _comment() + "\n- Tests run: 35 passed",
+        task_id="review-712", reviewed_sha=SHA, pr_number=PR,
+    )
+    assert result.verdict == "approve"
+    assert result.findings == []
 
 
 @pytest.mark.parametrize("verdict,findings", [

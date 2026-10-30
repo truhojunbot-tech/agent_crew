@@ -1633,8 +1633,21 @@ class CloudReconciliationOutcome:
     detail: str = ""
 
 
-_REVIEW_BLOCK_RE = re.compile(r"\A<!-- agent_crew:cloud-review (\{.*\}) -->\Z", re.DOTALL)
+_REVIEW_MARKER_PREFIX = "<!-- agent_crew:cloud-review "
+_REVIEW_BLOCK_RE = re.compile(r"\A<!-- agent_crew:cloud-review (\{[^\r\n]*\}) -->\Z")
 _REVIEW_FINDING_RE = re.compile(r"\A(HIGH|MED|LOW) ([^\s:]+):([1-9]\d*) - (.+)\Z")
+
+
+def _cloud_review_marker(body: str):
+    """Read the sole first-line marker; trailing platform text has no authority."""
+    stripped = body.strip()
+    if stripped.count(_REVIEW_MARKER_PREFIX) != 1:
+        raise ValueError("cloud review JSON block is missing or duplicated")
+    first_line = stripped.splitlines()[0]
+    marker = _REVIEW_BLOCK_RE.fullmatch(first_line)
+    if marker is None:
+        raise ValueError("cloud review JSON block is missing or has leading text")
+    return marker
 
 
 def _cloud_review_bodies_for_task(comments, task_id: str) -> list[str]:
@@ -1642,18 +1655,17 @@ def _cloud_review_bodies_for_task(comments, task_id: str) -> list[str]:
     matches = []
     for row in comments:
         body = str(row.get("body") or "") if isinstance(row, dict) else ""
-        if "<!-- agent_crew:cloud-review " not in body:
+        if _REVIEW_MARKER_PREFIX not in body:
             continue
-        marker = _REVIEW_BLOCK_RE.fullmatch(body.strip())
-        if marker is not None:
-            try:
-                record = json.loads(marker.group(1))
-            except (TypeError, ValueError):
-                record = None
-            if isinstance(record, dict) and "task_id" in record:
-                if record["task_id"] == task_id:
-                    matches.append(body)
-                continue
+        try:
+            marker = _cloud_review_marker(body)
+            record = json.loads(marker.group(1))
+        except (TypeError, ValueError):
+            record = None
+        if isinstance(record, dict) and "task_id" in record:
+            if record["task_id"] == task_id:
+                matches.append(body)
+            continue
         # A damaged marker naming this task must be rejected promptly rather
         # than waiting until the cloud stale timeout. The strict parser below
         # still owns all schema and identity validation.
@@ -1665,9 +1677,7 @@ def _cloud_review_bodies_for_task(comments, task_id: str) -> list[str]:
 def parse_cloud_review_comment(body: str, *, task_id: str, reviewed_sha: str,
                                pr_number: int) -> TaskResult:
     """Parse only the pinned JSON marker; prose cannot supply a verdict."""
-    match = _REVIEW_BLOCK_RE.fullmatch(body.strip())
-    if match is None:
-        raise ValueError("cloud review JSON block is missing or has extra text")
+    match = _cloud_review_marker(body)
 
     def unique_object(pairs):
         record = {}
