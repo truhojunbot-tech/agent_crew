@@ -16,7 +16,8 @@ def _pr():
 
 
 def _approval():
-    return [{"body": f"{gate.REVIEW} ✅ approve\nReviewed PR at {HEAD}",
+    return [{"body": (f"{gate.REVIEW} ✅ approve\nReviewed PR at {HEAD}\n"
+                     f"> reviewed head: {HEAD}\n> reviewer: codex | task: review-831"),
              "author_association": "OWNER", "created_at": "2026-10-25T00:00:00Z",
              "id": 1}]
 
