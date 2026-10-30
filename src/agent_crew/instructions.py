@@ -13,7 +13,11 @@ logger = logging.getLogger(__name__)
 
 def _base_role_addendum(worktree_path: str, role: str, base_branch: str = "") -> str | None:
     """Read role rules from the fetched base, never from the PR checkout."""
-    base = base_branch or remote_default_branch(worktree_path)
+    try:
+        base = base_branch or remote_default_branch(worktree_path)
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("Could not resolve default base branch in %s", worktree_path)
+        return None
     if not base:
         return None
     ref = f"refs/remotes/origin/{base}"

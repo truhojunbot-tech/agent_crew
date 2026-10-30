@@ -549,14 +549,12 @@ def _ensure_role_protocol(
             base_branch=base_branch,
         )
     except Exception:
-        logger.exception(
-            "dispatcher: could not regenerate missing protocol for role=%s worktree=%s",
-            role, worktree_path,
-        )
-        return False
+        logger.exception("dispatcher: could not regenerate protocol for role=%s worktree=%s",
+                         role, worktree_path)
+        return existed
     if not os.path.isfile(created):
         logger.error("dispatcher: protocol write returned missing path %s", created)
-        return False
+        return existed
     if not existed:
         logger.warning("dispatcher: regenerated missing %s protocol at %s (#353)", role, created)
     return True
@@ -6228,7 +6226,8 @@ def create_app(
             _lock_stack.close()
             return
 
-        if not _ensure_role_protocol(
+        if not await asyncio.to_thread(
+            _ensure_role_protocol,
             role, wt, _project, os.path.join(os.path.dirname(db_path), "port"), agent=agent, port=port,
             base_branch=str((task.context or {}).get("base_branch") or ""),
         ):
@@ -7257,7 +7256,8 @@ def create_app(
                         if not _wt:
                             continue
                         _agent = _DISPATCH_ROLE_TO_AGENT.get(_r, "")
-                        instructions.write(
+                        await asyncio.to_thread(
+                            instructions.write,
                             _r, _wt, _proj, _port_file,
                             agent=_agent, delivery="dispatcher",
                             base_branch=str((task.context or {}).get("base_branch") or ""),

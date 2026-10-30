@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 import subprocess
+import inspect
 
 import pytest
 from fastapi.testclient import TestClient
@@ -150,6 +151,38 @@ def test_dispatch_regenerates_existing_protocol_for_task_base(tmp_path):
     body = (worktree / "AGENTS.md").read_text()
     assert "DEV RULE" in body
     assert "MAIN RULE" not in body
+
+
+def test_dispatch_protocol_io_is_off_event_loop():
+    import agent_crew.server as server
+    source = inspect.getsource(server.create_app)
+    assert "await asyncio.to_thread(\n            _ensure_role_protocol" in source
+    assert "await asyncio.to_thread(\n                            instructions.write" in source
+
+
+def test_existing_protocol_survives_regeneration_error(tmp_path, monkeypatch):
+    from agent_crew import server
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    protocol = worktree / "AGENTS.md"
+    protocol.write_text("existing protocol\n")
+    monkeypatch.setattr(instructions, "write", lambda *a, **k: (_ for _ in ()).throw(
+        subprocess.TimeoutExpired("git fetch", 30)))
+    assert server._ensure_role_protocol("reviewer", str(worktree), "proj",
+                                        _port_file(tmp_path), agent="codex")
+    assert protocol.read_text() == "existing protocol\n"
+
+
+def test_default_branch_probe_timeout_does_not_abort_generation(tmp_path, monkeypatch):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    monkeypatch.setattr(instructions, "remote_default_branch",
+                        lambda *_a: (_ for _ in ()).throw(
+                            subprocess.TimeoutExpired("git default branch", 30)))
+    baseline = instructions.generate("reviewer", "proj", 9123,
+                                     agent="codex", delivery="dispatcher")
+    assert instructions.generate("reviewer", "proj", 9123, agent="codex",
+                                 delivery="dispatcher", worktree_path=str(worktree)) == baseline
 
 
 @pytest.mark.parametrize("agent,filename", [
