@@ -33,7 +33,8 @@ def test_unknown_key_refused_and_known_key_accepted(tmp_db):
     bad = _post(app, _payload("unknown", {"reviwed_sha": "a" * 40}))
     assert bad.status_code == 422
     assert bad.json()["detail"] == "unknown_context_key:reviwed_sha"
-    good = _post(app, _payload("known", {"reviewed_sha": "a" * 40}))
+    good = _post(app, _payload("known", {"reviewed_sha": "a" * 40,
+                                        "labels": ["P1", "bug"]}))
     assert good.status_code == 201, good.text
 
 
@@ -93,9 +94,26 @@ def test_internal_context_writers_are_allowlisted():
     """Literal writes to context dictionaries must be reflected in admission."""
     root = Path(__file__).resolve().parents[2] / "src" / "agent_crew"
     written = set()
+
+    def literal_keys(node):
+        if isinstance(node, ast.Dict):
+            return {key.value for key in node.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+        return set()
+
     for source in root.rglob("*.py"):
         tree = ast.parse(source.read_text())
         for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                if any(isinstance(target, ast.Name)
+                       and ("ctx" in target.id.lower() or "context" in target.id.lower())
+                       for target in node.targets):
+                    written.update(literal_keys(node.value))
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if "ctx" in node.target.id.lower() or "context" in node.target.id.lower():
+                    written.update(literal_keys(node.value))
+            if isinstance(node, ast.keyword) and node.arg == "context":
+                written.update(literal_keys(node.value))
             if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
                 if (isinstance(node.value, ast.Name)
                         and ("ctx" in node.value.id or "context" in node.value.id)

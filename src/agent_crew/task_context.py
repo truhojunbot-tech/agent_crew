@@ -126,6 +126,7 @@ TASK_CONTEXT_KEYS = frozenset({
     'issue_number',
     'issue_title',
     'issue_url',
+    'labels',
     'lineage_root_task_id',
     'lineage_terminal_reason',
     'modules',
