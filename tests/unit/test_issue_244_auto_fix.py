@@ -365,11 +365,13 @@ def _post_review_result(client, review_id, **kw):
 
 
 def _enqueue_review(client, review_id, context=None):
-    review_context = {"repo": "owner/repo", "cloud_review_comment_confirmed": True,
+    review_context = {"repo": "owner/repo", "pr_number": 244,
+                      "reviewed_sha": "a" * 40,
                       **(context or {})}
     return client.post("/tasks", json={
         "task_id": review_id, "task_type": "review", "description": "review",
         "branch": BRANCH, "priority": 3, "context": review_context,
+        "pr_number": 244,
         "project": ""})
 
 

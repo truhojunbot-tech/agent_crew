@@ -8,6 +8,8 @@ agents whose shell wrappers strip git's credential helper chain (gemini-
 cli most notably) can still ``git fetch`` against PR branches.
 """
 import json
+import io
+import urllib.error
 from unittest.mock import patch, MagicMock
 
 from click.testing import CliRunner
@@ -113,6 +115,23 @@ def test_b187_enqueue_test_type(tmp_path):
     assert captured["body"]["context"]["prev_task_id"] == "review-x"
     assert captured["body"]["pr_number"] == 1666
     assert captured["body"]["context"]["reviewed_sha"] == "a" * 40
+
+
+def test_b187_enqueue_surfaces_server_context_422(tmp_path):
+    state_dir = tmp_path / "proj"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(json.dumps({
+        "db": str(state_dir / "tasks.db"), "port": 9999}))
+    error = urllib.error.HTTPError(
+        "http://127.0.0.1:9999/tasks", 422, "Unprocessable Entity", {},
+        io.BytesIO(b'{"detail":"unknown_context_key:typo"}'))
+    with patch("agent_crew.cli._verify_project_server"), \
+         patch("urllib.request.urlopen", side_effect=error):
+        result = CliRunner().invoke(cli.crew, [
+            "enqueue", "implement", "work", "--project", "proj",
+            "--base", str(tmp_path), "--risk-tier", "1"])
+    assert result.exit_code != 0
+    assert "unknown_context_key:typo" in result.output
 
 
 def test_review_enqueue_requires_explicit_pr_and_full_head(tmp_path):

@@ -53,6 +53,7 @@ from agent_crew.context_identity import (
 from agent_crew.failure_kind import FailureKind, failure_kind, provider_failure_from_log
 from agent_crew import tokenomics_canary as _canary
 from agent_crew.github import get_repo, _repo_slug
+from agent_crew.task_context import TASK_CONTEXT_KEYS
 from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.pipeline import (
     requeue_review_at_head as _pipeline_requeue_review_at_head,
@@ -3356,6 +3357,25 @@ def notify_lineage_end(queue: TaskQueue, task_id: str, *,
               f"{'test not run (provider) ' if provider_not_run else ''}"
               f"summary={(task.summary or '')[:300]}")
     coordinator_notice_once(queue, task_id, "lineage_end", detail, notify_fn)
+
+
+def _task_context_default_branch(repo: str) -> str:
+    """Resolve the named repository's default for public task admission."""
+    from agent_crew.pipeline import _repo_default_branch
+    return _repo_default_branch(repo)
+
+
+def _task_context_open_pr(branch: str, repo: str) -> Optional[int]:
+    """Look up an open PR by branch; errors stay distinct from no open PR."""
+    result = subprocess.run(
+        ["gh", "pr", "list", "--repo", repo, "--head", branch,
+         "--state", "open", "--json", "number", "--limit", "1"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("open PR lookup failed")
+    rows = json.loads(result.stdout or "[]")
+    return int(rows[0]["number"]) if rows else None
 
 
 def create_app(
@@ -8572,6 +8592,46 @@ def create_app(
                      (not _dispatcher_enabled and bool(pane_map and pane_map.get(agent)))))
 
         ctx = task.context if isinstance(task.context, dict) else {}
+        unknown = sorted(set(ctx) - TASK_CONTEXT_KEYS)
+        if unknown:
+            raise HTTPException(status_code=422, detail=f"unknown_context_key:{unknown[0]}")
+        if (ctx.get("directive") or ctx.get("op")) and not ctx.get("external_operation_id"):
+            raise HTTPException(status_code=422, detail="directive requires external_operation_id")
+        is_rebase_directive = (task.task_type == "implement" and
+                               (str(ctx.get("directive") or ctx.get("op") or "").lower() == "rebase"
+                                or bool(re.match(r"\s*rebase\b", task.description, re.IGNORECASE))))
+        cloud_implement = (task.task_type == "implement" and task.branch and
+                           (ctx.get("agent_override") or _DISPATCH_ROLE_TO_AGENT.get("implementer"))
+                           == _claude_cloud.CLOUD_PROVIDER_NAME)
+        repo = (_repo_slug(str(ctx.get("repo") or "")) or get_repo()) if (
+            ctx.get("artifact_kind") == "rebase" or is_rebase_directive or cloud_implement
+        ) else ""
+        def _open_pr() -> Optional[int]:
+            if not repo:
+                raise HTTPException(status_code=422, detail="repo required for PR branch validation")
+            try:
+                return _task_context_open_pr(task.branch, repo)
+            except (OSError, subprocess.TimeoutExpired, RuntimeError,
+                    ValueError, KeyError, TypeError) as exc:
+                raise HTTPException(status_code=422, detail="open_pr_lookup_unavailable") from exc
+        if ctx.get("artifact_kind") == "rebase" or is_rebase_directive:
+            # A plain implement mentioning rebase is a round only when its
+            # branch already has an open PR. A declared rebase always is one.
+            if ctx.get("artifact_kind") == "rebase" or (task.branch and _open_pr()):
+                default_branch = _task_context_default_branch(repo) if repo else ""
+                if not default_branch or ctx.get("rebase_onto") != default_branch:
+                    raise HTTPException(status_code=422, detail=(
+                        f"rebase_onto must equal repo default branch {default_branch or '(unresolved)'}"))
+        if cloud_implement:
+            open_pr = _open_pr()
+            if open_pr is not None:
+                field_pr = normalize_pr_number(task.pr_number)
+                context_pr = normalize_pr_number(ctx.get("pr_number"))
+                if ((field_pr is None and context_pr is None)
+                        or (task.pr_number is not None and field_pr != open_pr)
+                        or (ctx.get("pr_number") is not None and context_pr != open_pr)):
+                    raise HTTPException(status_code=422, detail=(
+                        f"claude_cloud continuation requires matching pr_number:{open_pr}"))
         if task.task_type in {"review", "test"}:
             # Pipeline successors are built in-process. An external PR review
             # or test must identify the PR before admission. The dispatcher

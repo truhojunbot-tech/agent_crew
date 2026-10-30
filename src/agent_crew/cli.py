@@ -4140,6 +4140,7 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
             --reviewed-sha <full-head-sha> --prev-task-id review-... --risk-tier 1
     """
     import uuid as _uuid
+    import urllib.error as _urllib_err
     import urllib.request as _urllib_req
 
     if not db:
@@ -4236,6 +4237,13 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
                     raise click.ClickException(
                         f"POST /tasks failed: HTTP {resp.status}"
                     )
+        except _urllib_err.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read().decode()).get("detail", str(exc))
+            except (ValueError, UnicodeDecodeError):
+                detail = str(exc)
+            raise click.ClickException(
+                f"POST /tasks rejected (HTTP {exc.code}): {detail}") from exc
         except Exception as exc:
             raise click.ClickException(f"POST /tasks failed: {exc}") from exc
     else:
