@@ -43,7 +43,7 @@ REPO = SCRIPT_DIR.parent
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("project")
     parser.add_argument("sha")
     parser.add_argument("step", choices=("preflight", "go", "post"))

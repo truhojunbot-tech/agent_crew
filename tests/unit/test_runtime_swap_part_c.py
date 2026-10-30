@@ -26,6 +26,14 @@ def test_non_go_steps_ignore_free_form_receipt_actor(monkeypatch, step):
     assert args.actor == "hojun@host"
 
 
+def test_go_rejects_abbreviated_actor_option(monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_SWAP_ACTOR", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        runtime_swap.parse_args(["demo", "a" * 40, "go", "--decision-id", "T0-1",
+                                 "--act", "hojun"])
+    assert exc.value.code == 2
+
+
 def test_explicit_actor_reaches_signed_verifier(tmp_path, monkeypatch):
     sha = "a" * 40
     snapshot = write_snapshot(tmp_path, principals=("owner:hojun",),
