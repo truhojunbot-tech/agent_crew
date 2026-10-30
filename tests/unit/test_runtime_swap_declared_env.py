@@ -1,6 +1,7 @@
 """#940: only declared project files can supply the next server environment."""
 
 import json
+import os
 
 import pytest
 
@@ -16,6 +17,10 @@ def test_launch_env_uses_invoker_base_and_declared_files_only(tmp_path, monkeypa
     monkeypatch.setenv("USER", "worker")
     monkeypatch.setenv("PATH", "/bin")
     monkeypatch.setenv("LANG", "C.UTF-8")
+    monkeypatch.delenv("LOGNAME", raising=False)
+    for key in list(os.environ):
+        if key.startswith("LC_"):
+            monkeypatch.delenv(key)
     monkeypatch.setenv("UNDECLARED_SECRET", "must-not-launch")
 
     env = spawn_from_env.launch_env(fleet, cea, tmp_path / "src")
@@ -26,6 +31,34 @@ def test_launch_env_uses_invoker_base_and_declared_files_only(tmp_path, monkeypa
         "CUSTOM": "declared-secret", "AGENT_CREW_CEA_MODE": "shadow",
         "PYTHONPATH": str(tmp_path / "src"),
     }
+
+
+def test_launch_env_accepts_missing_optional_base_keys(tmp_path, monkeypatch):
+    fleet = tmp_path / "fleet.env"
+    fleet.write_text("")
+    cea = tmp_path / "cea.env"
+    cea.write_text("AGENT_CREW_CEA_MODE=shadow\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "/bin")
+    for key in ("USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE"):
+        monkeypatch.delenv(key, raising=False)
+    env = spawn_from_env.launch_env(fleet, cea, tmp_path / "src")
+    assert env == {"HOME": str(tmp_path), "PATH": "/bin", "PYTHONPATH": str(tmp_path / "src"),
+                   "AGENT_CREW_CEA_MODE": "shadow"}
+
+
+def test_launch_env_copies_optional_locale_keys_when_present(tmp_path, monkeypatch):
+    fleet = tmp_path / "fleet.env"
+    fleet.write_text("")
+    cea = tmp_path / "cea.env"
+    cea.write_text("AGENT_CREW_CEA_MODE=shadow\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "/bin")
+    monkeypatch.setenv("LOGNAME", "operator")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    env = spawn_from_env.launch_env(fleet, cea, tmp_path / "src")
+    assert env["LOGNAME"] == "operator"
+    assert env["LC_ALL"] == "C.UTF-8"
 
 
 def test_missing_fleet_and_foreign_cea_refuse(tmp_path, monkeypatch):
