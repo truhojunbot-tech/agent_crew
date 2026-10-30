@@ -1766,7 +1766,10 @@ class TaskQueue:
                 continue
             conn.execute("UPDATE gates SET kind = ?, target_task_id = ? WHERE id = ?",
                          (kind, target, gate_id))
-        conn.execute("INSERT INTO task_metadata_migrations (name) VALUES (?)", (marker,))
+        # Another initializer can finish the same idempotent backfill after
+        # our marker read. Treat its committed claim as success.
+        conn.execute("INSERT OR IGNORE INTO task_metadata_migrations (name) VALUES (?)",
+                     (marker,))
 
     def _connect(self) -> sqlite3.Connection:
         # sqlite3's timeout parameter installs a 10,000 ms busy_timeout on

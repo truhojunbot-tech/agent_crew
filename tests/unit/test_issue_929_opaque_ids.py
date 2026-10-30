@@ -93,6 +93,53 @@ def test_legacy_gate_table_gets_kind_and_target_columns(tmp_path):
     assert (gate.kind, gate.target_task_id) == ("review", "impl-old")
 
 
+def test_concurrent_init_marker_claim_is_idempotent(tmp_path, monkeypatch):
+    """A second initializer can finish after the first has checked the marker."""
+    db = str(tmp_path / "tasks.db")
+    TaskQueue(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM task_metadata_migrations WHERE name = 'opaque_task_ids_v1'")
+
+    original_connect = TaskQueue._connect
+    overlap_done = False
+
+    class MarkerCursor:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        def fetchone(self):
+            nonlocal overlap_done
+            row = self.cursor.fetchone()
+            if row is None and not overlap_done:
+                overlap_done = True
+                # The other initializer commits between this one's SELECT
+                # and its marker INSERT. No live database is involved.
+                with sqlite3.connect(db) as other:
+                    TaskQueue._backfill_legacy_task_metadata(other)
+            return row
+
+    class OverlappingConnection:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def execute(self, sql, *args):
+            cursor = self.conn.execute(sql, *args)
+            if sql.startswith("SELECT 1 FROM task_metadata_migrations"):
+                return MarkerCursor(cursor)
+            return cursor
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+    monkeypatch.setattr(TaskQueue, "_connect",
+                        lambda self: OverlappingConnection(original_connect(self)))
+    TaskQueue(db)
+    assert overlap_done
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_metadata_migrations WHERE name = ?",
+                            ("opaque_task_ids_v1",)).fetchone()[0] == 1
+
+
 @pytest.mark.parametrize("ingress,context", [
     ("cascade.fix", {"prev_task_id": "review-x"}),
     ("retry.failed_task", {"original_task_id": "impl-x"}),
