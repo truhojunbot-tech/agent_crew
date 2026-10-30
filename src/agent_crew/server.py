@@ -3315,10 +3315,8 @@ def notify_lineage_end(queue: TaskQueue, task_id: str, *,
     if task is None or task.status not in ("completed", "needs_human", "failed", "cancelled"):
         return
     # A retry or a previously inserted successor still continues the lineage.
-    for child in queue.list_tasks():
-        child_ctx = child.context if isinstance(child.context, dict) else {}
-        if child_ctx.get("prev_task_id") == task_id or child_ctx.get("original_task_id") == task_id:
-            return
+    if queue.has_successor(task_id):
+        return
     ctx = task.context if isinstance(task.context, dict) else {}
     # #914 already claimed a durable notice for this refused successor.
     # Sending lineage_end as well would wake the coordinator twice for one end.
@@ -9169,13 +9167,6 @@ def create_app(
                         task_id,
                     )
             logger.info(f"POST /tasks/{task_id}/result: marked done, task_type={task_type}")
-            if (task_type == "test" and result.status == "needs_human"
-                    and isinstance(result.error_info, dict)
-                    and result.error_info.get("reason") in {
-                        "config_error", "script_test_timeout", "script_test_rerun_limit",
-                        "script_test_rerun_unavailable", "script_test_rerun_unjudged",
-                    }):
-                _coordinator_notice(task_id, result.error_info["reason"], result.summary)
             if _prior in _LATE_RESULT_STATUSES and result.status != _prior:
                 logger.warning(
                     f"POST /tasks/{task_id}/result: LATE RESULT — this task was "
