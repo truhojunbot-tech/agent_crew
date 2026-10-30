@@ -52,24 +52,24 @@ def test_main_skips_fork_before_reading_comments_or_fetching_code(tmp_path, monk
     assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 0
 
 
-def test_stale_approval_is_normal_skip(tmp_path, monkeypatch, capsys):
+def test_stale_structured_approval_is_unbound(tmp_path, monkeypatch, capsys):
     pr = _pr(7, HEAD)
     comments = [_approved(7, OLD)]
     assert not gate.needs_gate(pr, comments)
-    assert not gate.unbound_approval(pr, comments)
+    assert gate.unbound_approval(pr, comments)
     monkeypatch.setattr(gate, "_api_list", lambda endpoint:
                         [pr] if "/pulls?" in endpoint else comments)
-    assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 0
-    assert not capsys.readouterr().err
+    assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 1
+    assert "approval_unbound" in capsys.readouterr().err
 
 
 def test_selects_latest_approval_only_for_current_head():
     pr = _pr(7, HEAD)
-    comments = [_comment(f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #7 at {OLD}: approve.", 1)]
+    comments = [_approved(7, OLD)]
     assert not gate.needs_gate(pr, comments)
     comments.append(_comment(f"[agent_crew review] verdict: 🔄 request_changes\n**Summary:** PR #7 at {HEAD}: request_changes.", 2))
     assert not gate.needs_gate(pr, comments)
-    comments.append(_comment(f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #7 at {HEAD}: approve.", 3))
+    comments.append({**_approved(7, HEAD), "id": 3, "created_at": "2026-01-01T00:00:03Z"})
     assert gate.needs_gate(pr, comments)
     comments.append(_comment(f"[agent_crew premerge gate]\nHEAD {HEAD}\nMAIN {MAIN}\nEXIT 0", 4))
     assert not gate.needs_gate(pr, comments)
@@ -77,10 +77,50 @@ def test_selects_latest_approval_only_for_current_head():
 
 def test_review_summary_short_sha_matches_current_head_only():
     pr = _pr(7, HEAD)
-    assert gate.needs_gate(pr, [_comment(
+    assert not gate.needs_gate(pr, [_comment(
         f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #7 at {HEAD[:7]}: approve.", 1)])
     assert not gate.needs_gate(pr, [_comment(
         f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #7 at {OLD[:7]}: approve.", 1)])
+
+
+def test_structured_review_head_binds_independent_of_summary():
+    pr = _pr(7, HEAD)
+    assert gate.needs_gate(pr, [_comment(
+        f"[agent_crew review] verdict: ✅ approve\n\n**Summary:** PR #7 @ {OLD[:7]} approve\n\n"
+        f"> reviewed head: {HEAD}\n> reviewer: codex | task: review-7", 1)])
+    assert gate.needs_gate(pr, [_comment(
+        f"[agent_crew review] verdict: ✅ approve\n\n**Summary:** approved\n\n"
+        f"> reviewed head: {HEAD}\n> reviewer: codex | task: review-7", 1)])
+    assert not gate.needs_gate(pr, [_comment(
+        f"[agent_crew review] verdict: ✅ approve\n\n**Summary:** approved\n\n"
+        f"> reviewed head: {OLD}\n> reviewer: codex | task: review-7", 1)])
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_unbound_approval_posts_one_blocker_per_head(tmp_path, monkeypatch, structured):
+    pr = _pr(7, HEAD)
+    comments = [_comment(
+        f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #7 at {HEAD[:7]} approve"
+        + (f"\n> reviewed head: {OLD}\n> reviewer: codex | task: review-7"
+           if structured else ""), 1)]
+    monkeypatch.setattr(gate, "_api_list", lambda endpoint:
+                        [pr] if "/pulls?" in endpoint else comments)
+    delivered = []
+    monkeypatch.setattr(gate, "post_blackboard", lambda _command, payload:
+                        delivered.append(payload))
+
+    def checked(args, **_kwargs):
+        if args[:3] == ["gh", "pr", "comment"]:
+            comments.append(_comment(args[args.index("--body") + 1], len(comments) + 1))
+        return ""
+
+    monkeypatch.setattr(gate, "checked", checked)
+    opts = ["--lock-file", str(tmp_path / "lock"), "--blackboard-command", "bb post"]
+    assert gate.main(opts) == 1
+    assert delivered == [{"repo": gate.REPO, "pr_number": 7,
+                          "head_sha": HEAD, "reason": "approval_unbound"}]
+    assert gate.main(opts) == 1
+    assert len(delivered) == 1
 
 
 def test_lock_refuses_second_run(tmp_path):
@@ -121,7 +161,7 @@ def test_run_gate_uses_temporary_worktree_and_cleans_up(tmp_path, monkeypatch):
         if args[:2] == ["gh", "api"] and args[2].startswith("repos/truhojunbot-tech/agent_crew/pulls?"):
             return SimpleNamespace(returncode=0, stdout=json.dumps([_pr(7, HEAD)]), stderr="")
         if args[:2] == ["gh", "api"] and args[2].startswith("repos/truhojunbot-tech/agent_crew/issues/7/comments?"):
-            return SimpleNamespace(returncode=0, stdout=json.dumps([_comment(f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #7 at {HEAD}: approve.", 1)]), stderr="")
+            return SimpleNamespace(returncode=0, stdout=json.dumps([_approved(7, HEAD)]), stderr="")
         if args == ["git", "rev-parse", "origin/main"]:
             return SimpleNamespace(returncode=0, stdout=MAIN + "\n", stderr="")
         if args == ["git", "rev-parse", "FETCH_HEAD"]:
@@ -138,7 +178,9 @@ def test_run_gate_uses_temporary_worktree_and_cleans_up(tmp_path, monkeypatch):
 
 
 def _approved(number, sha):
-    return _comment(f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #{number} at {sha[:7]}: approve.", 1)
+    return _comment(f"[agent_crew review] verdict: ✅ approve\n\n"
+                    f"**Summary:** PR #{number} at {sha[:7]}: approve.\n\n"
+                    f"> reviewed head: {sha}\n> reviewer: codex | task: review-{number}", 1)
 
 
 def test_one_pr_error_does_not_block_later_approved_pr(tmp_path, monkeypatch, capsys):

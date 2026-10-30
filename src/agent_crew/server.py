@@ -9611,6 +9611,7 @@ def create_app(
                                 summary=result.summary or "",
                                 findings=result.findings or [],
                                 files_reviewed=result.files_reviewed,
+                                reviewed_head_sha=getattr(_pub, "reviewed_head_sha", ""),
                                 task_id=task_id,
                                 reviewer=_reviewer_agent,
                                 repo=_review_repo,

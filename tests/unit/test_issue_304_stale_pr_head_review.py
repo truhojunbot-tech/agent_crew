@@ -136,6 +136,7 @@ def test_a_current_review_is_published():
     decision = review_publication_decision(_ctx(), 5652, head_sha_fn=_head(PINNED))
     assert decision.publish is True
     assert decision.requeue_head == ""
+    assert decision.reviewed_head_sha == PINNED
 
 
 def test_a_stale_review_is_not_published():
@@ -281,6 +282,7 @@ def test_a_current_verdict_is_still_posted(tmp_db, monkeypatch, *, unused_tcp_po
     posted, _ = _submit_review(tmp_db, monkeypatch, PINNED, unused_tcp_port=unused_tcp_port)
     assert len(posted) == 1
     assert posted[0]["pr_number"] == 5652
+    assert posted[0]["reviewed_head_sha"] == PINNED
 
 
 def test_the_suppression_is_recorded_on_the_task(tmp_db, monkeypatch, *, unused_tcp_port):
