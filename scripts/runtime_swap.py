@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Repo-owned, evidence-gated crew runtime swap. Never changes live STOP state.
 
-Usage: runtime_swap.sh PROJECT FULL_SHA preflight|go|post
-Set AGENT_CREW_SWAP_CEA_ENV_FILE to a private KEY=VAL file. A rollback uses
+Usage: runtime_swap.sh PROJECT FULL_SHA preflight|go|post [--accept-env-diff KEY[,KEY]]
+Use the project's private fleet.env and cea.env files. A rollback uses
 this same command with the previous full SHA after a healthy swap. For recovery
 after a failed relaunch, see docs/runtime_swap.md. No SIGKILL.
 """
@@ -29,9 +29,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from agent_crew.cea_launch import parse_env_file, resolve_cea_file
 if __package__:
-    from .spawn_from_env import parse_env
+    from .spawn_from_env import launch_env, parse_env
 else:
-    from spawn_from_env import parse_env
+    from spawn_from_env import launch_env, parse_env
 
 SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 PROJECT = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
@@ -44,12 +44,42 @@ def parse_args(argv=None):
     parser.add_argument("project")
     parser.add_argument("sha")
     parser.add_argument("step", choices=("preflight", "go", "post"))
+    parser.add_argument("--accept-env-diff", default="", metavar="KEY[,KEY]")
     args = parser.parse_args(argv)
     if not PROJECT.fullmatch(args.project):
         parser.error("project must be a simple name")
     if not SHA.fullmatch(args.sha):
         parser.error("sha must be a full lowercase git object ID")
+    names = args.accept_env_diff.split(",") if args.accept_env_diff else []
+    if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in names):
+        parser.error("--accept-env-diff needs comma-separated key names")
+    args.accept_env_diff = set(names)
     return args
+
+
+def project_env_files(directory: Path) -> tuple[Path, Path]:
+    fleet_file = directory / "fleet.env"
+    if not fleet_file.is_file() or fleet_file.resolve() != directory.resolve() / "fleet.env":
+        raise RuntimeError("fleet.env missing for project")
+    cea_file = resolve_cea_file(directory)
+    if cea_file.resolve() != directory.resolve() / "cea.env":
+        raise RuntimeError("CEA env must be project-local cea.env")
+    if not cea_file.is_file():
+        raise RuntimeError("project-local cea.env missing")
+    return fleet_file, cea_file
+
+
+def check_env_diff(live_raw: bytes, declared: dict[str, str], evidence: Path,
+                   accepted: set[str]) -> None:
+    live_names = set(parse_env(complete_environ(live_raw)))
+    declared_names = set(declared)
+    diff = {"live_but_undeclared": sorted(live_names - declared_names),
+            "declared_but_not_live": sorted(declared_names - live_names)}
+    write_json(evidence / "env_diff.json", diff)
+    names = (live_names - declared_names) | (declared_names - live_names)
+    if names != accepted:
+        raise RuntimeError("env diff requires --accept-env-diff naming exactly: "
+                           + ", ".join(sorted(names)))
 
 
 def run(*args: str) -> str:
@@ -128,6 +158,11 @@ def complete_environ(raw: bytes) -> bytes:
     if not raw or not raw.endswith(b"\0"):
         raise RuntimeError("captured environment missing or incomplete")
     return raw
+
+
+def read_live_environ(pid: int) -> bytes:
+    """Capture only for comparison and recovery source discovery."""
+    return complete_environ((Path("/proc") / str(pid) / "environ").read_bytes())
 
 
 def counts(db_path: Path) -> list[tuple[str, int]]:
@@ -277,9 +312,7 @@ def main(argv=None) -> int:
         raise RuntimeError("DB path escapes project directory")
     checkout = home / "alfred" / "runtime" / f"agent_crew-{args.sha[:7]}"
     evidence = home / ".sev0-evidence" / f"crew-swap-{args.project}-{args.sha[:7]}"
-    cea_file = resolve_cea_file(directory)
-    if not cea_file.is_file():
-        raise RuntimeError(f"CEA env file missing: {cea_file}")
+    fleet_file, cea_file = project_env_files(directory)
     cea_env = parse_env_file(cea_file)
     if args.step in ("preflight", "go"):
         enter_client_group(cea_env.get("AGENT_CREW_CEA_BROKER_SOCKET", ""),
@@ -309,16 +342,20 @@ def main(argv=None) -> int:
     evidence.mkdir(exist_ok=True)
     evidence.chmod(0o700)
     if args.step == "preflight":
-        (evidence / "env.pre.nul").write_bytes(
-            complete_environ((Path("/proc") / str(pid) / "environ").read_bytes()))
+        captured = read_live_environ(pid)
+        (evidence / "env.pre.nul").write_bytes(captured)
         (evidence / "env.pre.nul").chmod(0o600)
+        check_env_diff(captured, launch_env(fleet_file, cea_file, checkout / "src"),
+                       evidence, args.accept_env_diff)
         subprocess.run([sys.executable, str(SCRIPT_DIR / "spawn_from_env.py"), "--probe-broker",
-                        str(evidence / "env.pre.nul"), str(cea_file), str(checkout / "src")], check=True)
+                        str(fleet_file), str(cea_file), str(checkout / "src")], check=True)
         (evidence / "cmdline.pre.nul").write_bytes((Path("/proc") / str(pid) / "cmdline").read_bytes())
         (evidence / "cwd.pre").write_text(os.readlink(Path("/proc") / str(pid) / "cwd"))
         write_json(evidence / "health.pre.json", health)
         write_json(evidence / "preflight.json", {"sha": args.sha, "project": args.project,
                                                  "pid": pid, "port": port,
+                                                 "fleet_sha256": hashlib.sha256(fleet_file.read_bytes()).hexdigest(),
+                                                 "cea_sha256": hashlib.sha256(cea_file.read_bytes()).hexdigest(),
                                                  "at": datetime.now(timezone.utc).isoformat()})
         print(f"PREFLIGHT_OK evidence={evidence}")
         return 0
@@ -328,12 +365,25 @@ def main(argv=None) -> int:
     if args.step == "go":
         if preflight["pid"] != pid:
             raise RuntimeError("listener changed since preflight")
+        if (preflight.get("fleet_sha256") and
+                hashlib.sha256(fleet_file.read_bytes()).hexdigest() != preflight["fleet_sha256"]):
+            raise RuntimeError("fleet.env changed since preflight")
+        if (preflight.get("cea_sha256") and
+                hashlib.sha256(cea_file.read_bytes()).hexdigest() != preflight["cea_sha256"]):
+            raise RuntimeError("cea.env changed since preflight")
+        diff_path = evidence / "env_diff.json"
+        if diff_path.is_file():
+            diff = json.loads(diff_path.read_text())
+            required = set(diff["live_but_undeclared"]) | set(diff["declared_but_not_live"])
+            if required != args.accept_env_diff:
+                raise RuntimeError("go requires --accept-env-diff naming exactly: "
+                                   + ", ".join(sorted(required)))
         if not (evidence / "env.pre.nul").is_file():
             raise RuntimeError("captured environment missing")
         complete_environ((evidence / "env.pre.nul").read_bytes())
         # Recheck immediately before the process boundary; permissions may have changed.
         subprocess.run([sys.executable, str(SCRIPT_DIR / "spawn_from_env.py"), "--probe-broker",
-                        str(evidence / "env.pre.nul"), str(cea_file), str(checkout / "src")], check=True)
+                        str(fleet_file), str(cea_file), str(checkout / "src")], check=True)
         # Back up before the irreversible process boundary. SQLite backup is consistent
         # even with WAL enabled; retain the original state and pause files verbatim.
         with sqlite3.connect(db_path) as source, sqlite3.connect(evidence / "tasks.db.pre") as target:
@@ -362,7 +412,7 @@ def main(argv=None) -> int:
             raise RuntimeError("listener still active after SIGTERM; no SIGKILL issued")
         new_pid = None
         try:
-            new_pid = spawn_runtime(env_dump, cea_file, log, port, checkout / "src", cwd)
+            new_pid = spawn_runtime(fleet_file, cea_file, log, port, checkout / "src", cwd)
             after = wait_for_health(port, args.project, args.sha, new_pid, budget)
             paused(db_path, after)
             write_json(evidence / "health.post.json", after)
@@ -372,7 +422,7 @@ def main(argv=None) -> int:
             try:
                 if new_pid is not None:
                     stop_spawned_runtime(new_pid, port)
-                rollback_pid = spawn_runtime(env_dump, cea_file, log, port, old_source, cwd)
+                rollback_pid = spawn_runtime(fleet_file, cea_file, log, port, old_source, cwd)
                 restored = wait_for_health(port, args.project, previous_sha, rollback_pid, budget)
                 paused(db_path, restored)
                 scrub_captured_env(evidence)
