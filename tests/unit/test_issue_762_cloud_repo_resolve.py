@@ -38,7 +38,8 @@ def _state(tmp_path, claude_checkout):
 
 def _implement(task_id="impl-762", context=None):
     return TaskRequest(task_id=task_id, task_type="implement", description="Implement #762",
-                       branch=f"agent/{task_id}", project="agent_crew", context=context or {})
+                       branch=f"agent/{task_id}", project="agent_crew",
+                       context={"risk_tier": 1, **(context or {})})
 
 
 def _cloud_env(monkeypatch):
@@ -182,14 +183,15 @@ def test_cloud_implement_refuses_unpublishable_branch_before_launch(tmp_path, mo
     "Inspect ~/.agent_crew/state.json for this task",
     "Use /tmp/worktrees/agent_crew/codex/local.txt",
 ])
-def test_cloud_preflight_refuses_local_only_files(tmp_path, monkeypatch, description):
+def test_cloud_preflight_refuses_declared_local_inputs(tmp_path, monkeypatch, description):
     _cloud_env(monkeypatch)
     monkeypatch.setattr(cloud, "_validated_cloud_checkout",
                         lambda *a, **kw: ("/fixture/claude", "owner/agent_crew"))
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("impl-local", "implement", description,
                               branch="agent/762-work", project="agent_crew",
-                              context={"repo": "owner/agent_crew"}))
+                              context={"repo": "owner/agent_crew",
+                                       "local_inputs": [description]}))
     calls = []
     def run(argv, **kwargs):
         calls.append(argv)

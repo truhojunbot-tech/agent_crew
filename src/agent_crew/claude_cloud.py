@@ -982,12 +982,6 @@ def _enqueue_cloud_retry_once(queue: TaskQueue, task: TaskRequest,
     return retry_id
 
 
-_LOCAL_ONLY_PATH = re.compile(
-    r"(?<![\w/])(?:~/|/home/[^\s/'\"`]+/|/tmp/|/var/tmp/|\.agent_crew/)",
-    re.IGNORECASE,
-)
-
-
 def _derived_cloud_branch(task: TaskRequest) -> str:
     """#890: name the output branch of a fresh implement queued on its base.
 
@@ -1018,9 +1012,7 @@ def _cloud_preflight_reason(task: TaskRequest, repo: str) -> str:
     if not repo or not _github._repo_slug(repo):
         return "cloud_repo_unresolved"
     context = task.context if isinstance(task.context, dict) else {}
-    instructions = context.get("instructions")
-    work = task.description + "\n" + (instructions if isinstance(instructions, str) else "")
-    if _LOCAL_ONLY_PATH.search(work):
+    if context.get("local_inputs"):
         return "cloud_local_files_required"
     return ""
 

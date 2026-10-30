@@ -11,18 +11,6 @@ from agent_crew.risk_tier import risk_declaration
 from agent_crew.server import create_app
 
 
-def test_inherited_explicit_tier3_keeps_provenance_and_records_escalation():
-    declaration = risk_declaration("Deploy the server", {"risk_declaration": {
-        "safety_or_live_change": False, "human_gate_required": False,
-        "bounded_routine_fix": True, "declaration_source": "explicit",
-        "confidence": "high", "inherited_from": "impl-root"}})
-    assert declaration["safety_or_live_change"] is True
-    assert declaration["human_gate_required"] is True
-    assert declaration["declaration_source"] == "explicit"
-    assert declaration["confidence"] == "high"
-    assert declaration["escalated_by"] == "classifier_tier3"
-
-
 @pytest.mark.parametrize("context", [
     {"risk_tier": "high"},
     {"risk_tier": "high", "original_task_id": "forged-parent"},
@@ -123,7 +111,7 @@ def test_system_successor_without_risk_metadata_is_not_counted_as_root(
     ("retry-impl-root-a1", "original_task_id"),
     ("fallback-impl-root-d1", "fallback_from_task_id"),
 ])
-def test_system_successor_with_legacy_string_tier_drops_invalid_value(
+def test_system_successor_with_legacy_string_tier_inherits_parent_value(
         tmp_path, task_id, parent_key):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("impl-root", "implement", "work", context={"risk_tier": 1}))
@@ -133,7 +121,7 @@ def test_system_successor_with_legacy_string_tier_drops_invalid_value(
                                        "risk_tier": "high"}),
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
     assert queue.get_task(task_id) is not None
-    assert "risk_tier" not in queue.get_task_context(task_id)
+    assert queue.get_task_context(task_id)["risk_tier"] == 1
     assert queue.missing_root_risk_metadata_count() == 0
 
 

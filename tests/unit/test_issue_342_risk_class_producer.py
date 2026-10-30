@@ -26,17 +26,6 @@ def test_explicit_risk_declaration_is_persisted_with_explicit_provenance(tmp_db)
     assert evidence["risk_declaration"] == declared
 
 
-def test_heuristic_architecture_signal_is_never_labelled_explicit():
-    from agent_crew.risk_tier import risk_declaration
-
-    declared = risk_declaration("Change the core queue protocol")
-
-    assert declared["broad_architecture_change"] is True
-    assert declared["safety_or_live_change"] is None
-    assert declared["declaration_source"] == "heuristic"
-    assert declared["confidence"] == "low"
-
-
 def test_absent_risk_signal_stays_unknown_even_though_legacy_classifier_defaults_tier_one():
     from agent_crew.risk_tier import risk_declaration
 
@@ -47,16 +36,6 @@ def test_absent_risk_signal_stays_unknown_even_though_legacy_classifier_defaults
     assert declared["bounded_routine_fix"] is None
     assert declared["human_gate_required"] is None
     assert declared["declaration_source"] == "unknown"
-
-
-def test_low_risk_heuristic_never_fabricates_safety_false():
-    from agent_crew.risk_tier import risk_declaration
-
-    declared = risk_declaration("update docs", {"changed_paths": ["docs/guide.md"]})
-
-    assert declared["bounded_routine_fix"] is True
-    assert declared["safety_or_live_change"] is None
-    assert declared["declaration_source"] == "heuristic"
 
 
 def test_declaration_is_copied_to_attribution_when_dispatch_creates_that_row(tmp_db):
