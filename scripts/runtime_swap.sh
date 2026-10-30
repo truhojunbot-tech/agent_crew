@@ -1,11 +1,27 @@
 #!/usr/bin/env bash
 # Usage: runtime_swap.sh <project> <full-sha> preflight|go|post
-# go additionally requires --decision-id T0-ID.
+# go additionally requires --decision-id T0-ID and --actor NAME (or AGENT_CREW_SWAP_ACTOR).
 set -euo pipefail
 
 project=${1:?Usage: runtime_swap.sh <project> <full-sha> preflight|go|post}
 target_sha=${2:?Usage: runtime_swap.sh <project> <full-sha> preflight|go|post}
 step=${3:?Usage: runtime_swap.sh <project> <full-sha> preflight|go|post}
+# The go receipt and the T0 verifier must cite the same explicit actor.
+# Extract only this option; runtime_swap.py remains the argument validator.
+if [[ $step == go ]]; then
+    swap_args=("${@:4}")
+    for ((i=0; i<${#swap_args[@]}; i++)); do
+        case ${swap_args[i]} in
+            --actor)
+                if (( i + 1 < ${#swap_args[@]} )); then
+                    export AGENT_CREW_SWAP_ACTOR=${swap_args[i+1]}
+                    i=$((i + 1))
+                fi
+                ;;
+            --actor=*) export AGENT_CREW_SWAP_ACTOR=${swap_args[i]#--actor=} ;;
+        esac
+    done
+fi
 precheck=${AGENT_CREW_SWAP_PRECHECK:-}
 if [[ -z ${precheck//[[:space:]]/} ]]; then
     echo 'FAIL: AGENT_CREW_SWAP_PRECHECK is unset; set a precheck command or explicitly set none' >&2

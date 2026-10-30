@@ -78,6 +78,30 @@ printf "called\\n" > "$SWAP_RUNTIME_MARKER"
         assert runtime_marker.exists()
 
 
+def test_shell_go_actor_matches_precheck_receipt_actor(tmp_path):
+    """The T0 principal and the precheck receipt must name the same actor."""
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    fake_python = bin_dir / 'python3'
+    fake_python.write_text('''#!/usr/bin/env bash
+if [[ $1 == *swap_precheck_receipt.py ]]; then exec "$SWAP_REAL_PYTHON" "$@"; fi
+exit 0
+''')
+    fake_python.chmod(0o755)
+    env = {**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+           'AGENT_CREW_SWAP_PRECHECK': 'none',
+           'AGENT_CREW_SWAP_RECEIPT_DIR': str(tmp_path / 'receipts'),
+           'SWAP_REAL_PYTHON': sys.executable}
+    env.pop('AGENT_CREW_SWAP_ACTOR', None)
+    script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
+    result = subprocess.run(['bash', str(script), 'demo', 'a' * 40, 'go',
+                             '--decision-id', 'T0-1', '--actor', 'hojun'],
+                            env=env, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(next((tmp_path / 'receipts').glob('*.json')).read_text())
+    assert receipt['actor'] == 'hojun'
+
+
 @pytest.mark.parametrize(('precheck', 'allowed'), [(None, False), ('none', True)])
 def test_shell_precheck_requires_explicit_configuration(tmp_path, precheck, allowed):
     bin_dir = tmp_path / 'bin'
@@ -330,6 +354,7 @@ def _swap_fixture(tmp_path, monkeypatch, *, db_outside=False):
     monkeypatch.setenv('USER', 'test-user')
     monkeypatch.setenv('PATH', '/usr/bin:/bin')
     monkeypatch.setenv('LANG', 'C.UTF-8')
+    monkeypatch.setenv('AGENT_CREW_SWAP_ACTOR', 'test-owner')
     directory = tmp_path / '.agent_crew' / 'demo'
     directory.mkdir(parents=True)
     db = (tmp_path / 'elsewhere.db') if db_outside else (directory / 'tasks.db')

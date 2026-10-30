@@ -26,7 +26,7 @@ def test_go_requires_decision_id():
     with pytest.raises(SystemExit):
         runtime_swap.parse_args(["demo", "a" * 40, "go"])
     assert runtime_swap.parse_args([
-        "demo", "a" * 40, "go", "--decision-id", "T0-1"
+        "demo", "a" * 40, "go", "--decision-id", "T0-1", "--actor", "hojun"
     ]).decision_id == "T0-1"
 
 
@@ -61,22 +61,21 @@ def test_expired_signed_decision_refuses(tmp_path, monkeypatch):
     snapshot = write_snapshot(tmp_path, principals=("owner:hojun",),
                               build_commits=(sha,), runtimes=("agent_crew",))
     key = write_key(tmp_path)
-    monkeypatch.setenv("AGENT_CREW_SWAP_ACTOR", "hojun")
     env = {"AGENT_CREW_CEA_MODE": "shadow",
            "AGENT_CREW_CEA_SNAPSHOT_PATH": str(snapshot),
            "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE": str(key)}
-    runtime_swap.verify_swap_decision("agent_crew", sha, "T0-4E-1", env)
+    runtime_swap.verify_swap_decision("agent_crew", sha, "T0-4E-1", env, "hojun")
     with pytest.raises(RuntimeError, match="T0 decision refused"):
-        runtime_swap.verify_swap_decision("other_project", sha, "T0-4E-1", env)
+        runtime_swap.verify_swap_decision("other_project", sha, "T0-4E-1", env, "hojun")
     with pytest.raises(RuntimeError, match="T0 decision refused"):
-        runtime_swap.verify_swap_decision("agent_crew", "b" * 40, "T0-4E-1", env)
+        runtime_swap.verify_swap_decision("agent_crew", "b" * 40, "T0-4E-1", env, "hojun")
     doc = json.loads(snapshot.read_text())
     doc["decisions"][0]["expires_at"] = time.time() - 1
     body = {name: value for name, value in doc.items() if name != "signature"}
     doc["signature"]["value"] = hmac.new(KEY, _canonical(body), hashlib.sha256).hexdigest()
     snapshot.write_text(json.dumps(doc))
     with pytest.raises(RuntimeError, match="T0 decision refused"):
-        runtime_swap.verify_swap_decision("agent_crew", sha, "T0-4E-1", env)
+        runtime_swap.verify_swap_decision("agent_crew", sha, "T0-4E-1", env, "hojun")
 
 
 def test_go_rechecks_precheck_and_decision_before_sigterm(tmp_path, monkeypatch):
