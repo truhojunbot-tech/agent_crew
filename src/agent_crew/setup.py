@@ -12,6 +12,7 @@ _logger = logging.getLogger(__name__)
 from agent_crew import instructions, pane_submit, session
 from agent_crew.port_validation import require_project_port
 from agent_crew.role_mapping import LEGACY_AGENT_TO_ROLE
+from agent_crew.worktree_default_branch import remote_default_branch
 
 _AGENT_CMDS = {
     "claude": "claude --dangerously-skip-permissions --continue --model claude-sonnet-5",
@@ -519,7 +520,8 @@ def write_instruction_files(
     dispatcher_mode = os.getenv("AGENT_CREW_DISPATCHER", "1").lower() not in ("0", "false", "no")
     delivery = "dispatcher" if dispatcher_mode else None
     for role, agent, wt_path in _iter_role_entries(worktrees, roles):
-        instructions.write(role, wt_path, project, port_file, agent=agent, delivery=delivery)
+        instructions.write(role, wt_path, project, port_file, agent=agent,
+                           delivery=delivery, base_branch=remote_default_branch(wt_path))
 
 
 def _mcp_python_invocation() -> tuple[str, list[str], str]:

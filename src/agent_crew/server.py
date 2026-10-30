@@ -527,6 +527,7 @@ def _ensure_slot_worktree(base: str, path: str) -> bool:
 
 def _ensure_role_protocol(
     role: str, worktree_path: str, project: str, port_file: str, *, agent: str, port: int = 0,
+    base_branch: str = "",
 ) -> bool:
     """Ensure the role's worker contract survived worktree synchronisation (#353)."""
     relative = instructions.AGENT_FILES.get(agent, instructions.ROLE_FILES.get(role))
@@ -534,8 +535,7 @@ def _ensure_role_protocol(
         logger.error("dispatcher: no protocol file is defined for role=%s", role)
         return False
     expected = os.path.join(worktree_path, relative)
-    if os.path.isfile(expected):
-        return True
+    existed = os.path.isfile(expected)
     try:
         # Production setup writes this first.  Keep recovery/test dispatches
         # self-contained: regenerating a protocol needs a port file, and the
@@ -546,6 +546,7 @@ def _ensure_role_protocol(
                 f.write(f"{port}\n")
         created = instructions.write(
             role, worktree_path, project, port_file, agent=agent, delivery="dispatcher",
+            base_branch=base_branch,
         )
     except Exception:
         logger.exception(
@@ -556,7 +557,8 @@ def _ensure_role_protocol(
     if not os.path.isfile(created):
         logger.error("dispatcher: protocol write returned missing path %s", created)
         return False
-    logger.warning("dispatcher: regenerated missing %s protocol at %s (#353)", role, created)
+    if not existed:
+        logger.warning("dispatcher: regenerated missing %s protocol at %s (#353)", role, created)
     return True
 
 
@@ -4755,6 +4757,7 @@ def create_app(
         if _push_worktree and not _ensure_role_protocol(
             role, _push_worktree, _push_project,
             os.path.join(os.path.dirname(db_path), "port"), agent=_target_agent, port=port,
+            base_branch=str((task.context or {}).get("base_branch") or ""),
         ):
             _fail_if_active(task.task_id, "missing_role_protocol")
             return
@@ -6227,6 +6230,7 @@ def create_app(
 
         if not _ensure_role_protocol(
             role, wt, _project, os.path.join(os.path.dirname(db_path), "port"), agent=agent, port=port,
+            base_branch=str((task.context or {}).get("base_branch") or ""),
         ):
             _lock_stack.close()
             _fail_if_active(task.task_id, "missing_role_protocol")
@@ -7256,6 +7260,7 @@ def create_app(
                         instructions.write(
                             _r, _wt, _proj, _port_file,
                             agent=_agent, delivery="dispatcher",
+                            base_branch=str((task.context or {}).get("base_branch") or ""),
                         )
             except Exception:
                 logger.exception(

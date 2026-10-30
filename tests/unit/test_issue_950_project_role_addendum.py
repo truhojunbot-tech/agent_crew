@@ -1,6 +1,7 @@
 """#950: repo-tracked role rules survive protocol regeneration."""
 
 from types import SimpleNamespace
+import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,17 +19,52 @@ def _port_file(tmp_path):
     return str(port_file)
 
 
+def _git(worktree, *args):
+    return subprocess.run(["git", "-C", str(worktree), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _base_and_head(tmp_path, role="reviewer", base_text="BASE RULE\n",
+                   head_text=None):
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                   capture_output=True)
+    worktree = tmp_path / "wt"
+    subprocess.run(["git", "init", "-b", "main", str(worktree)], check=True,
+                   capture_output=True)
+    _git(worktree, "config", "user.name", "Test")
+    _git(worktree, "config", "user.email", "test@example.invalid")
+    _git(worktree, "remote", "add", "origin", str(remote))
+    path = worktree / ".agent_crew" / f"{role}.md"
+    path.parent.mkdir()
+    if base_text is None:
+        (worktree / "README.md").write_text("base\n")
+    else:
+        path.write_text(base_text)
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "base rules")
+    _git(worktree, "push", "-u", "origin", "main")
+    _git(worktree, "checkout", "-b", "pr-head")
+    if head_text is None and base_text is not None:
+        _git(worktree, "rm", str(path.relative_to(worktree)))
+    elif head_text is not None:
+        path.write_text(head_text)
+        _git(worktree, "add", ".")
+    if head_text is not None or base_text is not None:
+        _git(worktree, "commit", "-m", "PR head")
+    return worktree
+
+
+@pytest.mark.parametrize("head_text", [None, "PR HEAD RULE\n"])
 @pytest.mark.parametrize("agent,filename", [
     ("codex", "AGENTS.md"),
     ("claude", ".claude/CLAUDE.md"),
     ("gemini", "GEMINI.md"),
 ])
 def test_reviewer_addendum_reaches_every_provider_and_survives_rewrite(
-        tmp_path, agent, filename):
-    worktree = tmp_path / agent
-    (worktree / ".agent_crew").mkdir(parents=True)
+        tmp_path, agent, filename, head_text):
     addendum = "**Verdict:** approve\n변경 파일 확인: src/a.py, src/b.py\n"
-    (worktree / ".agent_crew" / "reviewer.md").write_text(addendum)
+    worktree = _base_and_head(tmp_path, base_text=addendum, head_text=head_text)
     port_file = _port_file(tmp_path)
     expected = None
     for _ in range(2):
@@ -40,6 +76,7 @@ def test_reviewer_addendum_reaches_every_provider_and_survives_rewrite(
         body = (worktree / filename).read_text()
         assert "## Project role addendum" in body
         assert addendum in body
+        assert "PR HEAD RULE" not in body
         assert body.count("## Project role addendum") == 1
         if expected is not None:
             assert body == expected
@@ -48,12 +85,71 @@ def test_reviewer_addendum_reaches_every_provider_and_survives_rewrite(
 
 @pytest.mark.parametrize("role", ["implementer", "tester"])
 def test_other_role_addenda_are_loaded_from_their_own_file(tmp_path, role):
-    worktree = tmp_path / role
-    (worktree / ".agent_crew").mkdir(parents=True)
-    (worktree / ".agent_crew" / f"{role}.md").write_text(f"ONLY {role}\n")
+    worktree = _base_and_head(tmp_path, role=role, base_text=f"ONLY {role}\n")
     body = instructions.generate(role, "proj", 9123, agent="codex",
                                  delivery="dispatcher", worktree_path=str(worktree))
     assert f"ONLY {role}\n" in body
+
+
+def test_explicit_dev_base_is_used_instead_of_main(tmp_path):
+    worktree = _base_and_head(tmp_path, base_text="MAIN RULE\n")
+    _git(worktree, "checkout", "main")
+    _git(worktree, "checkout", "-b", "dev")
+    (worktree / ".agent_crew" / "reviewer.md").write_text("DEV RULE\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "dev rules")
+    _git(worktree, "push", "origin", "dev")
+    _git(worktree, "checkout", "pr-head")
+    body = instructions.generate("reviewer", "proj", 9123, agent="codex",
+                                 delivery="dispatcher", worktree_path=str(worktree),
+                                 base_branch="dev")
+    assert "DEV RULE" in body
+    assert "MAIN RULE" not in body
+
+
+def test_fetch_failure_uses_last_fetched_base_ref(tmp_path, monkeypatch):
+    worktree = _base_and_head(tmp_path, base_text="FETCHED RULE\n")
+    original = instructions.subprocess.run
+    def fail_fetch(argv, **kwargs):
+        if argv[0:4] == ["git", "-C", str(worktree), "fetch"]:
+            return SimpleNamespace(returncode=1, stderr="offline")
+        return original(argv, **kwargs)
+    monkeypatch.setattr(instructions.subprocess, "run", fail_fetch)
+    body = instructions.generate("reviewer", "proj", 9123, agent="codex",
+                                 delivery="dispatcher", worktree_path=str(worktree))
+    assert "FETCHED RULE" in body
+
+
+def test_head_only_addendum_is_ignored(tmp_path):
+    worktree = _base_and_head(tmp_path, base_text=None,
+                              head_text="UNTRUSTED HEAD RULE\n")
+    baseline = instructions.generate("reviewer", "proj", 9123,
+                                     agent="codex", delivery="dispatcher")
+    body = instructions.generate("reviewer", "proj", 9123, agent="codex",
+                                 delivery="dispatcher", worktree_path=str(worktree))
+    assert body == baseline
+
+
+def test_dispatch_regenerates_existing_protocol_for_task_base(tmp_path):
+    from agent_crew import server
+    worktree = _base_and_head(tmp_path, base_text="MAIN RULE\n")
+    _git(worktree, "checkout", "main")
+    _git(worktree, "checkout", "-b", "dev")
+    (worktree / ".agent_crew" / "reviewer.md").write_text("DEV RULE\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "dev rules")
+    _git(worktree, "push", "origin", "dev")
+    _git(worktree, "checkout", "pr-head")
+    port_file = _port_file(tmp_path)
+    instructions.write("reviewer", str(worktree), "proj", port_file,
+                       agent="codex", delivery="dispatcher")
+    assert "MAIN RULE" in (worktree / "AGENTS.md").read_text()
+    assert server._ensure_role_protocol(
+        "reviewer", str(worktree), "proj", port_file, agent="codex",
+        base_branch="dev")
+    body = (worktree / "AGENTS.md").read_text()
+    assert "DEV RULE" in body
+    assert "MAIN RULE" not in body
 
 
 @pytest.mark.parametrize("agent,filename", [
