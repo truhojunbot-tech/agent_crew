@@ -46,9 +46,48 @@ def test_A_standalone_completion_has_one_structured_end_notice(harness):
     assert len(notices) == 1
     assert all(s in notices[0] for s in ("kind=lineage_end", "task_id=research-943",
                                          "task_type=discuss", "status=completed",
-                                         "lineage_head=research-943", "issue=943", "summary="))
-    assert "x" * 300 in notices[0]
-    assert "x" * 301 not in notices[0]
+                                         "lineage_head=research-943", "issue=943"))
+    assert "summary=" not in notices[0]
+    assert "x" * 300 not in notices[0]
+
+
+def test_A_protected_free_text_never_enters_lineage_notice(harness, monkeypatch):
+    """C3: emitted detail and delivered notice both exclude protected fields."""
+    import agent_crew.server as server_module
+
+    app, queue, delivered = harness
+    sentinel = "C3_PROTECTED_SENTINEL_943"
+    queue.enqueue(TaskRequest(
+        task_id="c3-943", task_type="discuss", description="task",
+        branch=f"agent/{sentinel}", project="agent_crew",
+        context={"risk_tier": 2, "issue": 943,
+                 "repo": f"owner/{sentinel}",
+                 "cloud_session_url": f"https://example.invalid/{sentinel}"},
+    ), ingress="http.tasks")
+    emitted_details = []
+    original = server_module.coordinator_notice_once
+
+    def capture(queue, task_id, kind, detail="", notify_fn=None, **kwargs):
+        if kind == "lineage_end":
+            emitted_details.append(detail)
+        return original(queue, task_id, kind, detail, notify_fn, **kwargs)
+
+    monkeypatch.setattr(server_module, "coordinator_notice_once", capture)
+    with TestClient(app) as client:
+        response = _result(
+            client, "c3-943", status="failed", summary=sentinel,
+            error_info={"reason": sentinel},
+        )
+    assert response.status_code == 200, response.text
+    assert len(emitted_details) == len(delivered) == 1
+    assert all(sentinel not in text for text in emitted_details + delivered)
+    assert "summary=" not in delivered[0]
+    assert "reason=" not in delivered[0]
+    assert "session_url=" not in delivered[0]
+    assert "branch=" not in delivered[0]
+    assert "repo=" not in delivered[0]
+    assert "kind=lineage_end" in delivered[0]
+    assert "task_id=c3-943" in delivered[0]
 
 
 def test_B_successor_suppresses_parent_and_merged_leaf_carries_pr(harness, monkeypatch):
@@ -121,7 +160,7 @@ def test_F_exhausted_provider_failure_uses_lineage_end_once(harness):
                        error_info={"reason": "exit_1", "final": True}).status_code == 200
     assert len(notices) == 1
     assert "kind=lineage_end" in notices[0]
-    assert "test not run (provider)" in notices[0]
+    assert "test_result=not_run" in notices[0]
 
 
 def test_refused_review_fix_has_only_the_existing_successor_refused_notice(
@@ -199,6 +238,7 @@ def test_mcp_completed_leaf_notifies_and_fallback_continuation_does_not(
     assert submit(task_id="mcp-leaf-943", status="completed",
                   summary="research complete")["acknowledged"]
     assert len(sent) == 1 and "kind=lineage_end" in sent[0]
+    assert "summary=" not in sent[0]
 
     monkeypatch.setattr("agent_crew.mcp_server.auto_fallback_failed_task",
                         lambda *a, **k: True)
