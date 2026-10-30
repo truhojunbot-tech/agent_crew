@@ -173,9 +173,15 @@ def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
         ctx = task.context if task is not None and isinstance(task.context, dict) else {}
         detail_limit = 800 if kind == "lineage_end" else 300
         safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:detail_limit]
-        message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
-                   f"branch={task.branch if task else ''} repo={intent['repo'] if intent else ctx.get('repo') or ''} "
-                   f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
+        # #943/C3: terminal notices must never copy task-originated branch,
+        # repo or cloud URL prose into the coordinator's durable notice sink.
+        if kind == "lineage_end":
+            message = (f"agent_crew coordinator notice: task={task_id} "
+                       f"kind={kind} {safe_detail}")[:1000]
+        else:
+            message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
+                       f"branch={task.branch if task else ''} repo={intent['repo'] if intent else ctx.get('repo') or ''} "
+                       f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
         if not queue.claim_coordinator_notice(task_id, kind):
             return
         claimed = True
@@ -3344,12 +3350,13 @@ def notify_lineage_end(queue: TaskQueue, task_id: str, *,
                             error_info=info)) == "not_run")
     issue = (ctx.get("issue") or ctx.get("issue_number")
              or root_ctx.get("issue") or root_ctx.get("issue_number") or "")
+    # #943/C3: only typed lineage metadata is eligible for notice emission.
+    # Raw task summary, provider reason, pane/log text and cloud links can
+    # contain protected context. Coordinators fetch details by task_id.
     detail = (f"task_id={task_id} task_type={task.task_type} status={task.status} "
               f"pr_number={task.pr_number or ctx.get('pr_number') or ''} "
               f"lineage_head={root} issue={issue} "
-              f"reason={info.get('reason') or ''} "
-              f"{'test not run (provider) ' if provider_not_run else ''}"
-              f"summary={(task.summary or '')[:300]}")
+              f"test_result={'not_run' if provider_not_run else 'unreported'}")
     coordinator_notice_once(queue, task_id, "lineage_end", detail, notify_fn)
 
 
