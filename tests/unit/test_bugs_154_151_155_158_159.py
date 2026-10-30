@@ -132,7 +132,6 @@ class TestUsageLimitOnFallbackAgentPaneReroutes:
             fallback_payload = _impl_payload("fb-t1")
             fallback_payload["context"] = {
                 "agent_override": "codex",
-                "fallback_excluded": ["claude"],
             }
             client.post("/tasks", json=fallback_payload)
 
@@ -162,7 +161,6 @@ class TestUsageLimitOnFallbackAgentPaneReroutes:
             fallback_payload = _impl_payload("fb-t2")
             fallback_payload["context"] = {
                 "agent_override": "codex",
-                "fallback_excluded": ["claude"],
             }
             client.post("/tasks", json=fallback_payload)
 

@@ -150,10 +150,8 @@ def _review_task_payload(task_id="r1", no_tester=False):
         "description": "review the code",
         "branch": "feat",
         "priority": 3,
-        "context": ({"no_tester": True, "risk_tier": 1, "repo": "owner/repo",
-                     "cloud_review_comment_confirmed": True}
-                    if no_tester else {"risk_tier": 1, "repo": "owner/repo",
-                                       "cloud_review_comment_confirmed": True}),
+        "context": ({"no_tester": True, "risk_tier": 1, "repo": "owner/repo"}
+                    if no_tester else {"risk_tier": 1, "repo": "owner/repo"}),
         "project": "",
     }
 

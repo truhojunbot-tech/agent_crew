@@ -87,7 +87,7 @@ def test_i_ar03_auto_review_preserves_checklist(test_client):
         "description": "Implement feature Z",
         "branch": "feat/z",
         "priority": 1,
-        "context": {"custom": "context"},
+        "context": {"issue": 54},
     }
     test_client.post("/tasks", json=impl_payload)
 

@@ -149,6 +149,9 @@ def assert_not_admitted(response, push, db, task_id):
     """§11 / I2 dynamic pass condition: never 201, not runnable, not pushed."""
     assert response.status_code != 201, (
         f"admitted: {response.status_code} {response.json()}")
+    # A context-schema refusal says nothing about the CEA decision under test.
+    assert not str(response.json().get("detail", "")).startswith("unknown_context_key:"), (
+        f"CEA decision was not reached: {response.json()}")
     assert rows(db).get(task_id) not in ("pending", "in_progress"), rows(db).get(task_id)
     assert not [m for _, m in push.calls if task_id in m], "pushed to a pane"
 
@@ -595,18 +598,18 @@ def test_control_honest_executor_result_is_accepted(crew):
     assert rows(db)["ctl-honest"] not in ("pending", "in_progress")
 
 
-def test_control_shadow_work_is_admitted_regardless_of_asserted_caller_class(crew, tmp_path, monkeypatch):
-    """P2a: caller-independent shadow work may ALLOW even under UNVERIFIED caller
-    identity; the asserted provenance changes nothing. A "block everything"
-    change fails this."""
+def test_control_unknown_shadow_and_caller_context_is_rejected(crew, tmp_path, monkeypatch):
+    """The public context contract refuses hypothetical caller metadata."""
     make, push, db = crew
     write_registry(tmp_path, monkeypatch)
     with make() as client:
         r = post(client, request("ctl-shadow", "Shadow-measure context pack recall rate",
                                  context={"shadow": True, "caller_provenance": "cron"}),
                  headers={"X-Agent-Crew-Adapter": "cron:admitted_trigger"})
-    assert r.status_code == 201
-    assert [t for t, _ in push.calls] == [PANES["implementer"]]
+    assert r.status_code == 422
+    assert r.json()["detail"].startswith("unknown_context_key:")
+    assert push.calls == []
+    assert "ctl-shadow" not in rows(db)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -125,6 +125,8 @@ def assert_duplicate_blocked(client, response, push, db, task_id):
     """
     assert response.status_code != 201, (
         f"duplicate admitted: {response.status_code} {response.json()}")
+    assert not str(response.json().get("detail", "")).startswith("unknown_context_key:"), (
+        f"duplicate check was not reached: {response.json()}")
     rows = {r["task_id"]: r["status"] for r in TaskQueue(db).list_all_with_status()}
     assert rows.get(task_id) not in ("pending", "in_progress"), rows.get(task_id)
     assert not [m for _, m in push.calls if task_id in m], "duplicate pushed to a pane"
@@ -165,7 +167,7 @@ def test_s3_owner_not_called(crew, tmp_path, monkeypatch):
     with make() as client:
         r = client.post("/tasks", json=request(
             "s3", "Implement risk-tier enforcement in agent_crew",
-            context={"capability": CAPABILITY["id"]}))            # declared, owner not consulted
+            context={"capability_id": CAPABILITY["id"]}))         # declared, owner not consulted
         assert_duplicate_blocked(client, r, push, db, "s3")
 
 
@@ -321,6 +323,6 @@ def test_control_review_of_existing_work_is_not_a_duplicate(crew, tmp_path, monk
         r = client.post("/tasks", json={
             "task_id": "ctl-review", "task_type": "review",
             "description": "Review PR #1 — risk-tier enforcement", "branch": "feat/risk-tier",
-            "priority": 2, "context": {"pr_number": 1, "capability": CAPABILITY["id"]},
+            "priority": 2, "context": {"pr_number": 1, "capability_id": CAPABILITY["id"]},
             "project": "quota-core"})
     assert r.status_code == 201
