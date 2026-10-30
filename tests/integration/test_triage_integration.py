@@ -24,17 +24,22 @@ _REPO = "org/agent_crew"
 
 # Raw gh CLI JSON output (same shape as `gh issue list --json number,title,labels`)
 _GH_ISSUES = [
-    {"number": 7, "title": "Add login feature", "labels": [{"name": "enhancement"}]},
-    {"number": 8, "title": "Fix null pointer", "labels": [{"name": "bug"}]},
-    {"number": 9, "title": "Old done issue", "labels": [{"name": "agent_crew:done"}]},
+    {"id": "I_7", "number": 7, "title": "Add login feature", "labels": [{"name": "enhancement"}]},
+    {"id": "I_8", "number": 8, "title": "Fix null pointer", "labels": [{"name": "bug"}]},
+    {"id": "I_9", "number": 9, "title": "Old done issue", "labels": [{"name": "agent_crew:done"}]},
 ]
 
 # All issues already processed
 _GH_ISSUES_ALL_DONE = [
-    {"number": 9, "title": "Old done issue", "labels": [{"name": "agent_crew:done"}]},
+    {"id": "I_9", "number": 9, "title": "Old done issue", "labels": [{"name": "agent_crew:done"}]},
 ]
 
 _AGENT_RESPONSE = "ISSUE: 7\nDESCRIPTION: Implement user login feature"
+
+
+@pytest.fixture(autouse=True)
+def _project_header(test_client):
+    test_client.headers["X-Agent-Crew-Project"] = test_client.get("/health").json()["project"]
 
 
 class _FakeProcess:
@@ -46,7 +51,14 @@ class _FakeProcess:
 
 def _subprocess_mock(issues):
     """Return a fake subprocess.run that yields issues as gh CLI JSON."""
-    return lambda *a, **kw: _FakeProcess(json.dumps(issues))
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "api", "graphql"]:
+            return _FakeProcess(json.dumps({"data": {"nodes": [
+                {"id": issue["id"], "parent": None,
+                 "trackedInIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
+                for issue in issues]}}))
+        return _FakeProcess(json.dumps(issues))
+    return run
 
 
 def _agent_fn(response_text):

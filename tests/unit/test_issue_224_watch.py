@@ -223,11 +223,10 @@ def test_hold_label_is_not_shadowed_by_urgency_relabelling(queue, ledger):
 
 
 def test_issue_blocked_by_open_parent_is_skipped(queue, ledger):
-    """Reuses the existing dependency markers — parent still open."""
-    gh = FakeGitHub([
-        make_issue(20, "Parent work", ["bug"]),
-        make_issue(21, "Child work", ["bug"], body="Depends on #20"),
-    ])
+    """A declared parent link blocks the child while the parent is open."""
+    child = make_issue(21, "Child work", ["bug"], body="Depends on #20")
+    child["parent"] = {"number": 20}
+    gh = FakeGitHub([make_issue(20, "Parent work", ["bug"]), child])
 
     result = run_cycle(queue=queue, ledger=ledger, repo=REPO, gh=gh, max_claims=5)
 

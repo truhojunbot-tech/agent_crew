@@ -1356,44 +1356,6 @@ CREATE INDEX IF NOT EXISTS idx_gates_status ON gates(status);
 """
 
 
-#: A task whose description OPENS with `Implement #<n>` is naming the issue it
-#: implements. Anchored, and deliberately narrow — see `issue_from_description`.
-_ISSUE_IN_DESCRIPTION = re.compile(r"^\s*implement\s+#(\d+)\b", re.IGNORECASE)
-
-
-def issue_from_description(description) -> Optional[int]:
-    """The issue number a task description names, or ``None`` (#276).
-
-    #272 was implemented twice because dedup reads `context["issue"]` and the
-    first task carried the number only here, in free text. This is the safety
-    net for enqueue paths that do not populate the structured field.
-
-    ⛔Anchored to the start, and to `implement` specifically. Measured over all
-      5085 task rows on this host, 4721 of them without `context.issue`:
-
-        ^implement #N          →   4 distinct numbers,    7 rows
-        any #N minus "PR #N"   → 987 distinct numbers, 3829 rows
-        "issue #N" anywhere    → 121 distinct numbers,  426 rows
-
-      The broad rule matches spec section numbers, list markers and prose; at
-      987 numbers it would stop the watcher claiming almost anything. The
-      `issue #N` shape is dominated by *discuss* tasks, and a panel discussion
-      is not work in flight on the issue. The anchored rule matched exactly the
-      seven genuine rows and nothing else.
-
-      The asymmetry is the argument. A miss costs one duplicate provider
-      invocation; a false hit silently makes a real issue unclaimable for as
-      long as the task is non-terminal. Prefer the miss.
-    """
-    if not isinstance(description, str):
-        return None
-    match = _ISSUE_IN_DESCRIPTION.match(description)
-    if not match:
-        return None
-    number = int(match.group(1))
-    return number if number > 0 else None
-
-
 def _result_to_json(result) -> str:
     """TaskResult를 replay 재현 가능한 JSON 문자열로. pydantic model_dump 우선, 실패 시 __dict__.
     ⛔절대 'unknown' placeholder 금지 — cascade_outbox의 result_json은 executor가 원 제출 result를
@@ -1484,20 +1446,7 @@ def _is_issue_number(value) -> bool:
 
 
 def task_issue_number(task) -> Optional[int]:
-    """The issue a task is about — structured field first, description second.
-
-    ⛔One resolver, because there are two call sites and they must agree.
-      `TaskQueue.enqueue` backfills `context["issue"]` from an opening
-      `Implement #N` description (#276), and `POST /tasks`'s in-flight advisory
-      (#294) has to answer the same question BEFORE that write happens. Reading
-      `context.issue` alone there meant a direct enqueue whose issue lived only
-      in its description reported no collision and was then stored under that
-      very issue — the advisory and the row it produced disagreeing about one
-      task, and missing precisely the shape #276 exists for (review of PR #295).
-
-    Structured precedence is unchanged: a description is free text, a context
-    key is a claim, and when both are present the claim answers.
-    """
+    """Return the declared issue number; descriptions never provide identity."""
     context = task.context if isinstance(getattr(task, "context", None), dict) else {}
     number = context.get("issue")
     if _is_issue_number(number):
@@ -1505,7 +1454,7 @@ def task_issue_number(task) -> Optional[int]:
     number = context.get("issue_number")
     if _is_issue_number(number):
         return number
-    return issue_from_description(getattr(task, "description", None))
+    return None
 
 
 def _schema_lock_error(exc: BaseException) -> bool:
@@ -2620,11 +2569,8 @@ class TaskQueue:
         that gets written are built from the *same* dict. Resolving the issue
         number twice would let the receipt describe a task the row does not.
         """
-        # #276: make the structured field true at the choke point. Every path —
-        # HTTP, MCP, pipeline, cli — arrives here, so backfilling once means
-        # the read-side fallback in `watch.active_issue_numbers` rarely has to
-        # fire, which is the right end state: a parser that is load-bearing on
-        # free text will eventually be wrong.
+        # Keep the two structured issue aliases consistent at the enqueue
+        # boundary; task descriptions are never an identity source.
         #
         # ⛔A copy, never the caller's dict. A caller may reuse the TaskRequest,
         #   and a backfill written through would be found by a later pass as if

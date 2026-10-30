@@ -926,8 +926,7 @@ def test_scope_resolution_reads_explicit_producer_fields():
     assert set(modules) == {"agent_crew.server", "agent_crew.watch"}
 
 
-def test_scope_resolution_reads_paths_named_in_the_issue():
-    """For an ordinary bug report this is the only pre-work signal there is."""
+def test_scope_resolution_ignores_paths_named_only_in_the_issue():
     from agent_crew.context_pack import resolve_task_scope
 
     paths, modules = resolve_task_scope({
@@ -936,8 +935,7 @@ def test_scope_resolution_reads_paths_named_in_the_issue():
                       "tests/unit/test_issue_224_watch.py",
     })
 
-    assert paths == ["src/agent_crew/watch.py", "tests/unit/test_issue_224_watch.py"]
-    assert "agent_crew.watch" in modules
+    assert paths == [] and modules == []
 
 
 def test_scope_resolution_does_not_manufacture_scope_from_prose():
@@ -956,7 +954,7 @@ def test_scope_resolution_is_bounded():
     from agent_crew.context_pack import MAX_RESOLVED_SCOPE, resolve_task_scope
 
     body = " ".join(f"src/pkg/mod{i}.py" for i in range(500))
-    paths, modules = resolve_task_scope({"issue_body": body})
+    paths, modules = resolve_task_scope({"paths": body})
 
     assert len(paths) == MAX_RESOLVED_SCOPE
     assert len(modules) == MAX_RESOLVED_SCOPE
@@ -988,7 +986,8 @@ def test_pack_includes_a_module_scoped_procedure_for_a_task_in_that_module(tmp_p
 
     pack = build_pack_for_task(
         {"issue": 43, "repo": "org/repo", "issue_title": "watcher drops claims",
-         "issue_body": "reconcile in src/agent_crew/watch.py is wrong"},
+         "issue_body": "reconcile in src/agent_crew/watch.py is wrong",
+         "paths": ["src/agent_crew/watch.py"]},
         task_id="t-in", task_type="implement", role="implementer",
         repo_path=str(tmp_path), procedures_path=str(procs))
 
@@ -1019,7 +1018,8 @@ def test_shadow_telemetry_is_not_written_for_an_out_of_scope_procedure(tmp_path)
 
     build_pack_for_task(
         {"issue": 43, "repo": "org/repo", "issue_title": "watcher",
-         "issue_body": "src/agent_crew/watch.py"},
+         "issue_body": "src/agent_crew/watch.py",
+         "paths": ["src/agent_crew/watch.py"]},
         task_id="t-in", task_type="implement", role="implementer",
         repo_path=str(tmp_path), procedures_path=str(procs),
         shadow_path=str(shadow))
@@ -1089,7 +1089,7 @@ def test_enabled_dispatcher_respects_module_scope(tmp_path, monkeypatch, *, unus
                 task_id=tid, task_type="implement", description="do it",
                 branch="main",
                 context={"issue": 42, "repo": "org/repo", "issue_title": "t",
-                         "issue_body": body}))
+                         "issue_body": body, "paths": [body.split()[0]]}))
             task = q.dequeue(role="implementer")
             assert task is not None
             asyncio.run(app.state.dispatch_task(task, "implementer"))

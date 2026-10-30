@@ -45,8 +45,7 @@ from typing import Optional
 
 from agent_crew.context_pack import ISSUE_BODY_MAX_CHARS, cap_issue_body
 from agent_crew.protocol import TaskRequest
-from agent_crew.queue import issue_from_description
-from agent_crew.triage import parse_issues
+from agent_crew.triage import fetch_issues_from_gh, parse_issues
 
 logger = logging.getLogger(__name__)
 
@@ -444,17 +443,7 @@ class GhCli:
         self._timeout = timeout
 
     def list_issues(self, repo: str) -> list:
-        result = subprocess.run(
-            ["gh", "issue", "list", "--repo", repo, "--state", "open",
-             "--limit", "200", "--json", "number,title,labels,body,url"],
-            capture_output=True, text=True, timeout=self._timeout,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"gh issue list failed ({result.returncode}): "
-                f"{(result.stderr or '').strip()[:300]}"
-            )
-        return json.loads(result.stdout or "[]")
+        return fetch_issues_from_gh(repo, timeout=self._timeout)
 
     def add_label(self, repo: str, number: int, label: str) -> bool:
         return self._label(repo, number, label, add=True)
@@ -476,29 +465,34 @@ class GhCli:
             return False
 
     def issue_has_open_pr(self, repo: str, number: int) -> bool:
-        """Best-effort check for an open PR that references this issue.
+        """Best-effort check for an open PR that declares it closes this issue.
 
         ⛔Fails *open* (returns False, "no PR known") rather than stalling
         intake on a `gh` hiccup. Duplicate work is already prevented by the
         ledger, so the cheaper failure mode here is to keep the loop alive.
         """
         try:
+            owner, name = repo.split("/", 1)
+            query = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name)"
+                     "{pullRequests(first:100,states:OPEN){nodes{closingIssuesReferences"
+                     "(first:100){nodes{number}}}}}}")
             result = subprocess.run(
-                ["gh", "pr", "list", "--repo", repo, "--state", "open",
-                 "--limit", "100", "--json", "number,title,body,headRefName"],
+                ["gh", "api", "graphql", "-f", f"query={query}",
+                 "-F", f"owner={owner}", "-F", f"name={name}"],
                 capture_output=True, text=True, timeout=self._timeout,
             )
             if result.returncode != 0:
                 return False
-            prs = json.loads(result.stdout or "[]")
+            payload = json.loads(result.stdout or "{}")
+            if payload.get("errors"):
+                return False
+            prs = payload["data"]["repository"]["pullRequests"]["nodes"]
         except Exception:  # noqa: BLE001
             return False
-        needle = re.compile(rf"#{number}\b")
-        branch_needle = re.compile(rf"(^|[/_-]){number}([/_-]|$)")
         for pr in prs:
-            if needle.search(pr.get("title") or "") or needle.search(pr.get("body") or ""):
-                return True
-            if branch_needle.search(pr.get("headRefName") or ""):
+            if any(ref.get("number") == number for ref in
+                   ((pr.get("closingIssuesReferences") or {}).get("nodes") or [])
+                   if isinstance(ref, dict)):
                 return True
         return False
 
@@ -509,21 +503,13 @@ class GhCli:
 
 
 def _issue_of(row) -> Optional[int]:
-    """The issue a task row is about — structured field first, description second.
-
-    #276: dedup read only `context["issue"]`, so a task that named its issue in
-    the description was invisible and #272 was implemented twice. The parse is
-    a fallback, never an arbiter: when both are present the structured field
-    wins, because a description is free text and a context key is a claim.
-
-    Old rows are covered too — this reads at query time, so tasks enqueued
-    before the write-side backfill in `TaskQueue.enqueue` still resolve.
-    """
+    """The issue a task row declares in structured context."""
     context = row.get("context") or {}
-    number = context.get("issue")
-    if isinstance(number, int) and not isinstance(number, bool):
-        return number
-    return issue_from_description(row.get("description"))
+    for key in ("issue", "issue_number"):
+        number = context.get(key)
+        if isinstance(number, int) and not isinstance(number, bool) and number > 0:
+            return number
+    return None
 
 
 def active_issue_numbers(queue, repo: str = "") -> set:
@@ -757,8 +743,9 @@ def unblocked(issues: list, all_issues: list) -> list:
     }
     return [
         issue for issue in issues
-        if not any(
-            p in open_numbers and p != issue["number"]
+        if not issue.get("dependency_unknown") and not any(
+            (p in open_numbers or p in issue.get("open_parents", []))
+            and p != issue["number"]
             for p in (issue.get("parents") or [])
         )
     ]
@@ -850,6 +837,10 @@ def run_cycle(
     try:
         raw = gh.list_issues(repo)
         all_issues = parse_issues(raw or [])
+        for issue in all_issues:
+            if issue.get("dependency_unknown"):
+                out["skipped"].append(issue["number"])
+                logger.warning("watch: dependency_unknown for issue #%s", issue["number"])
         # `parse_issues` drops `url`; carry it back so the task can link out.
         urls = {i.get("number"): i.get("url")
                 for i in (raw or []) if isinstance(i, dict)}

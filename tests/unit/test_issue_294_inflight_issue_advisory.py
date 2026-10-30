@@ -95,21 +95,18 @@ def test_no_response_ever_carries_the_advisory_key(tmp_db, *, unused_tcp_port):
 
 
 def test_the_issue_resolver_itself_is_untouched():
-    """`task_issue_number` stays: `enqueue` still backfills `context.issue` from
-    the description (#276), which is provenance the receipt will carry. Removing
-    the advisory removed a *decision*, not the ability to name an issue."""
+    """The resolver uses declared identity and ignores description text."""
     task = TaskRequest(task_id="t", task_type="implement",
                        description="Implement #292: go", branch="main", context={})
-    assert task_issue_number(task) == 292
+    assert task_issue_number(task) is None
     task = TaskRequest(task_id="t", task_type="implement", description="go",
                        branch="main", context={"issue": True})
     assert task_issue_number(task) is None, "a bool is not a claim about an issue"
 
 
 def test_the_backfill_still_happens_on_enqueue(tmp_db):
-    """The behaviour #276 added survives the removal: an issue named only in the
-    description is still stored, so nothing downstream loses the number."""
+    """Only a declared issue is copied to the canonical context aliases."""
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-a", task_type="implement",
                           description="Implement #292: go", branch="main", project="demo", context={}))
-    assert q.get_task_context("impl-a").get("issue") == 292
+    assert q.get_task_context("impl-a").get("issue") is None

@@ -192,36 +192,34 @@ from agent_crew.triage import (  # noqa: E402
 )
 
 
-# U-T11: parse_dependencies extracts Parent + Phase from issue body
+# U-T11: dependencies and phase come from GitHub links and labels
 def test_u_t11_parse_dependencies_basic():
-    body = "Parent: #54 | Phase 2\n\nImplement RegimeDetector consumer."
-    deps = parse_dependencies(body)
+    deps = parse_dependencies({"parent": {"number": 54},
+                               "labels": [{"name": "phase:2"}]})
     assert deps["parents"] == [54]
     assert deps["phase"] == 2
 
 
 def test_u_t11b_parse_dependencies_alternate_keywords():
-    """`depends on` and `blocked by` should both register parents."""
-    body = "Depends on #10 and blocked by #11. Phase 3."
-    deps = parse_dependencies(body)
-    assert sorted(deps["parents"]) == [10, 11]
-    assert deps["phase"] == 3
+    """Prose markers never register parents or phase."""
+    deps = parse_dependencies({"body": "Depends on #10 and blocked by #11. Phase 3."})
+    assert deps == {"parents": [], "phase": None}
 
 
 def test_u_t11c_parse_dependencies_no_markers():
-    deps = parse_dependencies("Plain description, no metadata.")
+    deps = parse_dependencies({"body": "Plain description, no metadata."})
     assert deps["parents"] == []
     assert deps["phase"] is None
 
 
 def test_u_t11d_parse_dependencies_none_body():
-    deps = parse_dependencies(None)
+    deps = parse_dependencies({"body": None})
     assert deps == {"parents": [], "phase": None}
 
 
 def test_u_t11e_parse_dependencies_dedupes():
-    body = "Parent: #54. Also Parent: #54. Depends on #54."
-    deps = parse_dependencies(body)
+    deps = parse_dependencies({"parent": {"number": 54},
+                               "blockedBy": [{"number": 54}]})
     assert deps["parents"] == [54]
 
 
@@ -231,8 +229,9 @@ def test_u_t12_parse_issues_carries_dependencies():
         {
             "number": 100,
             "title": "Build consumer",
-            "labels": [],
+            "labels": [{"name": "phase:2"}],
             "body": "Parent: #54 | Phase 2",
+            "parent": {"number": 54},
         }
     ]
     result = parse_issues(raw)
