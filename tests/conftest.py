@@ -117,8 +117,12 @@ def _tier_legacy_task_posts(monkeypatch, request):
     """
     if ("risk_tier" in request.node.path.name
             or "risk_declaration" in request.node.path.name
-            or "mandatory_risk" in request.node.path.name):
+            or "mandatory_risk" in request.node.path.name
+            or "issue_928_declared_inputs" in request.node.path.name):
         return
+    if request.node.path.name not in {"test_issue_362_project_identity.py",
+                                      "test_runtime_swap.py"}:
+        request.getfixturevalue("project_task_transport")
     # Legacy CLI/watch fixtures use the documented default in place of a
     # per-call --risk-tier or issue label. Contract tests above keep it absent.
     monkeypatch.setenv("AGENT_CREW_DEFAULT_RISK_TIER", "1")
@@ -136,6 +140,19 @@ def _tier_legacy_task_posts(monkeypatch, request):
         return original_post(client, url, *args, **kwargs)
 
     monkeypatch.setattr(TestClient, "post", post)
+
+    # Older queue-level fixtures also bypass the CLI/HTTP producer adapter.
+    # Supply their declaration at that boundary; the #928 contract tests above
+    # exercise the unmodified enqueue path, including deliberate refusals.
+    original_enqueue = TaskQueue.enqueue
+
+    def enqueue(queue, task, *args, **kwargs):
+        if isinstance(task, TaskRequest) and isinstance(task.context, dict):
+            if "risk_tier" not in task.context and "risk_declaration" not in task.context:
+                task = replace(task, context={**task.context, "risk_tier": 1})
+        return original_enqueue(queue, task, *args, **kwargs)
+
+    monkeypatch.setattr(TaskQueue, "enqueue", enqueue)
 
 
 @pytest.fixture(autouse=True)
