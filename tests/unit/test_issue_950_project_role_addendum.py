@@ -253,6 +253,25 @@ def test_files_reviewed_result_field_and_comment_rendering(monkeypatch):
     assert "변경 파일 확인: src/a.py src/b.py\n\n" in bodies[2]
 
 
+def test_review_comment_includes_only_valid_structured_head(monkeypatch):
+    from types import SimpleNamespace
+
+    from agent_crew import github
+
+    bodies = []
+    monkeypatch.setattr(github, "check_gh_installed", lambda: True)
+    monkeypatch.setattr(github.subprocess, "run", lambda argv, **_kwargs:
+                        bodies.append(argv[argv.index("--body") + 1]) or
+                        SimpleNamespace(returncode=0))
+    for head in ("a" * 40, "a" * 7, "z" * 40, "a" * 40 + "\nextra", None):
+        assert format_review_comment(
+            950, "approve", "approved", [], "review-950", repo="owner/repo",
+            reviewed_head_sha=head)
+    assert bodies[0].endswith(
+        f"> reviewed head: {'a' * 40}\n> reviewer: agent | task: review-950")
+    assert all("> reviewed head:" not in body for body in bodies[1:])
+
+
 def test_server_forwards_files_reviewed_to_comment_writer(tmp_db, monkeypatch):
     import agent_crew.server as server
 

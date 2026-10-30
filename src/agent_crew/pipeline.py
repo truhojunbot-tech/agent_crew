@@ -935,6 +935,8 @@ class ReviewPublication:
     reason: str
     #: The head to requeue a review against, or ``""`` for "do not requeue".
     requeue_head: str = ""
+    #: The verified PR head for a current, pinned review.
+    reviewed_head_sha: str = ""
 
 
 def review_publication_decision(
@@ -966,7 +968,8 @@ def review_publication_decision(
     status, head, why = review_head_status(
         review_ctx, pr_number, head_sha_fn=head_sha_fn, repo=repo, repo_cwd=repo_cwd)
     if status in ("current", "unpinned"):
-        return ReviewPublication(publish=True, status=status, reason=why)
+        return ReviewPublication(publish=True, status=status, reason=why,
+                                 reviewed_head_sha=head if status == "current" else "")
     if status == "stale":
         return ReviewPublication(publish=False, status=status, reason=why,
                                  requeue_head=head)

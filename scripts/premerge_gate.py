@@ -27,6 +27,7 @@ BASETEMP_ROOT = Path("/dev/shm")
 REVIEW = "[agent_crew review] verdict:"
 MARKER = "[agent_crew premerge gate]"
 BLACKBOARD_MARKER = "[agent_crew premerge blackboard]"
+BLOCKER_MARKER = "[agent_crew premerge blocker]"
 SHA = re.compile(r"\b[0-9a-f]{40}\b", re.I)
 SUMMARY = re.compile(r"^(?:=+\s*)?\d+ (?:passed|failed|error|skipped|xfailed|xpassed).*", re.I)
 TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
@@ -85,6 +86,16 @@ def trusted_comments(comments):
     return [c for c in comments if c.get("author_association") in TRUSTED_ASSOCIATIONS]
 
 
+def reviewed_head(body):
+    """Read only the server's final structured head line, never review prose."""
+    lines = body.splitlines()
+    if (body.count("> reviewed head:") != 1 or len(lines) < 2
+            or not lines[-1].startswith("> reviewer: ")):
+        return ""
+    match = re.fullmatch(r"> reviewed head: ([0-9a-f]{40})", lines[-2], re.I)
+    return match.group(1).lower() if match else ""
+
+
 def needs_gate(pr, comments):
     """Require the latest review verdict to approve this exact head."""
     if not same_repo_pr(pr):
@@ -105,8 +116,7 @@ def needs_gate(pr, comments):
     first_line = latest.splitlines()[0]
     if not re.fullmatch(r"\[agent_crew review\] verdict:\s*(?:✅\s*)?approve\s*", first_line):
         return False
-    reviewed = re.search(r"\bat\s+([0-9a-f]{7,40})\b", latest.lower())
-    return bool(reviewed and head.startswith(reviewed.group(1)))
+    return reviewed_head(latest) == head
 
 
 def unbound_approval(pr, comments):
@@ -124,8 +134,7 @@ def unbound_approval(pr, comments):
     first_line = (latest.get("body") or "").splitlines()[0]
     approved = re.fullmatch(r"\[agent_crew review\] verdict:\s*(?:✅\s*)?approve\s*",
                             first_line)
-    return bool(approved and not re.search(r"\bat\s+[0-9a-f]{7,40}\b",
-                                           (latest.get("body") or "").lower()))
+    return bool(approved and reviewed_head(latest.get("body") or "") != head)
 
 
 def gate_for_head(comments, head):
@@ -141,6 +150,21 @@ def legacy_gate_for_head(comments, head):
 def blackboard_posted(comments, head):
     return any(BLACKBOARD_MARKER in (c.get("body") or "")
                and f"HEAD {head}" in (c.get("body") or "") for c in trusted_comments(comments))
+
+
+def blocker_posted(comments, head):
+    return any(BLOCKER_MARKER in (c.get("body") or "")
+               and f"HEAD {head}" in (c.get("body") or "") for c in trusted_comments(comments))
+
+
+def deliver_unbound_blocker(command, number, head):
+    if not command:
+        raise RuntimeError("approval_unbound: blackboard command is not configured")
+    post_blackboard(command, {"repo": REPO, "pr_number": number,
+                              "head_sha": head, "reason": "approval_unbound"})
+    checked(["gh", "pr", "comment", str(number), "--repo", REPO,
+             "--body", f"{BLOCKER_MARKER}\nHEAD {head}\nreason=approval_unbound\n"],
+            cwd=ROOT)
 
 
 def gate_payload(number, body):
@@ -277,6 +301,8 @@ def main(argv=None):
                         continue
                     if not needs_gate(pr, comments):
                         if unbound_approval(pr, comments):
+                            if not blocker_posted(comments, head):
+                                deliver_unbound_blocker(args.blackboard_command, number, head)
                             raise ValueError("latest approval cannot be bound to current head SHA")
                         continue
                     if main is None:

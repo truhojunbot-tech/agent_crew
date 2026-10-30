@@ -172,6 +172,7 @@ def post_review_comment(
     reviewer: str = "agent",
     repo: Optional[str] = None,
     files_reviewed: Optional[list[str]] = None,
+    reviewed_head_sha: Optional[str] = None,
 ) -> bool:
     """Post a review result as a PR comment via gh CLI. Returns True on success."""
     if not check_gh_installed():
@@ -202,6 +203,8 @@ def post_review_comment(
         lines.append("변경 파일 확인: " + ", ".join(
             path.replace("\r", " ").replace("\n", " ") for path in files_reviewed))
         lines.append("")
+    if isinstance(reviewed_head_sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", reviewed_head_sha):
+        lines.append(f"> reviewed head: {reviewed_head_sha}")
     lines.append(f"> reviewer: {reviewer} | task: {task_id}")
     body = "\n".join(lines)
 
