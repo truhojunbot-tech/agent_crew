@@ -342,11 +342,12 @@ def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path, *, u
     from agent_crew.queue import _CEA_SYSTEM_SUCCESSOR_PROVENANCE
     from agent_crew.protocol import TaskRequest
     q.enqueue(TaskRequest(
-        task_id="retry-review-1-ab12", task_type="review", description="retry",
-        context={"retry_attempt": 1, "original_task_id": "review-1"},
+        task_id="opaque-retry-202", task_type="review", description="retry",
+        context={"retry_attempt": 1, "original_task_id": "review-1",
+                 "retry_of": "review-1"},
     ), _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
     q.enqueue(TaskRequest(
-        task_id="fallback-review-1-cd34", task_type="review", description="fallback",
+        task_id="opaque-fallback-202", task_type="review", description="fallback",
         context={"fallback_from_task_id": "review-1", "original_task_id": "review-1"},
     ), _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
     with patch.dict(os.environ, {
@@ -363,12 +364,12 @@ def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path, *, u
                 )
                 with TestClient(app2):
                     observed = _wait_for_dispatch(lambda: (
-                        _attribution_row(tmp_db, "retry-review-1-ab12") is not None
-                        and _attribution_row(tmp_db, "fallback-review-1-cd34") is not None))
+                        _attribution_row(tmp_db, "opaque-retry-202") is not None
+                        and _attribution_row(tmp_db, "opaque-fallback-202") is not None))
                     assert observed, "retry and fallback dispatches did not persist attribution"
 
-    retry_row = _attribution_row(tmp_db, "retry-review-1-ab12")
-    fallback_row = _attribution_row(tmp_db, "fallback-review-1-cd34")
+    retry_row = _attribution_row(tmp_db, "opaque-retry-202")
+    fallback_row = _attribution_row(tmp_db, "opaque-fallback-202")
     assert retry_row["retry_of"] == "review-1"
     assert fallback_row["fallback_of"] == "review-1"
 

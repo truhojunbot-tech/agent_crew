@@ -68,8 +68,12 @@ def test_cascade_chain_keeps_root_tier_and_declaration(tmp_path):
             ("fix-review-root", "implement", "cascade.fix"),
             ("retry-fix-root", "implement", "retry.failed_task"),
             ("test-root", "test", "cascade.test")):
-        request = TaskRequest(task_id, task_type, "routine work", context={
-            "prev_task_id": previous.task_id})
+        context = {"prev_task_id": previous.task_id}
+        if ingress == "cascade.fix":
+            context["fix_round"] = 1
+        if ingress == "retry.failed_task":
+            context["retry_of"] = previous.task_id
+        request = TaskRequest(task_id, task_type, "routine work", context=context)
         _enqueue_with_inherited_risk(
             queue, request, {task.task_id: task for task in queue.list_tasks()},
             previous, ingress=ingress,

@@ -2303,6 +2303,7 @@ def auto_enqueue_review(
             if not any(g.id == gate_id for g in queue.list_gates()):
                 queue.create_gate(GateRequest(
                     id=gate_id, type="approval",
+                    kind="review", target_task_id=impl_task_id,
                     message=(f"Tier 3 human/independent gate for {impl_task_id}: "
                              "irreversible or external work must be explicitly approved "
                              "before review/test continuation."),
@@ -2392,6 +2393,7 @@ def auto_enqueue_review(
                     retry_context.update({
                         "prev_task_id": impl_task_id,
                         "original_task_id": impl_task_id,
+                        "retry_of": impl_task_id,
                         "retry_attempt": retry_attempt + 1,
                         "retry_reason": reason,
                         "lineage_root_task_id": (
@@ -2511,7 +2513,7 @@ def auto_enqueue_review(
             prior_fix_round = int(impl_ctx.get("fix_round") or 0)
         except (TypeError, ValueError):
             prior_fix_round = 0
-        if impl_task_id.startswith("fix-") or prior_fix_round > 0:
+        if prior_fix_round > 0:
             prior_review = next((
                 task for candidate in (impl_ctx.get("prev_task_id"),
                                        impl_ctx.get("review_task_id"))
@@ -2686,6 +2688,7 @@ def auto_enqueue_test(
             if not any(g.id == gate_id for g in queue.list_gates()):
                 queue.create_gate(GateRequest(
                     id=gate_id, type="approval",
+                    kind="test", target_task_id=review_task_id,
                     message=(f"Tier 3 human/independent gate for {review_task_id}: "
                              "approve before test continuation."),
                 ))
@@ -2806,16 +2809,13 @@ def resume_tier3_gate(queue: TaskQueue, gate_id: str, *,
     gate = next((item for item in queue.list_gates() if item.id == gate_id), None)
     if gate is None or gate.status != "approved":
         return None
-    # Test gates deliberately come first: their prefix is a strict extension
-    # of the review-gate prefix and must resume a test, never be misread as an
-    # implementation task named ``test-...``.
-    if gate_id.startswith("risk-tier3-test-"):
-        review_task_id = gate_id[len("risk-tier3-test-"):]
+    if gate.kind == "test" and gate.target_task_id:
+        review_task_id = gate.target_task_id
         queue.patch_context(review_task_id, {"tier3_gate_approved": True})
         return auto_enqueue_test(queue, review_task_id, server_project=server_project,
                                  pr_state_fn=pr_state_fn)
-    if gate_id.startswith("risk-tier3-"):
-        impl_task_id = gate_id[len("risk-tier3-"):]
+    if gate.kind == "review" and gate.target_task_id:
+        impl_task_id = gate.target_task_id
         queue.patch_context(impl_task_id, {"tier3_gate_approved": True})
         return auto_enqueue_review(queue, impl_task_id, server_project=server_project,
                                    pr_state_fn=pr_state_fn)

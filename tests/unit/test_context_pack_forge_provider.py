@@ -16,7 +16,7 @@ FIXTURE = Path(__file__).parents[1] / "fixtures/context_pack/forge-get-context.j
 
 def _build():
     return cp.build_pack_for_task(
-        {"issue_title": "dispatch context", "repo": "org/agent_crew"},
+        {"issue_title": "dispatch context", "repo": "org/agent_crew", "fix_round": 1},
         task_id="fix-1", task_type="implement", role="implementer",
     )
 

@@ -40,6 +40,7 @@ def _task(queue, task_id, role, *, parent=None, status="completed",
         context["external_operation_id"] = operation_id
     if retry_of is not None:
         context["original_task_id"] = retry_of
+        context["retry_of"] = retry_of
     queue.enqueue(TaskRequest(task_id=task_id, task_type=role,
                               description=f"{role} for #405", branch="agent/405",
                               project="alfred", context=context),

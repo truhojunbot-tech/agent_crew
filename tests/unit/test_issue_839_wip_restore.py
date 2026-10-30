@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from agent_crew import server
 from agent_crew.protocol import TaskRequest, TaskResult
-from agent_crew.queue import TaskQueue
+from agent_crew.queue import TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE
 
 
 def _git(path, *args):
@@ -133,9 +133,11 @@ def test_retry_restores_source_task_stash(tmp_path, monkeypatch):
     queue.enqueue(_task("impl-source"))
     queue.dequeue(role="implementer")
     queue.force_fail("impl-source", "quota hold", {"wip_stash": sha})
-    queue.enqueue(_task("retry-impl-source-a1", {
+    queue.enqueue(_task("opaque-retry-1", {
         "prev_task_id": "impl-source", "original_task_id": "impl-source",
-        "retry_attempt": 1}))
+        "retry_of": "impl-source", "retry_attempt": 1}),
+        ingress="retry.failed_task",
+        _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
 
     with TestClient(app):
         app.state.try_push_next("implementer")
@@ -143,7 +145,7 @@ def test_retry_restores_source_task_stash(tmp_path, monkeypatch):
     assert len(pushes) == 1
     assert (wt / "app.py").read_text() == "value = 2\n"
     assert (wt / "new_test.py").exists()
-    assert queue.get_task("retry-impl-source-a1").error_info["wip_restored"] == sha
+    assert queue.get_task("opaque-retry-1").error_info["wip_restored"] == sha
 
 
 def test_retry_does_not_reapply_source_stash_already_restored(tmp_path, monkeypatch):
@@ -162,8 +164,9 @@ def test_retry_does_not_reapply_source_stash_already_restored(tmp_path, monkeypa
     })
     queue.enqueue(_task("retry-impl-source-a1", {
         "prev_task_id": "impl-source", "original_task_id": "impl-source",
-        "retry_attempt": 1,
-    }))
+        "retry_of": "impl-source", "retry_attempt": 1,
+    }), ingress="retry.failed_task",
+        _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
 
     with TestClient(app):
         app.state.try_push_next("implementer")

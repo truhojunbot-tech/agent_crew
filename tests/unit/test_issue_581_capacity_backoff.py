@@ -478,7 +478,7 @@ def test_u_581_capacity_successor_can_replace_its_active_review_target(
                         role="reviewer" if task_type == "review" else "tester")
     assert claimed is not None and claimed.task_id == parent.task_id
     ctx = successor_context(q.get_task_context(parent.task_id))
-    ctx.update({"original_task_id": parent.task_id,
+    ctx.update({"original_task_id": parent.task_id, "retry_of": parent.task_id,
                 "provider_capacity_root": parent.task_id,
                 "push_refusal_reason": "codex_capacity",
                 "provider_capacity_count": 1})
@@ -578,7 +578,7 @@ def test_u_581_capacity_review_readmission_claims_with_signed_receipt(
                                     blocked_after_s=3600)
     assert cap is not None and cap["readmit"] is True
     ctx = successor_context(q.get_task_context(parent.task_id))
-    ctx.update({"original_task_id": parent.task_id,
+    ctx.update({"original_task_id": parent.task_id, "retry_of": parent.task_id,
                 "provider_capacity_root": parent.task_id,
                 "push_refusal_reason": "codex_capacity",
                 "push_not_before": 0,

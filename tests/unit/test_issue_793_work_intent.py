@@ -226,6 +226,7 @@ def _system_retry(queue, task_id, parent_id, task_type, **context):
     provenance token without which admission drops that key."""
     queue.enqueue(TaskRequest(**_lineage_task(task_id, task_type, parent_id,
                                               original_task_id=parent_id,
+                                              retry_of=parent_id,
                                               retry_attempt=1, **context)),
                   ingress="retry.failed_task",
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
@@ -608,6 +609,7 @@ def test_declared_retry_of_other_revision_does_not_supersede(tmp_path):
     queue.enqueue(TaskRequest(**_lineage_task("retry-test-1-a1", "test", "test-1",
                                               reviewed_sha="b" * 40,
                                               original_task_id="test-1",
+                                              retry_of="test-1",
                                               retry_attempt=1)),
                   ingress="retry.failed_task",
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
@@ -667,6 +669,7 @@ def test_declared_retry_provenance_supersedes_dead_task(tmp_path):
     _fail(queue, "test-1", status="timed_out")
     queue.enqueue(TaskRequest(**_lineage_task("retry-test-1-a1", "test", "test-1",
                                               original_task_id="test-1",
+                                              retry_of="test-1",
                                               retry_attempt=1)),
                   ingress="retry.failed_task",
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
@@ -692,6 +695,7 @@ def test_needs_human_task_is_never_superseded(tmp_path):
     _assert_blocked_on(queue, "test-held=needs_human")
     queue.enqueue(TaskRequest(**_lineage_task("retry-test-held-a1", "test", "test-held",
                                               original_task_id="test-held",
+                                              retry_of="test-held",
                                               retry_attempt=1)),
                   ingress="retry.failed_task",
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)

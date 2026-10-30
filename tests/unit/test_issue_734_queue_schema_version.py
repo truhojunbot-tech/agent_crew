@@ -24,6 +24,7 @@ SCHEMA_SIGNATURES = {
     7: "1804c5c60296bffde40d28b7358f4b7f6cc3d5db44832641ae826911ee104c12",
     8: "d7dc3d5928a0bae5122f50e9d8c4273d597e0874bf57b7bc622402a15475859f",
     9: "45e1c81521d215e86b4171bb96cd72834f1a88445d4d4401d4f060e73ca28a8b",
+    10: "d6f9f7976fd8dae601d9db7470d7e017dc1c4f0e5f99835e7c011c0ff68b819a",
 }
 _SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "agent_crew"
 _DDL_SOURCES = {

@@ -49,7 +49,9 @@ def test_golden_missing_context(case_id, category, item_types, expected):
             items.extend(cpack.Artifact(f"{kind}-{case_id}", f"fixture://{kind}", kind)
                          for kind in item_types if kind not in {cpack.TYPE_ISSUE, cpack.TYPE_AC})
     pack = cpack.ContextPack(task_id, "implementer", cpack.MODE_LEXICAL, items=items)
-    actual = cpack.is_sufficient(pack).missing_signals
+    actual = cpack.is_sufficient(
+        pack, fix_round=1 if category in {"prior_finding", "linked_review"} else 0,
+    ).missing_signals
     canonical = []
     for signal in expected:
         if signal.startswith("AC artifact missing"):
@@ -63,33 +65,33 @@ def test_golden_missing_context(case_id, category, item_types, expected):
 
 def test_all_rules_priority_and_no_ac():
     pack = cpack.ContextPack("fix-r", "implementer", cpack.MODE_LEXICAL)
-    signals = cpack.is_sufficient(pack, retry_of="old").missing_signals
+    signals = cpack.is_sufficient(pack, retry_of="old", fix_round=1).missing_signals
     assert [s.split(" ", 1)[0] for s in signals] == ["issue", "AC", "fix", "retry"]
     issue = cpack.Artifact("issue", "issue://1", cpack.TYPE_ISSUE,
                            provenance="the claimed issue; no_ac=true")
     review = cpack.Artifact("review", "review://1", cpack.TYPE_REVIEW)
     episode = cpack.Artifact("episode:old", "episode://old", cpack.TYPE_EPISODE)
     pack.items = [issue, review, episode]
-    assert cpack.is_sufficient(pack, retry_of="old").ok
+    assert cpack.is_sufficient(pack, retry_of="old", fix_round=1).ok
     block = pack.to_prompt_block(cpack.InjectGate(False, ["missing test signal"]))
     assert block.index("INJECT WARNING") < block.index("--- [issue]")
 
 
 @pytest.mark.parametrize(
-    "task_id,task_type,requires_review",
+    "task_id,fix_round,requires_review",
     [
-        ("impl-tok31-fixround-x", "implement", False),
-        ("fix-foo", "implement", True),
-        ("impl-foo", "fix", True),
+        ("fix-foo", 0, False),
+        ("opaque-foo", 1, True),
+        ("impl-foo", 2, True),
     ],
 )
-def test_fix_round_identification_uses_prefix_or_task_type(task_id, task_type, requires_review):
+def test_fix_round_identification_uses_field(task_id, fix_round, requires_review):
     items = [
         cpack.Artifact("issue", "issue://1", cpack.TYPE_ISSUE),
         cpack.Artifact("ac", "issue://1#ac", cpack.TYPE_AC),
     ]
     pack = cpack.ContextPack(task_id, "implementer", cpack.MODE_LEXICAL, items=items)
-    signals = cpack.is_sufficient(pack, task_type=task_type).missing_signals
+    signals = cpack.is_sufficient(pack, task_type="implement", fix_round=fix_round).missing_signals
     assert bool(signals) is requires_review
     if requires_review:
         assert signals[0].startswith("fix round requires linked_review")
