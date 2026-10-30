@@ -9558,6 +9558,7 @@ def create_app(
                                 verdict=_resolve_verdict(result),   # #208 defensive resolver
                                 summary=result.summary or "",
                                 findings=result.findings or [],
+                                files_reviewed=result.files_reviewed,
                                 task_id=task_id,
                                 reviewer=_reviewer_agent,
                                 repo=_review_repo,

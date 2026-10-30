@@ -194,6 +194,7 @@ def build_mcp_server(
         summary: str = "",
         verdict: Optional[str] = None,
         findings: Optional[list[Union[str, dict]]] = None,
+        files_reviewed: Optional[list[str]] = None,
         error_info: Optional[dict] = None,
         # `int | str` for the same reason as the HTTP body: agents write PR
         # numbers as `#268`, and a transport that 422s on the spelling throws
@@ -231,6 +232,7 @@ def build_mcp_server(
                 summary=summary,
                 verdict=verdict,  # type: ignore[arg-type]
                 findings=list(findings or []),
+                files_reviewed=files_reviewed,
                 error_info=error_info,
                 pr_number=pr_number,
                 # #305: `commit` is normalised by `TaskResult` itself — a value
