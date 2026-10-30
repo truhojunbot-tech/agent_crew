@@ -89,7 +89,8 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               TaskAlreadyExistsError,
                               TaskQueue, WorkIntentTargetConflict, QUEUE_SCHEMA_VERSION,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
-                              validate_http_root_risk, claim_lease_seconds,
+                              validate_http_root_risk, validate_local_inputs,
+                              claim_lease_seconds,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE,
                               RequestSqliteTiming, request_sqlite_timing)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
@@ -8720,6 +8721,10 @@ def create_app(
         try:
             validate_http_root_risk(ctx)
         except InvalidRiskTierError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            validate_local_inputs(ctx)
+        except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/work-intents/admit", status_code=201)

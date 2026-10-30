@@ -1,20 +1,14 @@
-"""Deterministic, metadata-first cascade safety classification (Council #39).
-
-The classifier is deliberately conservative: an explicit valid operator tier
-wins, clear irreversible/external keywords escalate, documentation-only work
-does not consume a review/test cascade, and unfamiliar work remains Tier 1.
-It is policy metadata, not an LLM judgement, so replaying a task is stable.
-"""
+"""Declared risk metadata for cascade decisions (Council #39)."""
 from __future__ import annotations
 
-import logging
 import os
-import re
 from typing import Mapping
 
-logger = logging.getLogger(__name__)
-
 TIER_0, TIER_1, TIER_2, TIER_3 = range(4)
+
+
+class InvalidRiskTierError(ValueError):
+    """A producer or legacy task has no valid declared risk tier."""
 
 RISK_DECLARATION_FIELDS = (
     "safety_or_live_change",
@@ -22,10 +16,6 @@ RISK_DECLARATION_FIELDS = (
     "bounded_routine_fix",
     "human_gate_required",
 )
-
-_TIER3 = re.compile(r"\b(stop|pause|resume|merge|deploy|external\s+(?:mutation|write|api)|delete|destroy)\b", re.I)
-_TIER2 = re.compile(r"\b(core|queue|pipeline|server|protocol|schema|migration|database|api|mcp|interface|auth(?:entication)?|security)\b", re.I)
-
 
 def risk_tier_enforcement_enabled() -> bool:
     """Return whether the Council #39 cascade is explicitly enabled.
@@ -40,47 +30,17 @@ def risk_tier_enforcement_enabled() -> bool:
 
 def _override(context: Mapping | None):
     value = (context or {}).get("risk_tier")
-    if isinstance(value, bool):
-        return None
-    try:
-        value = int(value)
-    except (TypeError, ValueError):
+    if type(value) is not int:
         return None
     return value if TIER_0 <= value <= TIER_3 else None
 
 
 def classify_task(description: str, context: Mapping | None = None) -> int:
-    """Return Council #39 tier from durable task metadata.
-
-    ``context.risk_tier`` is the explicit operator override. Invalid values are
-    ignored rather than coerced into a potentially lower safety tier.
-    """
-    ctx = context or {}
-    # Watch/direct enqueue callers often put the touched paths in structured
-    # metadata and leave the description as a short title. Fold only declared
-    # routing metadata into the deterministic classifier; never infer it from
-    # cwd/provider/session state.
-    path_values = []
-    for key in ("changed_paths", "paths", "files", "touches"):
-        value = ctx.get(key) if isinstance(ctx, Mapping) else None
-        if isinstance(value, str):
-            path_values.append(value)
-        elif isinstance(value, (list, tuple)):
-            path_values.extend(str(item) for item in value)
-    text = " ".join([description or "", *path_values])
-    if isinstance(ctx, Mapping) and any(ctx.get(key) is True for key in
-                                        ("external_impact", "irreversible", "requires_human_gate")):
-        automatic = TIER_3
-    elif _TIER3.search(text):
-        automatic = TIER_3
-    elif _TIER2.search(text):
-        automatic = TIER_2
-    elif path_values and all(path.startswith("docs/") or path.endswith(".md") for path in path_values):
-        automatic = TIER_0
-    else:
-        automatic = TIER_1
-    explicit = _override(context)
-    return max(automatic, explicit) if explicit is not None else automatic
+    """Return the declared Council #39 tier; prose has no authority."""
+    tier = _override(context)
+    if tier is None:
+        raise InvalidRiskTierError("context.risk_tier must be an integer 0-3")
+    return tier
 
 
 def _empty_risk_declaration() -> dict:
@@ -135,52 +95,11 @@ def _explicit_risk_declaration(context: Mapping | None) -> dict | None:
 
 
 def risk_declaration(description: str, context: Mapping | None = None) -> dict:
-    """Produce nullable #342(C) risk facts without changing execution policy.
-
-    Explicit declarations win.  Otherwise this records only positive signals
-    from the existing deterministic classifier: a low tier is not evidence
-    that a task is *not* safety-relevant, so its safety fact remains unknown.
-    """
+    """Return only declared risk facts; never infer them from task prose."""
     explicit = _explicit_risk_declaration(context)
     if explicit is not None:
-        if explicit.get("inherited_from"):
-            tier = classify_task(description, context)
-            stronger = {}
-            if tier == TIER_3:
-                stronger = {"safety_or_live_change": True, "human_gate_required": True}
-            # A cascade fix embeds the review's prose and file paths in its
-            # description. Words such as "server.py" describe the finding,
-            # not a new broad-architecture declaration by this successor.
-            # Keep the root's explicit fact; still escalate live/safety work.
-            if any(explicit[field] is not True for field in stronger):
-                return {**explicit, **stronger,
-                        "escalated_by": "classifier_tier3"}
-        # A tier is a floor for the classifier. Preserve a stronger live/safety
-        # signal when this declaration came from the tier, without overriding
-        # an operator's separate risk_declaration or structured risk flags.
-        if (isinstance(context, Mapping) and _override(context) is not None
-                and _explicit_risk_declaration(
-                    {key: value for key, value in context.items() if key != "risk_tier"}
-                ) is None
-                and classify_task(description, context) == TIER_3):
-            return {**explicit, "safety_or_live_change": True,
-                    "human_gate_required": True}
         return explicit
-
-    tier = classify_task(description, context)
-    values = {field: None for field in RISK_DECLARATION_FIELDS}
-    if tier == TIER_3:
-        values["safety_or_live_change"] = True
-        values["human_gate_required"] = True
-    elif tier == TIER_2:
-        values["broad_architecture_change"] = True
-    elif tier == TIER_0:
-        values["bounded_routine_fix"] = True
-    else:
-        # Tier 1 is the legacy classifier's safe default, not an observed risk
-        # class.  Preserve unknown rather than presenting that default as fact.
-        return _empty_risk_declaration()
-    return {**values, "declaration_source": "heuristic", "confidence": "low"}
+    return _empty_risk_declaration()
 
 
 def effective_fix_round_cap(context: Mapping | None, ceiling: int | None = None) -> int:
@@ -191,7 +110,7 @@ def effective_fix_round_cap(context: Mapping | None, ceiling: int | None = None)
 def cascade_metadata(description: str, context: Mapping | None) -> dict:
     """Stable context copied to every successor in a lineage."""
     tier = classify_task(description, context)
-    return {"risk_tier": tier, "risk_tier_source": "explicit" if _override(context) is not None else "metadata"}
+    return {"risk_tier": tier, "risk_tier_source": "explicit"}
 
 
 def shadow_decision(

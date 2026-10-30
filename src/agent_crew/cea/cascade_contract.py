@@ -111,13 +111,8 @@ def decide(description: str, context: Optional[Mapping],
     if not enforced:
         contract = CascadeContract(enforced=False, source="admission")
     else:
-        # A review→fix lineage created before Council #39 has no tier receipt.
-        # Do not retroactively alter its already-running cap halfway through.
-        if "fix_round" in ctx and "risk_tier" not in ctx:
-            tier, metadata = TIER_2, {}
-        else:
-            metadata = cascade_metadata(description, ctx)
-            tier = metadata["risk_tier"]
+        metadata = cascade_metadata(description, ctx)
+        tier = metadata["risk_tier"]
         contract = CascadeContract(
             enforced=True, tier=tier,
             tier_source=(metadata or {}).get("risk_tier_source"),

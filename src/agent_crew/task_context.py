@@ -130,6 +130,7 @@ TASK_CONTEXT_KEYS = frozenset({
     'labels',
     'lineage_root_task_id',
     'lineage_terminal_reason',
+    'local_inputs',
     'modules',
     'no_tester',
     'op',

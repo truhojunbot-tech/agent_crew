@@ -301,11 +301,12 @@ def test_a_failed_review_is_not_reused_so_the_retry_can_actually_happen(tmp_db):
 
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="review-dead", task_type="review", description="d",
-                          branch="main", context={"prev_task_id": "impl-1"}))
+                          branch="main", context={"prev_task_id": "impl-1", "risk_tier": 1}))
     q.submit_result("review-dead", TaskResult(task_id="review-dead", status="failed",
                                               summary="exit_1"))
 
-    retry_id = enqueue_review(q, "d", "main", prev_task_id="impl-1")
+    retry_id = enqueue_review(q, "d", "main", prev_task_id="impl-1",
+                              context={"risk_tier": 1})
     assert retry_id != "review-dead", "the retry reused the review that just died"
 
 

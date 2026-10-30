@@ -1996,10 +1996,9 @@ def auto_enqueue_fix(
         }
         if failed_test:
             fix_context["feedback"] = findings_text
-        inherited_tiers = [tier for tier in (review_ctx.get("risk_tier"), contract.tier)
-                           if type(tier) is int and 0 <= tier <= 3]
-        if inherited_tiers:
-            fix_context["risk_tier"] = max(inherited_tiers)
+        inherited_tier = review_ctx.get("risk_tier")
+        if type(inherited_tier) is int and 0 <= inherited_tier <= 3:
+            fix_context["risk_tier"] = inherited_tier
         if pr_number is not None:
             # #186: lets the dispatcher check out the PR head for this task.
             fix_context["pr_number"] = pr_number
@@ -2727,10 +2726,9 @@ def auto_enqueue_test(
             return test_id
         tester_agent = tester_agent or DEFAULT_ROLE_TO_AGENT["tester"]
         test_context: dict = {"prev_task_id": review_task_id}
-        inherited_tiers = [tier for tier in (review_ctx.get("risk_tier"), contract.tier)
-                           if type(tier) is int and 0 <= tier <= 3]
-        if inherited_tiers:
-            test_context["risk_tier"] = max(inherited_tiers)
+        inherited_tier = review_ctx.get("risk_tier")
+        if type(inherited_tier) is int and 0 <= inherited_tier <= 3:
+            test_context["risk_tier"] = inherited_tier
         # Test the exact revision approved by the reviewer. This is also the
         # artifact component of the test's CEA intent identity.
         if review_ctx.get("reviewed_sha"):
@@ -2741,7 +2739,7 @@ def auto_enqueue_test(
             test_context["fix_round"] = review_ctx["fix_round"]
         if enforce_risk_tier:
             test_context.update({
-                "risk_tier": max(inherited_tiers) if inherited_tiers else contract.tier,
+                "risk_tier": inherited_tier,
                 "risk_tier_source": review_ctx.get("risk_tier_source", "metadata"),
             })
         if (enforce_risk_tier and contract.test_scope

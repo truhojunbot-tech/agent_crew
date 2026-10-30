@@ -332,7 +332,7 @@ def test_a_broken_provenance_read_does_not_stop_the_server(tmp_path, monkeypatch
     with TestClient(create_app(db_path=db, pane_map={}, port=8105,
                                project="p", watchdog_disabled=True,
                                anomaly_disabled=True)) as c:
-        assert c.get("/tasks").status_code == 200
+        assert c.get("/tasks", headers={"X-Agent-Crew-Project": "p"}).status_code == 200
 
 
 # ── 6. the CLI gate ───────────────────────────────────────────────────

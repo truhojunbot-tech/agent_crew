@@ -60,7 +60,7 @@ def _review(q, *, findings=(FINDING,), summary="request_changes: fix the cap",
             verdict="request_changes", status="completed", pr_number=None,
             context=None, project="", branch=BRANCH):
     review_id = f"review-{uuid.uuid4().hex[:8]}"
-    ctx = {"prev_task_id": "impl-1"}
+    ctx = {"prev_task_id": "impl-1", "risk_tier": 1}
     if pr_number is not None:
         ctx["pr_number"] = pr_number
     ctx.update(context or {})

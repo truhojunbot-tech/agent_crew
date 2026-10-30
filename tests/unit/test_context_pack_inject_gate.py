@@ -166,7 +166,7 @@ def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=Fals
         q = TaskQueue(db)
         q.enqueue(TaskRequest(task_id="gate-t", task_type="implement", description="do it",
                               branch="main", project=task_project,
-                              context={"issue": 1, "issue_title": "A",
+                              context={"risk_tier": 1, "issue": 1, "issue_title": "A",
                                                        "issue_body": "Body without AC"}))
         task = q.dequeue(role="implementer")
         asyncio.run(app.state.dispatch_task(task, "implementer"))

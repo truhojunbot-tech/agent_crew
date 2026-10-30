@@ -35,7 +35,7 @@ def test_auto_fix_stored_row_matches_signed_broker_payload(tmp_db, monkeypatch):
     key = Ed25519PrivateKey.generate()
     queue.enqueue(TaskRequest(
         "risk-root", "implement", "implement feature", branch="feature/risk",
-        context={"risk_declaration": {
+        context={"risk_tier": 1, "risk_declaration": {
             "safety_or_live_change": False,
             "broad_architecture_change": False,
             "bounded_routine_fix": True,
@@ -101,7 +101,7 @@ def test_review_and_test_successors_match_signed_broker_payload(
     key = Ed25519PrivateKey.generate()
     queue.enqueue(TaskRequest(
         "risk-root", "implement", "implement feature", branch="feature/risk",
-        context={"risk_declaration": {
+        context={"risk_tier": 1, "risk_declaration": {
             "safety_or_live_change": False, "broad_architecture_change": False,
             "bounded_routine_fix": True, "human_gate_required": False,
             "declaration_source": "explicit", "confidence": "high"}},
@@ -163,7 +163,7 @@ def test_failed_task_retry_matches_signed_broker_payload(tmp_db, monkeypatch):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(
         "risk-root", "implement", "implement feature", branch="feature/risk",
-        context={"risk_declaration": {
+        context={"risk_tier": 1, "risk_declaration": {
             "safety_or_live_change": False, "broad_architecture_change": False,
             "bounded_routine_fix": True, "human_gate_required": False,
             "declaration_source": "explicit", "confidence": "high"}},

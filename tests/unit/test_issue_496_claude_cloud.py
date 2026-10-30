@@ -64,7 +64,8 @@ def _enqueue_implement(q, task_id=None, branch=None, context=None):
     task_id = task_id or f"impl-{uuid.uuid4().hex[:8]}"
     branch = branch or f"claude/{task_id}"
     q.enqueue(TaskRequest(task_id=task_id, task_type="implement", description="do the thing",
-                          branch=branch, context={"repo": "owner/repo", **(context or {})},
+                          branch=branch, context={"risk_tier": 1, "repo": "owner/repo",
+                                                  **(context or {})},
                           project="agent_crew"))
     return task_id, branch
 

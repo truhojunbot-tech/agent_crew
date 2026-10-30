@@ -68,8 +68,10 @@ def test_trusted_generated_successor_without_tier_is_accepted(tmp_path):
     assert queue.get_task("review-root") is not None
 
 
-def test_explicit_declaration_accepts_root_without_tier(tmp_path):
+def test_explicit_declaration_does_not_replace_required_tier(tmp_path):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
-    queue.enqueue(TaskRequest("root", "review", "work", context={
-        "risk_declaration": {"bounded_routine_fix": True}}))
-    assert queue.get_task("root") is not None
+    with pytest.raises(Exception, match="context.risk_tier"):
+        queue.enqueue(TaskRequest("root", "review", "work", context={
+            "risk_declaration": {"bounded_routine_fix": True}}),
+            ingress="cli.enqueue")
+    assert queue.get_task("root") is None

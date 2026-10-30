@@ -25,7 +25,8 @@ def _review(task_id, *, parent, sha, pr=7, branch="feat/x"):
     return TaskRequest(
         task_id=task_id, task_type="review", description="Review PR #7",
         branch=branch,
-        context={"prev_task_id": parent, "pr_number": pr, "reviewed_sha": sha},
+        context={"risk_tier": 1, "prev_task_id": parent, "pr_number": pr,
+                 "reviewed_sha": sha},
     )
 
 

@@ -48,7 +48,8 @@ from agent_crew.role_mapping import (
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
 from agent_crew.tokenomics_shadow import shadow_recommendation, shadow_recommendation_for_task_id
-from agent_crew.risk_tier import RISK_DECLARATION_FIELDS, risk_declaration
+from agent_crew.risk_tier import (InvalidRiskTierError, RISK_DECLARATION_FIELDS,
+                                  risk_declaration)
 
 
 @dataclass
@@ -1444,21 +1445,12 @@ class DuplicateReviewError(Exception):
         super().__init__(f"DUPLICATE_REVIEW: existing task {existing_task_id}")
 
 
-class InvalidRiskTierError(ValueError):
-    """An HTTP task declared no valid integer tier or mismatched its root."""
-
-
 class WorkIntentTargetConflict(ValueError):
     """A replay tried to replace a work intent's already recorded target."""
 
 
 def validate_http_root_risk(context: dict | None) -> None:
-    """Validate untrusted POST /tasks input before queue admission writes a row.
-
-    HTTP context cannot prove successor provenance, even when it names a
-    parent. Internal adapters and legacy successors retain their own ingress
-    contracts and continue through the common queue admission path.
-    """
+    """Require a declared tier before any task is admitted."""
     context = context if isinstance(context, dict) else {}
     if "risk_tier" in context and (
             isinstance(context["risk_tier"], bool)
@@ -1466,7 +1458,15 @@ def validate_http_root_risk(context: dict | None) -> None:
             or not 0 <= context["risk_tier"] <= 3):
         raise InvalidRiskTierError("context.risk_tier must be an integer 0-3")
     if "risk_tier" not in context:
-        raise InvalidRiskTierError("root context.risk_tier must be an integer 0-3")
+        raise InvalidRiskTierError("context.risk_tier must be an integer 0-3")
+
+
+def validate_local_inputs(context: dict | None) -> None:
+    """Cloud input declarations have one transport-independent shape."""
+    context = context if isinstance(context, dict) else {}
+    value = context.get("local_inputs", [])
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("context.local_inputs must be a list of strings")
 
 
 def _is_issue_number(value) -> bool:
@@ -2657,14 +2657,18 @@ class TaskQueue:
         """
         context = self._enqueue_context(task)
         if successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
-            inherited_tier = context.get("risk_tier")
             if "risk_tier" in context and (
-                    isinstance(inherited_tier, bool)
-                    or not isinstance(inherited_tier, int)
-                    or not 0 <= inherited_tier <= 3):
+                    type(context["risk_tier"]) is not int
+                    or not 0 <= context["risk_tier"] <= 3):
                 context.pop("risk_tier")
-                logger.warning("cea: dropped invalid inherited risk_tier for %s",
-                               task.task_id)
+            parent_id = (context.get("prev_task_id")
+                         or _cea_lineage_parent_from_ctx(context))
+            if parent_id and "risk_tier" not in context:
+                parent = self.get_task(parent_id)
+                if parent is not None and isinstance(parent.context, dict):
+                    parent_tier = parent.context.get("risk_tier")
+                    if type(parent_tier) is int and 0 <= parent_tier <= 3:
+                        context["risk_tier"] = parent_tier
             return context
 
         dropped = [key for key in _CEA_LINEAGE_PARENT_KEYS if key in context]
@@ -4545,8 +4549,15 @@ class TaskQueue:
         # rather than admitted under a project it chose for itself.
         with self._implement_admission_lock(task):
             task, refusal = self._project_from_queue_identity(task)
+            if ingress is not None and isinstance(task.context, dict) and "risk_tier" in task.context:
+                validate_http_root_risk(task.context)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
+            # Product producers name their ingress. Bare enqueue() remains the
+            # legacy test/fixture API; every production adapter is checked.
+            if ingress is not None:
+                validate_http_root_risk(context)
+                validate_local_inputs(context)
             if _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
                 if (ingress == "cascade.fix" and context.get("artifact_kind") != "rebase"
                         and (type(context.get("fix_round")) is not int

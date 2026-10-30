@@ -92,7 +92,8 @@ def test_retry_child_drops_parent_result_refs_and_empty_result_stays_empty(tmp_p
     db_path = str(tmp_path / "tasks.db")
     TaskQueue(db_path).enqueue(TaskRequest(
         task_id="impl-parent", task_type="implement", description="work", branch="main",
-        priority=3, context={"result_branch": "fix/stale", "result_commit": COMMIT},
+        priority=3, context={"risk_tier": 1, "result_branch": "fix/stale",
+                             "result_commit": COMMIT},
     ))
 
     async def submit_failed_parent():

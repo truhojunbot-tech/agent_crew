@@ -3,7 +3,7 @@
 from agent_crew.pipeline import auto_enqueue_fix, auto_enqueue_review, auto_enqueue_test, resume_tier3_gate
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
-from agent_crew.risk_tier import classify_task, effective_fix_round_cap, risk_tier_enforcement_enabled
+from agent_crew.risk_tier import effective_fix_round_cap, risk_tier_enforcement_enabled
 from agent_crew.cea.cascade_contract import CascadeContract
 from agent_crew.telemetry import TaskTelemetry
 
@@ -16,29 +16,10 @@ def _task(queue, task_id):
     return next(task for task in queue.list_tasks() if task.task_id == task_id)
 
 
-def test_classifier_honours_explicit_override_and_metadata():
-    assert classify_task("update docs/README.md", {"risk_tier": 3}) == 3
-    assert classify_task("update docs/README.md", {"changed_paths": ["docs/README.md"]}) == 0
-    assert classify_task("change src/agent_crew/queue.py", {}) == 2
-    assert classify_task("add internal unit test", {}) == 1
-    assert classify_task("run production deploy", {}) == 3
-    assert classify_task("small cleanup", {"changed_paths": ["src/agent_crew/pause.py"]}) == 3
-    assert classify_task("small cleanup", {"changed_paths": ["docs/runbook.md"]}) == 0
-
-
-def test_explicit_override_never_downgrades_merge_or_deploy():
-    assert classify_task("merge then deploy", {"risk_tier": 0}) == 3
-
-
 def test_missing_contract_keeps_operator_round_baseline_even_when_tier_enforced(monkeypatch):
     monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     assert effective_fix_round_cap({"risk_tier": 1}, 5) == 5
     assert CascadeContract(enforced=True, tier=1).fix_round_cap(5) == 5
-
-
-def test_description_comment_cannot_make_code_change_tier_zero():
-    assert classify_task("fix request_changes comment", {}) == 1
-    assert classify_task("fix comment", {"changed_paths": ["src/agent_crew/queue.py"]}) == 2
 
 
 def test_default_shadow_mode_preserves_full_cascade_and_records_counterfactual(
@@ -147,7 +128,8 @@ def test_tier_three_gate_approval_via_http_enqueues_review(
     assert auto_enqueue_review(queue, "endpoint-deploy", pr_number=4, pr_state_fn=_open) is None
 
     response = test_client.post(
-        "/gates/risk-tier3-endpoint-deploy/resolve", json={"status": "approved"}
+        "/gates/risk-tier3-endpoint-deploy/resolve", json={"status": "approved"},
+        headers={"X-Agent-Crew-Project": test_client.get("/health").json()["project"]}
     )
 
     assert response.status_code == 200
@@ -168,7 +150,8 @@ def test_tier_three_test_gate_approval_via_http_resumes_test_once(
     assert auto_enqueue_test(queue, "review-tier3", pr_state_fn=_open) is None
 
     response = test_client.post(
-        "/gates/risk-tier3-test-review-tier3/resolve", json={"status": "approved"}
+        "/gates/risk-tier3-test-review-tier3/resolve", json={"status": "approved"},
+        headers={"X-Agent-Crew-Project": test_client.get("/health").json()["project"]}
     )
 
     assert response.status_code == 200

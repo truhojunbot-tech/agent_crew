@@ -63,7 +63,7 @@ def test_lineage_and_refused_admissions_do_not_reach_promotion_log(tmp_path, mon
     root = TaskRequest("natural", "discuss", "natural work", project="demo")
     q.enqueue(root, ingress="http.tasks")
     child = TaskRequest("child", "discuss", "child work", project="demo",
-                        context={"prev_task_id": "natural"})
+                        context={"risk_tier": 1, "prev_task_id": "natural"})
     q.enqueue(child, ingress="http.tasks")
     with pytest.raises(TaskAlreadyExistsError):
         q.enqueue(root, ingress="http.tasks")
@@ -86,7 +86,8 @@ def test_natural_ingress_excludes_system_and_retry_context_and_watchdog(tmp_path
 
     # The private capability is sufficient to make a task a system successor
     # even when it has no parent field to trigger the other eligibility checks.
-    system = TaskRequest("system", "discuss", "system work", project="demo")
+    system = TaskRequest("system", "discuss", "system work", project="demo",
+                         context={"risk_tier": 1})
     assert q.enqueue(system, ingress="http.tasks",
                      _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE) == "system"
 

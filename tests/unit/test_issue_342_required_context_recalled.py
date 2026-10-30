@@ -51,7 +51,7 @@ def test_context_evidence_has_quota_core_required_shape(tmp_db):
         "risk_declaration",
     }
     assert evidence["required_context_recalled"] is None
-    assert evidence["risk_declaration"]["declaration_source"] == "unknown"
+    assert evidence["risk_declaration"]["declaration_source"] == "explicit"
     assert set(evidence["token_observations"]) == {
         "uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
         "output_tokens", "reasoning_tokens",

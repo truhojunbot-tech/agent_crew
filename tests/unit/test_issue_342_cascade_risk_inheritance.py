@@ -143,7 +143,7 @@ def test_server_same_role_retry_marks_root_declaration_inherited(tmp_db, monkeyp
         response = client.post("/tasks/risk-root/result", json={
             "task_id": "risk-root", "status": "failed", "summary": "usage limit hit",
             "findings": [],
-        })
+        }, headers={"X-Agent-Crew-Project": client.get("/health").json()["project"]})
     assert response.status_code == 200, response.text
     retry_id = "retry-risk-root-a1"
     assert queue.get_task_status(retry_id) == "pending"
@@ -153,7 +153,7 @@ def test_server_same_role_retry_marks_root_declaration_inherited(tmp_db, monkeyp
     assert retry["risk_declaration_confidence"] == "high"
 
 
-def test_risky_descendant_escalates_inherited_routine_without_losing_source(tmp_db):
+def test_review_prose_does_not_escalate_inherited_routine(tmp_db):
     queue = TaskQueue(tmp_db)
     _root(queue)
     review_id = _review(queue)
@@ -164,11 +164,11 @@ def test_risky_descendant_escalates_inherited_routine_without_losing_source(tmp_
                               repo="owner/repo")
     assert fix_id
     attribution = _attribution(queue, fix_id)
-    assert attribution["safety_or_live_change"] == 1
-    assert attribution["human_gate_required"] == 1
+    assert attribution["safety_or_live_change"] == 0
+    assert attribution["human_gate_required"] == 0
     assert attribution["risk_declaration_source"] == "explicit"
     assert attribution["risk_declaration_confidence"] == "high"
-    assert queue.get_task_context(fix_id)["risk_declaration"]["escalated_by"] == "classifier_tier3"
+    assert "escalated_by" not in queue.get_task_context(fix_id)["risk_declaration"]
 
 
 def test_rate_limit_does_not_create_cross_provider_successor(tmp_db):

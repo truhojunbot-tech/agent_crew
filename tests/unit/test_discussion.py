@@ -36,7 +36,7 @@ def test_u_d01_enqueue_panel_tasks():
 def test_panel_tasks_have_explicit_no_rounds_risk_declaration(tmp_path):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     ids = enqueue_panel_tasks(queue, ["claude", "codex", "gemini"],
-                              "Analyze a possible change", {"round": 1})
+                              "Analyze a possible change", {"round": 1, "risk_tier": 1})
     assert len(ids) == 3
     for task_id in ids:
         task = queue.get_task(task_id)

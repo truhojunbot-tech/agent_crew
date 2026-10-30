@@ -85,7 +85,7 @@ def test_distinct_terminal_tasks_in_one_lineage_each_notify_once(tmp_path, monke
         queue.enqueue(TaskRequest(
             task_id="retry-root-801-a2", task_type="test", description="provider retry",
             branch="agent/801-failed-no-successor-notice", project="agent_crew",
-            context={"coordinator_managed": True, "retry_attempt": 2,
+            context={"risk_tier": 1, "coordinator_managed": True, "retry_attempt": 2,
                      "lineage_root_task_id": "root-801"}),
             ingress="http.tasks")
         response = client.post("/tasks/retry-root-801-a2/result", json={

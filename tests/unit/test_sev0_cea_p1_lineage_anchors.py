@@ -24,7 +24,8 @@ from agent_crew.queue import TaskQueue, intent_for_task
 def task(task_id, *, task_type="implement", context=None, project="agent_crew",
          description="add a --json flag", branch="main") -> TaskRequest:
     return TaskRequest(task_id=task_id, task_type=task_type, description=description,
-                       branch=branch, priority=3, context=dict(context or {}),
+                       branch=branch, priority=3,
+                       context={"risk_tier": 1, **(context or {})},
                        project=project)
 
 
