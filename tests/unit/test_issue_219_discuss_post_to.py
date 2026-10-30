@@ -63,7 +63,7 @@ def _make_completed_discuss(db_path: str, output: str, topic: str = "AI strategy
     both immediately without needing to actually wait/timeout."""
     queue = TaskQueue(db_path)
     task_ids = enqueue_panel_tasks(
-        queue, ["analyst", "critic"], topic, {"round": 1}, port=0
+        queue, ["analyst", "critic"], topic, {"round": 1, "risk_tier": 1}, port=0
     )
     queue.submit_result(task_ids[0], TaskResult(
         task_id=task_ids[0], status="completed", summary="analyst take.",
@@ -87,6 +87,7 @@ class TestDiscussPostToOption:
                 "discuss", "AI strategy",
                 "--db", db_path,
                 "--agents", "analyst,critic",
+                "--risk-tier", "1",
                 "--output", output,
                 "--post-to", "42",
             ])
@@ -113,6 +114,7 @@ class TestDiscussPostToOption:
                 "discuss", "AI strategy",
                 "--db", db_path,
                 "--agents", "analyst,critic",
+                "--risk-tier", "1",
                 "--output", output,
             ])
 
@@ -134,6 +136,7 @@ class TestDiscussPostToOption:
                 "discuss", "AI strategy",
                 "--db", db_path,
                 "--agents", "analyst,critic",
+                "--risk-tier", "1",
                 "--output", output,
                 "--post-to", "42",
             ])
@@ -153,6 +156,7 @@ class TestDiscussPostToOption:
                 "discuss", "AI strategy",
                 "--db", db_path,
                 "--agents", "analyst,critic",
+                "--risk-tier", "1",
                 "--nowait",
                 "--post-to", "42",
             ])
@@ -172,7 +176,7 @@ class TestDiscussPostToOption:
         output = str(tmp_path / "synthesis.md")
         queue = TaskQueue(db_path)
         task_ids = enqueue_panel_tasks(
-            queue, ["analyst", "critic"], "AI strategy", {"round": 1}, port=0
+            queue, ["analyst", "critic"], "AI strategy", {"round": 1, "risk_tier": 1}, port=0
         )
         # Neither task_ids[0] nor [1] ever gets a result — both time out.
 
@@ -183,6 +187,7 @@ class TestDiscussPostToOption:
                 "discuss", "AI strategy",
                 "--db", db_path,
                 "--agents", "analyst,critic",
+                "--risk-tier", "1",
                 "--output", output,
                 "--timeout", "1",
                 "--post-to", "42",

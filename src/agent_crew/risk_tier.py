@@ -6,6 +6,10 @@ from typing import Mapping
 
 TIER_0, TIER_1, TIER_2, TIER_3 = range(4)
 
+
+class InvalidRiskTierError(ValueError):
+    """A producer or legacy task has no valid declared risk tier."""
+
 RISK_DECLARATION_FIELDS = (
     "safety_or_live_change",
     "broad_architecture_change",
@@ -35,7 +39,7 @@ def classify_task(description: str, context: Mapping | None = None) -> int:
     """Return the declared Council #39 tier; prose has no authority."""
     tier = _override(context)
     if tier is None:
-        raise ValueError("context.risk_tier must be an integer 0-3")
+        raise InvalidRiskTierError("context.risk_tier must be an integer 0-3")
     return tier
 
 

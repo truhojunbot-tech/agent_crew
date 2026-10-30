@@ -5,7 +5,9 @@ from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
 from agent_crew.claude_cloud import _cloud_preflight_reason
+from agent_crew.cea.cascade_contract import decide
 from agent_crew.cli import crew
+from agent_crew.discussion import enqueue_panel_tasks
 from agent_crew.pipeline import auto_enqueue_review
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import InvalidRiskTierError, TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE
@@ -96,12 +98,35 @@ def test_orphan_generated_successor_without_tier_is_refused(tmp_db):
     assert queue.get_task("orphan-928") is None
 
 
+def test_legacy_tierless_parent_cannot_create_a_successor(tmp_db):
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("legacy-928", "implement", "old task", context={}))
+    with pytest.raises(InvalidRiskTierError, match="context.risk_tier"):
+        queue.enqueue(TaskRequest("child-928", "review", "work",
+                                  context={"prev_task_id": "legacy-928"}),
+                      ingress="cascade.review",
+                      _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    assert queue.get_task("child-928") is None
+
+
+def test_enforced_legacy_fix_round_does_not_guess_a_tier(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
+    with pytest.raises(InvalidRiskTierError, match="risk_tier"):
+        decide("fix review findings", {"fix_round": 1})
+
+
 def test_cli_refuses_missing_tier(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENT_CREW_DEFAULT_RISK_TIER", raising=False)
     result = CliRunner().invoke(crew, ["run", "deploy server", "--db",
                                        str(tmp_path / "tasks.db")])
     assert result.exit_code != 0
     assert "--risk-tier" in result.output
+
+
+def test_panel_adapter_refuses_missing_tier(tmp_db):
+    queue = TaskQueue(tmp_db)
+    with pytest.raises(InvalidRiskTierError, match="risk_tier"):
+        enqueue_panel_tasks(queue, ["codex"], "topic", {"round": 1})
 
 
 @pytest.mark.parametrize("tier,review_mode", [(1, None), (2, "adversarial")])

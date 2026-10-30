@@ -48,7 +48,8 @@ from agent_crew.role_mapping import (
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
 from agent_crew.tokenomics_shadow import shadow_recommendation, shadow_recommendation_for_task_id
-from agent_crew.risk_tier import RISK_DECLARATION_FIELDS, risk_declaration
+from agent_crew.risk_tier import (InvalidRiskTierError, RISK_DECLARATION_FIELDS,
+                                  risk_declaration)
 
 
 @dataclass
@@ -1444,10 +1445,6 @@ class DuplicateReviewError(Exception):
         super().__init__(f"DUPLICATE_REVIEW: existing task {existing_task_id}")
 
 
-class InvalidRiskTierError(ValueError):
-    """An HTTP task declared no valid integer tier or mismatched its root."""
-
-
 class WorkIntentTargetConflict(ValueError):
     """A replay tried to replace a work intent's already recorded target."""
 
@@ -2669,7 +2666,9 @@ class TaskQueue:
             if parent_id and "risk_tier" not in context:
                 parent = self.get_task(parent_id)
                 if parent is not None and isinstance(parent.context, dict):
-                    context["risk_tier"] = parent.context.get("risk_tier")
+                    parent_tier = parent.context.get("risk_tier")
+                    if type(parent_tier) is int and 0 <= parent_tier <= 3:
+                        context["risk_tier"] = parent_tier
             return context
 
         dropped = [key for key in _CEA_LINEAGE_PARENT_KEYS if key in context]
