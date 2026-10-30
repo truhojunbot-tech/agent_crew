@@ -2,7 +2,7 @@
 """Repo-owned, evidence-gated crew runtime swap. Never changes live STOP state.
 
 Usage: runtime_swap.sh PROJECT FULL_SHA preflight|go|post [--accept-env-diff KEY[,KEY]]
-       runtime_swap.sh PROJECT FULL_SHA go --decision-id T0-ID
+       runtime_swap.sh PROJECT FULL_SHA go --decision-id T0-ID --actor NAME
 Use the project's private fleet.env and cea.env files. A rollback uses
 this same command with the previous full SHA after a healthy swap. For recovery
 after a failed relaunch, see docs/runtime_swap.md. No SIGKILL.
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import getpass
 import grp
 import hashlib
 import json
@@ -50,6 +49,7 @@ def parse_args(argv=None):
     parser.add_argument("step", choices=("preflight", "go", "post"))
     parser.add_argument("--accept-env-diff", default="", metavar="KEY[,KEY]")
     parser.add_argument("--decision-id", default="", metavar="T0-ID")
+    parser.add_argument("--actor", default=None, metavar="NAME")
     args = parser.parse_args(argv)
     if not PROJECT.fullmatch(args.project):
         parser.error("project must be a simple name")
@@ -57,6 +57,12 @@ def parse_args(argv=None):
         parser.error("sha must be a full lowercase git object ID")
     if args.step == "go" and not args.decision_id.strip():
         parser.error("go requires --decision-id")
+    args.actor = (args.actor if args.actor is not None else
+                  os.environ.get("AGENT_CREW_SWAP_ACTOR", "")).strip()
+    if args.step == "go" and not args.actor:
+        parser.error("go requires --actor NAME or AGENT_CREW_SWAP_ACTOR")
+    if args.actor and not PROJECT.fullmatch(args.actor):
+        parser.error("actor must be a simple name")
     names = args.accept_env_diff.split(",") if args.accept_env_diff else []
     if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in names):
         parser.error("--accept-env-diff needs comma-separated key names")
@@ -105,7 +111,7 @@ def recheck_precheck(project: str) -> None:
 
 
 def verify_swap_decision(project: str, sha: str, decision_id: str,
-                         env: dict[str, str]) -> None:
+                         env: dict[str, str], actor: str) -> None:
     """Use the same signed-snapshot T0 authority as crew resume for the target build."""
     from agent_crew.cea.wiring import build_wiring
     from agent_crew.queue import SnapshotLooseningAuthority
@@ -116,7 +122,6 @@ def verify_swap_decision(project: str, sha: str, decision_id: str,
         raise RuntimeError("swap T0 decision cannot be verified from a signed snapshot")
     authority = SnapshotLooseningAuthority(snapshot, build_commit=sha,
                                            runtime=project, project=project)
-    actor = os.environ.get("AGENT_CREW_SWAP_ACTOR", "").strip() or getpass.getuser()
     verdict = authority.verify(frm="STOPPED", to="ACTIVE", who=f"owner:{actor}",
                                decision_id=decision_id)
     if not verdict.granted:
@@ -126,32 +131,44 @@ def verify_swap_decision(project: str, sha: str, decision_id: str,
 def repoint_cli_source(home: Path, source: Path, sha: str) -> bool:
     """Point cli_src at the checkout only after every configured crew serves it."""
     root = home / ".agent_crew"
-    mismatched = []
-    for state_path in sorted(root.glob("*/state.json")):
+    problems = []
+    state_paths = sorted(root.glob("*/state.json"))
+    for state_path in state_paths:
         project = state_path.parent.name
         try:
             port = int(json.loads(state_path.read_text())["port"])
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise RuntimeError(f"invalid port in {state_path}") from exc
+            if not 0 < port <= 65535:
+                raise ValueError("invalid port")
+        except (OSError, ValueError, KeyError, TypeError):
+            problems.append((str(state_path), "unreadable state or port"))
+            continue
         try:
             health = api(port, "/health", project)
-            if health.get("project") != project or health.get("build", {}).get("commit") != sha:
-                mismatched.append(port)
-        except (OSError, ValueError, KeyError, TypeError):
-            mismatched.append(port)
-    if mismatched:
-        print("CLI source unchanged; differing ports: " + ", ".join(map(str, mismatched)))
+            if not isinstance(health, dict) or not isinstance(health.get("build"), dict):
+                problems.append((str(port), "malformed health"))
+            elif health.get("project") != project or health["build"].get("commit") != sha:
+                problems.append((str(port), "build differs"))
+        except Exception:  # noqa: BLE001 — an optional CLI update cannot fail a verified post
+            problems.append((str(port), "health unavailable"))
+    if not state_paths:
+        problems.append((str(root), "no crew state files"))
+    if problems:
+        for label, reason in problems:
+            print(f"CLI source unchanged: {label}: {reason}")
         return False
-    if not list(root.glob("*/state.json")):
-        raise RuntimeError("no crew state files to verify before cli_src update")
     target = root / "cli_src"
     temporary = root / f".cli_src-{os.getpid()}"
-    temporary.unlink(missing_ok=True)
     try:
+        temporary.unlink(missing_ok=True)
         temporary.symlink_to(source)
         os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 — symlink failure is non-fatal after verified post
+        print("CLI source unchanged: cli_src: update failed")
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
     return True
 
 
@@ -495,7 +512,7 @@ def _run_step(args, home: Path, directory: Path) -> int:
         budget = startup_budget_seconds()
         recheck_precheck(args.project)
         verify_swap_decision(args.project, args.sha, args.decision_id,
-                             launch_env(fleet_file, cea_file, checkout / "src"))
+                             launch_env(fleet_file, cea_file, checkout / "src"), args.actor)
         os.kill(pid, signal.SIGTERM)
         for _ in range(30):
             time.sleep(1)
@@ -547,7 +564,10 @@ def _run_step(args, home: Path, directory: Path) -> int:
     # The captured environment can carry provider tokens. It is needed only
     # until a verified post; retain its digest, not its secret contents.
     scrub_captured_env(evidence)
-    repoint_cli_source(home, checkout / "src", args.sha)
+    try:
+        repoint_cli_source(home, checkout / "src", args.sha)
+    except Exception:  # noqa: BLE001 — verified post remains successful
+        print("CLI source unchanged: cli_src: update unavailable")
     print(f"POST_OK evidence={evidence}")
     return 0
 

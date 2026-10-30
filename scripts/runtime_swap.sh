@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: runtime_swap.sh <project> <full-sha> preflight|go|post
-# go additionally requires --decision-id T0-ID.
+# go additionally requires --decision-id T0-ID and --actor NAME (or AGENT_CREW_SWAP_ACTOR).
 set -euo pipefail
 
 project=${1:?Usage: runtime_swap.sh <project> <full-sha> preflight|go|post}

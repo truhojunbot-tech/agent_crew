@@ -330,6 +330,7 @@ def _swap_fixture(tmp_path, monkeypatch, *, db_outside=False):
     monkeypatch.setenv('USER', 'test-user')
     monkeypatch.setenv('PATH', '/usr/bin:/bin')
     monkeypatch.setenv('LANG', 'C.UTF-8')
+    monkeypatch.setenv('AGENT_CREW_SWAP_ACTOR', 'test-owner')
     directory = tmp_path / '.agent_crew' / 'demo'
     directory.mkdir(parents=True)
     db = (tmp_path / 'elsewhere.db') if db_outside else (directory / 'tasks.db')
