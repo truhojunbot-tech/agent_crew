@@ -265,6 +265,20 @@ def test_block_does_not_merge_and_needs_human(tmp_path, monkeypatch, gate, comme
 # --- end to end through `crew run --auto-merge` -----------------------------
 
 def _run_auto_merge(tmp_path, monkeypatch, review_evidence=None, events=None):
+    # This suite tests the merge gate. Supply the review row that the server
+    # normally creates after an implement result; crew run only follows it.
+    def server_review(queue, stage, parent, timeout):
+        assert stage == "review"
+        review_id = f"review-{parent}-r0"
+        if queue.get_task(review_id) is None:
+            queue.enqueue(TaskRequest(
+                task_id=review_id, task_type="review", description="review",
+                branch="main", pr_number=42,
+                context={"prev_task_id": parent, "pr_number": 42,
+                         "reviewed_sha": "a" * 40, "risk_tier": 1}))
+        return review_id
+
+    monkeypatch.setattr("agent_crew.loop.wait_for_pipeline_successor", server_review)
     def fake_result(_q, task_id):
         if task_id.startswith("review"):
             return TaskResult(task_id=task_id, status="completed", summary="ok",

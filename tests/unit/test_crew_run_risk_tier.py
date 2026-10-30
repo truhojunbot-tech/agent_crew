@@ -72,14 +72,28 @@ def test_tier_one_records_explicit_high_declaration(monkeypatch, tmp_path):
 
 
 def test_cli_review_and_test_inherit_declared_root_tier(monkeypatch, tmp_path):
-    db = tmp_path / "tasks.db"
+    from agent_crew import pipeline
 
-    def result_for(_queue, task_id):
+    db = tmp_path / "tasks.db"
+    monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **k: False)
+    seen = set()
+
+    def result_for(queue, task_id):
         if task_id.startswith("impl-"):
-            return TaskResult(task_id, "completed", "implemented",
-                              branch="fix/risk-tier", commit="a" * 40)
+            result = TaskResult(task_id, "completed", "implemented",
+                                branch="fix/risk-tier", commit="a" * 40,
+                                pr_number=42)
+            if task_id not in seen:
+                seen.add(task_id)
+                pipeline.auto_enqueue_review(queue, task_id, pr_number=42,
+                                             result=result)
+            return result
         if task_id.startswith("review-"):
-            return TaskResult(task_id, "completed", "approved", verdict="approve")
+            result = TaskResult(task_id, "completed", "approved", verdict="approve")
+            if task_id not in seen:
+                seen.add(task_id)
+                pipeline.auto_enqueue_test(queue, task_id)
+            return result
         return TaskResult(task_id, "completed", "tests passed")
 
     monkeypatch.setattr(TaskQueue, "get_result", result_for)
