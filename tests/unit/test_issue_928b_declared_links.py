@@ -76,6 +76,7 @@ def test_graphql_parent_and_tracked_links_reach_triage(monkeypatch):
                 "id": "I_6", "number": 6, "parent": {"number": 5},
                 "trackedInIssues": {"nodes": [{"number": 4}],
                                     "pageInfo": {"hasNextPage": False}},
+                "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": False}},
             }]}}), "")
         return subprocess.CompletedProcess(args, 0, json.dumps(rows), "")
 
@@ -83,6 +84,44 @@ def test_graphql_parent_and_tracked_links_reach_triage(monkeypatch):
     issue = triage.parse_issues(triage.fetch_issues_from_gh("owner/repo"))[0]
     assert issue["parents"] == [5, 4]
     assert issue["dependency_unknown"] is False
+
+
+def test_graphql_blocked_by_link_blocks_issue(monkeypatch):
+    rows = [{"id": "I_6", "number": 6, "title": "child", "labels": [], "body": ""}]
+
+    def api(args, **_kwargs):
+        if args[:3] == ["gh", "api", "graphql"]:
+            assert "blockedBy(first:100)" in args[args.index("-f") + 1]
+            node = {"id": "I_6", "parent": None,
+                    "trackedInIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+                    "blockedBy": {"nodes": [{"number": 5, "state": "OPEN"}],
+                                  "pageInfo": {"hasNextPage": False}}}
+            return subprocess.CompletedProcess(args, 0, json.dumps({"data": {"nodes": [node]}}), "")
+        return subprocess.CompletedProcess(args, 0, json.dumps(rows), "")
+
+    monkeypatch.setattr(triage.subprocess, "run", api)
+    issue = triage.parse_issues(triage.fetch_issues_from_gh("owner/repo"))[0]
+    assert issue["dependency_unknown"] is False
+    assert issue["parents"] == [5]
+    assert triage.filter_blocked([issue], set()) == []
+    assert watch.unblocked([issue], [issue]) == []
+
+
+def test_paginated_blocked_by_link_remains_dependency_unknown(monkeypatch):
+    rows = [{"id": "I_6", "number": 6, "title": "child", "labels": [], "body": ""}]
+
+    def api(args, **_kwargs):
+        if args[:3] == ["gh", "api", "graphql"]:
+            node = {"id": "I_6", "parent": None,
+                    "trackedInIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+                    "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": True}}}
+            return subprocess.CompletedProcess(args, 0, json.dumps({"data": {"nodes": [node]}}), "")
+        return subprocess.CompletedProcess(args, 0, json.dumps(rows), "")
+
+    monkeypatch.setattr(triage.subprocess, "run", api)
+    issue = triage.parse_issues(triage.fetch_issues_from_gh("owner/repo"))[0]
+    assert issue["dependency_unknown"] is True
+    assert triage.filter_blocked([issue], set()) == []
 
 
 def test_issue_body_paths_do_not_create_scope():

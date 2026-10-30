@@ -39,7 +39,8 @@ def _gh_mock(issues_json: str = _GH_ISSUES_JSON):
         if args[0][:3] == ["gh", "api", "graphql"]:
             return _FakeProcess(json.dumps({"data": {"nodes": [
                 {"id": issue["id"], "parent": None,
-                 "trackedInIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
+                 "trackedInIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+                 "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
                 for issue in json.loads(issues_json)]}}))
         return _FakeProcess(issues_json)
     return _run

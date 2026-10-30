@@ -239,7 +239,7 @@ def fetch_issues_from_gh(repo: str, *, timeout: float = 30.0) -> list[dict]:
         return rows
 
     # The installed gh may not expose parent/sub-issue fields through --json.
-    # GraphQL's Issue.parent and trackedInIssues are declared links; batching
+    # GraphQL's Issue.parent, trackedInIssues, and blockedBy are declared links; batching
     # node IDs avoids one API call per issue on every watcher cycle.
     by_id = {row.get("id"): row for row in rows if isinstance(row.get("id"), str)}
     for row in rows:
@@ -251,7 +251,9 @@ def fetch_issues_from_gh(repo: str, *, timeout: float = 30.0) -> list[dict]:
         chunk = ids[start:start + 100]
         query = ("query { nodes(ids:" + json.dumps(chunk) + ") { ... on Issue { "
                  "id number parent { number state } trackedInIssues(first:100) { "
-                 "nodes { number state } pageInfo { hasNextPage } } } } }")
+                 "nodes { number state } pageInfo { hasNextPage } } "
+                 "blockedBy(first:100) { nodes { number state } "
+                 "pageInfo { hasNextPage } } } } }")
         try:
             lookup = subprocess.run(["gh", "api", "graphql", "-f", f"query={query}"],
                                     capture_output=True, text=True, check=True, timeout=timeout)
@@ -262,13 +264,17 @@ def fetch_issues_from_gh(repo: str, *, timeout: float = 30.0) -> list[dict]:
             for node in nodes:
                 if not isinstance(node, dict) or node.get("id") not in by_id:
                     continue
-                links = node.get("trackedInIssues")
-                if (not isinstance(links, dict) or not isinstance(links.get("nodes"), list)
-                        or (links.get("pageInfo") or {}).get("hasNextPage") is not False):
+                tracked = node.get("trackedInIssues")
+                blocked = node.get("blockedBy")
+                if any(not isinstance(links, dict)
+                       or not isinstance(links.get("nodes"), list)
+                       or (links.get("pageInfo") or {}).get("hasNextPage") is not False
+                       for links in (tracked, blocked)):
                     continue
                 row = by_id[node["id"]]
                 row["parent"] = node.get("parent")
-                row["trackedInIssues"] = links["nodes"]
+                row["trackedInIssues"] = tracked["nodes"]
+                row["blockedBy"] = blocked["nodes"]
                 row["dependency_unknown"] = False
         except Exception:
             continue

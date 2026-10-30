@@ -55,7 +55,8 @@ def _subprocess_mock(issues):
         if args[:3] == ["gh", "api", "graphql"]:
             return _FakeProcess(json.dumps({"data": {"nodes": [
                 {"id": issue["id"], "parent": None,
-                 "trackedInIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
+                 "trackedInIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+                 "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
                 for issue in issues]}}))
         return _FakeProcess(json.dumps(issues))
     return run
