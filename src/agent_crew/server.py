@@ -8187,7 +8187,7 @@ def create_app(
             return False
 
     def _auto_merge_pr(pr_number: int, repo: str = "", repo_cwd: str = "",
-                       review_task_id: str = "") -> None:
+                       review_task_id: str = "", test_task_id: str = "") -> Optional[bool]:
         """Merge PR via gh CLI after the pipeline approves it (#171).
 
         Failures are logged and swallowed — a merge error must never break
@@ -8207,9 +8207,27 @@ def create_app(
             "0", "false", "no", "off")
         resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
         if not resv.get("admitted"):
+            deferred = False
+            if test_task_id and resv.get("state") == "stop_blocked":
+                try:
+                    refused_head = (pr_head_sha(int(pr_number), repo=_merge_repo)
+                                    if _merge_repo else "") or ""
+                except Exception:
+                    refused_head = ""
+                try:
+                    deferred = q().defer_test_merge(test_task_id, {
+                        "pr_number": int(pr_number), "head_sha": refused_head,
+                        "review_task_id": review_task_id, "repo": _merge_repo,
+                    })
+                    if not deferred:
+                        logger.error("_auto_merge_pr: owed merge outbox missing for %s",
+                                     test_task_id)
+                except Exception:
+                    logger.exception("_auto_merge_pr: could not retain owed merge for %s",
+                                     test_task_id)
             logger.warning(f"[PAUSE-SUPPRESSED] _auto_merge_pr(#{pr_number}) 억제 — "
                            f"STOP admission 거부({resv.get('state')})")
-            return
+            return deferred
         if resv.get("state") == "done":
             logger.info(f"_auto_merge_pr: {op_key} already done — merge not retried")
             return
@@ -8641,6 +8659,8 @@ def create_app(
         unknown = sorted(set(ctx) - TASK_CONTEXT_KEYS)
         if unknown:
             raise HTTPException(status_code=422, detail=f"unknown_context_key:{unknown[0]}")
+        if "suppressed_merge" in ctx:
+            raise HTTPException(status_code=422, detail="reserved_context_key:suppressed_merge")
         if (ctx.get("directive") or ctx.get("op")) and not ctx.get("external_operation_id"):
             raise HTTPException(status_code=422, detail="directive requires external_operation_id")
         is_rebase_directive = (task.task_type == "implement" and
@@ -9669,8 +9689,12 @@ def create_app(
                 if test_pr:
                     _test_wt = _any_worktree_path()
                     _test_repo = _task_ctx.get("repo") or ""
-                    _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt,
-                                   review_task_id=_task_ctx.get("prev_task_id") or "")
+                    if _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt,
+                                      review_task_id=_task_ctx.get("prev_task_id") or "",
+                                      test_task_id=task_id):
+                        _lineage_continues_without_task = True
+            if _REPLAYING.get() and isinstance(_task_ctx.get("suppressed_merge"), dict):
+                _lineage_continues_without_task = True
             _lineage_end_notice(task_id, continuation=_lineage_continues_without_task)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
@@ -9712,20 +9736,25 @@ def create_app(
             if not claim:
                 continue                                 # 다른 executor 처리중 or 이미 applied
             try:
+                task = q().get_task(parent)
+                ctx = (task.context if task is not None
+                       and isinstance(task.context, dict) else {})
+                owed = (ctx.get("suppressed_merge")
+                        if rec.get("task_type") == "test" else None)
                 created = float(claim["created_at"])
                 if not math.isfinite(created) or created > time.time():
                     disposition, reason = "pending", "invalid_created_at"
-                elif time.time() - created > max_age:
+                elif time.time() - created > max_age and not isinstance(owed, dict):
                     disposition, reason = "expired", "age_limit"
                 else:
-                    task = q().get_task(parent)
                     if task is None:
                         disposition, reason = "pending", "parent_unavailable"
                     else:
-                        ctx = task.context if isinstance(task.context, dict) else {}
                         if (task.status == "cancelled" or
                                 q().has_superseding_review(parent)):
-                            disposition, reason = "expired", "parent_cancelled_or_superseded"
+                            disposition = ("merge_refused" if isinstance(owed, dict)
+                                           else "expired")
+                            reason = "parent_cancelled_or_superseded"
                         else:
                             rd = json.loads(claim["result_json"])
                             pr = (rd.get("pr_number") or task.pr_number or
@@ -9739,10 +9768,23 @@ def create_app(
                                 else:
                                     from agent_crew.github import pr_state
                                     state = pr_state(int(pr), repo=repo, timeout=5.0)
-                                    if state in ("closed", "merged"):
+                                    if state == "merged" and isinstance(owed, dict):
+                                        disposition, reason = "merge_done", ""
+                                    elif state == "closed" and isinstance(owed, dict):
+                                        disposition, reason = "merge_refused", "pr_closed"
+                                    elif state in ("closed", "merged"):
                                         disposition, reason = "expired", f"pr_{state}"
                                     elif state != "open":
                                         disposition, reason = "pending", "pr_state_unknown"
+                                    elif isinstance(owed, dict) and owed.get("head_sha"):
+                                        from agent_crew.github import pr_head_sha
+                                        current_head = pr_head_sha(int(pr), repo=repo)
+                                        if not current_head:
+                                            disposition, reason = "pending", "pr_head_unknown"
+                                        elif current_head != owed["head_sha"]:
+                                            disposition, reason = "merge_refused", "head_changed"
+                                        else:
+                                            disposition, reason = "replay", ""
                                     else:
                                         disposition, reason = "replay", ""
                             else:
@@ -9750,6 +9792,24 @@ def create_app(
             except Exception:
                 logger.exception("outbox replay safety check failed parent=%s", parent)
                 disposition, reason = "pending", "safety_check_failed"
+            if disposition in ("merge_done", "merge_refused"):
+                owed = (ctx.get("suppressed_merge") or {})
+                pr = int(owed["pr_number"])
+                if disposition == "merge_done":
+                    resv = q().external_op_reserve(f"merge:pr:{pr}", pr_number=pr)
+                    if not resv.get("admitted"):
+                        q().outbox_finish_claim(parent, owner, state="pending")
+                        continue
+                    q().external_op_mark(f"merge:pr:{pr}", "done")
+                else:
+                    coordinator_notice_once(
+                        q(), parent, "merge_replay_refused",
+                        f"pr_number={pr} reason_code={reason}", coordinator_notify_fn)
+                q().outbox_mark_applied(parent, owner)
+                if disposition == "merge_done":
+                    _lineage_end_notice(parent)
+                done.append(parent)
+                continue
             if disposition != "replay":
                 q().outbox_finish_claim(parent, owner, state=disposition)
                 logger.warning("outbox replay %s parent=%s reason=%s", disposition,
@@ -9766,7 +9826,25 @@ def create_app(
                 if isinstance(response, dict) and response.get("suppressed_by_pause"):
                     q().outbox_finish_claim(parent, owner, state="pending")
                     continue
+                if rec.get("task_type") == "test" and isinstance(
+                        (ctx or {}).get("suppressed_merge"), dict):
+                    if q().outbox_get(parent)["state"] == "pending":
+                        continue  # STOP won admission again during replay.
+                    merge = ctx["suppressed_merge"]
+                    op = q().external_op_get(f"merge:pr:{merge['pr_number']}")
+                    if op is None or op["state"] == "reserved":
+                        q().outbox_finish_claim(parent, owner, state="pending")
+                        continue
+                    if op["state"] != "done":
+                        coordinator_notice_once(
+                            q(), parent, "merge_replay_refused",
+                            f"pr_number={merge['pr_number']} reason_code=merge_gate_refused",
+                            coordinator_notify_fn)
                 q().outbox_mark_applied(parent, owner)    # 성공분만 replaying→applied CAS
+                if (rec.get("task_type") == "test" and isinstance(
+                        (ctx or {}).get("suppressed_merge"), dict)
+                        and op["state"] == "done"):
+                    _lineage_end_notice(parent)
                 done.append(parent)
             except Exception:
                 logger.exception(f"replay-suppressed: {parent} 실패(lease 만료 후 reclaim)")
