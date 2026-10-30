@@ -6536,6 +6536,36 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def defer_test_merge(self, task_id: str, merge: dict) -> bool:
+        """Atomically retain an owed merge and reopen its result for replay."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT context FROM tasks WHERE task_id=? AND task_type='test'",
+                               (task_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return False
+            context = json.loads(row["context"] or "{}")
+            context["suppressed_merge"] = merge
+            conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
+                         (json.dumps(context), task_id))
+            updated = conn.execute(
+                "UPDATE cascade_outbox SET state='pending', lease_owner=NULL, "
+                "attempt_id=NULL, lease_expires_at=NULL, updated_at=? "
+                "WHERE parent_task_id=? AND state IN ('applied','replaying')",
+                (time.time(), task_id)).rowcount
+            if not updated:
+                conn.execute("ROLLBACK")
+                return False
+            conn.execute("COMMIT")
+            return True
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     # ── #314 §5: external mutation receipt (merge idempotency) ────────────
 
     def external_op_reserve(self, op_key: str, pr_number: Optional[int] = None) -> dict:

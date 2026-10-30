@@ -7,6 +7,7 @@ validated as top-level task context here.
 """
 
 TASK_CONTEXT_KEYS = frozenset({
+    'suppressed_merge',
     'admitted_ref',
     'agent',
     'agent_override',
