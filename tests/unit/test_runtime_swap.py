@@ -327,6 +327,9 @@ def _swap_fixture(tmp_path, monkeypatch, *, db_outside=False):
     import sqlite3
     import scripts.runtime_swap as swap
     monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('USER', 'test-user')
+    monkeypatch.setenv('PATH', '/usr/bin:/bin')
+    monkeypatch.setenv('LANG', 'C.UTF-8')
     directory = tmp_path / '.agent_crew' / 'demo'
     directory.mkdir(parents=True)
     db = (tmp_path / 'elsewhere.db') if db_outside else (directory / 'tasks.db')
@@ -522,6 +525,7 @@ def test_complete_environ_preserves_valid_capture():
 
 def test_spawn_declared_env_preserves_spaces_and_uses_new_agent_source(tmp_path, monkeypatch):
     import scripts.spawn_from_env as spawn
+    monkeypatch.setenv('LANG', 'C.UTF-8')
     old = tmp_path / 'unusual' / 'worktree' / 'src'
     (old / 'agent_crew').mkdir(parents=True)
     new = tmp_path / 'new' / 'src'
@@ -548,6 +552,7 @@ def test_spawn_declared_env_preserves_spaces_and_uses_new_agent_source(tmp_path,
 def test_broker_probe_uses_client_group_and_connects(tmp_path, monkeypatch):
     import scripts.spawn_from_env as spawn
     import grp
+    monkeypatch.setenv('LANG', 'C.UTF-8')
     directory = tmp_path / 'sock'
     directory.mkdir()
     path = directory / 'broker.sock'
