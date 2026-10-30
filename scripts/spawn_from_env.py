@@ -28,13 +28,17 @@ def parse_env(raw: bytes) -> dict[str, str]:
 
 
 def launch_env(env_file: Path, cea_file: Path, source: Path) -> dict[str, str]:
-    base_keys = ("HOME", "USER", "PATH", "LANG")
-    missing = [key for key in base_keys if key not in os.environ]
+    required_keys = ("HOME", "PATH")
+    optional_keys = ("USER", "LOGNAME", "LANG")
+    missing = [key for key in required_keys if key not in os.environ]
     if missing:
         raise RuntimeError(f"swap invoker missing base keys: {', '.join(missing)}")
-    env = {key: os.environ[key] for key in base_keys}
+    env = {key: os.environ[key] for key in required_keys}
+    env.update({key: os.environ[key] for key in optional_keys if key in os.environ})
+    env.update({key: value for key, value in os.environ.items() if key.startswith("LC_")})
     fleet = parse_env_file(env_file, prefix=None, require_nonempty=False)
-    forbidden = set(fleet) & {*base_keys, "PYTHONPATH"}
+    forbidden = set(fleet) & {*required_keys, *optional_keys, "PYTHONPATH"}
+    forbidden.update(key for key in fleet if key.startswith("LC_"))
     forbidden.update(key for key in fleet if key.startswith("AGENT_CREW_CEA_"))
     if forbidden:
         raise ValueError(f"fleet.env has reserved keys: {', '.join(sorted(forbidden))}")

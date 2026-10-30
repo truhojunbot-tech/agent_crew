@@ -233,7 +233,7 @@ def test_argument_parsing_rejects_short_sha_and_unknown_step():
     with pytest.raises(SystemExit):
         parse_args(['alpha_engine', sha, 'deploy'])
     with pytest.raises(SystemExit):
-        parse_args(['../other', sha, 'go'])
+        parse_args(['../other', sha, 'go', '--decision-id', 'T0-TEST'])
 
 
 def test_env_file_preserves_spaces_and_rejects_bad_keys(tmp_path):
@@ -345,12 +345,15 @@ def _swap_fixture(tmp_path, monkeypatch, *, db_outside=False):
     old_source = tmp_path / 'old' / 'src'
     (old_source / 'agent_crew').mkdir(parents=True, exist_ok=True)
     live = {key: os.environ[key] for key in ('HOME', 'USER', 'PATH', 'LANG')}
+    live.update({key: value for key, value in os.environ.items() if key == 'LOGNAME' or key.startswith('LC_')})
     live.update(AGENT_CREW_CEA_MODE='shadow', PYTHONPATH=str(old_source))
     monkeypatch.setattr(swap, 'read_live_environ', lambda _pid: b''.join(
         f'{key}={value}'.encode() + b'\0' for key, value in live.items()))
     monkeypatch.setattr(swap, 'prepare_checkout', lambda *args: None)
     monkeypatch.setattr(swap, 'api', lambda port, path, project: {'stop': {'paused': True}, 'build': {'commit': 'a' * 40}, 'project': 'demo'} if path == '/health' else [])
     monkeypatch.setattr(swap, 'listener_pid', lambda port: __import__('os').getpid())
+    monkeypatch.setattr(swap, 'recheck_precheck', lambda _project: None)
+    monkeypatch.setattr(swap, 'verify_swap_decision', lambda *_args: None)
     return swap, directory, db
 
 
@@ -403,12 +406,12 @@ def test_preflight_refuses_undeclared_live_key_with_names_only(tmp_path, monkeyp
     signalled = []
     monkeypatch.setattr(swap.os, 'kill', lambda *args: signalled.append(args))
     with pytest.raises(RuntimeError, match='go requires --accept-env-diff'):
-        swap.main(['demo', 'a' * 40, 'go'])
+        swap.main(['demo', 'a' * 40, 'go', '--decision-id', 'T0-TEST'])
     assert signalled == []
 
     (tmp_path / '.agent_crew' / 'demo' / 'fleet.env').write_text('EXTRA=changed\n')
     with pytest.raises(RuntimeError, match='fleet.env changed'):
-        swap.main(['demo', 'a' * 40, 'go', '--accept-env-diff', 'UNDECLARED_TOKEN'])
+        swap.main(['demo', 'a' * 40, 'go', '--decision-id', 'T0-TEST', '--accept-env-diff', 'UNDECLARED_TOKEN'])
     assert signalled == []
 
 
@@ -498,7 +501,7 @@ def test_main_refuses_mismatched_preflight(tmp_path, monkeypatch):
     evidence.mkdir(parents=True)
     (evidence / 'preflight.json').write_text(json.dumps({'sha': 'b' * 40, 'project': 'demo', 'port': 8765}))
     with pytest.raises(RuntimeError, match='does not match'):
-        swap.main(['demo', 'a' * 40, 'go'])
+        swap.main(['demo', 'a' * 40, 'go', '--decision-id', 'T0-TEST'])
 
 
 @pytest.mark.parametrize('captured', [b'', b'X=Y'])
@@ -514,7 +517,7 @@ def test_go_refuses_incomplete_captured_env_before_signalling(tmp_path, monkeypa
     monkeypatch.setattr(swap.os, 'kill', lambda *args: signalled.append(args))
 
     with pytest.raises(RuntimeError, match='captured environment missing or incomplete'):
-        swap.main(['demo', 'a' * 40, 'go'])
+        swap.main(['demo', 'a' * 40, 'go', '--decision-id', 'T0-TEST'])
     assert signalled == []
     assert not (evidence / 'tasks.db.pre').exists()
 
@@ -633,7 +636,7 @@ def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch, capsys):
         candidate == signalled and sig == swap.signal.SIGTERM for signalled, sig in killed))
     monkeypatch.setattr(swap, 'api', lambda port, path, project: {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}, 'project': 'demo'} if path == '/health' else [])
     with pytest.raises(RuntimeError, match='build SHA differs'):
-        swap.main(['demo', 'a' * 40, 'go'])
+        swap.main(['demo', 'a' * 40, 'go', '--decision-id', 'T0-TEST'])
     assert len(killed) >= 1
     assert len(spawns) == 2
     assert spawns[1][-1] == str(old_src)
@@ -653,7 +656,7 @@ def test_swap_refuses_foreign_cea_override_before_signalling(tmp_path, monkeypat
     monkeypatch.setattr(swap.os, 'kill', lambda *args: signalled.append(args))
 
     with pytest.raises(RuntimeError, match='project-local cea.env'):
-        swap.main(['demo', 'a' * 40, 'go'])
+        swap.main(['demo', 'a' * 40, 'go', '--decision-id', 'T0-TEST'])
     assert signalled == []
 
 
@@ -671,7 +674,7 @@ def test_go_broker_probe_failure_keeps_old_server(tmp_path, monkeypatch):
         raise subprocess.CalledProcessError(1, args[0])
     monkeypatch.setattr(swap.subprocess, 'run', fail_probe)
     with pytest.raises(subprocess.CalledProcessError):
-        swap.main(['demo', 'a' * 40, 'go'])
+        swap.main(['demo', 'a' * 40, 'go', '--decision-id', 'T0-TEST'])
     assert killed == []
 
 
@@ -736,7 +739,7 @@ def test_go_waits_past_sixty_seconds_for_live_startup(tmp_path, monkeypatch, cap
             return {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}, 'project': 'demo'}
         raise OSError('starting')
     monkeypatch.setattr(swap, 'api', health)
-    assert swap.main(['demo', 'a' * 40, 'go']) == 0
+    assert swap.main(['demo', 'a' * 40, 'go', '--decision-id', 'T0-TEST']) == 0
     assert clock[0] > 60
     assert 'STARTING' in capsys.readouterr().out
     assert not (evidence / 'env.pre.nul').exists()
@@ -774,7 +777,7 @@ def test_go_failure_rolls_back_previous_source_and_scrubs_env(tmp_path, monkeypa
         raise OSError('starting')
     monkeypatch.setattr(swap, 'api', health)
     with pytest.raises(RuntimeError, match='died|budget'):
-        swap.main(['demo', 'a' * 40, 'go'])
+        swap.main(['demo', 'a' * 40, 'go', '--decision-id', 'T0-TEST'])
     assert len(spawns) == 2
     assert spawns[1][-1] == str(old_src)
     assert 'ROLLBACK_OK' in capsys.readouterr().out
@@ -810,7 +813,7 @@ def test_failed_rollback_retains_captured_env_for_manual_recovery(tmp_path, monk
         [] if path == '/tasks' else
         (_ for _ in ()).throw(OSError('unavailable'))))
     with pytest.raises(RuntimeError, match='died'):
-        swap.main(['demo', 'a' * 40, 'go'])
+        swap.main(['demo', 'a' * 40, 'go', '--decision-id', 'T0-TEST'])
     assert len(spawns) == 2 and spawns[1][-1] == str(old_src)
     assert 'ROLLBACK_FAILED' in capsys.readouterr().out
     assert (evidence / 'env.pre.nul').read_bytes() == raw
