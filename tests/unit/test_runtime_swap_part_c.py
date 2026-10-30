@@ -18,6 +18,14 @@ def test_go_without_actor_refuses_before_sigterm(tmp_path, monkeypatch):
     assert signals == []
 
 
+@pytest.mark.parametrize("step", ["preflight", "post"])
+def test_non_go_steps_ignore_free_form_receipt_actor(monkeypatch, step):
+    monkeypatch.setenv("AGENT_CREW_SWAP_ACTOR", "hojun@host")
+    args = runtime_swap.parse_args(["demo", "a" * 40, step])
+    assert args.step == step
+    assert args.actor == "hojun@host"
+
+
 def test_explicit_actor_reaches_signed_verifier(tmp_path, monkeypatch):
     sha = "a" * 40
     snapshot = write_snapshot(tmp_path, principals=("owner:hojun",),

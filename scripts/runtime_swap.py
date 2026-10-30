@@ -61,7 +61,7 @@ def parse_args(argv=None):
                   os.environ.get("AGENT_CREW_SWAP_ACTOR", "")).strip()
     if args.step == "go" and not args.actor:
         parser.error("go requires --actor NAME or AGENT_CREW_SWAP_ACTOR")
-    if args.actor and not PROJECT.fullmatch(args.actor):
+    if args.step == "go" and args.actor and not PROJECT.fullmatch(args.actor):
         parser.error("actor must be a simple name")
     names = args.accept_env_diff.split(",") if args.accept_env_diff else []
     if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in names):
