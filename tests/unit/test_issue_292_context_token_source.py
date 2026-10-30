@@ -42,7 +42,21 @@ def _pane(text):
         returncode = 0
         stdout = text
         stderr = ""
-    return lambda *a, **k: _R()
+
+    class _MissingAddendum:
+        returncode = 128
+        stdout = b""
+        stderr = b""
+
+    def run(argv, *args, **kwargs):
+        # Protocol regeneration now probes the tracked base-ref addendum.
+        # This pane fixture has no such file; do not return pane text as git output.
+        if (isinstance(argv, (list, tuple)) and "show" in argv
+                and any(isinstance(arg, str) and ":.agent_crew/" in arg for arg in argv)):
+            return _MissingAddendum()
+        return _R()
+
+    return run
 
 
 def _session(home, cwd, usage):
