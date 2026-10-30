@@ -3949,6 +3949,12 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
         raw = triage_module.fetch_issues_from_gh(repo)
         issues = triage_module.parse_issues(raw)
         filtered = triage_module.filter_processed(issues)
+        for issue in filtered:
+            if issue.get("dependency_unknown"):
+                click.echo(f"Issue #{issue['number']}: dependency_unknown")
+        filtered = triage_module.filter_blocked(
+            filtered, triage_module.fetch_closed_issue_numbers(repo)
+        )
         prompt = triage_module.build_prompt(filtered, merge_history)
         if prompt is None:
             click.echo("No issues to triage.")

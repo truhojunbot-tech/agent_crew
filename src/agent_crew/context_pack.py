@@ -1137,25 +1137,16 @@ def _procedure_triggers(episodes: list, issue: Optional[int]) -> tuple:
 #: A path-looking token inside issue text: at least one directory segment and
 #: a short extension. Deliberately strict — a loose pattern would manufacture
 #: scope out of prose, and a wrong module is worse than no module.
-_PATH_TOKEN_RE = re.compile(r"(?<![\w/.])((?:[\w.-]+/)+[\w-]+\.[A-Za-z0-9]{1,5})\b")
-
-#: Bound on how much scope one task may claim, so a pathological issue body
-#: cannot turn into thousands of comparisons.
+#: Bound on how much explicit scope one task may claim.
 MAX_RESOLVED_SCOPE = 40
 
 
 def resolve_task_scope(ctx: dict) -> tuple:
     """``(paths, modules)`` this task is about, best-effort and bounded.
 
-    Three sources, most authoritative first:
+    Scope comes from `ctx["modules"]`, `ctx["paths"]`, and `ctx["files"]` only.
 
-      1. `ctx["modules"]` / `ctx["paths"]` / `ctx["files"]` — whatever the
-         producer knew explicitly;
-      2. file paths named in the issue title and body, which for an ordinary
-         bug report is the only pre-work signal of where the change goes;
-      3. nothing — and that is a real, common answer.
-
-    ⛔Case 3 is the load-bearing one. It resolves to an empty list, and an empty
+    ⛔Missing scope is a real answer. It resolves to an empty list, and an empty
       list makes `Scope.matches` REJECT every module- or path-scoped rule. An
       unresolvable task must not be treated as matching everything: that is
       precisely the defect this function was added to close (review of PR #242,
@@ -1173,8 +1164,6 @@ def resolve_task_scope(ctx: dict) -> tuple:
         return []
 
     paths = _tokens(ctx.get("paths")) + _tokens(ctx.get("files"))
-    text = " ".join(str(ctx.get(k) or "") for k in ("issue_title", "issue_body"))
-    paths.extend(m.group(1) for m in _PATH_TOKEN_RE.finditer(text))
 
     modules = [normalise_module(m) for m in _tokens(ctx.get("modules"))]
     modules.extend(normalise_module(p) for p in paths)

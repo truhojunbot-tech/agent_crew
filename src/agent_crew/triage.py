@@ -1,23 +1,14 @@
 import json
+import logging
 import re
 import subprocess
 import time
 import uuid
-from typing import Optional
 
 from agent_crew.protocol import GateRequest, TaskRequest
 
-# Dependency markers we recognise inside an issue body. All are matched
-# case-insensitively against the body text.
-_PARENT_PATTERNS: tuple[str, ...] = (
-    r"parent\s*:\s*#(\d+)",            # "Parent: #54"
-    r"depends?\s+on\s+#(\d+)",         # "depends on #54", "depend on #54"
-    r"blocked\s+by\s+#(\d+)",          # "blocked by #54"
-)
-_PHASE_PATTERN = r"phase\s*[:\-]?\s*(\d+)"  # "Phase 2", "Phase: 2", "Phase-2"
-
-_PARENT_RE = re.compile("|".join(_PARENT_PATTERNS), re.IGNORECASE)
-_PHASE_RE = re.compile(_PHASE_PATTERN, re.IGNORECASE)
+logger = logging.getLogger(__name__)
+_PHASE_LABEL_RE = re.compile(r"phase:(\d+)", re.IGNORECASE)
 
 # Severity tiers for deterministic pre-sort (Issue #131).
 # Lower score = higher priority. LLM only sees candidates of the same tier,
@@ -36,43 +27,42 @@ def _severity_score(labels: list[str]) -> int:
     return len(_SEVERITY_TIER)
 
 
-def parse_dependencies(body: Optional[str]) -> dict:
-    """Extract dependency hints from an issue body.
-
-    Returns ``{"parents": [int, ...], "phase": int | None}``. The same body
-    can mention several parents (Parent + Depends on); we return them all
-    deduplicated. Phase is the first numeric Phase-marker we hit.
-    """
-    if not body:
-        return {"parents": [], "phase": None}
-    parents: list[int] = []
-    seen: set[int] = set()
-    for match in _PARENT_RE.finditer(body):
-        # Each pattern in the alternation has exactly one capture group, so
-        # we walk the groups and pick the first non-None number.
-        for grp in match.groups():
-            if grp:
-                num = int(grp)
-                if num not in seen:
-                    seen.add(num)
-                    parents.append(num)
-                break
-    phase_match = _PHASE_RE.search(body)
-    phase = int(phase_match.group(1)) if phase_match else None
+def parse_dependencies(issue: dict) -> dict:
+    """Read GitHub's declared parent/blocker links and phase label."""
+    parents = []
+    for parent in [issue.get("parent"), *(issue.get("trackedInIssues") or []),
+                   *(issue.get("blockedBy") or [])]:
+        number = parent.get("number") if isinstance(parent, dict) else None
+        if isinstance(number, int) and not isinstance(number, bool) and number > 0:
+            if number not in parents:
+                parents.append(number)
+    phase = None
+    for label in issue.get("labels") or []:
+        name = label.get("name", "") if isinstance(label, dict) else label
+        match = _PHASE_LABEL_RE.fullmatch(name) if isinstance(name, str) else None
+        if match:
+            phase = int(match.group(1))
+            break
     return {"parents": parents, "phase": phase}
 
 
 def parse_issues(data: list[dict]) -> list[dict]:
     result = []
     for item in data:
-        deps = parse_dependencies(item.get("body"))
+        deps = parse_dependencies(item)
+        links = [item.get("parent"), *(item.get("trackedInIssues") or []),
+                 *(item.get("blockedBy") or [])]
         result.append({
             "number": item["number"],
             "title": item["title"],
             "labels": [label["name"] for label in item.get("labels", [])],
             "body": item.get("body", "") or "",
             "parents": deps["parents"],
+            "open_parents": [link["number"] for link in links
+                             if isinstance(link, dict) and link.get("state") == "OPEN"
+                             and isinstance(link.get("number"), int)],
             "phase": deps["phase"],
+            "dependency_unknown": bool(item.get("dependency_unknown")),
         })
     return result
 
@@ -91,13 +81,13 @@ def filter_blocked(issues: list[dict], closed_issue_numbers: set[int]) -> list[d
     open_set = {i["number"] for i in issues}
     eligible = []
     for issue in issues:
+        if issue.get("dependency_unknown"):
+            continue
         parents = issue.get("parents") or []
-        # An open parent that is not in our own list of remaining open issues
-        # might still be considered blocking. We treat parent as resolved
-        # when it is either closed or absent from the current open set.
         blocking = [
             p for p in parents
-            if p in open_set and p not in closed_issue_numbers
+            if (p in open_set or p in issue.get("open_parents", []))
+            and p not in closed_issue_numbers
         ]
         if not blocking:
             eligible.append(issue)
@@ -237,14 +227,58 @@ def validate_repo_origin(repo: str, project_path: str) -> tuple[bool, str]:
     )
 
 
-def fetch_issues_from_gh(repo: str) -> list[dict]:
-    result = subprocess.run(
-        ["gh", "issue", "list", "--repo", repo, "--json", "number,title,labels,body"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return json.loads(result.stdout)
+def fetch_issues_from_gh(repo: str, *, timeout: float = 30.0) -> list[dict]:
+    base = ["gh", "issue", "list", "--repo", repo, "--state", "open",
+            "--limit", "200", "--json"]
+    result = subprocess.run(base + ["id,number,title,labels,body,url"],
+                            capture_output=True, text=True, check=True, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError("issue discovery failed")
+    rows = json.loads(result.stdout or "[]")
+    if not rows:
+        return rows
+
+    # The installed gh may not expose parent/sub-issue fields through --json.
+    # GraphQL's Issue.parent, trackedInIssues, and blockedBy are declared links; batching
+    # node IDs avoids one API call per issue on every watcher cycle.
+    by_id = {row.get("id"): row for row in rows if isinstance(row.get("id"), str)}
+    for row in rows:
+        row["dependency_unknown"] = True
+    if not by_id:
+        return rows
+    ids = list(by_id)
+    for start in range(0, len(ids), 100):
+        chunk = ids[start:start + 100]
+        query = ("query { nodes(ids:" + json.dumps(chunk) + ") { ... on Issue { "
+                 "id number parent { number state } trackedInIssues(first:100) { "
+                 "nodes { number state } pageInfo { hasNextPage } } "
+                 "blockedBy(first:100) { nodes { number state } "
+                 "pageInfo { hasNextPage } } } } }")
+        try:
+            lookup = subprocess.run(["gh", "api", "graphql", "-f", f"query={query}"],
+                                    capture_output=True, text=True, check=True, timeout=timeout)
+            payload = json.loads(lookup.stdout or "{}")
+            nodes = (payload.get("data") or {}).get("nodes")
+            if lookup.returncode or payload.get("errors") or not isinstance(nodes, list):
+                continue
+            for node in nodes:
+                if not isinstance(node, dict) or node.get("id") not in by_id:
+                    continue
+                tracked = node.get("trackedInIssues")
+                blocked = node.get("blockedBy")
+                if any(not isinstance(links, dict)
+                       or not isinstance(links.get("nodes"), list)
+                       or (links.get("pageInfo") or {}).get("hasNextPage") is not False
+                       for links in (tracked, blocked)):
+                    continue
+                row = by_id[node["id"]]
+                row["parent"] = node.get("parent")
+                row["trackedInIssues"] = tracked["nodes"]
+                row["blockedBy"] = blocked["nodes"]
+                row["dependency_unknown"] = False
+        except Exception:
+            continue
+    return rows
 
 
 def run(
@@ -260,7 +294,7 @@ def run(
     agent_fn(prompt: str) -> str: callable that returns the triage agent's response text.
 
     Dependency-aware selection (Issue #82):
-    - Issue body is parsed for "Parent: #N", "depends on #N", "Phase N" markers.
+    - GitHub parent/blocker links and phase labels provide ordering.
     - Issues whose declared parent is still open are filtered out — the
       triage agent only sees unblocked candidates.
     - When the caller passes the default merge_history ("none"), we
@@ -269,11 +303,15 @@ def run(
     """
     raw = fetch_issues_from_gh(repo)
     issues = parse_issues(raw)
+    for issue in issues:
+        if issue["dependency_unknown"]:
+            logger.warning("triage: dependency_unknown for issue #%s", issue["number"])
     filtered = filter_processed(issues)
     closed = fetch_closed_issue_numbers(repo)
     eligible = filter_blocked(filtered, closed)
     # Pre-sort by severity so the LLM only sees same-tier candidates (#131).
-    eligible.sort(key=lambda i: (_severity_score(i["labels"]), i.get("phase") or 999))
+    eligible.sort(key=lambda i: (_severity_score(i["labels"]),
+                                 i["phase"] if i.get("phase") is not None else 999))
     top_score = _severity_score(eligible[0]["labels"]) if eligible else 0
     top_tier = [i for i in eligible if _severity_score(i["labels"]) == top_score]
     if merge_history == "none":

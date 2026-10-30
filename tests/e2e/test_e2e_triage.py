@@ -20,8 +20,8 @@ from agent_crew.queue import TaskQueue
 pytestmark = pytest.mark.e2e
 
 _GH_ISSUES = [
-    {"number": 42, "title": "Add OAuth login", "labels": [{"name": "enhancement"}]},
-    {"number": 43, "title": "Fix memory leak", "labels": [{"name": "bug"}]},
+    {"id": "I_42", "number": 42, "title": "Add OAuth login", "labels": [{"name": "enhancement"}]},
+    {"id": "I_43", "number": 43, "title": "Fix memory leak", "labels": [{"name": "bug"}]},
 ]
 
 _GH_ISSUES_JSON = json.dumps(_GH_ISSUES)
@@ -36,6 +36,12 @@ class _FakeProcess:
 def _gh_mock(issues_json: str = _GH_ISSUES_JSON):
     """Return a subprocess.run replacement that emits fake gh CLI output."""
     def _run(*args, **kwargs):
+        if args[0][:3] == ["gh", "api", "graphql"]:
+            return _FakeProcess(json.dumps({"data": {"nodes": [
+                {"id": issue["id"], "parent": None,
+                 "trackedInIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+                 "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
+                for issue in json.loads(issues_json)]}}))
         return _FakeProcess(issues_json)
     return _run
 
@@ -90,6 +96,22 @@ def test_e_tr02_no_confirm_enqueues_task(monkeypatch, db_path):
     impl_tasks = [t for t in tasks if t.task_type == "implement"]
     assert len(impl_tasks) == 1
     assert "add oauth login" in impl_tasks[0].description.lower()
+
+
+def test_no_confirm_reports_unknown_dependencies_without_enqueuing(monkeypatch, db_path):
+    def unavailable(*args, **kwargs):
+        if args[0][:3] == ["gh", "api", "graphql"]:
+            raise subprocess.CalledProcessError(1, args[0])
+        return _FakeProcess(_GH_ISSUES_JSON)
+
+    monkeypatch.setattr(subprocess, "run", unavailable)
+    result = CliRunner().invoke(
+        crew, ["triage", "--repo", "mock/repo", "--db", db_path, "--no-confirm"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "dependency_unknown" in result.output
+    assert "No issues to triage." in result.output
+    assert TaskQueue(db_path).list_tasks() == []
 
 
 # E-TR03: crew poll --cycles 2 --interval 1s → exactly 2 triage cycles observed
