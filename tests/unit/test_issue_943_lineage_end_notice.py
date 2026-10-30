@@ -1,8 +1,12 @@
 """#943: a terminal pipeline leaf wakes the coordinator exactly once."""
 
+import sqlite3
+
 import pytest
 from fastapi.testclient import TestClient
 
+from agent_crew.mcp_server import build_mcp_server
+from agent_crew.pipeline import fix_task_id
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
@@ -118,3 +122,86 @@ def test_F_exhausted_provider_failure_uses_lineage_end_once(harness):
     assert len(notices) == 1
     assert "kind=lineage_end" in notices[0]
     assert "test not run (provider)" in notices[0]
+
+
+def test_refused_review_fix_has_only_the_existing_successor_refused_notice(
+        harness, monkeypatch):
+    app, queue, notices = harness
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda *a, **k: "open")
+    monkeypatch.setattr("agent_crew.github.post_review_comment", lambda *a, **k: False)
+    queue.enqueue(TaskRequest(
+        task_id="review-refused-943", task_type="review", description="review",
+        branch="main", project="agent_crew",
+        context={"risk_tier": 2, "issue": 943, "pr_number": 943,
+                 "repo": "owner/repo"}), ingress="http.tasks")
+    with TestClient(app) as client:
+        response = _result(client, "review-refused-943", verdict="request_changes",
+                           findings=["HIGH src/x.py:1 - fix required"], pr_number=943)
+    assert response.status_code == 200, response.text
+    assert queue.get_task("review-refused-943").context["lineage_terminal_reason"] == (
+        "successor_refused: default_branch")
+    assert len(notices) == 1
+    assert "kind=successor_refused" in notices[0]
+
+
+def test_review_fix_created_by_server_suppresses_end_notice(harness, monkeypatch):
+    app, queue, notices = harness
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda *a, **k: "open")
+    monkeypatch.setattr("agent_crew.github.post_review_comment", lambda *a, **k: False)
+    _task(queue, "review-fix-943", "review", pr_number=943,
+          repo="owner/repo", base_branch="main")
+    with TestClient(app) as client:
+        response = _result(client, "review-fix-943", verdict="request_changes",
+                           findings=["HIGH src/x.py:1 - fix required"], pr_number=943)
+    assert response.status_code == 200, response.text
+    assert queue.get_task(fix_task_id("review-fix-943", 1)) is not None
+    assert notices == []
+
+
+@pytest.mark.parametrize("pr_number", [None, 943])
+def test_test_pass_without_merge_successor_notifies(harness, monkeypatch, pr_number):
+    app, queue, notices = harness
+    monkeypatch.setenv("AGENT_CREW_AUTO_MERGE", "0")
+    ctx = {"pr_number": pr_number} if pr_number else {}
+    _task(queue, "test-pass-943", "test", **ctx)
+    with TestClient(app) as client:
+        response = _result(client, "test-pass-943", pr_number=pr_number)
+    assert response.status_code == 200, response.text
+    assert len(notices) == 1
+    assert "kind=lineage_end" in notices[0]
+
+
+@pytest.mark.parametrize("status", ["failed", "needs_human"])
+def test_dispatcher_ended_task_uses_lineage_end(harness, status):
+    app, queue, notices = harness
+    _task(queue, f"dispatcher-{status}")
+    with sqlite3.connect(queue.db_path) as db:
+        db.execute("UPDATE tasks SET status='in_progress' WHERE task_id=?",
+                   (f"dispatcher-{status}",))
+    with TestClient(app):
+        assert app.state.fail_if_active(f"dispatcher-{status}", "provider stopped",
+                                        status=status)
+    assert queue.get_task_status(f"dispatcher-{status}") == status
+    assert len(notices) == 1
+    assert "kind=lineage_end" in notices[0]
+
+
+def test_mcp_completed_leaf_notifies_and_fallback_continuation_does_not(
+        harness, monkeypatch):
+    _, queue, _ = harness
+    _task(queue, "mcp-leaf-943")
+    _task(queue, "mcp-continuing-943")
+    sent = []
+    monkeypatch.setattr("agent_crew.server._deliver_coordinator_notice",
+                        lambda message: sent.append(message) or True)
+    mcp = build_mcp_server(queue.db_path)
+    submit = mcp._tool_manager._tools["submit_result"].fn
+    assert submit(task_id="mcp-leaf-943", status="completed",
+                  summary="research complete")["acknowledged"]
+    assert len(sent) == 1 and "kind=lineage_end" in sent[0]
+
+    monkeypatch.setattr("agent_crew.mcp_server.auto_fallback_failed_task",
+                        lambda *a, **k: True)
+    assert submit(task_id="mcp-continuing-943", status="failed",
+                  summary="provider limited")["acknowledged"]
+    assert len(sent) == 1

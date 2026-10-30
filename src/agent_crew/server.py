@@ -3320,6 +3320,10 @@ def notify_lineage_end(queue: TaskQueue, task_id: str, *,
         if child_ctx.get("prev_task_id") == task_id or child_ctx.get("original_task_id") == task_id:
             return
     ctx = task.context if isinstance(task.context, dict) else {}
+    # #914 already claimed a durable notice for this refused successor.
+    # Sending lineage_end as well would wake the coordinator twice for one end.
+    if str(ctx.get("lineage_terminal_reason") or "").startswith("successor_refused:"):
+        return
     root = str(ctx.get("lineage_root_task_id") or task_id)
     root_task = queue.get_task(root) if root != task_id else task
     if root == task_id:
