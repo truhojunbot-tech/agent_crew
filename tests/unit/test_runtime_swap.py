@@ -327,6 +327,9 @@ def _swap_fixture(tmp_path, monkeypatch, *, db_outside=False):
     import sqlite3
     import scripts.runtime_swap as swap
     monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('USER', 'test-user')
+    monkeypatch.setenv('PATH', '/usr/bin:/bin')
+    monkeypatch.setenv('LANG', 'C.UTF-8')
     directory = tmp_path / '.agent_crew' / 'demo'
     directory.mkdir(parents=True)
     db = (tmp_path / 'elsewhere.db') if db_outside else (directory / 'tasks.db')
@@ -338,6 +341,13 @@ def _swap_fixture(tmp_path, monkeypatch, *, db_outside=False):
     (directory / 'state.json').write_text(json.dumps({'port': 8765, 'db': str(db)}))
     (directory / 'pause.json').write_text('{"paused": true}')
     (directory / 'cea.env').write_text('AGENT_CREW_CEA_MODE=shadow\n')
+    (directory / 'fleet.env').write_text('')
+    old_source = tmp_path / 'old' / 'src'
+    (old_source / 'agent_crew').mkdir(parents=True, exist_ok=True)
+    live = {key: os.environ[key] for key in ('HOME', 'USER', 'PATH', 'LANG')}
+    live.update(AGENT_CREW_CEA_MODE='shadow', PYTHONPATH=str(old_source))
+    monkeypatch.setattr(swap, 'read_live_environ', lambda _pid: b''.join(
+        f'{key}={value}'.encode() + b'\0' for key, value in live.items()))
     monkeypatch.setattr(swap, 'prepare_checkout', lambda *args: None)
     monkeypatch.setattr(swap, 'api', lambda port, path, project: {'stop': {'paused': True}, 'build': {'commit': 'a' * 40}, 'project': 'demo'} if path == '/health' else [])
     monkeypatch.setattr(swap, 'listener_pid', lambda port: __import__('os').getpid())
@@ -371,6 +381,35 @@ def test_main_preflight_and_post_count_mismatch(tmp_path, monkeypatch):
         conn.execute("INSERT INTO tasks VALUES ('failed-1', 'failed')")
     with pytest.raises(RuntimeError, match='counts changed'):
         swap.main(['demo', 'a' * 40, 'post'])
+
+
+def test_preflight_refuses_undeclared_live_key_with_names_only(tmp_path, monkeypatch):
+    swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
+    original = swap.read_live_environ
+    monkeypatch.setattr(swap, 'read_live_environ',
+                        lambda pid: original(pid) + b'UNDECLARED_TOKEN=private-value\0')
+
+    with pytest.raises(RuntimeError, match='UNDECLARED_TOKEN') as error:
+        swap.main(['demo', 'a' * 40, 'preflight'])
+    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
+    diff = json.loads((evidence / 'env_diff.json').read_text())
+    assert diff['live_but_undeclared'] == ['UNDECLARED_TOKEN']
+    assert diff['declared_but_not_live'] == []
+    assert 'private-value' not in str(error.value) + (evidence / 'env_diff.json').read_text()
+    assert not (evidence / 'preflight.json').exists()
+
+    assert swap.main(['demo', 'a' * 40, 'preflight',
+                      '--accept-env-diff', 'UNDECLARED_TOKEN']) == 0
+    signalled = []
+    monkeypatch.setattr(swap.os, 'kill', lambda *args: signalled.append(args))
+    with pytest.raises(RuntimeError, match='go requires --accept-env-diff'):
+        swap.main(['demo', 'a' * 40, 'go'])
+    assert signalled == []
+
+    (tmp_path / '.agent_crew' / 'demo' / 'fleet.env').write_text('EXTRA=changed\n')
+    with pytest.raises(RuntimeError, match='fleet.env changed'):
+        swap.main(['demo', 'a' * 40, 'go', '--accept-env-diff', 'UNDECLARED_TOKEN'])
+    assert signalled == []
 
 
 def test_post_accepts_hidden_pid_only_with_matching_health(tmp_path, monkeypatch):
@@ -425,14 +464,8 @@ def test_preflight_hands_off_to_socket_group_before_proc_capture(tmp_path, monke
 
 def test_preflight_unreadable_environ_never_records_partial_capture(tmp_path, monkeypatch):
     swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
-    original = type(tmp_path).read_bytes
-
-    def read_bytes(path):
-        if str(path).endswith('/environ'):
-            raise PermissionError('environ unreadable')
-        return original(path)
-
-    monkeypatch.setattr(type(tmp_path), 'read_bytes', read_bytes)
+    monkeypatch.setattr(swap, 'read_live_environ', lambda _pid: (
+        _ for _ in ()).throw(PermissionError('environ unreadable')))
     with pytest.raises(PermissionError, match='environ unreadable'):
         swap.main(['demo', 'a' * 40, 'preflight'])
     evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
@@ -490,14 +523,18 @@ def test_complete_environ_preserves_valid_capture():
     assert complete_environ(b'X=Y\0') == b'X=Y\0'
 
 
-def test_spawn_captured_env_preserves_spaces_and_drops_old_agent_source(tmp_path, monkeypatch):
+def test_spawn_declared_env_preserves_spaces_and_uses_new_agent_source(tmp_path, monkeypatch):
     import scripts.spawn_from_env as spawn
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('USER', 'test-user')
+    monkeypatch.setenv('PATH', '/usr/bin:/bin')
+    monkeypatch.setenv('LANG', 'C.UTF-8')
     old = tmp_path / 'unusual' / 'worktree' / 'src'
     (old / 'agent_crew').mkdir(parents=True)
     new = tmp_path / 'new' / 'src'
     new.mkdir(parents=True)
-    env_file = tmp_path / 'env.nul'
-    env_file.write_bytes(f'PYTHONPATH={old}:/other/lib\0AGENT_CREW_CEA_MODE=old\0CUSTOM=has spaces\0'.encode())
+    env_file = tmp_path / 'fleet.env'
+    env_file.write_text('CUSTOM=has spaces\n')
     cea_file = tmp_path / 'cea.env'
     cea_file.write_text('AGENT_CREW_CEA_MODE=shadow\nAGENT_CREW_CEA_MEMORY_CMD=python3 /path with spaces/tool.py\n')
     captured = {}
@@ -511,12 +548,17 @@ def test_spawn_captured_env_preserves_spaces_and_drops_old_agent_source(tmp_path
     assert captured['env']['CUSTOM'] == 'has spaces'
     assert captured['env']['AGENT_CREW_CEA_MEMORY_CMD'] == 'python3 /path with spaces/tool.py'
     assert captured['env']['AGENT_CREW_CEA_MODE'] == 'shadow'
-    assert captured['env']['PYTHONPATH'] == f'{new}:/other/lib'
+    assert captured['env']['PYTHONPATH'] == str(new)
+    assert str(old) not in captured['env']['PYTHONPATH']
 
 
 def test_broker_probe_uses_client_group_and_connects(tmp_path, monkeypatch):
     import scripts.spawn_from_env as spawn
     import grp
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('USER', 'test-user')
+    monkeypatch.setenv('PATH', '/usr/bin:/bin')
+    monkeypatch.setenv('LANG', 'C.UTF-8')
     directory = tmp_path / 'sock'
     directory.mkdir()
     path = directory / 'broker.sock'
@@ -534,8 +576,8 @@ def test_broker_probe_uses_client_group_and_connects(tmp_path, monkeypatch):
     accepted = []
     thread = threading.Thread(target=lambda: accepted.append(listener.accept()[0]), daemon=True)
     thread.start()
-    env_file = tmp_path / 'env.nul'
-    env_file.write_bytes(b'HOME=/tmp\0')
+    env_file = tmp_path / 'fleet.env'
+    env_file.write_text('')
     cea_file = tmp_path / 'cea.env'
     cea_file.write_text(f'AGENT_CREW_CEA_BROKER_SOCKET={path}\n')
     command = spawn.client_command(spawn.launch_env(env_file, cea_file, tmp_path), ['python3', '-c', 'pass'])
@@ -552,8 +594,8 @@ def test_broker_probe_uses_client_group_and_connects(tmp_path, monkeypatch):
 
 def test_broker_probe_refuses_missing_socket(tmp_path):
     import scripts.spawn_from_env as spawn
-    env_file = tmp_path / 'env.nul'
-    env_file.write_bytes(b'HOME=/tmp\0')
+    env_file = tmp_path / 'fleet.env'
+    env_file.write_text('')
     cea_file = tmp_path / 'cea.env'
     cea_file.write_text(f'AGENT_CREW_CEA_BROKER_SOCKET={tmp_path / "missing.sock"}\n')
     with pytest.raises((FileNotFoundError, RuntimeError, KeyError)):
@@ -566,7 +608,7 @@ def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch, capsys):
     evidence.mkdir(parents=True)
     (evidence / 'preflight.json').write_text(json.dumps({'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': __import__('os').getpid()}))
     old_src = tmp_path / 'old' / 'src'
-    (old_src / 'agent_crew').mkdir(parents=True)
+    (old_src / 'agent_crew').mkdir(parents=True, exist_ok=True)
     (evidence / 'env.pre.nul').write_bytes(f'PYTHONPATH={old_src}\0'.encode())
     (evidence / 'cwd.pre').write_text(str(tmp_path))
     swap.write_json(evidence / 'health.pre.json', {'build': {'commit': 'b' * 40}})
@@ -601,55 +643,19 @@ def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch, capsys):
     assert not json.loads((directory / 'state.json').read_text()).get('cea_env_expected')
 
 
-def test_swap_cea_launch_makes_dead_server_recovery_require_cea(tmp_path, monkeypatch):
-    from click.testing import CliRunner
-    from agent_crew import cli
-
+def test_swap_refuses_foreign_cea_override_before_signalling(tmp_path, monkeypatch):
     swap, directory, _ = _swap_fixture(tmp_path, monkeypatch)
     configured = tmp_path / 'configured.env'
     configured.write_text('AGENT_CREW_CEA_MODE=enforce\n')
     (directory / 'cea.env').unlink()
     monkeypatch.setenv('AGENT_CREW_SWAP_CEA_ENV_FILE', str(configured))
-    state_path = directory / 'state.json'
-    state = json.loads(state_path.read_text())
-    state.update(session='crew-test', server_pid=999999, agents=[], pane_ids=[], worktrees={})
-    state_path.write_text(json.dumps(state))
-    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
-    evidence.mkdir(parents=True)
-    (evidence / 'preflight.json').write_text(json.dumps({
-        'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': os.getpid(),
-    }))
-    old_src = tmp_path / 'old' / 'src'
-    (old_src / 'agent_crew').mkdir(parents=True)
-    (evidence / 'env.pre.nul').write_bytes(f'PYTHONPATH={old_src}\0'.encode())
-    (evidence / 'cwd.pre').write_text(str(tmp_path))
-    swap.write_json(evidence / 'health.pre.json', {'build': {'commit': 'a' * 40}})
-    listener_calls = iter([os.getpid(), None])
+    signalled = []
+    monkeypatch.setattr(swap.os, 'kill', lambda *args: signalled.append(args))
 
-    def listener(_port):
-        pid = next(listener_calls, None)
-        if pid is None:
-            raise RuntimeError('no listener')
-        return pid
+    with pytest.raises(RuntimeError, match='project-local cea.env'):
+        swap.main(['demo', 'a' * 40, 'go'])
+    assert signalled == []
 
-    monkeypatch.setattr(swap, 'listener_pid', listener)
-    monkeypatch.setattr(swap.os, 'kill', lambda *_args: None)
-    monkeypatch.setattr(swap.time, 'sleep', lambda _seconds: None)
-    monkeypatch.setattr(swap.subprocess, 'run', lambda *_args, **_kwargs: type('Result', (), {'stdout': '43210\n'})())
-    monkeypatch.setattr(swap, 'process_alive', lambda _pid: True)
-    assert swap.main(['demo', 'a' * 40, 'go']) == 0
-    assert json.loads(state_path.read_text())['cea_env_expected'] is True
-
-    # The swap override is no longer available and the old listener is dead.
-    monkeypatch.delenv('AGENT_CREW_SWAP_CEA_ENV_FILE')
-    monkeypatch.setattr(cli, '_port_listening', lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(cli.subprocess, 'Popen',
-                        lambda *_args, **_kwargs: pytest.fail('recover launched without CEA'))
-    result = CliRunner().invoke(cli.crew, [
-        'recover', 'demo', '--base', str(tmp_path / '.agent_crew'),
-    ])
-    assert result.exit_code != 0
-    assert 'CEA env file missing' in result.output
 
 
 def test_go_broker_probe_failure_keeps_old_server(tmp_path, monkeypatch):
@@ -674,7 +680,7 @@ def _ready_go(tmp_path, monkeypatch):
     evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
     evidence.mkdir(parents=True)
     old_src = tmp_path / 'old' / 'src'
-    (old_src / 'agent_crew').mkdir(parents=True)
+    (old_src / 'agent_crew').mkdir(parents=True, exist_ok=True)
     (evidence / 'preflight.json').write_text(json.dumps({
         'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': os.getpid()}))
     raw = f'PYTHONPATH={old_src}:/other\0X=Y\0'.encode()

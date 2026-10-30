@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Relaunch crew using captured NUL env plus explicit KEY=VAL CEA overrides."""
+"""Relaunch crew using project-declared fleet and CEA environment files."""
 from __future__ import annotations
 
 import re
@@ -28,17 +28,19 @@ def parse_env(raw: bytes) -> dict[str, str]:
 
 
 def launch_env(env_file: Path, cea_file: Path, source: Path) -> dict[str, str]:
-    env = parse_env(env_file.read_bytes())
-    for key in list(env):
-        if key in {"_", "OLDPWD", "PWD", "SHLVL"} or key.startswith("AGENT_CREW_CEA_"):
-            env.pop(key)
-    # Remove any old checkout that actually contains agent_crew, regardless of
-    # its directory layout. Retain unrelated entries in their original order.
-    previous = env.get("PYTHONPATH", "").split(":")
-    other = [entry for entry in previous if entry and Path(entry) != source
-             and not (Path(entry) / "agent_crew").is_dir()]
-    env["PYTHONPATH"] = ":".join([str(source), *other])
+    base_keys = ("HOME", "USER", "PATH", "LANG")
+    missing = [key for key in base_keys if key not in os.environ]
+    if missing:
+        raise RuntimeError(f"swap invoker missing base keys: {', '.join(missing)}")
+    env = {key: os.environ[key] for key in base_keys}
+    fleet = parse_env_file(env_file, prefix=None, require_nonempty=False)
+    forbidden = set(fleet) & {*base_keys, "PYTHONPATH"}
+    forbidden.update(key for key in fleet if key.startswith("AGENT_CREW_CEA_"))
+    if forbidden:
+        raise ValueError(f"fleet.env has reserved keys: {', '.join(sorted(forbidden))}")
+    env.update(fleet)
     env.update(parse_env_file(cea_file))
+    env["PYTHONPATH"] = str(source)
     return env
 
 
@@ -52,7 +54,7 @@ def probe_broker(env_file: Path, cea_file: Path, source: Path) -> None:
                            env=env, stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, timeout=10)
     if probe.returncode:
-        raise RuntimeError(f"new server cannot connect to broker socket {sock}: {probe.stderr.strip()}")
+        raise RuntimeError("new server cannot connect to broker socket")
 
 
 def spawn(env_file: Path, cea_file: Path, log: Path, port: int, source: Path) -> int:
@@ -73,4 +75,4 @@ if __name__ == "__main__":
         print(spawn(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]),
                     int(sys.argv[4]), Path(sys.argv[5])))
     else:
-        raise SystemExit("usage: spawn_from_env.py [--probe-broker ENV_NUL CEA_ENV NEW_SRC | ENV_NUL CEA_ENV LOG PORT NEW_SRC]")
+        raise SystemExit("usage: spawn_from_env.py [--probe-broker FLEET_ENV CEA_ENV NEW_SRC | FLEET_ENV CEA_ENV LOG PORT NEW_SRC]")

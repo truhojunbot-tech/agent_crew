@@ -17,17 +17,19 @@ def resolve_cea_file(project_dir: Path) -> Path:
     return Path(os.environ.get("AGENT_CREW_SWAP_CEA_ENV_FILE", str(project_dir / "cea.env")))
 
 
-def parse_env_file(path: Path) -> dict[str, str]:
+def parse_env_file(path: Path, *, prefix: str | None = "AGENT_CREW_CEA_",
+                   require_nonempty: bool = True) -> dict[str, str]:
     values = {}
     for number, line in enumerate(path.read_text().splitlines(), 1):
         if not line or line.lstrip().startswith("#"):
             continue
         key, separator, value = line.partition("=")
-        if not separator or not ENV_KEY.fullmatch(key) or not key.startswith("AGENT_CREW_CEA_"):
-            raise ValueError(f"invalid env line {number}: expected AGENT_CREW_CEA_KEY=VALUE")
+        if not separator or not ENV_KEY.fullmatch(key) or (prefix is not None and not key.startswith(prefix)):
+            expected = "AGENT_CREW_CEA_KEY=VALUE" if prefix == "AGENT_CREW_CEA_" else "KEY=VALUE"
+            raise ValueError(f"invalid env line {number}: expected {expected}")
         values[key] = value
-    if not values:
-        raise ValueError("CEA env file is empty")
+    if not values and require_nonempty:
+        raise ValueError("CEA env file is empty" if prefix == "AGENT_CREW_CEA_" else "env file is empty")
     return values
 
 
