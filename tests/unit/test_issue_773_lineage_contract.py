@@ -72,7 +72,7 @@ def test_http_refuses_override_with_no_running_role(tmp_db, tmp_path, monkeypatc
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"role_agents": {"implementer": "claude_cloud",
-                                                       "reviewer": "codex", "tester": "gemini"}}))
+                                                       "reviewer": "codex", "tester": "script"}}))
     app = create_app(tmp_db, pane_map={}, state_path=str(state),
                      watchdog_disabled=True, anomaly_disabled=True,
                      identity_required=False)
@@ -89,7 +89,7 @@ def test_http_refuses_unclaimable_future_reviewer(tmp_db, tmp_path, monkeypatch)
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"role_agents": {"implementer": "claude_cloud",
-                                                       "reviewer": "codex", "tester": "gemini"}}))
+                                                       "reviewer": "codex", "tester": "script"}}))
     app = create_app(tmp_db, pane_map={}, state_path=str(state),
                      watchdog_disabled=True, anomaly_disabled=True,
                      identity_required=False)

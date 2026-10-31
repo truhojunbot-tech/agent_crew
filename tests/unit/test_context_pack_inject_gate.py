@@ -121,7 +121,8 @@ def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=Fals
     (wt / ".git").mkdir()
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"worktrees": {"claude": str(wt)},
-                                 "role_agents": {r: "claude" for r in ("implementer", "reviewer", "tester")}}))
+                                 "role_agents": {"implementer": "claude", "reviewer": "claude",
+                                                 "tester": "script"}}))
     commands = []
     patches = []
     original_patch = TaskQueue.patch_context

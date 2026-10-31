@@ -625,6 +625,7 @@ def test_the_peek_does_not_mint_a_context(tmp_db):
 def test_dispatch_measures_the_stored_session_not_the_newest(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The regression the review asked for: an older stored oversized id plus
     a newer under-cap rollout for the same cwd."""
+    monkeypatch.delenv("AGENT_CREW_CODEX_CONTEXT_MAX_MB", raising=False)
     import asyncio
 
     from fastapi.testclient import TestClient
@@ -639,7 +640,7 @@ def test_dispatch_measures_the_stored_session_not_the_newest(tmp_path, monkeypat
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"project": "p", "worktrees": {"codex": str(wt)},
                                  "role_agents": {"implementer": "codex", "reviewer": "codex",
-                                                 "tester": "codex"},
+                                                 "tester": "script"},
                                  "roles": [{"role": "reviewer", "agent": "codex",
                                             "worktree": str(wt)}],
                                  "codex_context_max_mb": 2}))

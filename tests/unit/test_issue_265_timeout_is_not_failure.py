@@ -68,7 +68,7 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, unused_tcp_port,
     state.write_text(json.dumps({
         "role_agents": {"implementer": agent,
                         "reviewer": "claude" if agent == "codex" else "codex",
-                        "tester": "gemini"},
+                        "tester": "script"},
         "worktrees": {agent: str(wt)},
     }))
     db = str(tmp_path / "t.db")

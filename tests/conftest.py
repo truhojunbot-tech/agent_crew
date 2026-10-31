@@ -675,12 +675,12 @@ def task_queue(tmp_db):
 
 @pytest.fixture
 def test_client(tmp_db):
-    # Tests on this client post tester results themselves, standing in for an
-    # LLM tester; #772 made that path opt-in (the default tester is a script).
+    # Keep the shared HTTP fixture on a valid role map. Individual tests may
+    # submit test results directly; the default tester provider is script.
     state_path = f"{tmp_db}.state.json"
     with open(state_path, "w") as f:
         json.dump({"role_agents": {"implementer": "codex", "reviewer": "claude",
-                                   "tester": "gemini"}}, f)
+                                   "tester": "script"}}, f)
     app = create_app(tmp_db, state_path=state_path)
     with TestClient(app) as client:
         yield client

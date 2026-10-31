@@ -5,7 +5,7 @@ import subprocess
 from agent_crew.prompts.task_loop import build_task_loop_prompt
 from agent_crew.testing_policy import load_scope, render_scope, render_implementer_scope
 from agent_crew.port_validation import require_project_port
-from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
+from agent_crew.role_mapping import default_agent_for_role
 from agent_crew.worktree_default_branch import remote_default_branch
 
 logger = logging.getLogger(__name__)
@@ -86,7 +86,6 @@ _AGENT_CREW_BLOCK_END = "<!-- agent_crew:end -->"
 # prompt's `[agent: NAME]` tag and the `get_next_task(agent=...)` arg.
 # Explicit pane instructions pass their agent; an omitted agent uses the
 # current role default.
-_DEFAULT_AGENT_FOR_ROLE: dict = dict(DEFAULT_ROLE_TO_AGENT)
 
 _COMMON = """\
 # Agent Crew — <project>
@@ -907,7 +906,7 @@ def generate(role: str, project: str, port: int, agent: str = "",
     """
     if delivery is None:
         delivery = os.getenv("AGENT_CREW_DELIVERY", "both").strip().lower()
-    resolved_agent = agent or _DEFAULT_AGENT_FOR_ROLE.get(role, role)
+    resolved_agent = agent or default_agent_for_role(role)
     section = _ROLE_SECTIONS.get(role, f"## Role: {role}\n")
     if "<bounded_pytest>" in section:
         section = section.replace("<bounded_pytest>", _BOUNDED_PYTEST)

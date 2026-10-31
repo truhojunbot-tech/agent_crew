@@ -27,7 +27,7 @@ def _harness(tmp_path, monkeypatch, unused_tcp_port):
     state = tmp_path / "state.json"
     state.write_text(json.dumps({
         "worktrees": {"claude": str(wt)},
-        "role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "gemini"},
+        "role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "script"},
     }))
     db = str(tmp_path / "tasks.db")
     seen = []
