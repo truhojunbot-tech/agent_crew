@@ -7726,8 +7726,9 @@ def create_app(
             result=result,
             repo_cwd=_any_worktree_path(),
             coordinator_notify_fn=coordinator_notify_fn,
+            reviewer_provider=_DISPATCH_ROLE_TO_AGENT.get("reviewer", ""),
         )
-        if review_id:
+        if isinstance(review_id, str) and review_id:
             _try_push_next("reviewer")
         elif ((parent := q().get_task(impl_task_id)) is not None
               and isinstance(parent.context, dict)
@@ -7797,7 +7798,9 @@ def create_app(
         _pipeline_requeue_review_at_head(
             q(), review_task_id, pr_number, head, ctx,
             project=_successor_project_for(
-                review_task_id, ctx if isinstance(ctx, dict) else {}))
+                review_task_id, ctx if isinstance(ctx, dict) else {}),
+            reviewer_provider=_DISPATCH_ROLE_TO_AGENT.get("reviewer", ""),
+            coordinator_notify_fn=coordinator_notify_fn)
 
     def _auto_enqueue_fix(review_task_id: str, repo: str = "") -> Optional[str]:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
