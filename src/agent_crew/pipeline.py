@@ -1028,7 +1028,7 @@ def _review_round_cap(queue: TaskQueue, predecessor: TaskRequest, review_id: str
             continue
         attribution = queue.get_attribution(task.task_id) or {}
         resolved = (attribution.get("agent") or ctx.get("agent_override")
-                    or ctx.get("reviewer_agent") or DEFAULT_ROLE_TO_AGENT["reviewer"])
+                    or ctx.get("reviewer_agent") or baseline_agent_for_role("reviewer"))
         if resolved == provider:
             count += 1
     if count < cap:
@@ -1085,7 +1085,7 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
         prior_attribution = queue.get_attribution(review_task_id) or {}
         provider = (base.get("agent_override") or base.get("reviewer_agent")
                     or reviewer_provider or prior_attribution.get("agent")
-                    or DEFAULT_ROLE_TO_AGENT["reviewer"])
+                    or baseline_agent_for_role("reviewer"))
         blocked = _review_round_cap(queue, predecessor, new_id, provider,
                                     pr_number, head, coordinator_notify_fn)
         if blocked is not None:
@@ -2670,7 +2670,7 @@ def auto_enqueue_review(
         provider = (review_context.get("agent_override")
                     or review_context.get("reviewer_agent") or reviewer_provider
                     or (default_agent_for_role("reviewer", pane_map) if pane_map else None)
-                    or DEFAULT_ROLE_TO_AGENT["reviewer"])
+                    or baseline_agent_for_role("reviewer"))
         blocked = _review_round_cap(queue, impl_task, review_id, provider,
                                     pr_number, review_context.get("reviewed_sha", ""),
                                     coordinator_notify_fn)
