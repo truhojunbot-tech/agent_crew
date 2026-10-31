@@ -1,4 +1,5 @@
 import re
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Union
@@ -73,6 +74,15 @@ class TaskRequest:
             raise ValueError(f"Invalid task_type: {self.task_type!r}. Must be one of {_VALID_TASK_TYPES}")
         if not (1 <= self.priority <= 5):
             raise ValueError(f"Invalid priority: {self.priority!r}. Must be between 1 and 5")
+        if not isinstance(self.context, dict):
+            raise ValueError("context must be a JSON object")
+        try:
+            json.dumps(self.context, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("context must be valid JSON") from exc
+        round_no = self.context.get("fix_round")
+        if "fix_round" in self.context and (type(round_no) is not int or round_no < 0):
+            raise ValueError("context.fix_round must be a non-negative integer")
 
 
 #: A full git object id — 40 hex for sha1 repos, 64 for sha256. Deliberately
@@ -148,14 +158,14 @@ class TaskResult:
                 presenter if isinstance(presenter, str) and presenter else None)
 
     def __post_init__(self):
-        # #305: keep the SPELLING honest without ever throwing the result away.
-        # ⛔A 422 over one field discarded an entire result once already (#270),
-        #   so a commit that is not an object id is normalised to empty rather
-        #   than raised on. Losing a branch report is recoverable; losing the
-        #   summary, verdict and findings is not.
+        # Reject malformed provenance before it reaches a queue or cascade.
         self.branch = (self.branch or "").strip() if isinstance(self.branch, str) else ""
-        _commit = (self.commit or "").strip() if isinstance(self.commit, str) else ""
-        self.commit = _commit if _OBJECT_ID_RE.match(_commit) else ""
+        if not isinstance(self.commit, str):
+            raise ValueError("commit must be a full object id or empty")
+        _commit = self.commit.strip()
+        if _commit and not _OBJECT_ID_RE.fullmatch(_commit):
+            raise ValueError("commit must be a full object id or empty")
+        self.commit = _commit
         normalized_findings = []
         for index, finding in enumerate(self.findings or []):
             if isinstance(finding, str):
@@ -163,12 +173,7 @@ class TaskResult:
             elif isinstance(finding, dict):
                 required = ("severity", "file", "line", "title", "detail")
                 if any(key not in finding or finding[key] in (None, "") for key in required):
-                    # Existing internal result producers carry provenance and
-                    # legacy finding objects. The review intake validator below
-                    # rejects malformed worker findings; keep internal payloads
-                    # intact so suppression and feedback retain that metadata.
-                    normalized_findings.append(finding)
-                    continue
+                    raise ValueError(f"findings[{index}] must contain severity, file, line, title, detail")
                 normalized_findings.append(
                     f"{finding['severity']} {finding['file']}:{finding['line']} - "
                     f"{finding['title']}: {finding['detail']}")

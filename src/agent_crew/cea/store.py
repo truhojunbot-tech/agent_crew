@@ -242,18 +242,23 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(_DDL_INTENT_LINEAGES)
     try:
         conn.execute(_DDL_MIGRATE_LINEAGE_WORK_HASH)
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
     conn.execute(_DDL_LINEAGE_WORK_HASH_INDEX)
     try:
         conn.execute(_DDL_MIGRATE_TASKS_RECEIPT_ID)
-    except sqlite3.OperationalError:
-        pass  # column already exists, or `tasks` not created yet on this connection
+    except sqlite3.OperationalError as exc:
+        if ("duplicate column name" not in str(exc).lower()
+                and "no such table: tasks" not in str(exc).lower()):
+            raise
     for stmt in _DDL_TASKS_RECEIPT_REQUIRED:
         try:
             conn.execute(stmt)
-        except sqlite3.OperationalError:
-            pass  # `tasks` is not on this connection (receipt-store-only DBs)
+        except sqlite3.OperationalError as exc:
+            if not ("no such table:" in str(exc).lower()
+                    and "tasks" in str(exc).lower()):
+                raise
 
 
 def _encode(receipt: dict) -> dict:

@@ -178,6 +178,11 @@ def test_terminal_legacy_cloud_row_does_not_overlap_new_cost(tmp_path, monkeypat
         with sqlite3.connect(queue._db_path) as db:
             db.execute("UPDATE tasks SET status_changed_at=0 WHERE task_id='impl-old'")
     assert "cloud_ended_at" not in queue.get_task_context("impl-old")
+    # Simulate upgrading a DB written before the one-time migration existed.
+    with sqlite3.connect(queue._db_path) as db:
+        db.execute("DELETE FROM task_metadata_migrations WHERE name='legacy_cloud_cost_v1'")
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    assert "cloud_ended_at" in queue.get_task_context("impl-old")
 
     started = time.time()
     monkeypatch.setenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "0")

@@ -8912,6 +8912,8 @@ def create_app(
                     time.sleep(0.05 * (2 ** attempt))
         except InvalidRiskTierError as e:
             raise HTTPException(status_code=422, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
         except TaskAlreadyExistsError as e:
             raise HTTPException(
                 status_code=409,
@@ -9351,7 +9353,7 @@ def create_app(
         except ValueError as e:
             msg = str(e)
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")
-            status_code = 404 if "not found" in msg.lower() else 400
+            status_code = 404 if "not found" in msg.lower() else 422
             raise HTTPException(status_code=status_code, detail=msg)
         # #202: lifecycle event for the agent-self-reported terminal outcome
         # (the internal dispatcher-detected failure paths emit their own

@@ -1360,14 +1360,37 @@ def _result_to_json(result) -> str:
     """TaskResult를 replay 재현 가능한 JSON 문자열로. pydantic model_dump 우선, 실패 시 __dict__.
     ⛔절대 'unknown' placeholder 금지 — cascade_outbox의 result_json은 executor가 원 제출 result를
       그대로 재실행하는 근거이므로 손실 없이 보존해야 한다(§3)."""
+    data = result.model_dump() if callable(getattr(result, "model_dump", None)) else vars(result)
+    return json.dumps(data, ensure_ascii=False, allow_nan=False)
+
+
+class MalformedStoredRow(ValueError):
+    """Stored task data is invalid; callers must stop rather than infer defaults."""
+
+
+def _stored_context(raw, task_id: str) -> dict:
     try:
-        data = result.model_dump()
-    except Exception:
-        data = getattr(result, "__dict__", None)
-        if data is None:
-            data = {"task_id": getattr(result, "task_id", None),
-                    "status": getattr(result, "status", None)}
-    return json.dumps(data, ensure_ascii=False, default=str)
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise MalformedStoredRow(f"malformed context for task {task_id}") from exc
+    if not isinstance(value, dict):
+        raise MalformedStoredRow(f"malformed context for task {task_id}")
+    round_no = value.get("fix_round")
+    if "fix_round" in value and (type(round_no) is not int or round_no < 0):
+        raise MalformedStoredRow(f"malformed fix_round for task {task_id}")
+    return value
+
+
+def _stored_findings(raw, task_id: str) -> list:
+    if raw is None:
+        return []  # A task without a submitted result has SQL NULL findings.
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise MalformedStoredRow(f"malformed findings for task {task_id}") from exc
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise MalformedStoredRow(f"malformed findings for task {task_id}")
+    return value
 
 
 def _is_duplicate_task_id(error: Exception) -> bool:
@@ -1666,6 +1689,79 @@ class TaskQueue:
         for idx_stmt in _DDL_INDEXES.strip().split('\n'):
             if idx_stmt.strip():
                 conn.execute(idx_stmt)
+        self._migrate_legacy_cloud_cost(conn)
+
+    @staticmethod
+    def _migrate_legacy_cloud_cost(conn: sqlite3.Connection) -> None:
+        """Turn old cloud credit and interval repairs into a one-time migration."""
+        marker = "legacy_cloud_cost_v1"
+        if conn.execute("SELECT 1 FROM task_metadata_migrations WHERE name=?",
+                        (marker,)).fetchone():
+            return
+        now = time.time()
+        rows = conn.execute("SELECT task_id, context, status, status_changed_at, "
+                            "last_activity_at FROM tasks").fetchall()
+        try:
+            settle = float(os.getenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "900"))
+        except ValueError:
+            settle = 900.0
+        if not math.isfinite(settle) or settle < 0:
+            settle = 900.0
+        for row in rows:
+            try:
+                context = _stored_context(row["context"], row["task_id"])
+            except MalformedStoredRow:
+                continue  # The ordinary read path will refuse this row.
+            changed = False
+            for prefix, attribution_id in (("cloud_", row["task_id"]),
+                                            ("cloud_shadow_", f"cloud-shadow:{row['task_id']}")):
+                began = context.get(prefix + "attempt_started_at") or context.get(prefix + "launched_at")
+                if (row["status"] not in ("pending", "in_progress")
+                        and isinstance(began, (int, float))
+                        and not isinstance(context.get(prefix + "ended_at"), (int, float))):
+                    stamps = (row["status_changed_at"], row["last_activity_at"])
+                    context[prefix + "ended_at"] = next(
+                        (stamp for stamp in stamps if isinstance(stamp, (int, float))
+                         and stamp >= began), now)
+                    changed = True
+                if (context.get(prefix + "usd") is not None
+                        and context.get(prefix + "cost_finalized_at")
+                        and context.get(prefix + "credit_before_fetched_at") is None):
+                    ended = context.get(prefix + "ended_at")
+                    overlaps = []
+                    if isinstance(began, (int, float)) and isinstance(ended, (int, float)):
+                        for other in rows:
+                            for shadow, other_prefix in ((False, "cloud_"),
+                                                         (True, "cloud_shadow_")):
+                                if other["task_id"] == row["task_id"] and other_prefix == prefix:
+                                    continue
+                                try:
+                                    other_context = _stored_context(other["context"], other["task_id"])
+                                except MalformedStoredRow:
+                                    continue
+                                other_began = (other_context.get(other_prefix + "attempt_started_at")
+                                               or other_context.get(other_prefix + "launched_at"))
+                                other_ended = other_context.get(other_prefix + "ended_at")
+                                if (isinstance(other_began, (int, float))
+                                        and other_began <= ended + settle
+                                        and (not isinstance(other_ended, (int, float))
+                                             or other_ended + settle >= began)):
+                                    overlaps.append(("cloud-shadow:" if shadow else "")
+                                                    + other["task_id"])
+                    overlaps = sorted(set(overlaps))
+                    cost_status = ("UNKNOWN_OVERLAP" if overlaps
+                                   else "UNKNOWN_NO_FRESH_READING")
+                    context[prefix + "usd"] = None
+                    context[prefix + "cost_overlaps"] = overlaps
+                    conn.execute("UPDATE task_attribution SET cloud_usd=NULL, "
+                                 "cloud_cost_status=?, cloud_cost_overlaps=? WHERE task_id=?",
+                                 (cost_status, json.dumps(overlaps), attribution_id))
+                    changed = True
+            if changed:
+                conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
+                             (json.dumps(context), row["task_id"]))
+        conn.execute("INSERT OR IGNORE INTO task_metadata_migrations (name) VALUES (?)",
+                     (marker,))
 
     @staticmethod
     def _backfill_legacy_task_metadata(conn: sqlite3.Connection) -> None:
@@ -3594,10 +3690,12 @@ class TaskQueue:
         try:
             sha = (pr_head_sha(pr, repo=repo, timeout=5.0) if pr is not None
                    else branch_head_sha(task.branch, repo=repo))
-        except Exception:
-            logger.exception("duplicate review head lookup failed for %s", task.task_id)
-            return ""
-        return sha.strip().lower() if isinstance(sha, str) and _CEA_COMMIT_RE.fullmatch(sha.strip()) else ""
+        except Exception as exc:
+            raise MalformedStoredRow(f"review head lookup failed for task {task.task_id}") from exc
+        # An absent head is a valid lookup result while a PR is being opened;
+        # a transport exception above is not.
+        return (sha.strip().lower() if isinstance(sha, str)
+                and _CEA_COMMIT_RE.fullmatch(sha.strip()) else "")
 
     @staticmethod
     def _duplicate_review_in_txn(conn, task: TaskRequest, context: dict, *,
@@ -3651,12 +3749,7 @@ class TaskQueue:
             if (row["task_id"] == ignore_active_task_id
                     and row["status"] == "in_progress"):
                 continue
-            try:
-                old = json.loads(row["context"] or "{}")
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(old, dict):
-                continue
+            old = _stored_context(row["context"], row["task_id"])
             old_pr = _normalize_pr_number(old.get("pr_number"))
             if old_pr is None:
                 old_pr = _normalize_pr_number(row["pr_number"])
@@ -4484,6 +4577,7 @@ class TaskQueue:
         ``DIRECT``, and the static §7 test refuses that for any call site in
         the product.
         """
+        task.__post_init__()  # Catch context mutations after construction.
         if ingress is not None:
             if provenance is not None:
                 raise ValueError("pass ingress or provenance, not both — the registry "
@@ -5008,17 +5102,10 @@ class TaskQueue:
         # receipt in the same lineage, so it reads the same project's mode.
         config = self.cea_config_for_receipt(receipt)
         if receipt is None:
-            # A pre-receipt legacy row. Same asymmetry as the claim gate: under
-            # enforcement "no receipt" is not "no objection".
-            if _cea_callsites.enforcing(config):
-                logger.warning("cea: requeue refused for %s via %s — NO_RECEIPT under enforce",
-                               task_id, path)
-                self._record_end_on(conn, task_id, time.time(), "requeue_refused_no_receipt",
-                                    posted=False)
-                return False, None
-            logger.info("cea: requeuing %s via %s with no receipt (shadow; enforce would refuse)",
-                        task_id, path)
-            return True, None
+            logger.warning("cea: requeue refused for %s via %s — NO_RECEIPT", task_id, path)
+            self._record_end_on(conn, task_id, time.time(), "requeue_refused_no_receipt",
+                                posted=False)
+            return False, None
         gate = _cea_callsites.gate_requeue(
             receipt, path=path, current=_cea_callsites.current_inputs(engine, receipt),
             config=config)
@@ -5207,8 +5294,12 @@ class TaskQueue:
             ).fetchone()
             if row is None:
                 return
-            existing = json.loads(row["context"] or "{}")
+            existing = _stored_context(row["context"], task_id)
             merged = {**existing, **extra}
+            round_no = merged.get("fix_round")
+            if "fix_round" in merged and (type(round_no) is not int or round_no < 0):
+                raise ValueError("context.fix_round must be a non-negative integer")
+            json.dumps(merged, allow_nan=False)
             conn.execute(
                 "UPDATE tasks SET context=? WHERE task_id=?",
                 (json.dumps(merged), task_id),
@@ -5492,6 +5583,7 @@ class TaskQueue:
         verdict and commit must never become verdict, commit provenance, or a
         cascade, even when a presented nonce passes the read-only check.
         """
+        result.__post_init__()  # The dataclass can be mutated before queue admission.
         conn = self._connect()
         try:
             if result.task_id != task_id:
@@ -5510,10 +5602,7 @@ class TaskQueue:
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
             prior_status = row["status"]
-            try:
-                task_context = json.loads(row["context"] or "{}")
-            except (TypeError, ValueError):
-                task_context = {}
+            task_context = _stored_context(row["context"], task_id)
             op_id = (task_context.get("external_operation_id")
                      if isinstance(task_context, dict) else None)
             if isinstance(op_id, str) and op_id:
@@ -7901,13 +7990,10 @@ class TaskQueue:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT context FROM tasks WHERE status = 'in_progress' AND task_type = 'discuss'"
+                "SELECT task_id, context FROM tasks WHERE status = 'in_progress' AND task_type = 'discuss'"
             ).fetchall()
             for r in rows:
-                try:
-                    ctx = json.loads(r["context"]) if r["context"] else {}
-                except Exception:
-                    continue
+                ctx = _stored_context(r["context"], r["task_id"])
                 if ctx.get("agent") == agent:
                     return True
             return False
@@ -7992,12 +8078,9 @@ class TaskQueue:
                 "SELECT context FROM tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
-            if row is None or not row["context"]:
+            if row is None:
                 return {}
-            try:
-                return json.loads(row["context"])
-            except Exception:
-                return {}
+            return _stored_context(row["context"], task_id)
         finally:
             conn.close()
 
@@ -8035,13 +8118,13 @@ class TaskQueue:
             description=r["description"],
             branch=r["branch"],
             priority=r["priority"],
-            context=json.loads(r["context"]),
+            context=_stored_context(r["context"], r["task_id"]),
             project=r["project"] if r["project"] else "",
             status=r["status"],
             # #213: result fields are part of both list and single-task reads.
             summary=r["summary"] or "",
             verdict=r["verdict"],
-            findings=json.loads(r["findings"]) if r["findings"] else [],
+            findings=_stored_findings(r["findings"], r["task_id"]),
             pr_number=r["pr_number"],
             error_info=json.loads(r["error_info"]) if r["error_info"] else None,
             status_changed_at=(r["status_changed_at"]
@@ -8938,24 +9021,18 @@ class TaskQueue:
             #   a hop further from the review that actually spoke.
             if (row["summary"] or "") == _CANARY_SUPPRESSED_REASON:
                 continue
-            try:
-                ctx = json.loads(row["context"] or "{}")
-            except (TypeError, ValueError):
+            ctx = _stored_context(row["context"], row["task_id"])
+            if (ctx.get("reviewed_sha") or "") != reviewed_sha:
                 continue
-            if not isinstance(ctx, dict) or (ctx.get("reviewed_sha") or "") != reviewed_sha:
-                continue
-            try:
-                findings = json.loads(row["findings"]) if row["findings"] else []
-            except (TypeError, ValueError):
-                findings = []
+            findings = _stored_findings(row["findings"], row["task_id"])
             return {"task_id": row["task_id"], "verdict": row["verdict"],
                     "status": row["status"], "pr_number": row["pr_number"],
                     "branch": row["branch"], "reviewed_sha": reviewed_sha,
                     # The findings themselves, not only their count: a
                     # suppression has to reproduce this verdict in full, and a
                     # count cannot be handed to a fix agent.
-                    "findings": findings if isinstance(findings, list) else [],
-                    "findings_count": len(findings) if isinstance(findings, list) else None}
+                    "findings": findings,
+                    "findings_count": len(findings)}
         return None
 
     def settle_unused_task_receipt(self, task_id: str, *, note: str) -> Optional[str]:

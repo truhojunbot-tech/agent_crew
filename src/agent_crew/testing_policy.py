@@ -73,23 +73,24 @@ def _base() -> str:
 
 
 def _coerce(raw, source: str, source_kind: str = "builtin") -> dict:
-    """A parsed config into the shape the renderer expects.
-
-    Tolerant on purpose: a malformed scope must not break dispatch, and a
-    string where a list belongs is the most likely hand-edit mistake.
-    """
+    """Validate the configured test scope before it can affect dispatch."""
     scope = dict(DEFAULT_SCOPE)
     if not isinstance(raw, dict):
-        logger.warning(f"test scope from {source} is not an object; ignoring it")
-        return scope
+        raise ValueError(f"test scope from {source} must be an object")
     for key in ("targeted", "guards", "full"):
-        value = raw.get(key)
-        if isinstance(value, str):
-            value = [value]
-        scope[key] = [str(v) for v in value if str(v).strip()] if isinstance(value, list) else []
-    scope["full_suite"] = bool(raw.get("full_suite", False))
+        value = raw.get(key, [])
+        if not isinstance(value, list) or any(not isinstance(v, str) or not v.strip()
+                                               for v in value):
+            raise ValueError(f"test scope {source}.{key} must be a list of nonempty strings")
+        scope[key] = value
+    full_suite = raw.get("full_suite", False)
+    if not isinstance(full_suite, bool):
+        raise ValueError(f"test scope {source}.full_suite must be a boolean")
+    scope["full_suite"] = full_suite
     scope["source"] = source
-    scope["source_kind"] = source_kind if source_kind in SOURCE_KINDS else "builtin"
+    if source_kind not in SOURCE_KINDS:
+        raise ValueError(f"unknown test scope source kind: {source_kind}")
+    scope["source_kind"] = source_kind
     return scope
 
 
@@ -100,11 +101,7 @@ def _read(path: str) -> dict | None:
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as e:
-        # ⛔Loud, but not fatal. A broken scope file silently falling back to
-        #   the default would be indistinguishable from "no file", and the
-        #   operator who wrote it would never learn it is not in effect.
-        logger.warning(f"test scope at {path} is unreadable ({e}); ignoring it")
-        return None
+        raise ValueError(f"test scope at {path} is unreadable") from e
 
 
 def load_scope(worktree: str = "", project: str = "", *, base: str | None = None) -> dict:
@@ -117,10 +114,7 @@ def load_scope(worktree: str = "", project: str = "", *, base: str | None = None
     raw_env = (os.environ.get(ENV_SCOPE) or "").strip()
     if raw_env:
         if raw_env.startswith("{"):
-            try:
-                return _coerce(json.loads(raw_env), f"env:{ENV_SCOPE}", "env")
-            except ValueError as e:
-                logger.warning(f"{ENV_SCOPE} is not valid JSON ({e}); ignoring it")
+            return _coerce(json.loads(raw_env), f"env:{ENV_SCOPE}", "env")
         else:
             data = _read(os.path.expanduser(raw_env))
             if data is not None:
