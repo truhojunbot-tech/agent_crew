@@ -7395,6 +7395,9 @@ def create_app(
             while True:
                 await asyncio.sleep(interval)
                 try:
+                    _refresh_role_map()
+                    if _notice_role_map_refusal():
+                        continue
                     _reroute_stale_bindings()
                     _AGENT_TO_ROLES, _workers, _discuss_workers = _worker_role_map()
                     try:
