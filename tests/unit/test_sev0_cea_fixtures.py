@@ -199,7 +199,8 @@ def test_cx_4b_coordinator_managed_completion_still_yields_review(crew):
     make, push, db = crew
     with make() as client:
         r = post(client, request("adm-impl-cm", "Implement work-class gate",
-                                 context={"coordinator_managed": True}))
+                                 context={"coordinator_managed": True,
+                                          "crew_run_branch": True}))
         assert r.status_code == 201
         assert complete(client, "adm-impl-cm").status_code == 200
         assert successors_of(client, "adm-impl-cm", "review"), (

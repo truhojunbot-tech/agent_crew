@@ -23,7 +23,8 @@ ROOT = "impl-canary-rounds"
 def q(tmp_db):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(task_id=ROOT, task_type="implement",
-                              description="root", branch="canary-branch"))
+                              description="root", branch="canary-branch",
+                              context={"crew_run_branch": True}))
     # A cap may cite only a decision published after the latest implement result.
     queue.submit_result(ROOT, TaskResult(ROOT, "completed", "root completed"))
     return queue

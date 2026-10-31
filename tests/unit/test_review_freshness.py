@@ -24,7 +24,8 @@ def _impl_payload(task_id="impl-1"):
         "description": "Implement Issue #79 — telegram notify helper",
         "branch": "agent/agent_crew/claude",
         "priority": 3,
-        "context": {"repo": "truhojunbot-tech/agent_crew"},
+        "context": {"repo": "truhojunbot-tech/agent_crew",
+                    "crew_run_branch": True},
         "project": "",
     }
 

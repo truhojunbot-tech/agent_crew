@@ -11,7 +11,9 @@ from agent_crew import pause  # noqa: E402
 
 def mk(i, tt="implement"):
     return TaskRequest(task_id=f"t{i}", task_type=tt, description=f"d{i}",
-                       branch="main", priority=1, context={}, project="testproj")
+                       branch="main", priority=1,
+                       context={"crew_run_branch": True} if tt == "implement" else {},
+                       project="testproj")
 
 
 class Base(unittest.TestCase):
@@ -359,7 +361,8 @@ class TestMcpTransportParity(Base):
 
     def test_mcp_result_under_pause_acknowledges_instead_of_raising(self):
         self.q.enqueue(TaskRequest(task_id="t1", task_type="implement", description="d",
-                                   branch="main", priority=1, context={}, project="testproj"))
+                                   branch="main", priority=1,
+                                   context={"crew_run_branch": True}, project="testproj"))
         self.assertIsNotNone(self.q.dequeue(role="implementer"))
         pause.set_pause(self.sd, True, reason="incident", incident="alfred#39")
 
@@ -425,7 +428,8 @@ class TestMcpTransportParity(Base):
         import agent_crew.mcp_server as mcp_server
 
         self.q.enqueue(TaskRequest(task_id="t1", task_type="implement", description="d",
-                                   branch="main", priority=1, context={}, project="testproj"))
+                                   branch="main", priority=1,
+                                   context={"crew_run_branch": True}, project="testproj"))
         self.q.dequeue(role="implementer")
 
         _real = mcp_server.auto_enqueue_review
@@ -468,7 +472,8 @@ class TestMcpTransportParity(Base):
         """⛔The control. Swallowing PausedError must not become swallowing the
         cascade."""
         self.q.enqueue(TaskRequest(task_id="t1", task_type="implement", description="d",
-                                   branch="main", priority=1, context={}, project="testproj"))
+                                   branch="main", priority=1,
+                                   context={"crew_run_branch": True}, project="testproj"))
         self.q.dequeue(role="implementer")
         ack = self._mcp("submit_result", task_id="t1", status="completed", summary="done")
         self.assertTrue(ack.get("acknowledged"), ack)

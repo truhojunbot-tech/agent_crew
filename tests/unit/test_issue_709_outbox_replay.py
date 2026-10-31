@@ -25,7 +25,7 @@ def pending(tmp_path, monkeypatch):
     queue.enqueue(TaskRequest(
         task_id="impl-709", task_type="implement", description="implement",
         branch="agent/709-test", project="testproj",
-        context={"risk_tier": 2}))
+        context={"risk_tier": 2, "crew_run_branch": True}))
     assert queue.dequeue(role="implementer") is not None
     queue.set_stop_epoch(True)
     queue.submit_result("impl-709", TaskResult(
