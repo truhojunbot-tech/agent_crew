@@ -991,8 +991,66 @@ def stale_review_task_id(pr_number, head_sha: str) -> str:
     return f"review-{int(pr_number)}-{(head_sha or '')[:12]}"
 
 
+@dataclass(frozen=True)
+class ReviewRoundCapReached:
+    reason: str
+    provider: str
+    count: int
+    cap: int
+    lineage_root: str
+
+
+def _review_round_cap(queue: TaskQueue, predecessor: TaskRequest, review_id: str,
+                      provider: str, pr_number, head_sha: str,
+                      coordinator_notify_fn=None) -> ReviewRoundCapReached | None:
+    """Refuse a review when this provider has spent its lineage round budget."""
+    if queue.get_task(review_id) is not None:
+        return None  # A result replay must keep the successor it already made.
+    key = "AGENT_CREW_REVIEW_MAX_ROUNDS_" + re.sub(r"[^A-Z0-9]", "_", provider.upper())
+    raw = os.getenv(key)
+    if raw is None:
+        return None
+    try:
+        cap = max(0, int(raw))
+    except ValueError:
+        logger.warning("%s is invalid; refusing additional %s reviews", key, provider)
+        cap = 0
+    tasks = {task.task_id: task for task in queue.list_tasks()}
+    parent_ctx = predecessor.context if isinstance(predecessor.context, dict) else {}
+    root = parent_ctx.get("lineage_root_task_id") or _lineage_root_task_id(tasks, predecessor)
+    count = 0
+    for task in tasks.values():
+        if task.task_type != "review" or task.status not in ("pending", "in_progress", "completed"):
+            continue
+        ctx = task.context if isinstance(task.context, dict) else {}
+        task_root = ctx.get("lineage_root_task_id") or _lineage_root_task_id(tasks, task)
+        if task_root != root:
+            continue
+        attribution = queue.get_attribution(task.task_id) or {}
+        resolved = (attribution.get("agent") or ctx.get("agent_override")
+                    or ctx.get("reviewer_agent") or DEFAULT_ROLE_TO_AGENT["reviewer"])
+        if resolved == provider:
+            count += 1
+    if count < cap:
+        return None
+    outcome = ReviewRoundCapReached("review_round_cap", provider, count, cap, str(root))
+    queue.patch_context(predecessor.task_id, {
+        "review_blocked_reason": outcome.reason,
+        "review_blocked_provider": provider,
+        "review_blocked_count": count,
+        "review_blocked_cap": cap,
+    })
+    from agent_crew.server import coordinator_notice_once
+    coordinator_notice_once(
+        queue, predecessor.task_id, outcome.reason,
+        f"lineage_root={root} pr_number={pr_number or ''} head_sha={head_sha or ''} "
+        f"provider={provider} count={count} cap={cap}", coordinator_notify_fn)
+    return outcome
+
+
 def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, head: str,
-                           ctx, *, project: str) -> Optional[str]:
+                           ctx, *, project: str, reviewer_provider: str = "",
+                           coordinator_notify_fn=None) -> str | ReviewRoundCapReached | None:
     """Enqueue one head-anchored review for a PR whose head moved (#304).
 
     Shared by the HTTP and MCP result transports (#887): a stale approval
@@ -1012,7 +1070,8 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
     context = {k: v for k, v in base.items()
                if k in ("pr_number", "repo", "project", "no_tester",
                         "coordinator_managed", "checklist_layers",
-                        "findings_only")}
+                        "findings_only", "agent_override", "reviewer_agent",
+                        "lineage_root_task_id")}
     context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
                     "expected_head_sha": head, "prev_task_id": review_task_id})
     inherited_tier = base.get("risk_tier")
@@ -1020,6 +1079,18 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
             and 0 <= inherited_tier <= 3):
         context["risk_tier"] = inherited_tier
     try:
+        predecessor = queue.get_task(review_task_id)
+        if predecessor is None:
+            return None
+        prior_attribution = queue.get_attribution(review_task_id) or {}
+        provider = (prior_attribution.get("agent") or base.get("agent_override")
+                    or base.get("reviewer_agent") or reviewer_provider
+                    or DEFAULT_ROLE_TO_AGENT["reviewer"])
+        context.setdefault("agent_override", provider)
+        blocked = _review_round_cap(queue, predecessor, new_id, provider,
+                                    pr_number, head, coordinator_notify_fn)
+        if blocked is not None:
+            return blocked
         queue.enqueue(TaskRequest(
             task_id=new_id,
             task_type="review",
@@ -2274,7 +2345,8 @@ def auto_enqueue_review(
     result=None,
     repo_cwd: str = "",
     coordinator_notify_fn=None,
-) -> Optional[str]:
+    reviewer_provider: str = "",
+) -> str | ReviewRoundCapReached | None:
     """Create the review task that follows a completed impl task.
 
     ``result`` is the implementer's own report (#305). When it names a branch
@@ -2592,6 +2664,15 @@ def auto_enqueue_review(
             context=review_context,
             project=_successor_project(queue, impl_task, server_project),
         )
+        provider = (review_context.get("agent_override")
+                    or review_context.get("reviewer_agent") or reviewer_provider
+                    or (default_agent_for_role("reviewer", pane_map) if pane_map else None)
+                    or DEFAULT_ROLE_TO_AGENT["reviewer"])
+        blocked = _review_round_cap(queue, impl_task, review_id, provider,
+                                    pr_number, review_context.get("reviewed_sha", ""),
+                                    coordinator_notify_fn)
+        if blocked is not None:
+            return blocked
         try:
             _enqueue_with_inherited_risk(
                 queue, review_req, {t.task_id: t for t in queue.list_tasks()},
