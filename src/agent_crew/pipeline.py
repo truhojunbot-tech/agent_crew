@@ -1083,10 +1083,9 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
         if predecessor is None:
             return None
         prior_attribution = queue.get_attribution(review_task_id) or {}
-        provider = (prior_attribution.get("agent") or base.get("agent_override")
-                    or base.get("reviewer_agent") or reviewer_provider
+        provider = (base.get("agent_override") or base.get("reviewer_agent")
+                    or reviewer_provider or prior_attribution.get("agent")
                     or DEFAULT_ROLE_TO_AGENT["reviewer"])
-        context.setdefault("agent_override", provider)
         blocked = _review_round_cap(queue, predecessor, new_id, provider,
                                     pr_number, head, coordinator_notify_fn)
         if blocked is not None:

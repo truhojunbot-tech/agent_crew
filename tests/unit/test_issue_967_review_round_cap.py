@@ -74,6 +74,23 @@ def test_requeue_at_new_head_is_blocked(tmp_path, monkeypatch):
     assert "head_sha=" + "a" * 40 in notices[0]
 
 
+@pytest.mark.parametrize("explicit_override", [None, "claude_cloud"])
+def test_requeue_without_cap_preserves_only_explicit_provider_override(
+        tmp_path, monkeypatch, explicit_override):
+    queue = _queue(tmp_path)
+    monkeypatch.delenv("AGENT_CREW_REVIEW_MAX_ROUNDS_CLAUDE", raising=False)
+    monkeypatch.delenv("AGENT_CREW_REVIEW_MAX_ROUNDS_CLAUDE_CLOUD", raising=False)
+    base = {"risk_tier": 1, "branch": "feature"}
+    if explicit_override:
+        base["agent_override"] = explicit_override
+    review_id = requeue_review_at_head(
+        queue, "prior-1", 7, "b" * 40, base, project="demo",
+        reviewer_provider="codex")
+    assert review_id == "review-7-bbbbbbbbbbbb"
+    context = queue.get_task(review_id).context
+    assert context.get("agent_override") == explicit_override
+
+
 @pytest.mark.parametrize("providers,cancelled,cap", [
     (("claude", "claude"), True, "2"),
     (("codex", "claude"), False, "2"),
