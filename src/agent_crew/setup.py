@@ -11,7 +11,7 @@ _logger = logging.getLogger(__name__)
 
 from agent_crew import instructions, pane_submit, session
 from agent_crew.port_validation import require_project_port
-from agent_crew.role_mapping import LEGACY_AGENT_TO_ROLE
+from agent_crew.role_mapping import resolve_agent_role
 from agent_crew.worktree_default_branch import remote_default_branch
 
 _AGENT_CMDS = {
@@ -185,7 +185,7 @@ def start_log_viewers_in_panes(
         if role_based and i < len(ROLES):
             role = ROLES[i]
         else:
-            role = _AGENT_TO_ROLE.get(agent, agent)
+            role = resolve_agent_role(agent)
         log_path = os.path.join(log_dir, f"dispatch_{role}.log")
         # Ensure the file exists before tail starts.
         subprocess.run(["touch", log_path], capture_output=True)
@@ -484,7 +484,6 @@ def _convert_origin_to_ssh_if_safe(project_path: str) -> None:
 
 # Legacy setup keeps its existing agent-first behavior.  The runtime resolves
 # explicit per-project role assignments from state.json after setup.
-_AGENT_TO_ROLE = dict(LEGACY_AGENT_TO_ROLE)
 
 
 def _iter_role_entries(
@@ -506,7 +505,7 @@ def _iter_role_entries(
     out: list[tuple[str, str, str]] = []
     for key, path in worktrees.items():
         # Legacy: key is agent name → look up role via default map.
-        role = _AGENT_TO_ROLE.get(key, "implementer")
+        role = resolve_agent_role(key)
         out.append((role, key, path))
     return out
 

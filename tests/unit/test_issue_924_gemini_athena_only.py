@@ -90,19 +90,15 @@ def test_custom_fallback_cannot_pick_gemini_for_test():
 
 
 @pytest.mark.parametrize("tester", ["gemini", "agy", "claude"])
-def test_refused_explicit_tester_keeps_other_role_assignments(tester, caplog):
+def test_refused_explicit_tester_refuses_entire_mapping(tester):
     state = {
         "role_agents": {"implementer": "claude_cloud", "reviewer": "codex",
                         "tester": tester},
         "roles": [{"role": "reviewer", "agent": "claude"}],
     }
 
-    mapping, source = effective_role_mapping(state, project="demo")
-
-    assert mapping == {"implementer": "claude_cloud", "reviewer": "codex",
-                       "tester": "script"}
-    assert source == "explicit project config"
-    assert "tester" in caplog.text and tester in caplog.text
+    with pytest.raises(ValueError, match="invalid_role_agents"):
+        effective_role_mapping(state, project="demo")
 
 
 def test_unmapped_gemini_override_claims_review_only(tmp_path):

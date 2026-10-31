@@ -54,7 +54,8 @@ from agent_crew.queue import (
     LateResultRejected, PausedError as _PausedError, TaskQueue, claim_lease_seconds,
 )
 from agent_crew.role_mapping import (
-    LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE, anonymous_pull_refusal, role_policy_refusal,
+    KNOWN_ROLE_AGENTS, RoleResolutionError, TASK_TYPE_TO_ROLE, anonymous_pull_refusal,
+    resolve_agent_role, role_policy_refusal,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,6 @@ logger = logging.getLogger(__name__)
 # into a provider tester. The script tester default is a dispatch choice, not
 # an agent identity; reversing it would remove gemini from this path (#772).
 # Stays in lockstep with `setup._AGENT_TO_ROLE` without importing setup.
-_DEFAULT_ROLE_FOR_AGENT: dict[str, str] = dict(LEGACY_AGENT_TO_ROLE)
 
 
 def _task_to_dict(task: TaskRequest, *, nonce: Optional[str] = None) -> dict[str, Any]:
@@ -141,7 +141,17 @@ def build_mcp_server(
         queue has no work ready. Tasks transition to ``in_progress``
         atomically.
         """
-        resolved_role = role or _DEFAULT_ROLE_FOR_AGENT.get(agent, "")
+        # Anonymous pulls retain the role-policy refusal, including when no
+        # role was supplied; they never attempt provider-name resolution.
+        anonymous = anonymous_pull_refusal(role, agent)
+        if anonymous is not None:
+            return {"task_id": None, "dispatch_refused": anonymous}
+        try:
+            resolved_role = role or resolve_agent_role(agent)
+        except RoleResolutionError as exc:
+            if agent in KNOWN_ROLE_AGENTS:
+                return None  # A known provider with no legacy role cannot claim anonymously.
+            return {"task_id": None, "dispatch_refused": str(exc)}
         # #889: refuse an unnamed restricted pull before it claims anything.
         anonymous = anonymous_pull_refusal(resolved_role, agent)
         if anonymous is not None:

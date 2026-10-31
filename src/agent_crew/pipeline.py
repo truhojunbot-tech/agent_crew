@@ -35,7 +35,7 @@ from agent_crew.fallback import (
     default_agent_for_role,
 )
 from agent_crew.loop import _resolve_verdict, handle_test_result
-from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
+from agent_crew.role_mapping import default_agent_for_role
 from agent_crew.protocol import (
     GateRequest,
     TaskRequest,
@@ -2726,7 +2726,7 @@ def auto_enqueue_test(
         existing_test = tasks_by_id.get(test_id)
         if existing_test:
             return test_id
-        tester_agent = tester_agent or DEFAULT_ROLE_TO_AGENT["tester"]
+        tester_agent = tester_agent or default_agent_for_role("tester")
         test_context: dict = {"prev_task_id": review_task_id}
         inherited_tier = review_ctx.get("risk_tier")
         if type(inherited_tier) is int and 0 <= inherited_tier <= 3:

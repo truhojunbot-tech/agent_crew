@@ -1,12 +1,13 @@
 """Regression coverage for explicit durable project role mappings (#337)."""
 
 import json
+import pytest
 
 from click.testing import CliRunner
 
 from agent_crew.cli import crew
 from agent_crew.protocol import TaskRequest
-from agent_crew.role_mapping import effective_role_mapping
+from agent_crew.role_mapping import RoleResolutionError, effective_role_mapping
 from agent_crew.server import _load_role_to_agent_with_source, _load_worktree_map, create_app
 
 
@@ -58,22 +59,17 @@ def test_explicit_agent_without_worktree_is_omitted_not_assigned_another_provide
         "role_agents": {"implementer": "codx", "reviewer": "claude", "tester": "script"},
     })
 
-    assert _load_worktree_map(str(state_path)) == {
-        "reviewer": "/wt/claude",
-    }
+    assert _load_worktree_map(str(state_path)) == {}
+    with pytest.raises(RoleResolutionError, match="invalid_role_agents"):
+        _load_role_to_agent_with_source(str(state_path))
 
 
-def test_malformed_explicit_mapping_warns_and_preserves_legacy_resolution(caplog):
+def test_malformed_explicit_mapping_refuses_legacy_resolution():
     state = {"roles": [{"role": "reviewer", "agent": "claude"}],
              "role_agents": {"implementer": "codex"}}
 
-    mapping, source = effective_role_mapping(state, project="demo")
-
-    # #772: the unset tester role takes the default, now the script tester.
-    assert mapping == {"implementer": "codex", "reviewer": "claude", "tester": "script"}
-    assert source == "legacy state.json.roles"
-    assert "demo" in caplog.text
-    assert "role_agents" in caplog.text
+    with pytest.raises(RoleResolutionError, match="invalid_role_agents"):
+        effective_role_mapping(state, project="demo")
 
 
 def test_roles_show_labels_all_sources_and_set_requires_an_existing_project(tmp_path):

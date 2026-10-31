@@ -25,8 +25,10 @@ from agent_crew.protocol import normalize_pr_number
 from agent_crew.queue import CANCEL_REASON_ATTEMPT, _TYPE_TO_ROLE
 from agent_crew.worktree_default_branch import remote_default_branch
 from agent_crew.role_mapping import (
-    DEFAULT_ROLE_TO_AGENT,
+    ROLE_ORDER,
+    default_role_mapping,
     effective_role_mapping,
+    resolve_agent_role,
     validate_explicit_role_agents,
 )
 
@@ -1054,7 +1056,7 @@ def roles_show(project: str, base: str):
     mapping, source = effective_role_mapping(state, project=project)
     click.echo(f"Project: {project}")
     click.echo(f"Source: {source}")
-    for role in DEFAULT_ROLE_TO_AGENT:
+    for role in ROLE_ORDER:
         click.echo(f"{role}: {mapping[role]}")
 
 
@@ -1192,7 +1194,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
             roles_meta.append({"role": _r, "agent": _a, "worktree": worktrees[_r]})
     else:
         for _a in agent_list:
-            _r = setup_module._AGENT_TO_ROLE.get(_a, "implementer")
+            _r = resolve_agent_role(_a)
             if _a in worktrees:
                 roles_meta.append({"role": _r, "agent": _a, "worktree": worktrees[_a]})
 
@@ -1296,7 +1298,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
                 pane_map[a] = pid
         else:
             for a, pid in zip(agent_list, pane_ids):
-                role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
+                role = resolve_agent_role(a)
                 pane_map[role] = pid
                 pane_map[a] = pid
         if len(agent_list) == 1:
@@ -1336,7 +1338,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
                 pane_map[a] = pid
         else:
             for a, pid in zip(agent_list, pane_ids):
-                role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
+                role = resolve_agent_role(a)
                 pane_map[role] = pid
                 pane_map[a] = pid
         if len(agent_list) == 1:
@@ -2351,7 +2353,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
                         role for role in ("implementer", "reviewer", "tester")
                         if old_pid and pane_map.get(role) == old_pid
                     ]
-                    for role in old_roles or [setup_module._AGENT_TO_ROLE.get(a, "implementer")]:
+                    for role in old_roles or [resolve_agent_role(a)]:
                         pane_map[role] = pid
                     pane_map[a] = pid
                 # Single-agent recovery mirrors setup behavior — fill missing
@@ -2504,7 +2506,7 @@ def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str,
                 agent = context.get("agent_override")
             if not agent:
                 role = _TYPE_TO_ROLE.get(detail.get("task_type"))
-                agent = (role_to_agent or DEFAULT_ROLE_TO_AGENT).get(role)
+                agent = (role_to_agent or default_role_mapping()).get(role)
             wt_path = worktrees.get(agent) if agent else None
             if wt_path:
                 busy[os.path.realpath(wt_path)] = task_id
@@ -3105,7 +3107,7 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
     # Determine port and worktrees (available when --project is set)
     _run_port = 0
     _run_worktrees: dict = {}
-    _run_role_to_agent = dict(DEFAULT_ROLE_TO_AGENT)
+    _run_role_to_agent = default_role_mapping()
     if project:
         _pstate = _read_state(base, project)
         if _pstate:
