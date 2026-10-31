@@ -171,6 +171,16 @@ class TaskResult:
             if isinstance(finding, str):
                 normalized_findings.append(finding)
             elif isinstance(finding, dict):
+                if (isinstance(finding.get("issue"), str)
+                        and isinstance(finding.get("canary_reused_from"), str)
+                        and finding["canary_reused_from"]):
+                    issue = finding["issue"]
+                    layer = finding.get("layer")
+                    if isinstance(layer, str) and layer:
+                        issue = f"{layer}: {issue}"
+                    normalized_findings.append(
+                        f"{issue} (standing finding reused from {finding['canary_reused_from']})")
+                    continue
                 required = ("severity", "file", "line", "title", "detail")
                 if any(key not in finding or finding[key] in (None, "") for key in required):
                     raise ValueError(f"findings[{index}] must contain severity, file, line, title, detail")

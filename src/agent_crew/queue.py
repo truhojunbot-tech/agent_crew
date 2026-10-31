@@ -1690,6 +1690,29 @@ class TaskQueue:
             if idx_stmt.strip():
                 conn.execute(idx_stmt)
         self._migrate_legacy_cloud_cost(conn)
+        self._migrate_legacy_findings(conn)
+
+    @staticmethod
+    def _migrate_legacy_findings(conn: sqlite3.Connection) -> None:
+        """Preserve old object findings as text before strict result reads (#931)."""
+        marker = "legacy_dict_findings_v1"
+        if conn.execute("SELECT 1 FROM task_metadata_migrations WHERE name=?",
+                        (marker,)).fetchone():
+            return
+        rows = conn.execute("SELECT task_id, findings FROM tasks WHERE findings IS NOT NULL").fetchall()
+        for row in rows:
+            try:
+                findings = json.loads(row["findings"])
+            except (TypeError, ValueError):
+                continue  # Malformed JSON remains a typed read refusal.
+            if not isinstance(findings, list) or not any(isinstance(item, dict) for item in findings):
+                continue
+            converted = [json.dumps(item, sort_keys=True, ensure_ascii=False)
+                         if isinstance(item, dict) else item for item in findings]
+            conn.execute("UPDATE tasks SET findings=? WHERE task_id=?",
+                         (json.dumps(converted, ensure_ascii=False), row["task_id"]))
+        conn.execute("INSERT OR IGNORE INTO task_metadata_migrations (name) VALUES (?)",
+                     (marker,))
 
     @staticmethod
     def _migrate_legacy_cloud_cost(conn: sqlite3.Connection) -> None:

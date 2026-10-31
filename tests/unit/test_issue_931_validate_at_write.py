@@ -129,6 +129,26 @@ def test_cloud_legacy_migration_runs_once(tmp_path):
     assert TaskQueue(path).get_task_context("cloud") == context
 
 
+def test_legacy_dict_findings_are_migrated_once_and_listable(tmp_path):
+    path = str(tmp_path / "tasks.db")
+    queue = TaskQueue(path)
+    queue.enqueue(_task("legacy-review", "review"))
+    old = [{"issue": "code_quality: name it", "canary_reused_from": "rev-old"},
+           {"severity": "HIGH", "file": "src/a.py", "line": 3,
+            "title": "Bug", "detail": "fix it"}]
+    _corrupt(queue, "legacy-review", findings=json.dumps(old))
+    conn = queue._connect()
+    conn.execute("DELETE FROM task_metadata_migrations WHERE name='legacy_dict_findings_v1'")
+    conn.commit()
+    conn.close()
+    upgraded = TaskQueue(path)
+    findings = upgraded.list_tasks()[0].findings
+    assert len(findings) == 2
+    assert all(isinstance(item, str) for item in findings)
+    assert "rev-old" in findings[0]
+    assert TaskQueue(path).list_tasks()[0].findings == findings
+
+
 def test_cea_alter_error_other_than_duplicate_column_propagates():
     class BrokenConnection:
         def execute(self, sql):
