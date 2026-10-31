@@ -303,6 +303,28 @@ class TestMcpNoClientAutoFail:
         conn.commit()
         conn.close()
 
+
+    def test_watchdog_redispatch_attempts_survive_restart_and_stop_at_cap(self, monkeypatch):
+        db, queue = _make_db()
+        task_id = "watchdog-retry-cap"
+        queue.enqueue(TaskRequest(task_id=task_id, task_type="implement",
+                                  description="pending", branch="main"))
+        self._make_stale_pending(db, task_id)
+        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+        monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "120")
+        with patch("agent_crew.server._pane_alive_for_push", return_value=False):
+            for expected in (1, 2):
+                app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
+                with TestClient(app):
+                    app.state.watchdog_tick(time.time())
+                assert TaskQueue(db).get_task_context(task_id)["watchdog_redispatch_attempt"] == expected
+                assert TaskQueue(db).get_task(task_id).status == "pending"
+            app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
+            with TestClient(app):
+                app.state.watchdog_tick(time.time())
+        assert TaskQueue(db).get_task(task_id).status == "failed"
+        assert TaskQueue(db).get_task_context(task_id)["watchdog_redispatch_attempt"] == 2
+
     def test_u145_stale_pending_auto_failed_in_mcp_mode(self):
         """In MCP mode, stale-pending tasks must be auto-failed by the watchdog."""
         db, q = _make_db()
@@ -312,7 +334,7 @@ class TestMcpNoClientAutoFail:
         self._make_stale_pending(db, task_id, seconds_ago=200)
 
         pane_map = {"implementer": "%93"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
+        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp", "AGENT_CREW_DISPATCHER": "0",
                                         "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
             from agent_crew.server import create_app
             app = create_app(
@@ -348,7 +370,7 @@ class TestMcpNoClientAutoFail:
         self._make_stale_pending(db, task_id, seconds_ago=10)
 
         pane_map = {"implementer": "%94"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
+        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp", "AGENT_CREW_DISPATCHER": "0",
                                         "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
             from agent_crew.server import create_app
             app = create_app(
@@ -434,7 +456,7 @@ class TestMcpNoClientAutoFail:
         conn.close()
 
         pane_map = {"implementer": "%96"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
+        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp", "AGENT_CREW_DISPATCHER": "0",
                                         "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
             from agent_crew.server import create_app
             app = create_app(

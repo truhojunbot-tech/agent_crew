@@ -103,7 +103,8 @@ def test_retryable_submit_failure_creates_one_review_retry(tmp_path, monkeypatch
     notices = []
     monkeypatch.setattr(server, "_deliver_coordinator_notice",
                         lambda message: notices.append(message) or True)
-    cloud._fail_closed_dispatch(queue, task, "review", "cloud_submit_timeout", retryable=True)
+    cloud._fail_closed_dispatch(queue, task, "review", "cloud_submit_timeout",
+                                retryable=True, failure_kind="timeout")
     retry = queue.get_task("retry-review-864-a1")
     assert retry.task_type == "review" and retry.branch == task.branch
     assert retry.context["pr_number"] == 864
@@ -111,7 +112,8 @@ def test_retryable_submit_failure_creates_one_review_retry(tmp_path, monkeypatch
     assert retry.context["retry_of"] == task.task_id
     assert retry.context["retry_attempt"] == 1
     assert not any(key.startswith("cloud_") for key in retry.context)
-    cloud._fail_closed_dispatch(queue, task, "review", "cloud_submit_timeout", retryable=True)
+    cloud._fail_closed_dispatch(queue, task, "review", "cloud_submit_timeout",
+                                retryable=True, failure_kind="timeout")
     assert len([t for t in queue.list_tasks() if t.task_id.startswith("retry-")]) == 1
     assert len(notices) == 1
 
@@ -144,6 +146,6 @@ def test_retry_budget_and_nonretryable_failure(tmp_path, monkeypatch,
     monkeypatch.setattr(server, "coordinator_notice_once",
                         lambda *args: notices.append(args))
     cloud._fail_closed_dispatch(queue, task, "review", "cloud_submit_timeout",
-                                retryable=retryable)
+                                retryable=retryable, failure_kind="timeout")
     assert queue.get_task("retry-review-864-a1") is None
     assert bool(notices) is expected

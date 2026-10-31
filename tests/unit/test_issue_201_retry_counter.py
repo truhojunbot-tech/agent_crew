@@ -36,7 +36,9 @@ def _test_payload(task_id: str) -> dict:
     }
 
 
-def test_u_i201_transient_retry_counter_caps_and_fails(tmp_db, tmp_path, *, unused_tcp_port):
+@pytest.mark.parametrize("persisted_attempt,expected_spawns", [(0, 2), (1, 1)])
+def test_u_i201_transient_retry_counter_caps_and_fails(
+        tmp_db, tmp_path, persisted_attempt, expected_spawns, *, unused_tcp_port):
     """A task that always produces a retriable transient error must give up
     after AGENT_CREW_TRANSIENT_RETRY_MAX attempts, not retry forever."""
     wt_claude = tmp_path / "claude"
@@ -92,7 +94,9 @@ def test_u_i201_transient_retry_counter_caps_and_fails(tmp_db, tmp_path, *, unus
                     anomaly_disabled=True,
                 )
                 with TestClient(app) as client:
-                    resp = client.post("/tasks", json=_test_payload("test-201"))
+                    payload = _test_payload("test-201")
+                    payload["context"] = {"transient_retry_attempt": persisted_attempt}
+                    resp = client.post("/tasks", json=payload)
                     assert resp.status_code == 201
 
                     # Give it far more time than 1 retry needs; if the
@@ -112,9 +116,9 @@ def test_u_i201_transient_retry_counter_caps_and_fails(tmp_db, tmp_path, *, unus
         f"task should give up and fail after AGENT_CREW_TRANSIENT_RETRY_MAX=1 "
         f"retries, but ended in status={status!r} (spawn_count={spawn_count})"
     )
-    # initial attempt + exactly 1 retry = 2 spawns, capped (not unbounded).
-    assert spawn_count == 2, (
-        f"expected exactly 2 dispatch attempts (initial + 1 retry), got {spawn_count}"
+    # A persisted attempt from before a restart still counts against the cap.
+    assert spawn_count == expected_spawns, (
+        f"expected {expected_spawns} dispatch attempts, got {spawn_count}"
     )
 
 pytestmark = [pytestmark, pytest.mark.usefixtures("pinned_task_transport")]

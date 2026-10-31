@@ -107,7 +107,7 @@ def test_distinct_terminal_tasks_in_one_lineage_each_notify_once(tmp_path, monke
 def test_implement_retry_with_budget_has_no_notice(tmp_path, monkeypatch):
     app, queue, notices = _harness(tmp_path, monkeypatch, task_type="implement")
     with TestClient(app) as client:
-        response = _fail(client)
+        response = _fail(client, kind="transient")
         assert response.status_code == 200, response.text
     assert queue.get_task("retry-root-801-a1") is not None
     assert notices == []

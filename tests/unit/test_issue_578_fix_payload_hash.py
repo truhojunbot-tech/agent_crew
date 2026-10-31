@@ -193,7 +193,7 @@ def test_failed_task_retry_matches_signed_broker_payload(tmp_db, monkeypatch):
     with TestClient(app) as client:
         response = client.post("/tasks/risk-root/result", json={
             "task_id": "risk-root", "status": "failed", "summary": "usage limit hit",
-            "findings": [],
+            "findings": [], "error_info": {"kind": "transient"},
         })
     assert response.status_code == 200, response.text
     retry_id = "retry-risk-root-a1"

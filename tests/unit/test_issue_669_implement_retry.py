@@ -61,7 +61,7 @@ def test_failed_implement_with_pushed_commit_is_not_retried(
         "work_pushed_or_unchanged_head")
 
 
-def test_failed_implement_without_commit_still_retries(tmp_db, monkeypatch):
+def test_failed_implement_without_transient_kind_is_not_retried(tmp_db, monkeypatch):
     from agent_crew import github
 
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
@@ -81,8 +81,8 @@ def test_failed_implement_without_commit_still_retries(tmp_db, monkeypatch):
         })
         assert result.status_code == 200, result.text
 
-    assert any(t.task_id == "retry-impl-no-commit-a1"
-               for t in TaskQueue(tmp_db).list_tasks())
+    assert not any(t.task_id == "retry-impl-no-commit-a1"
+                   for t in TaskQueue(tmp_db).list_tasks())
 
 
 @pytest.mark.parametrize("remote_head,expect_retry", [(SHA, False), ("b" * 40, True)])
@@ -105,6 +105,7 @@ def test_branch_head_requires_the_reported_commit(tmp_db, monkeypatch,
         result = client.post("/tasks/impl-branch/result", json={
             "task_id": "impl-branch", "status": "failed", "summary": "failed after push",
             "branch": BRANCH, "commit": SHA,
+            "error_info": {"kind": "transient", "reason": "provider_timeout"},
         })
         assert result.status_code == 200, result.text
 

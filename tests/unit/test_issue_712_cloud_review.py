@@ -121,7 +121,7 @@ def test_malformed_review_comment_fails_closed(queue, monkeypatch, body):
     assert queue.get_task(task.task_id).status == "failed"
 
 
-def test_stale_review_without_comment_uses_fallback(queue, monkeypatch):
+def test_stale_review_without_comment_ends_without_retry(queue, monkeypatch):
     task = _review(queue)
     monkeypatch.setenv(cloud._ENV_STALE_SECONDS, "1")
     monkeypatch.setattr(queue, "get_dispatched_at", lambda _: time.time() - 5)
@@ -131,12 +131,12 @@ def test_stale_review_without_comment_uses_fallback(queue, monkeypatch):
         queue, task, pr_comments_fn=lambda pr, repo=None: [],
         submit_review_result_fn=lambda *_: pytest.fail("stale review submitted"),
     )
-    assert outcome.action == "requeued"
-    assert queue.get_task(f"retry-{task.task_id}-a1").status == "pending"
+    assert outcome.action == "failed"
+    assert queue.get_task(f"retry-{task.task_id}-a1") is None
 
 
 @pytest.mark.parametrize("failure", ["raises", "held"])
-def test_stale_review_with_unaccepted_result_uses_fallback(queue, monkeypatch, failure):
+def test_stale_review_with_unaccepted_result_ends_without_retry(queue, monkeypatch, failure):
     task = _review(queue)
     monkeypatch.setenv(cloud._ENV_STALE_SECONDS, "1")
     monkeypatch.setattr(queue, "get_dispatched_at", lambda _: time.time() - 99999)
@@ -154,8 +154,8 @@ def test_stale_review_with_unaccepted_result_uses_fallback(queue, monkeypatch, f
         pr_comments_fn=lambda pr, repo=None: [{"body": _comment()}],
         submit_review_result_fn=submit,
     )
-    assert outcome.action == "requeued"
-    assert queue.get_task(f"retry-{task.task_id}-a1").status == "pending"
+    assert outcome.action == "failed"
+    assert queue.get_task(f"retry-{task.task_id}-a1") is None
     assert queue.get_task(task.task_id).status == "failed"
     assert len(fallback_calls) == 1
 
@@ -176,8 +176,8 @@ def test_recent_review_with_unaccepted_result_can_retry(queue, monkeypatch, fail
         pr_comments_fn=lambda pr, repo=None: [{"body": _comment()}],
         submit_review_result_fn=submit,
     )
-    assert outcome.action == "still_dispatched"
-    assert queue.get_task(task.task_id).status == "in_progress"
+    assert outcome.action == ("failed" if failure == "raises" else "still_dispatched")
+    assert queue.get_task(task.task_id).status == ("failed" if failure == "raises" else "in_progress")
 
 
 def test_cloud_is_disabled_by_default(monkeypatch):

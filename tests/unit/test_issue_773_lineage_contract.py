@@ -298,7 +298,7 @@ def test_server_retry_keeps_both_role_choices(tmp_db, monkeypatch):
     with TestClient(app) as client:
         response = client.post("/tasks/impl-773/result", json={
             "task_id": "impl-773", "status": "failed", "summary": "usage limit hit",
-            "findings": [],
+            "findings": [], "error_info": {"kind": "transient"},
         })
     assert response.status_code == 200, response.text
     retry = queue.get_task("retry-impl-773-a1")
