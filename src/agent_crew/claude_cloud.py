@@ -914,6 +914,10 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
         from agent_crew.server import coordinator_notice_once
         coordinator_notice_once(queue, task.task_id, reason,
                                 "cloud launch blocked by an interactive CLI prompt")
+    elif reason == "cloud_review_missing_pinned_pr_or_sha":
+        from agent_crew.server import coordinator_notice_once
+        coordinator_notice_once(queue, task.task_id, reason,
+                                "cloud review has no pinned PR or head SHA")
     return CloudDispatchOutcome(False, task_id=task.task_id, launch_error=reason,
                                 retryable=retryable)
 

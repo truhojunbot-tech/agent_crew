@@ -9,13 +9,16 @@ from agent_crew.queue import TaskQueue
 
 def _completed_impl(tmp_path, *, crew_run_branch=False, branch="agent/work"):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
+    context = {
+        "repo": "owner/repo", "risk_tier": 1,
+        "implementer_agent": "codex", "reviewer_agent": "claude",
+        "agent_override": "codex",
+    }
+    if crew_run_branch is not None:
+        context["crew_run_branch"] = crew_run_branch
     queue.enqueue(TaskRequest(
         task_id="impl-no-pr", task_type="implement", description="Implement #666",
-        branch=branch, context={
-            "repo": "owner/repo", "crew_run_branch": crew_run_branch,
-            "implementer_agent": "codex", "reviewer_agent": "claude",
-            "agent_override": "codex",
-        },
+        branch=branch, context=context,
     ))
     queue.submit_result("impl-no-pr", TaskResult(
         task_id="impl-no-pr", status="completed", summary="pushed",
@@ -121,21 +124,27 @@ def test_cli_branch_can_still_enqueue_before_pr_exists(tmp_path):
     assert len(_reviews(queue)) == 1
 
 
-def test_legacy_task_without_crew_run_branch_keeps_review_cascade(tmp_path):
-    queue = TaskQueue(str(tmp_path / "legacy.db"))
-    queue.enqueue(TaskRequest(
-        "impl-legacy", "implement", "legacy branch", branch="agent/work",
-    ))
-    queue.submit_result("impl-legacy", TaskResult(
-        task_id="impl-legacy", status="completed", summary="pushed",
-        branch="agent/work", commit="a" * 40,
-    ))
-    with patch("agent_crew.github.pr_number_for_branch") as lookup:
-        review_id = auto_enqueue_review(queue, "impl-legacy")
+def test_missing_cli_flag_without_pr_queues_open_pr_retry_and_notice(tmp_path):
+    queue = _completed_impl(tmp_path, crew_run_branch=None)
+    notices = []
+    with patch("agent_crew.github.pr_number_for_branch", return_value=None) as lookup, patch(
+        "agent_crew.server.coordinator_notice_once", side_effect=lambda *args: notices.append(args)
+    ):
+        assert auto_enqueue_review(queue, "impl-no-pr") is None
+    lookup.assert_called_once_with("agent/work", repo="owner/repo", state="open")
+    assert _reviews(queue) == []
+    retry = queue.get_task("retry-impl-no-pr-a1")
+    assert retry is not None and "Open a PR for pushed branch" in retry.description
+    assert len(notices) == 1 and notices[0][2] == "no_pr_for_review"
+
+
+def test_missing_cli_flag_with_open_pr_carries_pr_to_review(tmp_path):
+    queue = _completed_impl(tmp_path, crew_run_branch=None)
+    with patch("agent_crew.github.pr_number_for_branch", return_value=666):
+        review_id = auto_enqueue_review(queue, "impl-no-pr", pr_state_fn=lambda number: "open")
     assert review_id is not None
-    assert len(_reviews(queue)) == 1
+    assert queue.get_task(review_id).context["pr_number"] == 666
     assert _pr_opening_retries(queue) == []
-    lookup.assert_not_called()
 
 
 def test_no_branch_and_no_pr_keeps_161_guard(tmp_path):
