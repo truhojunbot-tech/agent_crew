@@ -325,6 +325,25 @@ class TestMcpNoClientAutoFail:
         assert TaskQueue(db).get_task(task_id).status == "failed"
         assert TaskQueue(db).get_task_context(task_id)["watchdog_redispatch_attempt"] == 2
 
+    def test_watchdog_busy_role_does_not_spend_redispatch_attempts(self, monkeypatch):
+        db, queue = _make_db()
+        queue.enqueue(TaskRequest(task_id="watchdog-busy", task_type="implement",
+                                  description="running", branch="main"))
+        assert queue.dequeue(role="implementer").task_id == "watchdog-busy"
+        waiting_id = "watchdog-waiting"
+        queue.enqueue(TaskRequest(task_id=waiting_id, task_type="implement",
+                                  description="waiting", branch="main"))
+        self._make_stale_pending(db, waiting_id)
+        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+        monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "120")
+        app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
+        with TestClient(app), patch("agent_crew.server._pane_alive_for_push", return_value=True):
+            for _ in range(3):
+                app.state.watchdog_tick(time.time())
+        assert TaskQueue(db).get_task("watchdog-busy").status == "in_progress"
+        assert TaskQueue(db).get_task(waiting_id).status == "pending"
+        assert TaskQueue(db).get_task_context(waiting_id).get("watchdog_redispatch_attempt", 0) == 0
+
     def test_u145_stale_pending_auto_failed_in_mcp_mode(self):
         """In MCP mode, stale-pending tasks must be auto-failed by the watchdog."""
         db, q = _make_db()

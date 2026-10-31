@@ -5387,10 +5387,25 @@ def create_app(
             return actions
         # Collect unique roles so we only fire _try_push_next once per role.
         stale_roles: set[str] = set()
+        busy_roles = {
+            f"discuss:{row['context'].get('agent')}"
+            if row["task_type"] == "discuss" else _TYPE_TO_ROLE.get(row["task_type"])
+            for row in rows
+        }
         for sp in stale:
             task_type = sp.get("task_type", "")
             ctx = sp.get("context") or {}
             task_id = sp.get("task_id")
+            if task_type == "discuss":
+                agent = ctx.get("agent") if isinstance(ctx, dict) else None
+                role_key = f"discuss:{agent}" if agent and agent in (pane_map or {}) else None
+            else:
+                role_key = _TYPE_TO_ROLE.get(task_type)
+            # A pending task behind an occupied lane has had no delivery
+            # attempt. Only the first stale task for a free lane can be tried
+            # by the single _try_push_next call below.
+            if not role_key or role_key in busy_roles or role_key in stale_roles:
+                continue
             attempt = int(ctx.get("watchdog_redispatch_attempt") or 0)
             if attempt >= MAX_TASK_RETRIES:
                 if task_id:
@@ -5402,18 +5417,9 @@ def create_app(
                         _coordinator_notice(task_id, "watchdog_redispatch_cap",
                                             "pending task was not dispatched after bounded retries")
                 continue
-            if task_type == "discuss":
-                agent = ctx.get("agent") if isinstance(ctx, dict) else None
-                if agent and agent in (pane_map or {}):
-                    stale_roles.add(f"discuss:{agent}")
-                    if task_id:
-                        q().patch_context(task_id, {"watchdog_redispatch_attempt": attempt + 1})
-            else:
-                role = _TYPE_TO_ROLE.get(task_type)
-                if role:
-                    stale_roles.add(role)
-                    if task_id:
-                        q().patch_context(task_id, {"watchdog_redispatch_attempt": attempt + 1})
+            stale_roles.add(role_key)
+            if task_id:
+                q().patch_context(task_id, {"watchdog_redispatch_attempt": attempt + 1})
         for role_key in stale_roles:
             try:
                 if role_key.startswith("discuss:"):
