@@ -582,13 +582,12 @@ def _legacy_in_progress_row(q, task_id="legacy-1"):
     return task_id
 
 
-@pytest.mark.parametrize("mode,expected", [("test", "in_progress"), ("shadow", "pending")])
+@pytest.mark.parametrize("mode,expected", [("test", "in_progress"), ("shadow", "in_progress")])
 def test_a_legacy_row_with_no_receipt_is_refused_a_requeue_under_enforce(
         tmp_path, mode, expected):
     """§8 through P2: "no receipt" is not "no objection" on the way back either.
 
-    Under ``shadow`` the same row is requeued and *reported* — the count a
-    deployment needs before it turns enforcement on.
+    A row without a receipt cannot be returned to pending in either mode.
     """
     q = queue_for(tmp_path, AuthorityState("active"), name=f"legacy-{mode}.db", mode=mode)
     tid = _legacy_in_progress_row(q)

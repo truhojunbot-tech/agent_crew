@@ -42,9 +42,9 @@ def test_every_source_kind_is_one_of_the_declared_four(kind):
     assert tp._coerce({}, "/some/path", kind)["source_kind"] == kind
 
 
-def test_an_unknown_source_kind_degrades_to_builtin():
-    """A typo must not invent a fifth cohort."""
-    assert tp._coerce({}, "/p", "operatorr")["source_kind"] == "builtin"
+def test_an_unknown_source_kind_is_rejected():
+    with pytest.raises(ValueError, match="source kind"):
+        tp._coerce({}, "/p", "operatorr")
 
 
 def test_the_fingerprint_ignores_where_the_policy_came_from():
@@ -74,13 +74,10 @@ def test_the_fingerprint_does_not_leak_the_commands():
     assert len(digest) == 16 and all(c in "0123456789abcdef" for c in digest)
 
 
-def test_a_malformed_override_reports_the_scope_that_was_USED(tmp_path, monkeypatch):
-    """★★#278 validation 3. A cohort built on the requested-but-invalid scope
-    measures intent; only the effective scope measures cost."""
+def test_a_malformed_override_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv(tp.ENV_SCOPE, '{"full_suite": true,')     # truncated JSON
-    scope = tp.load_scope(str(tmp_path), "demo", base=str(tmp_path / "nope"))
-    assert tp.effective_scope(scope) == tp.SCOPE_TARGETED
-    assert scope["source_kind"] == "builtin"
+    with pytest.raises(ValueError):
+        tp.load_scope(str(tmp_path), "demo", base=str(tmp_path / "nope"))
 
 
 # ── 2. it survives to the attribution row ─────────────────────────────

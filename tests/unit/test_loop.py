@@ -204,15 +204,15 @@ def test_u_l10b_handle_test_result_needs_human():
     assert handle_test_result(result) == "needs_human"
 
 
-# U-L10c: build_feedback — dict finding의 알 수 없는 layer → [unknown] 정규화
-def test_u_l10c_build_feedback_dict_unknown_layer():
+# U-L10c: unknown finding layer → [unknown] normalization
+def test_u_l10c_build_feedback_unknown_layer():
     result = TaskResult(
         task_id="r-002",
         status="completed",
         summary="Issues found",
         findings=[
-            {"layer": "typo", "issue": "misnamed variable"},
-            {"layer": "test_quality", "issue": "missing branch coverage"},
+            "typo: misnamed variable",
+            "test_quality: missing branch coverage",
         ],
     )
     feedback = build_feedback(result)

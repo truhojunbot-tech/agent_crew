@@ -189,6 +189,9 @@ def test_reconcile_relabels_legacy_zero_without_snapshot_proof(tmp_path, monkeyp
                               context={"cloud_attempt_started_at": 1020.0,
                                        "cloud_ended_at": 1030.0}))
     monkeypatch.setenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "900")
+    with sqlite3.connect(queue._db_path) as db:
+        db.execute("DELETE FROM task_metadata_migrations WHERE name='legacy_cloud_cost_v1'")
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
     cloud.reconcile_all_cloud_tasks(queue)
     attr = queue.get_attribution("old")
     assert attr["cloud_usd"] is None

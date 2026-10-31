@@ -60,8 +60,8 @@ def test_a_result_that_reports_neither_is_empty_not_none():
 
 
 @pytest.mark.parametrize("bogus", ["HEAD", "origin/main", "@", "HEAD~1", "main",
-                                   "9edda69", "not a sha", "  "])
-def test_a_commit_that_is_not_an_object_id_is_dropped(bogus):
+                                   "9edda69", "not a sha"])
+def test_a_commit_that_is_not_an_object_id_is_rejected(bogus):
     """★★My own mistake, pinned. The result for `impl-watch-0073c3a7` reported
     `commit: "HEAD"` — a literal string, useless to anything downstream.
 
@@ -69,7 +69,8 @@ def test_a_commit_that_is_not_an_object_id_is_dropped(bogus):
       against a full head SHA (#304), so a 7-char prefix would never match and
       would read as "the head moved" forever.
     """
-    assert _result(commit=bogus).commit == "", f"kept {bogus!r} as a commit"
+    with pytest.raises(ValueError, match="commit must be a full object id"):
+        _result(commit=bogus)
 
 
 @pytest.mark.parametrize("good", ["9edda6900000000000000000000000000000abcd",
@@ -80,14 +81,8 @@ def test_a_real_object_id_survives(good):
     assert _result(commit=good).commit == good.strip()
 
 
-def test_a_bad_commit_never_throws_away_the_result():
-    """⛔#270's lesson: a 422 over one field discarded an entire result. The
-    field is normalised to empty, never raised on — losing a branch report is
-    recoverable, losing the whole result is not."""
-    r = _result(commit="HEAD", branch="fix/304-stale-pr-head-review",
-                summary="the work that must not be lost")
-    assert r.summary == "the work that must not be lost"
-    assert r.branch == "fix/304-stale-pr-head-review"
+def test_an_empty_commit_is_accepted():
+    assert _result(commit="  ").commit == ""
 
 
 # ── 3. the cascade routes to what was actually pushed ─────────────────
@@ -133,16 +128,9 @@ def test_the_pushed_commit_becomes_the_reviewed_sha(tmp_db):
     assert _review_task(q).context.get("reviewed_sha") == sha
 
 
-def test_a_useless_commit_does_not_overwrite_the_pin(tmp_db):
-    """⛔`"HEAD"` must not become a `reviewed_sha`. Normalised away upstream, so
-    the task's own pin is left alone rather than replaced with nonsense."""
-    from agent_crew.pipeline import auto_enqueue_review
-
-    q = _queue(tmp_db)
-    auto_enqueue_review(q, "impl-watch-0073c3a7",
-                        result=_result(branch="fix/304-stale-pr-head-review",
-                                       commit="HEAD"))
-    assert _review_task(q).context.get("reviewed_sha") != "HEAD"
+def test_a_useless_commit_is_rejected_before_review_cascade():
+    with pytest.raises(ValueError, match="commit must be a full object id"):
+        _result(branch="fix/304-stale-pr-head-review", commit="HEAD")
 
 
 def test_the_freshness_directive_names_the_pushed_branch(tmp_db):
@@ -260,7 +248,8 @@ def _mcp_call(mcp, tool_name, **kwargs):
     return func(**kwargs)
 
 
-def _mcp_submit(tmp_db, monkeypatch=None, *, crew_run_branch=True, **result_fields):
+def _mcp_submit(tmp_db, monkeypatch=None, *, crew_run_branch=True,
+                expect_ack=True, **result_fields):
     """Enqueue a watch-shaped implement task and complete it over MCP."""
     from agent_crew.mcp_server import build_mcp_server
     from agent_crew.protocol import TaskRequest
@@ -283,7 +272,8 @@ def _mcp_submit(tmp_db, monkeypatch=None, *, crew_run_branch=True, **result_fiel
     _mcp_call(mcp, "get_next_task", role="implementer")
     ack = _mcp_call(mcp, "submit_result", task_id="impl-watch-mcp",
                     status="completed", summary="done", **result_fields)
-    assert ack.get("acknowledged") is True, ack
+    if expect_ack:
+        assert ack.get("acknowledged") is True, ack
     reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
     return ack, reviews
 
@@ -311,9 +301,12 @@ def test_the_mcp_transport_applies_the_same_commit_guard(tmp_db, monkeypatch):
     """⛔The normalisation lives in `TaskResult`, so both transports inherit it —
     but only if MCP actually constructs the field. Asserted through MCP so a
     future hand-rolled construction there cannot skip it."""
-    _, reviews = _mcp_submit(tmp_db, monkeypatch, branch="fix/304-stale-pr-head-review",
-                             commit="HEAD")
-    assert reviews[0].context.get("reviewed_sha") != "HEAD"
+    ack, reviews = _mcp_submit(tmp_db, monkeypatch,
+                               branch="fix/304-stale-pr-head-review", commit="HEAD",
+                               expect_ack=False)
+    assert ack["acknowledged"] is False
+    assert "commit" in ack["error"]
+    assert reviews == []
 
 
 def test_an_mcp_submission_reporting_nothing_is_held_for_missing_refs(tmp_db, monkeypatch):

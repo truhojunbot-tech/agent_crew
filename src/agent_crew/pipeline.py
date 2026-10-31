@@ -43,7 +43,7 @@ from agent_crew.protocol import (
     normalize_pr_number,
 )
 from agent_crew.queue import (TaskQueue, PausedError, TaskAlreadyExistsError,
-                              DuplicateReviewError,
+                              DuplicateReviewError, MalformedStoredRow,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                               risk_declaration)
 from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
@@ -1886,7 +1886,10 @@ def auto_enqueue_fix(
         # server restart and counts ROUNDS rather than tasks. An in-memory
         # per-task_id counter (the transient-retry shape) could not work here:
         # every round mints new task ids, so it would always read zero.
-        fix_round = int(review_ctx.get("fix_round") or 0) + 1
+        fix_round = review_ctx.get("fix_round", 0)
+        if type(fix_round) is not int or fix_round < 0:
+            raise MalformedStoredRow(f"malformed fix_round for task {review_task_id}")
+        fix_round += 1
         if (switch_enabled and canary_pinned and not prior_switch_on
                 and fix_round <= baseline_cap
                 and canary_reason in ("contract_predates_latest_result",
@@ -2152,6 +2155,8 @@ def auto_enqueue_fix(
             queue.outbox_reopen(review_task_id)
         except Exception:
             logger.exception(f"auto_enqueue_fix: outbox_reopen({review_task_id}) 실패")
+        raise
+    except MalformedStoredRow:
         raise
     except Exception as e:
         logger.warning(f"auto_enqueue_fix: unexpected error: {e}")
@@ -2581,10 +2586,9 @@ def auto_enqueue_review(
             "prev_task_id": impl_task_id,
             "pr_number": pr_number,
         }
-        try:
-            prior_fix_round = int(impl_ctx.get("fix_round") or 0)
-        except (TypeError, ValueError):
-            prior_fix_round = 0
+        prior_fix_round = impl_ctx.get("fix_round", 0)
+        if type(prior_fix_round) is not int or prior_fix_round < 0:
+            raise MalformedStoredRow(f"malformed fix_round for task {impl_task_id}")
         if prior_fix_round > 0:
             prior_review = next((
                 task for candidate in (impl_ctx.get("prev_task_id"),
@@ -2653,7 +2657,7 @@ def auto_enqueue_review(
 
         # #314 §4 P0-1: 결정론 successor id(stable transition key) — UUID 금지. crash 후 replay가
         # 같은 (impl parent, review, fix_round)에 대해 동일 id를 만들어 PK dedup으로 at-most-once.
-        _round = int(impl_ctx.get("fix_round", 0) or 0)
+        _round = prior_fix_round
         review_id = f"review-{impl_task_id}-r{_round}"
         review_req = TaskRequest(
             task_id=review_id,
@@ -2691,6 +2695,8 @@ def auto_enqueue_review(
             queue.outbox_reopen(impl_task_id)
         except Exception:
             logger.exception(f"auto_enqueue_review: outbox_reopen({impl_task_id}) 실패")
+        raise
+    except MalformedStoredRow:
         raise
     except Exception as e:
         logger.warning(f"auto_enqueue_review: unexpected error: {e}")

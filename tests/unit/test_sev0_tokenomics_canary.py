@@ -650,7 +650,7 @@ def test_armed_canary_does_not_push_the_identical_sha_rereview(monkeypatch, tmp_
         "a suppression is a reused verdict, not a dead review")
     assert result.summary == canary.SUPPRESSED_REASON
     assert result.verdict == "request_changes"
-    assert [f[canary.REUSED_FROM_KEY] for f in result.findings] == ["rev-standing"]
+    assert all("standing finding reused from rev-standing" in f for f in result.findings)
 
     row = queue.get_tokenomics_shadow_receipt("review-impl-77-r1")
     assert row["canary_applied"] == 1
@@ -772,7 +772,7 @@ def test_the_pipeline_cascade_creates_the_fix_from_a_suppressed_review(tmp_db):
     assert fix.task_type == "implement"
     assert (fix.context or {}).get("fix_round") == 1
     reused = (fix.context or {}).get("review_findings") or []
-    assert reused and all(f.get(canary.REUSED_FROM_KEY) == "rev-standing"
+    assert reused and all("standing finding reused from rev-standing" in f
                           for f in reused)
 
 

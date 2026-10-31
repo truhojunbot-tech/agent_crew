@@ -86,7 +86,7 @@ def test_a_real_rejection_still_requests_changes():
     exists; a fix that silenced it would trade one waste for a worse one."""
     outcome = handle_review_result(
         _review(status="completed", verdict="request_changes",
-                findings=[{"layer": "code_quality", "issue": "real problem"}]),
+                findings=["code_quality: real problem"]),
         iteration=1, max_iter=3)
     assert outcome == "request_changes"
 
@@ -137,7 +137,7 @@ def test_the_server_does_not_enqueue_a_fix_for_a_review_that_failed():
     assert _review_result_is_actionable(_review(status="failed")) is False
     assert _review_result_is_actionable(
         _review(status="completed", verdict="request_changes",
-                findings=[{"layer": "code_quality", "issue": "x"}])) is True
+                findings=["code_quality: x"])) is True
 
 
 # ── 3. prep must not review a branch this repo does not have ──────────
@@ -247,7 +247,7 @@ def test_the_new_outcome_is_not_silently_one_of_the_old_ones():
     assert outcomes == {"review_failed"}
     assert handle_review_result(
         _review(status="completed", verdict="request_changes",
-                findings=[{"layer": "code_quality", "issue": "x"}]),
+                findings=["code_quality: x"]),
         iteration=1, max_iter=3) == "request_changes"
 
 

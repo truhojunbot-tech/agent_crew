@@ -88,23 +88,18 @@ def test_the_env_var_may_also_be_a_path(worktree, tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("payload", ['{"targeted": "pytest {paths}"}', '{"targeted": null}'])
-def test_a_hand_edited_string_where_a_list_belongs_is_tolerated(payload, monkeypatch, worktree):
-    """A malformed scope must not break dispatch — a tester that cannot start
-    is worse than a tester running slightly the wrong commands."""
+def test_a_hand_edited_string_where_a_list_belongs_is_rejected(payload, monkeypatch, worktree):
     monkeypatch.setenv(tp.ENV_SCOPE, payload)
-    scope = tp.load_scope(worktree, "demo", base="/nonexistent")
-    assert isinstance(scope["targeted"], list)
+    with pytest.raises(ValueError, match="targeted"):
+        tp.load_scope(worktree, "demo", base="/nonexistent")
 
 
-def test_a_broken_scope_file_falls_back_without_exploding(worktree, monkeypatch, caplog):
-    """⛔And it says so. A broken file silently reading as "no file" would leave
-    the operator who wrote it believing it is in effect."""
+def test_a_broken_scope_file_is_rejected(worktree, monkeypatch):
     path = os.path.join(worktree, tp.REPO_SCOPE_FILE)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, "w").write("{not json")
-    with caplog.at_level("WARNING"):
-        assert tp.load_scope(worktree, "demo", base="/nonexistent")["source"] == "default"
-    assert "unreadable" in caplog.text
+    with pytest.raises(ValueError, match="unreadable"):
+        tp.load_scope(worktree, "demo", base="/nonexistent")
 
 
 # ── 2. what the tester is actually told ───────────────────────────────

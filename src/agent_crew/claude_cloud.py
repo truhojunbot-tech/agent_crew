@@ -222,16 +222,6 @@ def _cloud_cost_overlaps(queue: TaskQueue, task_id: str, started: float,
             if not isinstance(began, (int, float)):
                 continue
             finished = context.get(prefix + "ended_at")
-            if not isinstance(finished, (int, float)) and other.status not in ("pending", "in_progress"):
-                # Older terminal cloud tasks predate ended_at. Their status
-                # transition is the best available end of the interval; when
-                # even that stamp is absent, do not leave a legacy session
-                # open forever against every future credit measurement.
-                changed = other.status_changed_at
-                if isinstance(changed, (int, float)) and changed >= began:
-                    finished = changed
-                elif not context.get(prefix + "attempt_started_at"):
-                    continue
             # Credit from another session may post after that session ends.
             # Its settle window can contaminate this task's later reading.
             if began <= ended and (not isinstance(finished, (int, float)) or
@@ -324,29 +314,6 @@ def _record_shadow_review_cost(queue: TaskQueue, task_id: str) -> None:
                                   "cloud_shadow_usd": usd,
                                   "cloud_shadow_cost_overlaps": overlaps,
                                   "cloud_shadow_cost_finalized_at": time.time()})
-
-
-def _reclassify_legacy_cloud_cost(queue: TaskQueue, task: TaskRequest, *,
-                                  shadow: bool = False) -> None:
-    """Older measured rows have no snapshot dates, so their USD is unproven."""
-    context = task.context if isinstance(task.context, dict) else {}
-    prefix = "cloud_shadow_" if shadow else "cloud_"
-    if (context.get(prefix + "usd") is None or
-            not context.get(prefix + "cost_finalized_at") or
-            context.get(prefix + "credit_before_fetched_at") is not None):
-        return
-    started = context.get(prefix + "attempt_started_at") or context.get(prefix + "launched_at")
-    ended = context.get(prefix + "ended_at")
-    overlaps = (_cloud_cost_overlaps(queue, task.task_id, started,
-                                     ended + cloud_cost_settle_seconds(), shadow=shadow)
-                if isinstance(started, (int, float)) and isinstance(ended, (int, float)) else [])
-    status = "UNKNOWN_OVERLAP" if overlaps else "UNKNOWN_NO_FRESH_READING"
-    attribution_id = f"cloud-shadow:{task.task_id}" if shadow else task.task_id
-    queue.record_cloud_cost(attribution_id, context.get(prefix + "credit_used_before"),
-                            context.get(prefix + "credit_used_after"), None,
-                            status=status, overlaps=overlaps)
-    queue.patch_context(task.task_id, {prefix + "usd": None,
-                                      prefix + "cost_overlaps": overlaps})
 
 
 def record_terminal_cloud_cost(queue: TaskQueue, task_id: str) -> None:
@@ -1542,7 +1509,6 @@ def reconcile_shadow_reviews(queue: TaskQueue, *, pr_comments_fn=None) -> None:
     # periodic sweep must not read the whole table.
     for task in queue.list_tasks_with_context_key_prefix("cloud_shadow_"):
         context = task.context if isinstance(task.context, dict) else {}
-        _reclassify_legacy_cloud_cost(queue, task, shadow=True)
         if context.get("cloud_shadow_cost_pending_at") and not context.get(
                 "cloud_shadow_cost_finalized_at"):
             _record_shadow_review_cost(queue, task.task_id)
@@ -1960,7 +1926,6 @@ def reconcile_all_cloud_tasks(queue: TaskQueue, *, repo: Optional[str] = None,
     # Both checks below need a ``cloud_*`` key (#830: no full-table read per tick).
     for task in queue.list_tasks_with_context_key_prefix("cloud_"):
         context = task.context if isinstance(task.context, dict) else {}
-        _reclassify_legacy_cloud_cost(queue, task)
         if (context.get("cloud_cost_pending_at") and not context.get("cloud_cost_finalized_at")
                 and task.status in {"completed", "failed", "cancelled", "timed_out", "needs_human"}):
             _record_reconciled_cloud_cost(queue, task)
