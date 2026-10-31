@@ -200,7 +200,7 @@ def test_headless_dispatch_restores_before_worker_launch(tmp_path, monkeypatch, 
     sha = _stash(wt, "impl-headless")
     state = tmp_path / "state.json"
     state.write_text(json.dumps({
-        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"},
+        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "script"},
         "worktrees": {"codex": str(wt)},
     }))
     db = str(tmp_path / "tasks.db")

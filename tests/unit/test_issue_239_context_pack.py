@@ -672,7 +672,7 @@ def test_enabled_dispatcher_puts_the_ac_into_the_real_dispatched_prompt(
     state_file = tmp_path / "state.json"
     state_file.write_text(_json.dumps({"worktrees": {"claude": str(wt)},
                                       "role_agents": {"implementer": "claude", "reviewer": "codex",
-                                                      "tester": "gemini"}}))
+                                                      "tester": "script"}}))
     db = str(tmp_path / "t.db")
 
     spawned = {}
@@ -937,7 +937,7 @@ def test_enabled_dispatcher_ships_the_ac_of_a_capped_issue(tmp_path, monkeypatch
     state_file = tmp_path / "state.json"
     state_file.write_text(_json.dumps({"worktrees": {"claude": str(wt)},
                                       "role_agents": {"implementer": "claude", "reviewer": "codex",
-                                                      "tester": "gemini"}}))
+                                                      "tester": "script"}}))
     db = str(tmp_path / "t.db")
 
     spawned = {}

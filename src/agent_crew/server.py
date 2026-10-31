@@ -7644,7 +7644,14 @@ def create_app(
                                                               claim_source="dispatcher")
                         if task is None:
                             continue
-                        role = (_AGENT_TO_ROLES.get(agent) or [""])[0]
+                        assigned_roles = _AGENT_TO_ROLES.get(agent) or []
+                        if assigned_roles:
+                            role = assigned_roles[0]
+                        else:
+                            try:
+                                role = resolve_agent_role(agent)
+                            except RoleResolutionError:
+                                role = ""  # Discussion can use a checkout-only provider.
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
                         _slot = _target_agent or agent
                         if _slot in active_workers:

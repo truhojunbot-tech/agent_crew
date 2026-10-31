@@ -236,7 +236,7 @@ def test_one_worker_assigned_two_roles_claims_review_tasks(tmp_db, tmp_path, mon
         state = {
             "project": "t",
             "role_agents": {
-                "implementer": "claude", "reviewer": "claude", "tester": "gemini",
+                "implementer": "claude", "reviewer": "claude", "tester": "script",
             },
             "roles": [
                 {"role": role, "agent": "claude", "worktree": str(wt)}

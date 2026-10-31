@@ -25,7 +25,7 @@ def _state(tmp_path, implementer_worktree=True):
         roles.append({"role": role, "agent": agent, "worktree": str(wt)})
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"project": "agent_crew", "role_agents": {
-        "implementer": "claude_cloud", "reviewer": "codex", "tester": "gemini"},
+        "implementer": "claude_cloud", "reviewer": "codex", "tester": "script"},
         "roles": roles}))
     return str(path)
 
@@ -95,7 +95,7 @@ def test_legacy_schema_claude_cloud_role_has_no_worktree_map_warning(tmp_path, c
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"project": "agent_crew",
                                 "role_agents": {"implementer": "claude_cloud",
-                                                "reviewer": "codex", "tester": "gemini"},
+                                                "reviewer": "codex", "tester": "script"},
                                 "worktrees": {"codex": "/wt/codex", "gemini": "/wt/gemini"}}))
     caplog.set_level(logging.WARNING, logger="agent_crew.server")
     assert _load_worktree_map(str(path)) == {"reviewer": "/wt/codex"}
@@ -106,7 +106,7 @@ def test_non_cloud_role_without_worktree_still_warns(tmp_path, caplog):
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"project": "agent_crew",
                                 "role_agents": {"implementer": "claude",
-                                                "reviewer": "codex", "tester": "gemini"},
+                                                "reviewer": "codex", "tester": "script"},
                                 "worktrees": {"codex": "/wt/codex", "gemini": "/wt/gemini"}}))
     caplog.set_level(logging.WARNING, logger="agent_crew.server")
     _load_worktree_map(str(path))
@@ -122,7 +122,7 @@ def _reviewer_cloud_state(tmp_path):
         roles.append({"role": role, "agent": agent, "worktree": str(wt)})
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"project": "agent_crew", "role_agents": {
-        "implementer": "codex", "reviewer": "claude_cloud", "tester": "gemini"},
+        "implementer": "codex", "reviewer": "claude_cloud", "tester": "script"},
         "roles": roles}))
     return str(path)
 

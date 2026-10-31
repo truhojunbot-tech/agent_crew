@@ -38,7 +38,7 @@ def _state(tmp_path, reviewer_agent="claude_cloud", reviewer_worktree=True):
             roles.append({"role": role, "agent": agent, "worktree": str(worktree)})
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"project": "agent_crew", "role_agents": {
-        "implementer": "codex", "reviewer": reviewer_agent, "tester": "gemini"},
+        "implementer": "codex", "reviewer": reviewer_agent, "tester": "script"},
         "roles": roles}))
     return str(path)
 

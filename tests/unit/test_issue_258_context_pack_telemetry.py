@@ -93,7 +93,7 @@ def test_a_real_dispatch_writes_the_event(tmp_path, monkeypatch, *, unused_tcp_p
     wt.mkdir()
     (wt / ".git").mkdir()
     state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps({"worktrees": {"claude": str(wt)}, "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "claude"}}))
+    state_file.write_text(json.dumps({"worktrees": {"claude": str(wt)}, "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "script"}}))
     db = str(tmp_path / "t.db")
 
     async def _fake_exec(*cmd, **kwargs):
@@ -162,7 +162,7 @@ def test_the_dispatch_records_nothing_when_the_pack_is_disabled(tmp_path, monkey
     wt.mkdir()
     (wt / ".git").mkdir()
     state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps({"worktrees": {"claude": str(wt)}, "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "claude"}}))
+    state_file.write_text(json.dumps({"worktrees": {"claude": str(wt)}, "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "script"}}))
     db = str(tmp_path / "t.db")
 
     async def _fake_exec(*cmd, **kwargs):
@@ -221,7 +221,7 @@ def _dispatch_with_pack_telemetry(tmp_path, monkeypatch, extra_telemetry, *, unu
     wt.mkdir()
     (wt / ".git").mkdir()
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"worktrees": {"claude": str(wt)}, "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "claude"}}))
+    state.write_text(json.dumps({"worktrees": {"claude": str(wt)}, "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "script"}}))
     db = str(tmp_path / "t.db")
 
     async def _fake_exec(*cmd, **kwargs):
@@ -338,7 +338,7 @@ def _shadow_dispatch(tmp_path, monkeypatch, port, *, live=False, shadow=False, b
     state = tmp_path / "state.json"
     state.write_text(json.dumps({
         "worktrees": {"claude": str(wt)},
-        "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "claude"},
+        "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "script"},
     }))
     db = str(tmp_path / "t.db")
     commands = []
