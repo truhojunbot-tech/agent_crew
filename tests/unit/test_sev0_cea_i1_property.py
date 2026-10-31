@@ -387,7 +387,10 @@ def _drive(kind, tmp_path, live):
         target = live.s
         live.s = AuthorityState("active")
         q = TaskQueue(str(db))
-        q.enqueue(task("impl-p", branch="feat/x"), ingress="http.tasks")
+        # This transport test exercises cascade admission before the CLI opens
+        # its PR; the explicit CLI flag keeps it off the PR-opening retry path.
+        q.enqueue(task("impl-p", branch="feat/x",
+                       context={"crew_run_branch": True}), ingress="http.tasks")
         conn = sqlite3.connect(str(db))
         conn.execute("UPDATE tasks SET status='completed' WHERE task_id='impl-p'")
         conn.commit()

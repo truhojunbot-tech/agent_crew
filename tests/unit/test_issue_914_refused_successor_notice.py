@@ -107,7 +107,8 @@ def test_review_with_branch_sends_no_refusal_notice(q):
     sent = []
     impl_id = f"impl-{uuid.uuid4().hex[:8]}"
     q.enqueue(TaskRequest(task_id=impl_id, task_type="implement",
-                          description="implement", branch="agent/codex/914-x", context={}))
+                          description="implement", branch="agent/codex/914-x",
+                          context={"crew_run_branch": True}))
     q.submit_result(impl_id, TaskResult(task_id=impl_id, status="completed",
                                         summary="done"))
 
