@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -113,6 +114,23 @@ def test_retryable_submit_failure_creates_one_review_retry(tmp_path, monkeypatch
     cloud._fail_closed_dispatch(queue, task, "review", "cloud_submit_timeout", retryable=True)
     assert len([t for t in queue.list_tasks() if t.task_id.startswith("retry-")]) == 1
     assert len(notices) == 1
+
+
+def test_cloud_review_missing_pin_sends_one_coordinator_notice(tmp_path, monkeypatch):
+    queue = _queue(tmp_path)
+    task = _dispatched_review(queue)
+    missing_pin = replace(task, context={"repo": "owner/repo", "pr_number": 864})
+    notices = []
+    monkeypatch.setattr(server, "_deliver_coordinator_notice",
+                        lambda message: notices.append(message) or True)
+    for _ in range(2):
+        outcome = cloud._reconcile_cloud_review(
+            queue, missing_pin, repo="owner/repo",
+            pr_comments_fn=lambda *args, **kwargs: [],
+            submit_review_result_fn=None)
+        assert outcome.action == "failed"
+    assert len(notices) == 1
+    assert "cloud_review_missing_pinned_pr_or_sha" in notices[0]
 
 
 @pytest.mark.parametrize("retryable,attempt,expected", [

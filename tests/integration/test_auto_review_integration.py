@@ -21,7 +21,7 @@ def test_i_ar01_impl_completion_auto_enqueues_review(test_client):
         "description": "Implement feature X",
         "branch": "feat/x",
         "priority": 2,
-        "context": {},
+        "context": {"crew_run_branch": True},
     }
     resp = test_client.post("/tasks", json=impl_payload)
     assert resp.status_code == 201
@@ -87,7 +87,7 @@ def test_i_ar03_auto_review_preserves_checklist(test_client):
         "description": "Implement feature Z",
         "branch": "feat/z",
         "priority": 1,
-        "context": {"issue": 54},
+        "context": {"issue": 54, "crew_run_branch": True},
     }
     test_client.post("/tasks", json=impl_payload)
 
@@ -123,7 +123,7 @@ def test_i_ar04_multiple_impl_tasks_create_reviews(test_client):
             "description": f"Implement feature {i}",
             "branch": f"feat/{i}",
             "priority": 2,
-            "context": {},
+            "context": {"crew_run_branch": True},
         }
         test_client.post("/tasks", json=impl_payload)
 

@@ -39,7 +39,9 @@ def live_server(tmp_path):
     """Start a real uvicorn server; yield (port, db_path, tmp_path); stop after test."""
     db_path = str(tmp_path / "tasks.db")
     port = _find_free_port()
-    app = create_app(db_path)
+    # Stub pollers use no project header; keep this fixture independent of the
+    # worker's AGENT_CREW_PROJECT environment.
+    app = create_app(db_path, identity_required=False)
 
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
     server = uvicorn.Server(config)
@@ -63,7 +65,8 @@ def live_server(tmp_path):
 
 
 def _stub(port: int, role: str = "panel", verdict: str | None = None,
-          status: str = "completed", poll_timeout: float = 30.0) -> subprocess.CompletedProcess:
+          status: str = "completed", poll_timeout: float = 30.0,
+          pr_number: int | None = None) -> subprocess.CompletedProcess:
     env = {
         **os.environ,
         "STUB_PORT": str(port),
@@ -73,6 +76,8 @@ def _stub(port: int, role: str = "panel", verdict: str | None = None,
     }
     if verdict:
         env["STUB_VERDICT"] = verdict
+    if pr_number is not None:
+        env["STUB_PR_NUMBER"] = str(pr_number)
     return subprocess.run(
         [sys.executable, _STUB_SCRIPT],
         env=env,
@@ -178,9 +183,11 @@ def test_e_di02_two_rounds(live_server, tmp_path):
 
 
 # E-DI03: --then-run triggers full code-review loop (discuss → implement → review chain)
-def test_e_di03_then_run(live_server, tmp_path):
+def test_e_di03_then_run(live_server, tmp_path, monkeypatch):
     port, db_path, _ = live_server
     output = str(tmp_path / "synthesis.md")
+    monkeypatch.setattr("agent_crew.pipeline.pr_is_actionable",
+                        lambda *args, **kwargs: (True, "open"))
 
     cli_t, holder = _start_cli([
         "discuss", "Adopt event sourcing",
@@ -195,7 +202,7 @@ def test_e_di03_then_run(live_server, tmp_path):
     # Discussion phase: one panel agent responds
     assert _stub(port, "panel").returncode == 0
     # Code-review loop chain: coder implements, reviewer approves
-    assert _stub(port, "coder").returncode == 0
+    assert _stub(port, "coder", pr_number=965).returncode == 0
     assert _stub(port, "reviewer", verdict="approve").returncode == 0
 
     cli_t.join(timeout=60.0)

@@ -2364,11 +2364,10 @@ def auto_enqueue_review(
             )
             return None
 
-        # Only an explicit standalone branch declaration opts into this guard.
-        # Older tasks omit crew_run_branch; preserve their existing cascade.
         # A crew-run branch's CLI may open the PR after this result (#666).
+        # All other pushed branches need a PR before a reviewer is enqueued.
         if (pr_number is None and impl_task.branch
-                and impl_ctx.get("crew_run_branch") is False):
+                and impl_ctx.get("crew_run_branch") is not True):
             from agent_crew.github import pr_number_for_branch
 
             found_pr = pr_number_for_branch(

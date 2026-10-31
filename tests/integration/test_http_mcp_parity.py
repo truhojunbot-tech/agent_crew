@@ -307,7 +307,7 @@ class TestSubmitResultParity:
         verified = lambda *_args, **_kwargs: (True, "origin branch contains reported commit")
         monkeypatch.setattr("agent_crew.server.verify_implement_artifact", verified)
         monkeypatch.setattr("agent_crew.mcp_server.verify_implement_artifact", verified)
-        context = {"worktree_base_sha": "a" * 40}
+        context = {"worktree_base_sha": "a" * 40, "crew_run_branch": True}
         commit = "b" * 40
         http_client, _, db_a = parity_pair
         _enqueue_task(db_a, "p-artifact-http", branch="feat/work", context=context)
@@ -362,7 +362,8 @@ class TestSubmitResultParity:
         db_path = str(tmp_path / "mcp-real-artifact.db")
         _enqueue_task(
             db_path, "p-mcp-real-artifact", branch="main",
-            context={"issue": 366, "reviewed_sha": base_sha},
+            context={"issue": 366, "reviewed_sha": base_sha,
+                     "crew_run_branch": True},
         )
         previous_cwd = os.getcwd()
         try:

@@ -11,7 +11,8 @@ from agent_crew.server import create_app
 def _prepare(db, fallback_status=None, original_status="failed"):
     queue = TaskQueue(db)
     queue.enqueue(TaskRequest(task_id="impl-root", task_type="implement",
-                              description="work", branch="feature"))
+                              description="work", branch="feature",
+                              context={"crew_run_branch": True}))
     assert queue.dequeue(role="implementer")
     queue.submit_result("impl-root", TaskResult(
         task_id="impl-root", status=original_status, summary="wrapper failed"))

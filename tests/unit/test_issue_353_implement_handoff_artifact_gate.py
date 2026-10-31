@@ -32,7 +32,8 @@ def _app(tmp_db, monkeypatch, artifact_ok):
 
 def _implement(queue, task_id="impl-353"):
     queue.enqueue(TaskRequest(task_id, "implement", "change", branch="feat/work",
-                              context={"worktree_base_sha": SHA_BASE}))
+                              context={"worktree_base_sha": SHA_BASE,
+                                       "crew_run_branch": True}))
 
 
 def test_completed_implement_without_commit_becomes_no_artifact_and_never_dispatches_review(

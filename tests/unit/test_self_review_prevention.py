@@ -6,13 +6,17 @@ from agent_crew.server import create_app
 
 def _task_payload(task_id, task_type, description="do work", priority=3,
                   project="", context=None):
+    context = dict(context or {})
+    if task_type == "implement":
+        # These identity tests intentionally run the CLI's pre-PR handoff.
+        context["crew_run_branch"] = True
     return {
         "task_id": task_id,
         "task_type": task_type,
         "description": description,
         "branch": "main",
         "priority": priority,
-        "context": context or {},
+        "context": context,
         "project": project,
     }
 

@@ -31,7 +31,7 @@ def _task_payload(task_id="t1", task_type="implement"):
         "description": "do work",
         "branch": "main",
         "priority": 3,
-        "context": {"risk_tier": 1},
+        "context": {"risk_tier": 1, "crew_run_branch": True},
         "project": "",
     }
 
