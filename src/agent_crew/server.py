@@ -5385,6 +5385,10 @@ def create_app(
                 except Exception:
                     logger.exception(f"watchdog #145: force_fail_pending raised for task {tid}")
             return actions
+        # STOP prevents dequeue altogether. Time spent paused is not a failed
+        # delivery attempt and must not exhaust the pending-task retry cap.
+        if stale and q().get_stop_epoch()["paused"]:
+            return actions
         # Collect unique roles so we only fire _try_push_next once per role.
         stale_roles: set[str] = set()
         busy_roles = {
@@ -5406,6 +5410,11 @@ def create_app(
             # by the single _try_push_next call below.
             if not role_key or role_key in busy_roles or role_key in stale_roles:
                 continue
+            if task_type in ("implement", "review", "test"):
+                agent = ctx.get("agent_override") or _DISPATCH_ROLE_TO_AGENT.get(role_key)
+                if not agent or QuotaBudgetProvider().active_cooldown_until(agent) is not None:
+                    # _try_push_next holds this task before it reaches a pane.
+                    continue
             attempt = int(ctx.get("watchdog_redispatch_attempt") or 0)
             if attempt >= MAX_TASK_RETRIES:
                 if task_id:

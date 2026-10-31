@@ -344,6 +344,29 @@ class TestMcpNoClientAutoFail:
         assert TaskQueue(db).get_task(waiting_id).status == "pending"
         assert TaskQueue(db).get_task_context(waiting_id).get("watchdog_redispatch_attempt", 0) == 0
 
+    @pytest.mark.parametrize("hold", ["cooldown", "stop"])
+    def test_watchdog_held_task_does_not_spend_redispatch_attempts(self, monkeypatch, hold):
+        db, queue = _make_db()
+        task_id = f"watchdog-{hold}-hold"
+        queue.enqueue(TaskRequest(task_id=task_id, task_type="implement",
+                                  description="held", branch="main"))
+        self._make_stale_pending(db, task_id)
+        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+        monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "120")
+        if hold == "stop":
+            queue.set_stop_epoch(True, incident="watchdog-test")
+        else:
+            monkeypatch.setattr(
+                "agent_crew.server.QuotaBudgetProvider.active_cooldown_until",
+                lambda self, agent: time.time() + 3600,
+            )
+        app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
+        with TestClient(app), patch("agent_crew.server._pane_alive_for_push", return_value=True):
+            for _ in range(4):
+                app.state.watchdog_tick(time.time())
+        assert TaskQueue(db).get_task(task_id).status == "pending"
+        assert TaskQueue(db).get_task_context(task_id).get("watchdog_redispatch_attempt", 0) == 0
+
     def test_u145_stale_pending_auto_failed_in_mcp_mode(self):
         """In MCP mode, stale-pending tasks must be auto-failed by the watchdog."""
         db, q = _make_db()
