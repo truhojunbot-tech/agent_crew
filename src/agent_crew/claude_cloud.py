@@ -928,6 +928,12 @@ def _requeue_stale_cloud_once(queue: TaskQueue, task: TaskRequest,
                               reason: str) -> Optional[str]:
     """A stale cloud run has no changed input, so close it without a retry."""
     _fail_closed_dispatch(queue, task, task.task_type, reason)
+    from agent_crew.server import coordinator_notice_once
+    context = task.context if isinstance(task.context, dict) else {}
+    coordinator_notice_once(
+        queue, task.task_id, "cloud_stale_no_retry",
+        f"branch={task.branch or ''} session_url={context.get('cloud_session_url') or ''}",
+    )
     return ""
 
 

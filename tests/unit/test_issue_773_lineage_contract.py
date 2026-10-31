@@ -163,12 +163,11 @@ def test_cloud_stale_notifies_once_with_session_url(tmp_db, monkeypatch):
         app.state.watchdog_tick(20001)
     assert len(notices) == 1
     assert "impl-773" in notices[0]
-    assert "kind=cloud_stale_requeued" in notices[0]
-    assert "retry-impl-773-a1" in notices[0]
+    assert "kind=cloud_stale_no_retry" in notices[0]
     assert "https://example.test/session/773" in notices[0]
     assert "agent/773-work" in notices[0]
     assert queue.get_task("impl-773").status == "failed"
-    assert queue.get_task("retry-impl-773-a1").status == "pending"
+    assert queue.get_task("retry-impl-773-a1") is None
     assert queue.dequeue(agent="codex", role="implementer").task_id == "next-cloud-773"
 
 
