@@ -142,7 +142,7 @@ def test_server_same_role_retry_marks_root_declaration_inherited(tmp_db, monkeyp
     with TestClient(app) as client:
         response = client.post("/tasks/risk-root/result", json={
             "task_id": "risk-root", "status": "failed", "summary": "usage limit hit",
-            "findings": [],
+            "findings": [], "error_info": {"kind": "transient"},
         }, headers={"X-Agent-Crew-Project": client.get("/health").json()["project"]})
     assert response.status_code == 200, response.text
     retry_id = "retry-risk-root-a1"

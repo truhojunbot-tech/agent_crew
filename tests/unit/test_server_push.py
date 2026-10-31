@@ -476,9 +476,9 @@ def test_u_sp15_impl_failed_no_auto_review(tmp_db):
         )
         assert resp.status_code == 200
 
-    # Failed task auto-retries (not review) — expect 2 pushes: original + retry task
-    assert len(push.calls) == 2
-    # Verify no review task, both are implement (original + retry)
+    # An untyped self-reported failure is deterministic, so it does not retry.
+    assert len(push.calls) == 1
+    # Verify no review or retry task was pushed.
     for _, msg in push.calls:
         assert "task_type: implement" in msg
 

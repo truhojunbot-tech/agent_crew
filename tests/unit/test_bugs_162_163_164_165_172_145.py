@@ -303,6 +303,70 @@ class TestMcpNoClientAutoFail:
         conn.commit()
         conn.close()
 
+
+    def test_watchdog_redispatch_attempts_survive_restart_and_stop_at_cap(self, monkeypatch):
+        db, queue = _make_db()
+        task_id = "watchdog-retry-cap"
+        queue.enqueue(TaskRequest(task_id=task_id, task_type="implement",
+                                  description="pending", branch="main"))
+        self._make_stale_pending(db, task_id)
+        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+        monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "120")
+        with patch("agent_crew.server._pane_alive_for_push", return_value=False):
+            for expected in (1, 2):
+                app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
+                with TestClient(app):
+                    app.state.watchdog_tick(time.time())
+                assert TaskQueue(db).get_task_context(task_id)["watchdog_redispatch_attempt"] == expected
+                assert TaskQueue(db).get_task(task_id).status == "pending"
+            app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
+            with TestClient(app):
+                app.state.watchdog_tick(time.time())
+        assert TaskQueue(db).get_task(task_id).status == "failed"
+        assert TaskQueue(db).get_task_context(task_id)["watchdog_redispatch_attempt"] == 2
+
+    def test_watchdog_busy_role_does_not_spend_redispatch_attempts(self, monkeypatch):
+        db, queue = _make_db()
+        queue.enqueue(TaskRequest(task_id="watchdog-busy", task_type="implement",
+                                  description="running", branch="main"))
+        assert queue.dequeue(role="implementer").task_id == "watchdog-busy"
+        waiting_id = "watchdog-waiting"
+        queue.enqueue(TaskRequest(task_id=waiting_id, task_type="implement",
+                                  description="waiting", branch="main"))
+        self._make_stale_pending(db, waiting_id)
+        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+        monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "120")
+        app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
+        with TestClient(app), patch("agent_crew.server._pane_alive_for_push", return_value=True):
+            for _ in range(3):
+                app.state.watchdog_tick(time.time())
+        assert TaskQueue(db).get_task("watchdog-busy").status == "in_progress"
+        assert TaskQueue(db).get_task(waiting_id).status == "pending"
+        assert TaskQueue(db).get_task_context(waiting_id).get("watchdog_redispatch_attempt", 0) == 0
+
+    @pytest.mark.parametrize("hold", ["cooldown", "stop"])
+    def test_watchdog_held_task_does_not_spend_redispatch_attempts(self, monkeypatch, hold):
+        db, queue = _make_db()
+        task_id = f"watchdog-{hold}-hold"
+        queue.enqueue(TaskRequest(task_id=task_id, task_type="implement",
+                                  description="held", branch="main"))
+        self._make_stale_pending(db, task_id)
+        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+        monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "120")
+        if hold == "stop":
+            queue.set_stop_epoch(True, incident="watchdog-test")
+        else:
+            monkeypatch.setattr(
+                "agent_crew.server.QuotaBudgetProvider.active_cooldown_until",
+                lambda self, agent: time.time() + 3600,
+            )
+        app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
+        with TestClient(app), patch("agent_crew.server._pane_alive_for_push", return_value=True):
+            for _ in range(4):
+                app.state.watchdog_tick(time.time())
+        assert TaskQueue(db).get_task(task_id).status == "pending"
+        assert TaskQueue(db).get_task_context(task_id).get("watchdog_redispatch_attempt", 0) == 0
+
     def test_u145_stale_pending_auto_failed_in_mcp_mode(self):
         """In MCP mode, stale-pending tasks must be auto-failed by the watchdog."""
         db, q = _make_db()
@@ -312,7 +376,7 @@ class TestMcpNoClientAutoFail:
         self._make_stale_pending(db, task_id, seconds_ago=200)
 
         pane_map = {"implementer": "%93"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
+        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp", "AGENT_CREW_DISPATCHER": "0",
                                         "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
             from agent_crew.server import create_app
             app = create_app(
@@ -348,7 +412,7 @@ class TestMcpNoClientAutoFail:
         self._make_stale_pending(db, task_id, seconds_ago=10)
 
         pane_map = {"implementer": "%94"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
+        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp", "AGENT_CREW_DISPATCHER": "0",
                                         "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
             from agent_crew.server import create_app
             app = create_app(
@@ -434,7 +498,7 @@ class TestMcpNoClientAutoFail:
         conn.close()
 
         pane_map = {"implementer": "%96"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
+        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp", "AGENT_CREW_DISPATCHER": "0",
                                         "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
             from agent_crew.server import create_app
             app = create_app(
