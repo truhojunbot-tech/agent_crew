@@ -166,15 +166,20 @@ def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
             if emergency_key in _unclaimed_lock_notices:
                 return
     try:
-        task = queue.get_task(task_id)
+        quarantine_field = (queue.quarantine_field(task_id)
+                            if kind == "malformed_stored_row" else "")
+        task = None if quarantine_field else queue.get_task(task_id)
         intent = (queue.get_work_intent(task_id[len("work-intent:"):])
                   if task is None and task_id.startswith("work-intent:") else None)
-        if task is None and intent is None:
+        if task is None and intent is None and not quarantine_field:
             return
         ctx = task.context if task is not None and isinstance(task.context, dict) else {}
         detail_limit = 800 if kind == "lineage_end" else 300
         safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:detail_limit]
-        if kind == "lineage_end":
+        if quarantine_field:
+            message = (f"agent_crew coordinator notice: task={task_id} "
+                       f"kind=malformed_stored_row field={quarantine_field}")
+        elif kind == "lineage_end":
             # C3: the generic envelope contains repo/branch/session values from
             # task context. A lineage end has its own typed, allowlisted body.
             message = f"agent_crew coordinator notice: kind=lineage_end {safe_detail}"
@@ -3839,6 +3844,9 @@ def create_app(
         state["queue"] = TaskQueue(db_path, cea_providers=_cea_wiring.providers)
         if coordinator_notice_sink() == "none":
             logger.error("coordinator notice sink is none; stalled lineages cannot notify a coordinator")
+        for task_id, field in state["queue"].quarantined_task_fields():
+            coordinator_notice_once(state["queue"], task_id, "malformed_stored_row",
+                                    f"field={field}", coordinator_notify_fn)
         # #248: stamp the build into the durable event stream at startup, so a
         # production before/after cohort can be cut on the PROCESS boundary
         # instead of on a GitHub merge time. #247 showed those are not the same
