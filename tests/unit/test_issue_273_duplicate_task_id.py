@@ -85,6 +85,10 @@ def test_an_unrelated_constraint_is_not_a_duplicate(tmp_db, field):
     """★★The finding. A brand-new task_id that violates some *other* constraint
     must surface as the integrity error it is."""
     q = TaskQueue(tmp_db)
+    if field == "task_type":
+        with pytest.raises(ValueError, match="task_type"):
+            q.enqueue(_task(f"brand-new-{field}", **{field: None}))
+        return
     with pytest.raises(sqlite3.IntegrityError) as exc:
         q.enqueue(_task(f"brand-new-{field}", **{field: None}))
     assert "NOT NULL" in str(exc.value)
@@ -95,7 +99,8 @@ def test_an_unrelated_constraint_does_not_invent_a_task(tmp_db, field):
     """⛔And it leaves nothing behind. A rolled-back insert that still reported
     "already exists" would have the caller believe a row it cannot see."""
     q = TaskQueue(tmp_db)
-    with pytest.raises(sqlite3.IntegrityError):
+    expected = ValueError if field == "task_type" else sqlite3.IntegrityError
+    with pytest.raises(expected):
         q.enqueue(_task(f"ghost-{field}", **{field: None}))
     assert [t.task_id for t in q.list_tasks()] == []
 

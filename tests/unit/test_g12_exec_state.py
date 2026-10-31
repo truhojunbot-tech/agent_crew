@@ -222,7 +222,7 @@ def test_cancelled_result_is_rejected_without_row_or_artifact_mutation(tmp_db):
     with TestClient(app, raise_server_exceptions=False) as client:
         client.post("/tasks", json={"task_id": "late", "task_type": "implement", "description": "d", "branch": "main"})
         assert client.delete("/tasks/late").status_code == 200
-        response = client.post("/tasks/late/result", json={"task_id": "late", "status": "completed", "summary": "late", "commit": "deadbeef"})
+        response = client.post("/tasks/late/result", json={"task_id": "late", "status": "completed", "summary": "late", "commit": "d" * 40})
     assert response.status_code == 409
     assert "LATE_RESULT_REJECTED" in response.text
     with sqlite3.connect(tmp_db) as c:

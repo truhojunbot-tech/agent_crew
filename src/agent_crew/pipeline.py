@@ -43,7 +43,7 @@ from agent_crew.protocol import (
     normalize_pr_number,
 )
 from agent_crew.queue import (TaskQueue, PausedError, TaskAlreadyExistsError,
-                              DuplicateReviewError,
+                              DuplicateReviewError, MalformedStoredRow,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                               risk_declaration)
 from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
@@ -991,8 +991,66 @@ def stale_review_task_id(pr_number, head_sha: str) -> str:
     return f"review-{int(pr_number)}-{(head_sha or '')[:12]}"
 
 
+@dataclass(frozen=True)
+class ReviewRoundCapReached:
+    reason: str
+    provider: str
+    count: int
+    cap: int
+    lineage_root: str
+
+
+def _review_round_cap(queue: TaskQueue, predecessor: TaskRequest, review_id: str,
+                      provider: str, pr_number, head_sha: str,
+                      coordinator_notify_fn=None) -> ReviewRoundCapReached | None:
+    """Refuse a review when this provider has spent its lineage round budget."""
+    if queue.get_task(review_id) is not None:
+        return None  # A result replay must keep the successor it already made.
+    key = "AGENT_CREW_REVIEW_MAX_ROUNDS_" + re.sub(r"[^A-Z0-9]", "_", provider.upper())
+    raw = os.getenv(key)
+    if raw is None:
+        return None
+    try:
+        cap = max(0, int(raw))
+    except ValueError:
+        logger.warning("%s is invalid; refusing additional %s reviews", key, provider)
+        cap = 0
+    tasks = {task.task_id: task for task in queue.list_tasks()}
+    parent_ctx = predecessor.context if isinstance(predecessor.context, dict) else {}
+    root = parent_ctx.get("lineage_root_task_id") or _lineage_root_task_id(tasks, predecessor)
+    count = 0
+    for task in tasks.values():
+        if task.task_type != "review" or task.status not in ("pending", "in_progress", "completed"):
+            continue
+        ctx = task.context if isinstance(task.context, dict) else {}
+        task_root = ctx.get("lineage_root_task_id") or _lineage_root_task_id(tasks, task)
+        if task_root != root:
+            continue
+        attribution = queue.get_attribution(task.task_id) or {}
+        resolved = (attribution.get("agent") or ctx.get("agent_override")
+                    or ctx.get("reviewer_agent") or DEFAULT_ROLE_TO_AGENT["reviewer"])
+        if resolved == provider:
+            count += 1
+    if count < cap:
+        return None
+    outcome = ReviewRoundCapReached("review_round_cap", provider, count, cap, str(root))
+    queue.patch_context(predecessor.task_id, {
+        "review_blocked_reason": outcome.reason,
+        "review_blocked_provider": provider,
+        "review_blocked_count": count,
+        "review_blocked_cap": cap,
+    })
+    from agent_crew.server import coordinator_notice_once
+    coordinator_notice_once(
+        queue, predecessor.task_id, outcome.reason,
+        f"lineage_root={root} pr_number={pr_number or ''} head_sha={head_sha or ''} "
+        f"provider={provider} count={count} cap={cap}", coordinator_notify_fn)
+    return outcome
+
+
 def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, head: str,
-                           ctx, *, project: str) -> Optional[str]:
+                           ctx, *, project: str, reviewer_provider: str = "",
+                           coordinator_notify_fn=None) -> str | ReviewRoundCapReached | None:
     """Enqueue one head-anchored review for a PR whose head moved (#304).
 
     Shared by the HTTP and MCP result transports (#887): a stale approval
@@ -1012,7 +1070,8 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
     context = {k: v for k, v in base.items()
                if k in ("pr_number", "repo", "project", "no_tester",
                         "coordinator_managed", "checklist_layers",
-                        "findings_only")}
+                        "findings_only", "agent_override", "reviewer_agent",
+                        "lineage_root_task_id")}
     context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
                     "expected_head_sha": head, "prev_task_id": review_task_id})
     inherited_tier = base.get("risk_tier")
@@ -1020,6 +1079,17 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
             and 0 <= inherited_tier <= 3):
         context["risk_tier"] = inherited_tier
     try:
+        predecessor = queue.get_task(review_task_id)
+        if predecessor is None:
+            return None
+        prior_attribution = queue.get_attribution(review_task_id) or {}
+        provider = (base.get("agent_override") or base.get("reviewer_agent")
+                    or reviewer_provider or prior_attribution.get("agent")
+                    or DEFAULT_ROLE_TO_AGENT["reviewer"])
+        blocked = _review_round_cap(queue, predecessor, new_id, provider,
+                                    pr_number, head, coordinator_notify_fn)
+        if blocked is not None:
+            return blocked
         queue.enqueue(TaskRequest(
             task_id=new_id,
             task_type="review",
@@ -1816,7 +1886,10 @@ def auto_enqueue_fix(
         # server restart and counts ROUNDS rather than tasks. An in-memory
         # per-task_id counter (the transient-retry shape) could not work here:
         # every round mints new task ids, so it would always read zero.
-        fix_round = int(review_ctx.get("fix_round") or 0) + 1
+        fix_round = review_ctx.get("fix_round", 0)
+        if type(fix_round) is not int or fix_round < 0:
+            raise MalformedStoredRow(f"malformed fix_round for task {review_task_id}")
+        fix_round += 1
         if (switch_enabled and canary_pinned and not prior_switch_on
                 and fix_round <= baseline_cap
                 and canary_reason in ("contract_predates_latest_result",
@@ -2083,6 +2156,8 @@ def auto_enqueue_fix(
         except Exception:
             logger.exception(f"auto_enqueue_fix: outbox_reopen({review_task_id}) 실패")
         raise
+    except MalformedStoredRow:
+        raise
     except Exception as e:
         logger.warning(f"auto_enqueue_fix: unexpected error: {e}")
         return None
@@ -2274,7 +2349,8 @@ def auto_enqueue_review(
     result=None,
     repo_cwd: str = "",
     coordinator_notify_fn=None,
-) -> Optional[str]:
+    reviewer_provider: str = "",
+) -> str | ReviewRoundCapReached | None:
     """Create the review task that follows a completed impl task.
 
     ``result`` is the implementer's own report (#305). When it names a branch
@@ -2510,10 +2586,9 @@ def auto_enqueue_review(
             "prev_task_id": impl_task_id,
             "pr_number": pr_number,
         }
-        try:
-            prior_fix_round = int(impl_ctx.get("fix_round") or 0)
-        except (TypeError, ValueError):
-            prior_fix_round = 0
+        prior_fix_round = impl_ctx.get("fix_round", 0)
+        if type(prior_fix_round) is not int or prior_fix_round < 0:
+            raise MalformedStoredRow(f"malformed fix_round for task {impl_task_id}")
         if prior_fix_round > 0:
             prior_review = next((
                 task for candidate in (impl_ctx.get("prev_task_id"),
@@ -2582,7 +2657,7 @@ def auto_enqueue_review(
 
         # #314 §4 P0-1: 결정론 successor id(stable transition key) — UUID 금지. crash 후 replay가
         # 같은 (impl parent, review, fix_round)에 대해 동일 id를 만들어 PK dedup으로 at-most-once.
-        _round = int(impl_ctx.get("fix_round", 0) or 0)
+        _round = prior_fix_round
         review_id = f"review-{impl_task_id}-r{_round}"
         review_req = TaskRequest(
             task_id=review_id,
@@ -2592,6 +2667,15 @@ def auto_enqueue_review(
             context=review_context,
             project=_successor_project(queue, impl_task, server_project),
         )
+        provider = (review_context.get("agent_override")
+                    or review_context.get("reviewer_agent") or reviewer_provider
+                    or (default_agent_for_role("reviewer", pane_map) if pane_map else None)
+                    or DEFAULT_ROLE_TO_AGENT["reviewer"])
+        blocked = _review_round_cap(queue, impl_task, review_id, provider,
+                                    pr_number, review_context.get("reviewed_sha", ""),
+                                    coordinator_notify_fn)
+        if blocked is not None:
+            return blocked
         try:
             _enqueue_with_inherited_risk(
                 queue, review_req, {t.task_id: t for t in queue.list_tasks()},
@@ -2611,6 +2695,8 @@ def auto_enqueue_review(
             queue.outbox_reopen(impl_task_id)
         except Exception:
             logger.exception(f"auto_enqueue_review: outbox_reopen({impl_task_id}) 실패")
+        raise
+    except MalformedStoredRow:
         raise
     except Exception as e:
         logger.warning(f"auto_enqueue_review: unexpected error: {e}")
