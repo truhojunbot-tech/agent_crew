@@ -626,7 +626,7 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 10
+QUEUE_SCHEMA_VERSION = 11
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
@@ -727,6 +727,7 @@ _DDL_MIGRATE_LAST_ACTIVITY = (
 _DDL_MIGRATE_PUSH_AT = "ALTER TABLE tasks ADD COLUMN push_at REAL NOT NULL DEFAULT 0"
 _DDL_MIGRATE_DISPATCH_PANE = "ALTER TABLE tasks ADD COLUMN dispatch_pane_id TEXT NOT NULL DEFAULT ''"
 _DDL_MIGRATE_ERROR_INFO = "ALTER TABLE tasks ADD COLUMN error_info TEXT DEFAULT NULL"
+_DDL_MIGRATE_QUARANTINE = "ALTER TABLE tasks ADD COLUMN quarantine_field TEXT NOT NULL DEFAULT ''"
 _DDL_MIGRATE_CLAIM_SOURCE = "ALTER TABLE tasks ADD COLUMN claim_source TEXT NOT NULL DEFAULT ''"
 
 # G12 / D6: execution state per task (alfred#51 c5777790815 §2). The tasks
@@ -1657,6 +1658,12 @@ class TaskQueue:
             if _schema_lock_error(exc):
                 raise
             pass  # column already exists
+        if "quarantine_field" not in {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}:
+            try:
+                conn.execute(_DDL_MIGRATE_QUARANTINE)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
         # G12 / D6: execution-state snapshot columns + append-only history.
         for _stmt in _DDL_MIGRATE_EXEC_STATE_COLUMNS:
             try:
@@ -1691,6 +1698,44 @@ class TaskQueue:
                 conn.execute(idx_stmt)
         self._migrate_legacy_cloud_cost(conn)
         self._migrate_legacy_findings(conn)
+        self._migrate_legacy_task_rows(conn)
+
+    @staticmethod
+    def _migrate_legacy_task_rows(conn: sqlite3.Connection) -> None:
+        """Convert lossless legacy values and flag rows that still cannot be read."""
+        marker = "legacy_task_rows_v1"
+        if conn.execute("SELECT 1 FROM task_metadata_migrations WHERE name=?",
+                        (marker,)).fetchone():
+            return
+        for row in conn.execute("SELECT task_id, context, findings FROM tasks").fetchall():
+            task_id = row["task_id"]
+            field = ""
+            try:
+                context = json.loads(row["context"])
+                if not isinstance(context, dict):
+                    field = "context"
+                elif isinstance(context.get("fix_round"), str) and re.fullmatch(
+                        r"\+?[0-9]+", context["fix_round"].strip()):
+                    context["fix_round"] = int(context["fix_round"].strip())
+                    conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
+                                 (json.dumps(context, ensure_ascii=False), task_id))
+            except (TypeError, ValueError):
+                field = "context"
+            if not field:
+                try:
+                    _stored_context(json.dumps(context), task_id)
+                except MalformedStoredRow:
+                    field = "fix_round"
+            if not field:
+                try:
+                    _stored_findings(row["findings"], task_id)
+                except MalformedStoredRow:
+                    field = "findings"
+            if field:
+                conn.execute("UPDATE tasks SET quarantine_field=?, status='needs_human' "
+                             "WHERE task_id=?", (field, task_id))
+        conn.execute("INSERT OR IGNORE INTO task_metadata_migrations (name) VALUES (?)",
+                     (marker,))
 
     @staticmethod
     def _migrate_legacy_findings(conn: sqlite3.Connection) -> None:
@@ -3759,6 +3804,7 @@ class TaskQueue:
             "SELECT task_id, branch, pr_number, context, status, created_at, "
             "last_activity_at FROM tasks "
             "WHERE project=? AND task_type=? AND task_id<>? "
+            "AND quarantine_field='' "
             "AND (status IN ('pending', 'in_progress') "
             "OR (status='completed' AND (task_type='test' "
             "OR (verdict IS NOT NULL AND trim(verdict) <> '')))) "
@@ -7875,7 +7921,8 @@ class TaskQueue:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT 1 FROM tasks WHERE status = 'in_progress' AND task_type = ? LIMIT 1",
+                "SELECT 1 FROM tasks WHERE status = 'in_progress' AND quarantine_field='' "
+                "AND task_type = ? LIMIT 1",
                 (task_type,),
             ).fetchone()
             return row is not None
@@ -8135,6 +8182,9 @@ class TaskQueue:
     @staticmethod
     def _task_from_row(r: sqlite3.Row) -> TaskRequest:
         """Use one mapping for list and primary-key task reads."""
+        if r["quarantine_field"]:
+            raise MalformedStoredRow(
+                f"quarantined {r['quarantine_field']} for task {r['task_id']}")
         return TaskRequest(
             task_id=r["task_id"],
             task_type=r["task_type"],
@@ -8160,6 +8210,24 @@ class TaskQueue:
         try:
             row = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
             return self._task_from_row(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def quarantined_task_fields(self) -> list[tuple[str, str]]:
+        """Typed migration markers for coordinator notices and audit."""
+        conn = self._connect()
+        try:
+            return [(row[0], row[1]) for row in conn.execute(
+                "SELECT task_id, quarantine_field FROM tasks WHERE quarantine_field<>''")]
+        finally:
+            conn.close()
+
+    def quarantine_field(self, task_id: str) -> str:
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT quarantine_field FROM tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            return row[0] if row else ""
         finally:
             conn.close()
 
@@ -8218,27 +8286,48 @@ class TaskQueue:
         try:
             if limit is not None and status:
                 rows = conn.execute(
-                    "SELECT * FROM (SELECT * FROM tasks WHERE status = ? "
+                    "SELECT * FROM (SELECT * FROM tasks WHERE status = ? AND quarantine_field='' "
                     "ORDER BY rowid DESC LIMIT ?) "
                     "ORDER BY priority ASC, created_at ASC",
                     (status, limit),
                 ).fetchall()
             elif limit is not None:
                 rows = conn.execute(
-                    "SELECT * FROM (SELECT * FROM tasks ORDER BY rowid DESC LIMIT ?) "
+                    "SELECT * FROM (SELECT * FROM tasks WHERE quarantine_field='' ORDER BY rowid DESC LIMIT ?) "
                     "ORDER BY priority ASC, created_at ASC",
                     (limit,),
                 ).fetchall()
             elif status:
                 rows = conn.execute(
-                    "SELECT * FROM tasks WHERE status = ? ORDER BY priority ASC, created_at ASC",
+                    "SELECT * FROM tasks WHERE status = ? AND quarantine_field='' ORDER BY priority ASC, created_at ASC",
                     (status,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM tasks ORDER BY priority ASC, created_at ASC"
+                    "SELECT * FROM tasks WHERE quarantine_field='' ORDER BY priority ASC, created_at ASC"
                 ).fetchall()
             return [self._task_from_row(r) for r in rows]
+        finally:
+            conn.close()
+
+    def list_tasks_for_lineage(self, root_task_id: str) -> List[TaskRequest]:
+        """Read a lineage without decoding unrelated historical task rows."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "WITH RECURSIVE lineage(task_id) AS ("
+                "SELECT task_id FROM tasks WHERE task_id=? OR "
+                "(json_valid(context) AND "
+                "json_extract(context, '$.lineage_root_task_id')=?) "
+                "UNION "
+                "SELECT t.task_id FROM tasks t JOIN lineage l "
+                "ON json_valid(t.context) AND "
+                "json_extract(t.context, '$.prev_task_id')=l.task_id "
+                ") SELECT t.* FROM tasks t JOIN lineage l ON t.task_id=l.task_id "
+                "WHERE t.quarantine_field=''",
+                (root_task_id, root_task_id),
+            ).fetchall()
+            return [self._task_from_row(row) for row in rows]
         finally:
             conn.close()
 
@@ -8256,7 +8345,7 @@ class TaskQueue:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE context LIKE ? ESCAPE '\\' "
+                "SELECT * FROM tasks WHERE quarantine_field='' AND context LIKE ? ESCAPE '\\' "
                 "ORDER BY priority ASC, created_at ASC",
                 (f'%"{escaped}%',),
             ).fetchall()
@@ -8508,7 +8597,7 @@ class TaskQueue:
                 "SELECT task_id, task_type, context, last_activity_at, last_heartbeat_at, "
                 "push_at, project, claim_source, dispatched_at, dispatch_agent, "
                 "dispatch_target, dispatch_pane_id, lease_owner, lease_expires_at "
-                "FROM tasks WHERE status = 'in_progress'"
+                "FROM tasks WHERE status = 'in_progress' AND quarantine_field=''"
             ).fetchall()
             return [
                 {

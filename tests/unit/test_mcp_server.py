@@ -170,6 +170,23 @@ class TestGetNextTask:
 
 
 class TestSubmitResult:
+    def test_submit_result_reads_task_by_id_without_scanning(self, tmp_db, monkeypatch):
+        TaskQueue(tmp_db).enqueue(_make_task("t-no-scan"))
+        mcp = build_mcp_server(tmp_db)
+        _call_tool(mcp, "get_next_task", role="implementer", agent="codex")
+        monkeypatch.setattr(mcp._agent_crew_queue, "list_tasks", lambda *a, **k: (
+            _ for _ in ()).throw(AssertionError("MCP submit scanned all tasks")))
+        ack = _call_tool(mcp, "submit_result", task_id="t-no-scan",
+                         status="needs_human", summary="operator decision")
+        assert ack["acknowledged"] is True
+
+    def test_get_task_reads_by_id_without_scanning(self, tmp_db, monkeypatch):
+        TaskQueue(tmp_db).enqueue(_make_task("t-lookup"))
+        mcp = build_mcp_server(tmp_db)
+        monkeypatch.setattr(mcp._agent_crew_queue, "list_tasks", lambda *a, **k: (
+            _ for _ in ()).throw(AssertionError("MCP lookup scanned all tasks")))
+        assert _call_tool(mcp, "get_task", task_id="t-lookup")["task_id"] == "t-lookup"
+
     def test_completed_path_returns_ack(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-ok"))
         mcp = build_mcp_server(tmp_db)

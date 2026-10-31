@@ -1015,9 +1015,10 @@ def _review_round_cap(queue: TaskQueue, predecessor: TaskRequest, review_id: str
     except ValueError:
         logger.warning("%s is invalid; refusing additional %s reviews", key, provider)
         cap = 0
-    tasks = {task.task_id: task for task in queue.list_tasks()}
     parent_ctx = predecessor.context if isinstance(predecessor.context, dict) else {}
-    root = parent_ctx.get("lineage_root_task_id") or _lineage_root_task_id(tasks, predecessor)
+    ancestors = _ancestor_tasks_by_id(queue, predecessor)
+    root = parent_ctx.get("lineage_root_task_id") or _lineage_root_task_id(ancestors, predecessor)
+    tasks = {task.task_id: task for task in queue.list_tasks_for_lineage(str(root))}
     count = 0
     for task in tasks.values():
         if task.task_type != "review" or task.status not in ("pending", "in_progress", "completed"):
@@ -1238,6 +1239,18 @@ def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
             return current.task_id
         seen.add(prev)
         current = tasks_by_id[prev]
+
+
+def _ancestor_tasks_by_id(queue: TaskQueue, task) -> dict:
+    """Load only the requested task's lineage, never unrelated stored rows."""
+    tasks = {}
+    current = task
+    while current is not None and current.task_id not in tasks:
+        tasks[current.task_id] = current
+        ctx = current.context if isinstance(current.context, dict) else {}
+        prev = ctx.get("prev_task_id")
+        current = queue.get_task(prev) if isinstance(prev, str) else None
+    return tasks
 
 
 def _latest_lineage_implement(tasks_by_id: dict, task):
@@ -1736,10 +1749,9 @@ def auto_enqueue_fix(
     submission.
     """
     try:
-        review_tasks = [t for t in queue.list_tasks() if t.task_id == review_task_id]
-        if not review_tasks:
+        review_task = queue.get_task(review_task_id)
+        if review_task is None:
             return None
-        review_task = review_tasks[0]
 
         review_result = queue.get_result(review_task_id)
         if not review_result:
@@ -1838,7 +1850,7 @@ def auto_enqueue_fix(
         if not contract.enforced:
             _record_risk_tier_shadow(queue, review_task, "fix_legacy_cap")
         baseline_cap = contract.fix_round_cap(review_fix_max_rounds())
-        tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
+        tasks_by_id = _ancestor_tasks_by_id(queue, review_task)
         lineage_root_id = _lineage_root_task_id(tasks_by_id, review_task)
         # A prior evaluation may already have held this lineage at the canary
         # cap. That decision is durable: replay must not recompute against a
@@ -2107,7 +2119,7 @@ def auto_enqueue_fix(
         fix_id = fix_task_id(review_task_id, fix_round)
         # Cheap early-out with a legible log. It is NOT the guard — the
         # `enqueue` below is, because only the PRIMARY KEY is atomic.
-        existing = next((t for t in queue.list_tasks() if t.task_id == fix_id), None)
+        existing = queue.get_task(fix_id)
         if existing is not None:
             logger.info(
                 f"auto_enqueue_fix: {fix_id} already exists for {review_task_id} "
@@ -2362,10 +2374,9 @@ def auto_enqueue_review(
     the None — auto-enqueue must never crash a result submission.
     """
     try:
-        impl_tasks = [t for t in queue.list_tasks() if t.task_id == impl_task_id]
-        if not impl_tasks:
+        impl_task = queue.get_task(impl_task_id)
+        if impl_task is None:
             return None
-        impl_task = impl_tasks[0]
         impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
         # The whole review/test contract, as admission decided it (§11.2 #14).
         # Everything below reads this; nothing below classifies anything.
@@ -2492,7 +2503,7 @@ def auto_enqueue_review(
                     try:
                         _enqueue_with_inherited_risk(
                             queue, retry_task,
-                            {task.task_id: task for task in queue.list_tasks()},
+                            _ancestor_tasks_by_id(queue, impl_task),
                             impl_task, ingress="retry.failed_task",
                             successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                             coordinator_notify_fn=coordinator_notify_fn,
@@ -2678,7 +2689,7 @@ def auto_enqueue_review(
             return blocked
         try:
             _enqueue_with_inherited_risk(
-                queue, review_req, {t.task_id: t for t in queue.list_tasks()},
+                queue, review_req, _ancestor_tasks_by_id(queue, impl_task),
                 impl_task, ingress="cascade.review",
                 successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                 coordinator_notify_fn=coordinator_notify_fn)
@@ -2725,10 +2736,9 @@ def auto_enqueue_test(
     (review missing/rejected, exception).
     """
     try:
-        review_tasks = [t for t in queue.list_tasks() if t.task_id == review_task_id]
-        if not review_tasks:
+        review_task = queue.get_task(review_task_id)
+        if review_task is None:
             return None
-        review_task = review_tasks[0]
 
         # Use the defensive verdict resolver from loop.py so reviewers that
         # post `verdict=null` with empty findings still trip the auto-test
@@ -2746,7 +2756,7 @@ def auto_enqueue_test(
                           if review_ctx.get("duplicate_review_lineage_from") else None)
         cascade_branch = cascade_branch or review_task.branch
         contract = _review_cascade_contract(queue, review_task)
-        tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
+        tasks_by_id = _ancestor_tasks_by_id(queue, review_task)
         if (_tokenomics_canary.rounds_cap_enabled()
                 and _round_cap_pinned(tasks_by_id, review_task, queue, server_project)):
             try:
@@ -2809,7 +2819,7 @@ def auto_enqueue_test(
                              pr_state_fn=pr_state_fn, repo=_test_repo, repo_cwd=repo_cwd):
             return None
         test_id = f"test-{review_task_id}"
-        existing_test = tasks_by_id.get(test_id)
+        existing_test = queue.get_task(test_id)
         if existing_test:
             return test_id
         tester_agent = tester_agent or DEFAULT_ROLE_TO_AGENT["tester"]

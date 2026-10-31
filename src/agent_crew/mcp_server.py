@@ -252,7 +252,7 @@ def build_mcp_server(
         _task_ctx = queue.get_task_context(task_id)
         result, mismatch = hold_mismatched_pr_result(task_id, result, _task_ctx)
         _artifact_held = None
-        _task = next((item for item in queue.list_tasks() if item.task_id == task_id), None)
+        _task = queue.get_task(task_id)
         try:
             _runtime_paused = queue.get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
@@ -443,10 +443,8 @@ def build_mcp_server(
     @mcp.tool()
     def get_task(task_id: str) -> Optional[dict[str, Any]]:
         """Look up a task by ID. Returns None if unknown."""
-        for t in queue.list_tasks():
-            if t.task_id == task_id:
-                return _task_to_dict(t)
-        return None
+        task = queue.get_task(task_id)
+        return _task_to_dict(task) if task is not None else None
 
     @mcp.tool()
     def list_pending(role: str = "") -> list[dict[str, Any]]:
