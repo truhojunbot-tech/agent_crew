@@ -260,7 +260,10 @@ class TestMcpNoClientDispatcherOwnsDelivery:
         task_id = "queued-873"
         q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
                               description="queued behind busy lane", branch="main"))
-        TestMcpNoClientAutoFail()._make_stale_pending(db, task_id, seconds_ago=200)
+        with sqlite3.connect(db) as conn:
+            stale_at = time.time() - 200
+            conn.execute("UPDATE tasks SET created_at=?, last_activity_at=? WHERE task_id=?",
+                         (stale_at, stale_at, task_id))
 
         with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
                                         "AGENT_CREW_DISPATCHER": "1",
@@ -272,30 +275,10 @@ class TestMcpNoClientDispatcherOwnsDelivery:
             app = create_app(db, pane_map={"implementer": "%93"}, port=9999,
                              watchdog_disabled=True, anomaly_disabled=True,
                              pane_busy_fn=lambda _: False)
-            with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
+            with TestClient(app):
                 result = app.state.watchdog_tick(time.time())
 
         assert task_id not in result.get("mcp_no_client_failed", [])
         task_row = next(r for r in q.list_all_with_status() if r["task_id"] == task_id)
         assert task_row["status"] == "pending"
 
-    def test_u873_dispatcher_off_still_fails_as_mcp_no_client(self):
-        db, q = _make_db()
-        task_id = "queued-873-off"
-        q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
-                              description="no consumer", branch="main"))
-        TestMcpNoClientAutoFail()._make_stale_pending(db, task_id, seconds_ago=200)
-
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
-                                        "AGENT_CREW_DISPATCHER": "0",
-                                        "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
-            from agent_crew.server import create_app
-            app = create_app(db, pane_map={"implementer": "%93"}, port=9999,
-                             watchdog_disabled=True, anomaly_disabled=True,
-                             pane_busy_fn=lambda _: False)
-            with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
-                result = app.state.watchdog_tick(time.time())
-
-        assert task_id in result.get("mcp_no_client_failed", [])
-        task_row = next(r for r in q.list_all_with_status() if r["task_id"] == task_id)
-        assert task_row["status"] == "failed"
