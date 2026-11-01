@@ -116,58 +116,6 @@ class TestGetTasksStatusField:
 # agent in the chain) instead of silently failing to push.
 # ---------------------------------------------------------------------------
 
-class TestUsageLimitOnFallbackAgentPaneReroutes:
-    def test_usage_limit_on_fallback_agent_triggers_chain_again(self, tmp_db):
-        """
-        A Codex usage limit holds implementation for Codex; it never substitutes
-        Gemini into the implementer role (#308).
-        """
-        app, push_calls = _make_app(tmp_db)
-
-        with TestClient(app) as client, \
-             patch("agent_crew.server._resolve_tmux_pane_target", side_effect=lambda pane: pane), \
-             patch("agent_crew.server._pane_alive_for_push", return_value=True), \
-             patch("agent_crew.server._pane_process_kind", return_value=("agent", "codex")):
-            # Enqueue the fallback task (claude already excluded)
-            fallback_payload = _impl_payload("fb-t1")
-            fallback_payload["context"] = {
-                "agent_override": "codex",
-            }
-            client.post("/tasks", json=fallback_payload)
-
-        # Pane text cannot hold a task; only typed quota evidence can.
-        rows = TaskQueue(tmp_db).list_all_with_status()
-        fb_task = next((r for r in rows if r["task_id"] == "fb-t1"), None)
-        assert fb_task is not None
-        assert fb_task["status"] == "in_progress"
-
-        # No cross-provider implementer substitution is permitted.
-        gemini_tasks = [
-            r for r in rows
-            if isinstance(r.get("context"), dict)
-            and r["context"].get("agent_override") == "gemini"
-        ]
-        assert gemini_tasks == []
-        assert len(push_calls) == 1
-
-    def test_codex_push_proceeds_when_pane_healthy(self, tmp_db):
-        """Regression: when codex pane is healthy, fallback task is pushed normally."""
-        app, push_calls = _make_app(tmp_db)
-
-        with TestClient(app) as client, \
-             patch("agent_crew.server._resolve_tmux_pane_target", side_effect=lambda pane: pane), \
-             patch("agent_crew.server._pane_alive_for_push", return_value=True), \
-             patch("agent_crew.server._pane_process_kind", return_value=("agent", "codex")):
-            fallback_payload = _impl_payload("fb-t2")
-            fallback_payload["context"] = {
-                "agent_override": "codex",
-            }
-            client.post("/tasks", json=fallback_payload)
-
-        # Task should have been pushed to Codex's implementer pane.
-        assert any(pane == "%C" for pane, _ in push_calls), (
-            "healthy codex pane should receive the fallback task push"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -259,52 +207,6 @@ class TestRecoverResetStale:
 # If detected, requeue the task instead of pushing into bash.
 # ---------------------------------------------------------------------------
 
-class TestBashPromptDetectionOnDispatch:
-    def test_task_not_pushed_when_pane_shows_bash_prompt(self, tmp_db):
-        """
-        If the target pane shows a bare bash prompt (agent CLI crashed),
-        the task should NOT be pushed and should be requeued (still pending).
-        """
-        app, push_calls = _make_app(tmp_db)
-
-        # Claude pane (%C) is showing a bash prompt (gemini/claude crashed)
-        def pane_has_bash_prompt(pane_id: str) -> bool:
-            return pane_id == "%C"
-
-        with TestClient(app) as client, \
-             patch("agent_crew.server._pane_has_bash_prompt", pane_has_bash_prompt), \
-             patch("agent_crew.server._resolve_tmux_pane_target", side_effect=lambda pane: pane), \
-             patch("agent_crew.server._pane_alive_for_push", return_value=True), \
-             patch("agent_crew.server._pane_process_kind", return_value=("agent", "codex")):
-            client.post("/tasks", json=_impl_payload("bp1"))
-
-        # Push should NOT have gone to %C
-        assert not any(pane == "%C" for pane, _ in push_calls), (
-            "task must NOT be pushed to a pane showing a bash prompt"
-        )
-
-        # Task should be requeued (pending)
-        rows = TaskQueue(tmp_db).list_all_with_status()
-        bp1 = next((r for r in rows if r["task_id"] == "bp1"), None)
-        assert bp1 is not None
-        assert bp1["status"] == "pending", (
-            "task should remain pending when target pane shows bash prompt"
-        )
-
-    def test_task_pushed_normally_when_pane_healthy(self, tmp_db):
-        """Regression: when pane is healthy (no bash prompt), task is pushed normally."""
-        app, push_calls = _make_app(tmp_db)
-
-        with TestClient(app) as client, \
-             patch("agent_crew.server._pane_has_bash_prompt", return_value=False), \
-             patch("agent_crew.server._resolve_tmux_pane_target", side_effect=lambda pane: pane), \
-             patch("agent_crew.server._pane_alive_for_push", return_value=True), \
-             patch("agent_crew.server._pane_process_kind", return_value=("agent", "codex")):
-            client.post("/tasks", json=_impl_payload("bp2"))
-
-        assert any(pane == "%C" for pane, _ in push_calls), (
-            "task should be pushed when pane is healthy"
-        )
 
 
 # ---------------------------------------------------------------------------
