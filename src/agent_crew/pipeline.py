@@ -58,6 +58,34 @@ from agent_crew.cea import callsites as _cea_callsites
 logger = logging.getLogger(__name__)
 
 
+def git_fetch_timeout_s() -> float:
+    """One runtime timeout for every crew-managed fetch."""
+    try:
+        value = float(os.getenv("AGENT_CREW_GIT_FETCH_TIMEOUT_S", "180"))
+        return value if math.isfinite(value) and value > 0 else 180.0
+    except ValueError:
+        return 180.0
+
+
+def git_fetch_refspec(branch: str) -> str:
+    return f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
+
+
+def git_fetch_origin(repo_cwd: str, *branches: str) -> subprocess.CompletedProcess:
+    """Fetch named branches only, without opportunistic maintenance."""
+    refs = list(dict.fromkeys(git_fetch_refspec(branch) for branch in branches if branch))
+    if not refs:
+        raise ValueError("fetch requires at least one named branch")
+    command = ["git", "-C", repo_cwd, "-c", "gc.auto=0", "-c",
+               "maintenance.auto=false", "fetch", "origin", *refs, "--quiet"]
+    try:
+        return subprocess.run(
+            command, capture_output=True, text=True, timeout=git_fetch_timeout_s(),
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(command, 124, "", "fetch timed out")
+
+
 def successor_context(parent_context: object) -> dict:
     """Copy task metadata without the parent's per-receipt CEA decisions.
 
@@ -187,12 +215,7 @@ def verify_implement_artifact(
         ancestor = base
         rebase_tip = ""
         if has_rebase_target:
-            target_fetch = subprocess.run(
-                ["git", "-C", repo_cwd, "fetch", "origin",
-                 f"+refs/heads/{rebase_target}:refs/remotes/origin/{rebase_target}",
-                 "--quiet"],
-                capture_output=True, text=True, timeout=60,
-            )
+            target_fetch = git_fetch_origin(repo_cwd, rebase_target)
             if target_fetch.returncode != 0:
                 return False, f"rebase_onto target {rebase_target!r} is unavailable on origin"
             resolved_target = subprocess.run(
@@ -219,10 +242,7 @@ def verify_implement_artifact(
         # not discard code that origin can prove was pushed.  Deriving only
         # from the reported branch's fetched origin ref keeps this a git proof,
         # never a trust decision over summary prose.
-        fetch = subprocess.run(
-            ["git", "-C", repo_cwd, "fetch", "origin", branch, "--quiet"],
-            capture_output=True, text=True, timeout=60,
-        )
+        fetch = git_fetch_origin(repo_cwd, branch)
         derived_commit = False
         if not commit:
             if fetch.returncode != 0:
@@ -377,7 +397,12 @@ def verify_task_artifact(
 
 
 def _git(repo_cwd: str, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", repo_cwd, *args],
+    command = ["git", "-C", repo_cwd, *args]
+    if args and args[0] == "fetch":
+        command = ["git", "-C", repo_cwd, "-c", "gc.auto=0", "-c",
+                   "maintenance.auto=false", *args]
+        timeout = git_fetch_timeout_s()
+    return subprocess.run(command,
                           capture_output=True, text=True, timeout=timeout)
 
 
@@ -456,11 +481,11 @@ def verify_rebase_artifact(
     if branch == target:
         return False, "rebased branch is the rebase target"
     try:
-        if _git(repo_cwd, "fetch", "origin", target, "--quiet", timeout=60).returncode != 0:
+        if _git(repo_cwd, "fetch", "origin", git_fetch_refspec(target), "--quiet").returncode != 0:
             return False, f"rebase target origin/{target} unavailable"
         # Fetching the branch first is what #374's second case lacked: after a
         # force-push the new head is not local until it is fetched.
-        if _git(repo_cwd, "fetch", "origin", branch, "--quiet", timeout=60).returncode != 0:
+        if _git(repo_cwd, "fetch", "origin", git_fetch_refspec(branch), "--quiet").returncode != 0:
             return False, f"rebased branch origin/{branch} is not pushed"
         head = _git(repo_cwd, "rev-parse", "--verify", f"origin/{branch}^{{commit}}")
         tip = _git(repo_cwd, "rev-parse", "--verify", f"origin/{target}^{{commit}}")
@@ -561,7 +586,7 @@ def verify_report_artifact(
             return False, "artifact repository unavailable"
         try:
             if branch and _SAFE_REF_RE.match(branch):
-                _git(repo_cwd, "fetch", "origin", branch, "--quiet", timeout=60)
+                _git(repo_cwd, "fetch", "origin", git_fetch_refspec(branch), "--quiet")
             shown = _git(repo_cwd, "show", f"{commit}:{path}")
         except Exception as exc:
             return False, f"artifact verification unavailable: {type(exc).__name__}"

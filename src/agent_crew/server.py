@@ -76,6 +76,7 @@ from agent_crew.pipeline import (
     fix_task_id,
     stale_review_task_id,
     verify_implement_artifact,
+    git_fetch_origin,
 )
 from agent_crew import provenance as _prov
 from agent_crew.protocol import (
@@ -769,6 +770,12 @@ class WorktreeUnhealthy(WorktreePrepRefused):
     reason = "worktree_unhealthy"
 
 
+class WorktreeFetchFailed(WorktreePrepRefused):
+    """The declared implementer base could not be refreshed from origin."""
+
+    reason = "prep_fetch_failed"
+
+
 class WorktreeTargetUnresolved(WorktreePrepRefused):
     """The task named a PR whose head could not be resolved (#289).
 
@@ -996,9 +1003,10 @@ def _prepare_worktree_for_task(
       via `gh pr view` so the worktree tracks the real PR branch rather than
       the base branch stored in task.branch.
 
-    A survivable implementer prep error uses a verified caller base or the
-    worktree HEAD. Reviewers and testers cannot substitute the worktree HEAD
-    for the PR revision; they may only use their own recorded pin, verified
+    A fetch failure refuses implementer dispatch; other survivable prep errors
+    may use a verified caller base or the worktree HEAD. Reviewers and testers
+    cannot substitute the worktree HEAD for the PR revision; they may only use
+    their own recorded pin, verified
     as the detached HEAD (#824). The delivery paths refuse to launch without a
     base.
     """
@@ -1020,10 +1028,8 @@ def _prepare_worktree_for_task(
                 task_context.pop("prep_error_base_source", None)
         return prepared
     except WorktreePrepRefused:
-        # ⛔Not swallowed. Every other prep failure is survivable — a stash
-        #   conflict, a slow fetch — and dispatch continues on a worktree that
-        #   is merely stale. This one is not: continuing means reviewing the
-        #   wrong artifact and saying nothing (#289).
+        # A failed fetch is a typed refusal. An implementer must not start
+        # from the shared worktree's unrelated HEAD (#900).
         raise
     except Exception as exc:
         logger.exception(
@@ -1297,12 +1303,9 @@ def _prepare_worktree_for_task_inner(
                 f"{role} {task_id}: cannot stash worktree {worktree_path}; "
                 "manual recovery required before dispatch"
             )
-    # Fetch all remote branches so the target ref is up to date.
-    fetch = subprocess.run(
-        ["git", "-C", worktree_path, "fetch", "origin", "--quiet"],
-        capture_output=True, text=True,
-        timeout=60,
-    )
+    # Fetch only the declared base. Task/PR branch fetches follow once their
+    # names are known; a fresh implement branch does not exist on origin yet.
+    fetch = git_fetch_origin(worktree_path, main_branch)
 
     if role == "implementer":
         # Fresh branch per task from the configured base (#140/#353). Use task.branch when
@@ -1318,8 +1321,19 @@ def _prepare_worktree_for_task_inner(
         # The cascade sets both lineage fields when it creates a fix task.
         continuing_branch = bool(task_context.get("pr_number")) or bool(
             task_context.get("prev_task_id") and task_context.get("fix_round"))
+        if continuing_branch or task_context.get("crew_run_branch"):
+            branch_fetch = git_fetch_origin(worktree_path, branch)
+            # A task may name a new output branch that has not been pushed.
+            # In that case prep uses the declared base, never an old ref.
+            if (continuing_branch and branch_fetch.returncode != 0 and not pinned_base
+                    and "couldn't find remote ref" not in (branch_fetch.stderr or "")):
+                raise WorktreeFetchFailed(
+                    f"implementer {task_id}: could not fetch origin/{branch}: "
+                    f"{branch_fetch.stderr.strip()}"
+                )
         remote_branch = (_branch_ref(worktree_path, f"refs/remotes/origin/{branch}")
-                         if task_type in ("", "implement") and continuing_branch else "")
+                         if task_type in ("", "implement") and continuing_branch
+                         and branch_fetch.returncode == 0 else "")
         branch_start = ""
         if task_context.get("crew_run_branch"):
             # The caller's existing branch supplies its own content. Only a
@@ -1331,7 +1345,20 @@ def _prepare_worktree_for_task_inner(
             else:
                 branch_start = remote or local
         if discover_default and not pinned_base and not branch_start and not remote_branch:
-            main_branch = _remote_default_branch(worktree_path)
+            discovered = _remote_default_branch(worktree_path)
+            if discovered != main_branch:
+                main_branch = discovered
+                fetch = git_fetch_origin(worktree_path, main_branch)
+        # A pinned commit or freshly fetched PR branch is already a proven
+        # base. A failed main fetch matters only when checkout needs main.
+        if (fetch.returncode != 0 and not pinned_base and not remote_branch
+                and not branch_start
+                and (_pre_stash.returncode == 0 or
+                     (_is_repo.returncode == 0 and _is_repo.stdout.strip() == "true"))):
+            raise WorktreeFetchFailed(
+                f"implementer {task_id}: could not fetch origin/{main_branch}: "
+                f"{fetch.stderr.strip()}"
+            )
         base_ref = pinned_base or remote_branch or f"origin/{main_branch}"
         base_sha = _branch_ref(worktree_path, base_ref)
         checkout_base = base_sha or base_ref
@@ -1398,12 +1425,9 @@ def _prepare_worktree_for_task_inner(
                         f"_prepare_worktree_for_task: implementer checkout {branch} "
                         f"from {checkout_base} failed: {r.stderr.strip()}"
                     )
-        # #358: a failed or unresolvable prep has no proven base. Returning the
-        # old HEAD here made an unrelated PR branch look like the dispatch base
-        # (#397). Dispatch continues with explicit unknown; the artifact gate
-        # already refuses a completed implementation with no known base.
-        fresh_base = bool(pinned_base) or fetch.returncode == 0
-        return (base_sha if fresh_base and checkout_ok
+        # #358: the selected base must be the commit actually checked out.
+        # The old shared HEAD cannot stand in for an unresolved base (#397).
+        return (base_sha if checkout_ok
                 and _worktree_head(worktree_path) == base_sha else "")
     else:
         # ⛔The roles have different input commits: an implementer starts from
@@ -1467,6 +1491,16 @@ def _prepare_worktree_for_task_inner(
                     f"not be resolved, and there is no valid reviewed_sha pin. "
                     f"Refusing to fall back to task.branch={task_branch!r}, which "
                     f"for a PR task is the base branch (#289)."
+                )
+
+        if pr_branch and pr_branch != main_branch:
+            branch_fetch = git_fetch_origin(worktree_path, pr_branch)
+            if (branch_fetch.returncode != 0 and not _pinned_sha
+                    and not (task_type == "discuss" and "couldn't find remote ref"
+                             in (branch_fetch.stderr or ""))):
+                raise WorktreeTargetUnresolved(
+                    f"{role} {task_id}: could not fetch origin/{pr_branch}: "
+                    f"{branch_fetch.stderr.strip()}"
                 )
 
         if discover_default and not pr_branch and not _pinned_sha:
@@ -2799,7 +2833,8 @@ _LINEAGE_REASON_CODES = frozenset({
     "agent_failed", "capacity", "config_error", "provider_limit", "timeout",
     "test_failure", "transient", "no_artifact", "watchdog_timeout",
     "watchdog_script_test_timeout", "orphan_lease_expired",
-    "worktree_prep_refused", "worktree_unhealthy", "pr_head_unresolved",
+    "worktree_prep_refused", "worktree_unhealthy", "prep_fetch_failed",
+    "pr_head_unresolved",
     "worktree_base_unresolved", "prepared_base_not_recorded",
     "wip_restore_conflict", "missing_role_protocol", "no_worktree",
     "pane_target_unresolvable", "pane_not_owned", "dispatch_exception",
