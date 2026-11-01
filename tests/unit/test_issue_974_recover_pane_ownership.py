@@ -86,7 +86,11 @@ def test_recover_recreates_two_crews_in_their_own_sessions_after_tmux_restart(tm
         assert state["session"] == f"crew_{project}"
         assert state["pane_ids"] == sessions[f"crew_{project}"]
         assert len(state["pane_ids"]) == 2
-        assert state["pane_map"] == {}
+        first, second = state["pane_ids"]
+        assert state["pane_map"] == {
+            "claude": first, "reviewer": first,
+            "codex": second, "implementer": second,
+        }
     assert sessions["caller"] == ["%0", "%1"]
     assert [cmd[cmd.index("-t") + 1] for cmd in commands if cmd[1] == "split-window"] == [
         "crew_alpha:0", "crew_beta:0",
@@ -120,6 +124,28 @@ def test_recover_replaces_foreign_pane_even_when_id_is_alive(tmp_path, monkeypat
     assert state["pane_ids"] == ["%8"]
     assert set(state["pane_map"].values()) == {"%8"}
     assert any(cmd[1] == "split-window" for cmd in calls)
+
+
+def test_recover_missing_session_restores_all_roles_for_one_agent(tmp_path, monkeypatch):
+    _prepare(monkeypatch)
+    _state(tmp_path, "alpha", agents=("claude",))
+
+    def tmux(args, **_kwargs):
+        if args[1] == "has-session":
+            return _result(1)
+        if args[1] == "new-session":
+            return _result(stdout="%8\n")
+        if args[1] == "select-layout":
+            return _result()
+        raise AssertionError(args)
+
+    monkeypatch.setattr(cli.subprocess, "run", tmux)
+    result = CliRunner().invoke(cli.crew, ["recover", "alpha", "--base", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    state = json.loads((tmp_path / "alpha" / "state.json").read_text())
+    assert state["pane_map"] == {
+        "claude": "%8", "implementer": "%8", "reviewer": "%8", "tester": "%8",
+    }
 
 
 def test_failed_split_exits_without_success_and_clears_stale_id(tmp_path, monkeypatch):

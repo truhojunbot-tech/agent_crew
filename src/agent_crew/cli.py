@@ -2061,8 +2061,20 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
                 state.get("agents", []), pane_ids, proj_dir,
                 role_based=bool(state.get("role_based")),
             )
+            pane_map = {}
+            for i, (agent, pane_id) in enumerate(zip(agent_list, pane_ids)):
+                if state.get("role_based"):
+                    role = _ROLES[i] if i < len(_ROLES) else "implementer"
+                else:
+                    role = resolve_agent_role(agent)
+                pane_map[role] = pane_id
+                pane_map[agent] = pane_id
+            if len(agent_list) == 1:
+                for role in ("implementer", "reviewer", "tester"):
+                    pane_map.setdefault(role, pane_ids[0])
             state["window"] = "0"
             state["pane_ids"] = pane_ids
+            state["pane_map"] = pane_map
             _write_state(base, project, state)
             if _dispatcher_mode:
                 pane_map_file = os.path.join(proj_dir, "pane_map.json")
