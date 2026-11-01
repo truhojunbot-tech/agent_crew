@@ -325,7 +325,7 @@ def test_unresolved_implement_base_refuses_without_moving_head(tmp_path):
 
 
 def test_failed_fetch_cannot_turn_a_stale_tracking_ref_into_known_base(tmp_path):
-    from agent_crew.server import _prepare_worktree_for_task
+    from agent_crew.server import WorktreeFetchFailed, _prepare_worktree_for_task
 
     origin = tmp_path / "origin.git"
     _git(tmp_path, "init", "--bare", "-b", "main", str(origin))
@@ -339,5 +339,9 @@ def test_failed_fetch_cannot_turn_a_stale_tracking_ref_into_known_base(tmp_path)
     _git(worker, "push", "origin", "main")
     _git(worker, "remote", "set-url", "origin", str(tmp_path / "missing.git"))
 
-    assert _prepare_worktree_for_task(str(worker), "impl-next", "fix/next",
-                                      "implementer", {}) == ""
+    head = _git(worker, "rev-parse", "HEAD").stdout.strip()
+    with pytest.raises(WorktreeFetchFailed) as exc:
+        _prepare_worktree_for_task(str(worker), "impl-next", "fix/next",
+                                   "implementer", {})
+    assert exc.value.reason == "prep_fetch_failed"
+    assert _git(worker, "rev-parse", "HEAD").stdout.strip() == head

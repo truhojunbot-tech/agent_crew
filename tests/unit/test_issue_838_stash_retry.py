@@ -26,7 +26,7 @@ def _run_prep(monkeypatch, stash_errors):
             return subprocess.CompletedProcess(command, 1 if error else 0, "", error)
         if command[3:5] == ["rev-parse", "--is-inside-work-tree"]:
             return subprocess.CompletedProcess(command, 0, "true\n", "")
-        if command[3:5] == ["fetch", "origin"]:
+        if "fetch" in command and "origin" in command:
             raise ReachedFetch
         raise AssertionError(f"unexpected git command: {command}")
 

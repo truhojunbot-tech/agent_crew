@@ -124,7 +124,7 @@ def test_rebase_artifact_descending_from_declared_origin_target_passes(monkeypat
     ok, detail = verify_implement_artifact(task, result, repo_cwd="/repo")
 
     assert ok is True, detail
-    assert any(call[3] == "fetch" and any(
+    assert any("fetch" in call and any(
         "refs/heads/main:refs/remotes/origin/main" in arg for arg in call
     ) for call in calls)
     assert any(call[-1] == "origin/main^{commit}" for call in calls)
