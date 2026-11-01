@@ -573,6 +573,16 @@ def _pane_alive(pane_id: str) -> bool:
     return r.returncode == 0 and r.stdout.strip() == pane_id
 
 
+def _pane_in_window(pane_id: str, session: str, window: str) -> bool:
+    """A reused global pane id is not evidence that this crew owns the pane."""
+    r = subprocess.run(
+        ["tmux", "display-message", "-t", pane_id, "-p",
+         "#{session_name}:#{window_index}"],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0 and r.stdout.strip() == f"{session}:{window}"
+
+
 def _pane_cwd(pane_id: str) -> str | None:
     """Get the current working directory of a tmux pane."""
     r = subprocess.run(
@@ -2008,19 +2018,40 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
     ).returncode == 0
 
     if not has_session:
-        # Original session is gone — fall back to current tmux session/window.
-        cur_session, cur_window = _resolve_tmux_window(proj_dir)
-        window_target = f"{cur_session}:{cur_window}"
-        pane_ids: list[str] = []
-        for _, wt_path in worktrees.items():
+        # Pane ids are global and may now belong to another crew after a tmux restart.
+        agent_list = state.get("agents", [])
+        state["pane_ids"] = []
+        state["pane_map"] = {}
+        _write_state(base, project, state)
+        new_session = ["tmux", "new-session", "-d", "-s", session_name,
+                       "-x", "240", "-y", "60", "-P", "-F", "#{pane_id}"]
+        first_wt = worktrees.get(agent_list[0], "") if agent_list else ""
+        if first_wt:
+            new_session += ["-c", first_wt]
+        created = subprocess.run(new_session, capture_output=True, text=True)
+        if created.returncode != 0 or (agent_list and not created.stdout.strip()):
+            raise click.ClickException(
+                f"Failed to create tmux session {session_name}: {created.stderr.strip() or 'no pane id returned'}"
+            )
+        window_target = f"{session_name}:0"
+        pane_ids = [created.stdout.strip()] if agent_list else []
+        for agent in agent_list[1:]:
+            wt_path = worktrees.get(agent, "")
             result = subprocess.run(
                 ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target,
                  "-P", "-F", "#{pane_id}"],
                 capture_output=True, text=True,
             )
             pane_id = result.stdout.strip()
-            if pane_id:
-                pane_ids.append(pane_id)
+            if result.returncode != 0 or not pane_id:
+                subprocess.run(["tmux", "kill-session", "-t", session_name],
+                               capture_output=True)
+                state["pane_ids"] = []
+                _write_state(base, project, state)
+                raise click.ClickException(
+                    f"Failed to create pane for {agent}: {result.stderr.strip() or 'no pane id returned'}"
+                )
+            pane_ids.append(pane_id)
         subprocess.run(
             ["tmux", "select-layout", "-t", window_target, "main-vertical"],
             capture_output=True,
@@ -2030,9 +2061,20 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
                 state.get("agents", []), pane_ids, proj_dir,
                 role_based=bool(state.get("role_based")),
             )
-            state["session"] = cur_session
-            state["window"] = cur_window or "0"
+            pane_map = {}
+            for i, (agent, pane_id) in enumerate(zip(agent_list, pane_ids)):
+                if state.get("role_based"):
+                    role = _ROLES[i] if i < len(_ROLES) else "implementer"
+                else:
+                    role = resolve_agent_role(agent)
+                pane_map[role] = pane_id
+                pane_map[agent] = pane_id
+            if len(agent_list) == 1:
+                for role in ("implementer", "reviewer", "tester"):
+                    pane_map.setdefault(role, pane_ids[0])
+            state["window"] = "0"
             state["pane_ids"] = pane_ids
+            state["pane_map"] = pane_map
             _write_state(base, project, state)
             if _dispatcher_mode:
                 pane_map_file = os.path.join(proj_dir, "pane_map.json")
@@ -2041,7 +2083,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
                         json.dump({}, f)
                 except OSError:
                     pass
-        recovered.append("tmux")
+            recovered.append("tmux")
     else:
         # Session exists — validate window before touching tmux to avoid killing wrong panes
         window = state.get("window", "0")
@@ -2072,7 +2114,9 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
                 wt_path = worktrees.get(agent, "")
 
                 # Check if pane exists and is alive with valid worktree
-                if pane_id and _pane_alive(pane_id) and wt_path and os.path.isdir(wt_path):
+                if (pane_id and _pane_alive(pane_id)
+                        and _pane_in_window(pane_id, session_name, window)
+                        and wt_path and os.path.isdir(wt_path)):
                     # Keep alive pane that has valid worktree context
                     new_pane_ids.append(pane_id)
                     continue
@@ -2091,14 +2135,24 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
                 split_cmd += ["-t", window_target, "-P", "-F", "#{pane_id}"]
                 r = subprocess.run(split_cmd, capture_output=True, text=True)
                 new_id = r.stdout.strip()
-                if new_id:
+                if r.returncode == 0 and new_id:
                     new_pane_ids.append(new_id)
                     dead_agents.append(agent)
                     dead_targets.append(new_id)
                 else:
-                    # Fallback to existing if split failed
-                    click.echo(f"Warning: failed to create pane for {agent}", err=True)
-                    new_pane_ids.append(pane_id or "unknown")
+                    for created_id in dead_targets:
+                        subprocess.run(["tmux", "kill-pane", "-t", created_id],
+                                       capture_output=True)
+                    kept_ids = ["" if pid in dead_targets else pid for pid in new_pane_ids]
+                    state["pane_ids"] = kept_ids + [""] * (len(agent_list) - len(kept_ids))
+                    state["pane_map"] = {
+                        role: pid for role, pid in state.get("pane_map", {}).items()
+                        if pid in kept_ids and pid
+                    }
+                    _write_state(base, project, state)
+                    raise click.ClickException(
+                        f"Failed to create pane for {agent}: {r.stderr.strip() or 'no pane id returned'}"
+                    )
 
             if dead_agents:
                 subprocess.run(
@@ -2108,12 +2162,14 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
                 setup_module.start_log_viewers_in_panes(
                     dead_agents, dead_targets, proj_dir
                 )
-                pane_map = state.get("pane_map", {})
+                old_pane_map = state.get("pane_map", {})
+                pane_map = {key: pid for key, pid in old_pane_map.items()
+                            if pid in new_pane_ids}
                 for i, (a, pid) in enumerate(zip(agent_list, new_pane_ids)):
                     old_pid = existing_pane_ids[i] if i < len(existing_pane_ids) else None
                     old_roles = [
                         role for role in ("implementer", "reviewer", "tester")
-                        if old_pid and pane_map.get(role) == old_pid
+                        if old_pid and old_pane_map.get(role) == old_pid
                     ]
                     for role in old_roles or [resolve_agent_role(a)]:
                         pane_map[role] = pid
