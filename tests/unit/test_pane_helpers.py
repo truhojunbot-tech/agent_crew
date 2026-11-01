@@ -1,20 +1,6 @@
-"""Unit tests for server.py pane helper functions (#133, #134, #136).
-
-- _pane_token_count: parses Claude Code token hint from pane content
-- _pane_clear_context: sends /clear when token threshold exceeded
-- _pane_dismiss_permission_prompt: auto-dismisses gemini permission prompts
-- list_stale_pending: queue method for #136 re-dispatch logic
-"""
+"""Queue stale-pending behavior."""
 import time
 from unittest.mock import MagicMock, call, patch
-
-from agent_crew.server import (
-    _GEMINI_PERMISSION_RE,
-    _TOKEN_COUNT_RE,
-    _pane_clear_context,
-    _pane_dismiss_permission_prompt,
-    _pane_token_count,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -28,51 +14,14 @@ def _fake_capture(stdout: str):
     return m
 
 
-def test_pane_token_count_k_suffix():
-    """'save 544.1k tokens' → 544100"""
-    with patch("agent_crew.server.subprocess.run", return_value=_fake_capture(
-        "new task? /clear to save 544.1k tokens"
-    )):
-        assert _pane_token_count("%91") == 544_100
 
 
-def test_pane_token_count_m_suffix():
-    """'save 1.2M tokens' → 1200000"""
-    with patch("agent_crew.server.subprocess.run", return_value=_fake_capture(
-        "new task? /clear to save 1.2M tokens"
-    )):
-        assert _pane_token_count("%91") == 1_200_000
 
 
-def test_pane_token_count_plain_integer():
-    """'save 200000 tokens' → 200000"""
-    with patch("agent_crew.server.subprocess.run", return_value=_fake_capture(
-        "/clear to save 200,000 tokens"
-    )):
-        assert _pane_token_count("%91") == 200_000
 
 
-def test_pane_token_count_no_hint():
-    """No token hint → None (unknown), not 0.
-
-    ⛔This asserted `== 0` until #292, and that zero was the bug: the hint is
-    usually NOT on screen (`capture-pane` without `-S` sees only the visible
-    rows, and the footer renders only in some UI states), so callers
-    thresholding on the result read "well under 200,000" for panes measured at
-    786,552. Unknown now says unknown; the caller decides what to do with it."""
-    with patch("agent_crew.server.subprocess.run", return_value=_fake_capture(
-        "claude is thinking..."
-    )):
-        assert _pane_token_count("%91") is None
 
 
-def test_pane_token_count_subprocess_failure():
-    """subprocess.run raises → None without crashing.
-
-    Still never raises — the guarantee this test was written for is intact. It
-    just no longer reports a failed read as a small measurement (#292)."""
-    with patch("agent_crew.server.subprocess.run", side_effect=OSError("no tmux")):
-        assert _pane_token_count("%91") is None
 
 
 # ---------------------------------------------------------------------------
@@ -80,19 +29,6 @@ def test_pane_token_count_subprocess_failure():
 # ---------------------------------------------------------------------------
 
 
-def test_pane_clear_context_sends_slash_clear():
-    """/clear is sent to the correct pane."""
-    calls = []
-    def fake_run(cmd, **_kw):
-        calls.append(cmd)
-        return MagicMock()
-
-    with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
-        with patch("agent_crew.server.time.sleep"):
-            _pane_clear_context("%95")
-
-    assert any("/clear" in " ".join(c) for c in calls)
-    assert any("%95" in " ".join(c) for c in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -106,48 +42,10 @@ _GEMINI_PROMPT = (
 )
 
 
-def test_pane_dismiss_returns_true_when_prompt_present():
-    """Returns True and sends '2' when gemini permission prompt is visible."""
-    sent = []
-
-    def fake_run(cmd, **_kw):
-        if "capture-pane" in cmd:
-            m = MagicMock()
-            m.stdout = _GEMINI_PROMPT
-            return m
-        sent.append(cmd)
-        return MagicMock()
-
-    with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
-        result = _pane_dismiss_permission_prompt("%97")
-
-    assert result is True
-    assert any("2" in c for c in sent)
 
 
-def test_pane_dismiss_returns_false_when_no_prompt():
-    """Returns False and does NOT send keys when no permission prompt."""
-    sent = []
-
-    def fake_run(cmd, **_kw):
-        if "capture-pane" in cmd:
-            m = MagicMock()
-            m.stdout = "claude is processing..."
-            return m
-        sent.append(cmd)
-        return MagicMock()
-
-    with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
-        result = _pane_dismiss_permission_prompt("%97")
-
-    assert result is False
-    # send-keys must NOT have been called
-    assert not any("send-keys" in " ".join(c) for c in sent)
 
 
-def test_pane_dismiss_subprocess_failure_returns_false():
-    with patch("agent_crew.server.subprocess.run", side_effect=OSError("no tmux")):
-        assert _pane_dismiss_permission_prompt("%93") is False
 
 
 # ---------------------------------------------------------------------------

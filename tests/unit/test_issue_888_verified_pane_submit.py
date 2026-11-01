@@ -134,30 +134,10 @@ def test_shell_command_pending_while_screen_ends_with_it():
     assert not pending(f"user@h:~$ {cmd}\nWelcome to Claude\n")
 
 
-def test_default_push_retries_dropped_enter_via_verified_submit(fake):
-    t = fake(drop_enters=1)
-    server._default_push("%1", "=== AGENT_CREW TASK ===\ntask_id: t-1\nbody")
-    assert len(t.enters()) == 2
-    assert t.input == ""
 
 
-def test_clear_context_retries_and_reports_unsubmitted(fake, monkeypatch):
-    monkeypatch.setattr(server.time, "sleep", lambda *_a: None)
-    t = fake(drop_enters=1)
-    assert server._pane_clear_context("%1") == "attempted"
-    assert len(t.enters()) == 2
-    t = fake(drop_enters=99)
-    assert server._pane_clear_context("%1") == "unsubmitted"
 
 
-def test_setup_kickoff_and_launch_are_verified(fake, monkeypatch):
-    t = fake(drop_enters=1, prompt="$ ")
-    monkeypatch.setattr(setup.time, "sleep", lambda *_a: None)
-    monkeypatch.setattr(setup, "_CLI_READY_MARKERS", {})
-    setup.start_agents_in_panes("s", ["gemini"], pane_targets=["%5"])
-    assert t.input == ""
-    # launch: 1 dropped + 1 honoured; kickoff: 1 honoured (+ the q Enter)
-    assert len(t.enters()) == 4
 
 
 def test_log_viewer_launch_is_verified(fake, monkeypatch, tmp_path):

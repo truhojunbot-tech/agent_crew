@@ -294,12 +294,7 @@ def _verify_project_server(port: int, project: str) -> None:
         raise click.ClickException(str(exc)) from exc
 
 
-_PANE_IDLE_PATTERNS = [
-    "$",            # shell prompt (agent CLI exited)
-    "❯",            # zsh prompt
-    ">>>",          # python repl
-    "Completed",    # common completion signal
-]
+
 
 
 def _git_repo_identity(path: str) -> tuple[str, str] | None:
@@ -569,74 +564,6 @@ def _resolve_tmux_window(proj_dir: str) -> tuple[str, str]:
 PANE_PROBE_TIMEOUT_S = 5.0
 
 
-def _capture_pane(target: str) -> str | None:
-    """Capture last 5 lines of a tmux pane. target is a pane_id (e.g. '%42')
-    or a session:window.pane spec. Returns None if tmux fails.
-
-    ⛔"tmux fails" includes tmux being absent or wedged, not just exiting
-      non-zero. This runs every poll of the `crew run` wait loop, so an
-      escaping exception here would abort the loop before it could
-      auto-submit a result and the task would sit in_progress forever.
-    """
-    try:
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-t", target, "-p", "-S", "-5"],
-            capture_output=True, text=True, timeout=PANE_PROBE_TIMEOUT_S,
-        )
-    except Exception:  # noqa: BLE001 — a probe must never break the caller
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout
-
-
-def _pane_looks_idle(pane_output: str) -> bool:
-    """Last-line prompt heuristic — kept as a fallback signal alongside the
-    content-diff probe in `_wait`. Returns True if the last visible line
-    contains one of the canonical idle markers (bare prompt or completion
-    keyword). Brittle on multi-line agent footers (Claude Code's
-    ``⏵⏵ bypass permissions`` line is the last one when the prompt is
-    actually idle), so the watchdog and `_wait` rely primarily on
-    `_pane_changed` instead."""
-    last_line = pane_output.rstrip().rsplit("\n", 1)[-1] if pane_output.strip() else ""
-    return any(pat in last_line for pat in _PANE_IDLE_PATTERNS)
-
-
-# Per-pane snapshot for `_pane_changed`. Mutated only inside `_wait` (single
-# CLI invocation, single thread), so the dict can live at module scope.
-_PANE_CONTENT_LAST: dict[str, str] = {}
-
-
-def _reset_pane_content_cache() -> None:
-    """Clear the per-pane content snapshot. Test-only entry point."""
-    _PANE_CONTENT_LAST.clear()
-
-
-def _pane_changed(pane_target: str) -> bool:
-    """Return True if the pane capture differs from the previous call.
-
-    Text-agnostic idle detector — works against any agent CLI because it
-    compares whole captures rather than scraping for specific banner
-    strings (the same lesson #84-v2 codified for the server's watchdog).
-
-    First-call semantics: returns False (no prior snapshot to compare).
-    Mirrors `agent_crew.server._pane_is_busy` so the CLI and server use
-    the same convention. Callers seed the cache by calling once before
-    starting their idle clock.
-
-    tmux failure: returns False (inconclusive). The watchdog must never
-    auto-fail purely because a transient capture failed.
-    """
-    capture = _capture_pane(pane_target)
-    if capture is None:
-        return False
-    prev = _PANE_CONTENT_LAST.get(pane_target)
-    _PANE_CONTENT_LAST[pane_target] = capture
-    if prev is None:
-        return False
-    return capture != prev
-
-
 def _pane_alive(pane_id: str) -> bool:
     """Return True if the tmux pane still exists."""
     r = subprocess.run(
@@ -690,69 +617,6 @@ _HEALTHY_PANE_COMMANDS_LEGACY = {
 }
 _HEALTHY_PANE_COMMAND_DISPATCHER = {"python", "python3"}
 _DEAD_PANE_COMMANDS = {"bash", "sh", "zsh", "fish", "dash"}
-
-
-#: Idle window policy (#231).
-#:
-#: The old window was a flat 300s regardless of role, while #214 gives the
-#: implementer a 1800s dispatch budget. A full pytest suite is legitimately
-#: silent for 5+ minutes, so the watchdog was firing *below the length of
-#: normal work* — silence was being read as death. The window now scales
-#: with the caller's own timeout, with the previous 300s kept as a floor so
-#: short waits do not get slower to clean up.
-IDLE_FAIL_TIMEOUT_RATIO = 0.5
-IDLE_FAIL_FLOOR_SECONDS = 300.0
-IDLE_WARN_FRACTION = 0.5
-
-
-def idle_thresholds(wait_timeout: float) -> tuple[float, float]:
-    """``(warn_after, fail_after)`` seconds of pane silence for this task.
-
-    Scales with ``wait_timeout`` so a long-running role gets a proportionate
-    window, never dropping below the historical 300s.
-    """
-    try:
-        budget = float(wait_timeout)
-    except (TypeError, ValueError):
-        budget = 0.0
-    fail_after = max(IDLE_FAIL_FLOOR_SECONDS, budget * IDLE_FAIL_TIMEOUT_RATIO)
-    return fail_after * IDLE_WARN_FRACTION, fail_after
-
-
-def agent_liveness(pane_target: str) -> str:
-    """Is the agent in ``pane_target`` alive? ``alive`` | ``dead`` | ``unknown``.
-
-    Reuses the #195 crash signature: a pane whose foreground command is a
-    shell means the agent CLI exited. Anything else running is treated as
-    alive — deliberately conservative, because guessing "dead" is what
-    destroys real work, whereas guessing "alive" only costs a wait that the
-    caller's own timeout already bounds.
-    """
-    if not pane_target:
-        return "unknown"
-    try:
-        cmd = _pane_current_command(pane_target)
-    except Exception:  # noqa: BLE001
-        # Defence in depth. The helper is guarded, but this function states a
-        # policy the wait loop depends on — an escape here aborts `_wait`
-        # before it can auto-submit, stranding the task in_progress.
-        return "unknown"
-    if not cmd:
-        return "unknown"
-    return "dead" if cmd in _DEAD_PANE_COMMANDS else "alive"
-
-
-def should_auto_fail_idle(liveness: str) -> bool:
-    """Whether a pane that has gone quiet should be auto-failed (#231).
-
-    ⛔Only silence *plus* a dead process justifies failing. A quiet-but-alive
-      agent keeps its task — that is the entire bug this fixes.
-    ⚠️``unknown`` keeps the previous auto-fail behaviour on purpose. If tmux
-      cannot tell us anything, refusing to ever fail would let a genuinely
-      dead agent hold the queue for the whole wait_timeout on a transient
-      tmux hiccup.
-    """
-    return liveness != "alive"
 
 
 def _detect_dead_agent_panes(
@@ -1222,135 +1086,54 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
         sessions_file, agent_dicts, worktrees=worktrees, roles=roles_meta
     )
 
-    _dispatcher_mode = os.getenv("AGENT_CREW_DISPATCHER", "1").lower() not in ("0", "false", "no")
+    _dispatcher_mode = True
 
-    if not _dispatcher_mode:
-        # Agent panes live in the caller's own tmux window. Coordinator stays on
-        # the left (full height); agents stack vertically on the right via
-        # main-vertical layout. No width preflight — narrow windows get narrower
-        # agent panes rather than an error.
-        session_name, window_index = _resolve_tmux_window(proj_dir)
-        window_target = f"{session_name}:{window_index}"
-        _crew_log(proj_dir, f"tmux using session={session_name} window={window_index}: {_tmux_snapshot(session_name)}")
+    # Dispatcher owns delivery; panes display logs only.
+    # Dispatcher mode: create panes for log visibility but run tail -f instead
+    # of interactive CLIs. Agents spawn as headless subprocesses per task.
+    session_name, window_index = _resolve_tmux_window(proj_dir)
+    window_target = f"{session_name}:{window_index}"
+    _crew_log(proj_dir, f"dispatcher mode: creating log-viewer panes in {window_target}")
 
-        # Check window width — main-vertical layout needs minimum width for readable panes
-        window_width_result = subprocess.run(
-            ["tmux", "display-message", "-t", window_target, "-p", "#{window_width}"],
+    pane_ids = []
+    for agent, wt_path in worktrees.items():
+        result = subprocess.run(
+            ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target,
+             "-P", "-F", "#{pane_id}"],
             capture_output=True, text=True,
         )
-        if window_width_result.returncode == 0:
-            try:
-                window_width = int(window_width_result.stdout.strip())
-                min_width_needed = (len(agent_list) + 1) * 60
-                if window_width < min_width_needed:
-                    click.echo(
-                        f"Warning: window width {window_width} may be too narrow for {len(agent_list)} agents.\n"
-                        f"         Minimum recommended: {min_width_needed} chars ({len(agent_list)+1} panes × 60)\n"
-                        f"         Agent panes may be unreadable (< 20 chars wide).",
-                        err=True,
-                    )
-            except (ValueError, AttributeError):
-                pass
+        pane_id = result.stdout.strip()
+        rc = result.returncode
+        _crew_log(proj_dir, f"split-window agent={agent} rc={rc} pane_id={pane_id!r}")
+        if pane_id:
+            pane_ids.append(pane_id)
 
-        pane_ids: list[str] = []
-        for agent, wt_path in worktrees.items():
-            result = subprocess.run(
-                ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target,
-                 "-P", "-F", "#{pane_id}"],
-                capture_output=True, text=True,
-            )
-            pane_id = result.stdout.strip()
-            rc = result.returncode
-            _crew_log(proj_dir, f"split-window agent={agent} rc={rc} pane_id={pane_id!r} stderr={result.stderr.strip()!r}")
-            if pane_id:
-                pane_ids.append(pane_id)
+    subprocess.run(
+        ["tmux", "select-layout", "-t", window_target, "main-vertical"],
+        capture_output=True, text=True,
+    )
 
-        layout_result = subprocess.run(
-            ["tmux", "select-layout", "-t", window_target, "main-vertical"],
-            capture_output=True, text=True,
-        )
-        _crew_log(proj_dir, f"select-layout rc={layout_result.returncode} after: {_tmux_snapshot(session_name)}")
-
-        if pane_ids:
-            for pane_id in pane_ids:
-                width_result = subprocess.run(
-                    ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_width}"],
-                    capture_output=True, text=True,
-                )
-                if width_result.returncode == 0:
-                    try:
-                        width = int(width_result.stdout.strip())
-                        if width < 20:
-                            click.echo(
-                                f"Warning: pane {pane_id} width is {width} chars (too narrow for CLI).\n"
-                                f"         Expand your tmux window or use fewer agents.",
-                                err=True,
-                            )
-                    except (ValueError, AttributeError):
-                        pass
-
-        # Write pane_map.json — server reads this at startup for push routing.
-        pane_map: dict[str, str] = {}
-        if _role_based:
-            for i, (a, pid) in enumerate(zip(agent_list, pane_ids)):
-                role = _ROLES[i] if i < len(_ROLES) else "implementer"
-                pane_map[role] = pid
-                pane_map[a] = pid
-        else:
-            for a, pid in zip(agent_list, pane_ids):
-                role = resolve_agent_role(a)
-                pane_map[role] = pid
-                pane_map[a] = pid
-        if len(agent_list) == 1:
-            sole_pid = pane_ids[0]
-            for role in ("implementer", "reviewer", "tester"):
-                pane_map.setdefault(role, sole_pid)
+    pane_map = {}
+    if _role_based:
+        for i, (a, pid) in enumerate(zip(agent_list, pane_ids)):
+            role = _ROLES[i] if i < len(_ROLES) else "implementer"
+            pane_map[role] = pid
+            pane_map[a] = pid
     else:
-        # Dispatcher mode: create panes for log visibility but run tail -f instead
-        # of interactive CLIs. Agents spawn as headless subprocesses per task.
-        session_name, window_index = _resolve_tmux_window(proj_dir)
-        window_target = f"{session_name}:{window_index}"
-        _crew_log(proj_dir, f"dispatcher mode: creating log-viewer panes in {window_target}")
-
-        pane_ids = []
-        for agent, wt_path in worktrees.items():
-            result = subprocess.run(
-                ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target,
-                 "-P", "-F", "#{pane_id}"],
-                capture_output=True, text=True,
-            )
-            pane_id = result.stdout.strip()
-            rc = result.returncode
-            _crew_log(proj_dir, f"split-window agent={agent} rc={rc} pane_id={pane_id!r}")
-            if pane_id:
-                pane_ids.append(pane_id)
-
-        subprocess.run(
-            ["tmux", "select-layout", "-t", window_target, "main-vertical"],
-            capture_output=True, text=True,
-        )
-
-        pane_map = {}
-        if _role_based:
-            for i, (a, pid) in enumerate(zip(agent_list, pane_ids)):
-                role = _ROLES[i] if i < len(_ROLES) else "implementer"
-                pane_map[role] = pid
-                pane_map[a] = pid
-        else:
-            for a, pid in zip(agent_list, pane_ids):
-                role = resolve_agent_role(a)
-                pane_map[role] = pid
-                pane_map[a] = pid
-        if len(agent_list) == 1:
-            sole_pid = pane_ids[0] if pane_ids else ""
-            for role in ("implementer", "reviewer", "tester"):
-                pane_map.setdefault(role, sole_pid)
+        for a, pid in zip(agent_list, pane_ids):
+            role = resolve_agent_role(a)
+            pane_map[role] = pid
+            pane_map[a] = pid
+    if len(agent_list) == 1:
+        sole_pid = pane_ids[0] if pane_ids else ""
+        for role in ("implementer", "reviewer", "tester"):
+            pane_map.setdefault(role, sole_pid)
 
     pane_map_file = os.path.join(proj_dir, "pane_map.json")
     # In dispatcher mode the server spawns subprocesses — pane_map must be
     # empty so the push path is never used. Pane IDs are kept in state.json
     # only for `crew status` display.
-    server_pane_map = {} if _dispatcher_mode else pane_map
+    server_pane_map = {}
     with open(pane_map_file, "w") as f:
         json.dump(server_pane_map, f)
     _crew_log(proj_dir, f"pane_map written: {server_pane_map}")
@@ -1423,7 +1206,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             "AGENT_CREW_CONTEXT_PACK": context_pack_value,
             "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
-            **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
+            "AGENT_CREW_DISPATCHER": "1",
         }
         server_command, server_env = _server_spawn_args(port, server_env, cea_env)
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
@@ -1480,7 +1263,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             "AGENT_CREW_CONTEXT_PACK": context_pack_value,
             "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
-            **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
+            "AGENT_CREW_DISPATCHER": "1",
         }
         server_command, server_env = _server_spawn_args(port, server_env, cea_env)
         old_pid = existing_state.get("server_pid") if existing_state else None
@@ -1529,20 +1312,12 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
     # "Trust this folder?" prompt at first launch.
     setup_module.pretrust_claude_worktree(worktrees)
 
-    if not _dispatcher_mode:
-        # Start agent CLIs in tmux panes (push model).
-        setup_module.start_agents_in_panes(
-            session_name, agent_list, pane_targets=pane_ids or None, worktrees=worktrees
+    if pane_ids:
+        setup_module.start_log_viewers_in_panes(
+            agent_list, pane_ids, proj_dir, role_based=_role_based
         )
-        _crew_log(proj_dir, f"agents started pane_ids={pane_ids}")
-    else:
-        if pane_ids:
-            setup_module.start_log_viewers_in_panes(
-                agent_list, pane_ids, proj_dir, role_based=_role_based
-            )
-            _crew_log(proj_dir, f"log viewers started pane_ids={pane_ids}")
-        click.echo("Dispatcher mode: panes show tail -f logs. Agents spawn per task.")
-        _crew_log(proj_dir, "dispatcher mode: log viewers started")
+        _crew_log(proj_dir, f"log viewers started pane_ids={pane_ids}")
+    click.echo("Dispatcher mode: panes show tail -f logs. Agents spawn per task.")
 
     # Direct launch PIDs are persisted immediately; sg launch PIDs are the
     # verified listeners, persisted once the port is ready.
@@ -2157,7 +1932,8 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
     worktrees = state.get("worktrees", {})
     db_file = state["db"]
     port_file = os.path.join(proj_dir, "port")
-    _dispatcher_mode = state.get("dispatcher_mode", False)
+    _dispatcher_mode = True
+    state["dispatcher_mode"] = True
     recovered = []
 
     # Validate pane_ids match actual tmux state
@@ -2195,7 +1971,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             "AGENT_CREW_CONTEXT_PACK": context_pack_value,
             "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
-            **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
+            "AGENT_CREW_DISPATCHER": "1",
         }
         server_command, server_env = _server_spawn_args(port, server_env, cea_env)
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
@@ -2250,18 +2026,10 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
             capture_output=True,
         )
         if pane_ids:
-            if _dispatcher_mode:
-                setup_module.start_log_viewers_in_panes(
-                    state.get("agents", []), pane_ids, proj_dir,
-                    role_based=bool(state.get("role_based")),
-                )
-            else:
-                setup_module.start_agents_in_panes(
-                    cur_session,
-                    state.get("agents", []),
-                    pane_targets=pane_ids,
-                    worktrees=worktrees,
-                )
+            setup_module.start_log_viewers_in_panes(
+                state.get("agents", []), pane_ids, proj_dir,
+                role_based=bool(state.get("role_based")),
+            )
             state["session"] = cur_session
             state["window"] = cur_window or "0"
             state["pane_ids"] = pane_ids
@@ -2337,15 +2105,9 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
                     ["tmux", "select-layout", "-t", window_target, "main-vertical"],
                     capture_output=True,
                 )
-                if _dispatcher_mode:
-                    setup_module.start_log_viewers_in_panes(
-                        dead_agents, dead_targets, proj_dir
-                    )
-                else:
-                    setup_module.start_agents_in_panes(
-                        session_name, dead_agents,
-                        pane_targets=dead_targets, worktrees=worktrees,
-                    )
+                setup_module.start_log_viewers_in_panes(
+                    dead_agents, dead_targets, proj_dir
+                )
                 pane_map = state.get("pane_map", {})
                 for i, (a, pid) in enumerate(zip(agent_list, new_pane_ids)):
                     old_pid = existing_pane_ids[i] if i < len(existing_pane_ids) else None
@@ -2366,7 +2128,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
                 state["pane_map"] = pane_map
                 _write_state(base, project, state)
                 pane_map_file = os.path.join(proj_dir, "pane_map.json")
-                server_pane_map = {} if _dispatcher_mode else pane_map
+                server_pane_map = {}
                 try:
                     with open(pane_map_file, "w") as f:
                         json.dump(server_pane_map, f)
@@ -2836,30 +2598,8 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             click.echo(f"  Auto-submit failed: {e}")
 
     def _wait(task_id: str):
-        # Reset the per-pane content cache so a fresh `_wait` invocation
-        # starts with no baseline (otherwise consecutive `crew run` calls
-        # would carry over stale snapshots from the previous task).
-        _reset_pane_content_cache()
         start_time = time.time()
         deadline = start_time + wait_timeout
-        # Grace period before any idle decision so the agent has time to
-        # acknowledge the paste, render its initial response, and stream
-        # the first tokens out.
-        idle_check_start = start_time + 30.0
-        # Threshold timeline for idle (issue #103), scaled per-task (#231):
-        # - <warn: silent
-        # - warn: emit warning so the operator sees something happen before
-        #   the auto-fail kicks in
-        # - fail: auto-fail *only if the agent process is actually gone* —
-        #   see should_auto_fail_idle(). A flat 300s used to fire below the
-        #   length of normal work (a full pytest run is silent for 5+ min),
-        #   which cost real work on #224.
-        warn_after_idle_seconds, fail_after_idle_seconds = idle_thresholds(
-            wait_timeout
-        )
-        pane_idle_started_at: float | None = None
-        pane_warning_emitted = False
-        pane_alive_notice_emitted = False
         last_progress_print = start_time
         while time.time() < deadline:
             result = _retry_locked_queue_read(queue.get_result, task_id)
@@ -2867,67 +2607,9 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
                 return result
             now = time.time()
             if now - last_progress_print >= 10:
-                elapsed = int(now - start_time)
-                click.echo(f"  Waiting... ({elapsed}s elapsed)")
+                click.echo(f"  Waiting... ({int(now - start_time)}s elapsed)")
                 last_progress_print = now
-            if first_pane_target and now > idle_check_start:
-                # Diff-based idle probe — text-agnostic, covers Claude
-                # Code's multi-line footer that the old last-line scan
-                # misses ("Cooked for 5m 4s" + "⏵⏵ bypass permissions").
-                changed = _pane_changed(first_pane_target)
-                if changed:
-                    pane_idle_started_at = None
-                    pane_warning_emitted = False
-                    pane_alive_notice_emitted = False
-                else:
-                    if pane_idle_started_at is None:
-                        pane_idle_started_at = now
-                    idle_for = now - pane_idle_started_at
-                    if (
-                        idle_for >= warn_after_idle_seconds
-                        and not pane_warning_emitted
-                    ):
-                        click.echo(
-                            f"Warning: pane has shown no activity for "
-                            f"{idle_for:.0f}s on task {task_id!r}. Auto-fail "
-                            f"in {fail_after_idle_seconds - idle_for:.0f}s "
-                            f"if it stays quiet."
-                        )
-                        pane_warning_emitted = True
-                    if idle_for >= fail_after_idle_seconds:
-                        # #231: silence alone is not death. Ask the pane what
-                        # is actually running before destroying the task —
-                        # this is the check whose absence lost real work.
-                        liveness = agent_liveness(first_pane_target)
-                        if not should_auto_fail_idle(liveness):
-                            if not pane_alive_notice_emitted:
-                                click.echo(
-                                    f"  Pane quiet for {idle_for:.0f}s but the "
-                                    f"agent process is still running — not "
-                                    f"auto-failing {task_id!r}. Bounded by the "
-                                    f"{wait_timeout:.0f}s task timeout."
-                                )
-                                pane_alive_notice_emitted = True
-                            time.sleep(2)
-                            continue
-                        reason = (
-                            f"watchdog timeout: CLI detected pane idle for "
-                            f"{idle_for:.0f}s on task {task_id!r} (no "
-                            f"capture changes since {warn_after_idle_seconds:.0f}s; "
-                            f"agent process {liveness}). "
-                            f"Auto-failed for queue cleanup."
-                        )
-                        click.echo(f"Warning: {reason}")
-                        _auto_submit_failed(task_id, reason)
-                        raise click.ClickException(
-                            f"task {task_id!r}: agent idle for "
-                            f"{idle_for:.0f}s — result auto-submitted as "
-                            f"failed (fallback policy will reroute). "
-                            f"Check pane manually or re-run."
-                        )
-                time.sleep(2)  # #177: 10s→2s reduces coordinator lag on task completion
-            else:
-                time.sleep(0.5)
+            time.sleep(0.5)
         # #159: if the task was never picked up (still pending), stop waiting
         # without auto-failing. The task stays in queue and will be dispatched
         # when an agent becomes free. This prevents a crew run that launched
@@ -2974,53 +2656,20 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
                     last_progress_print = now
                 time.sleep(2)
 
-        # Wrapper deadline hit before the agent posted a result. Don't blanket-
-        # auto-fail (#92): if the pane shows the agent is still actively working,
-        # extend the deadline rather than killing legitimate long tasks. Cap the
-        # extensions to prevent runaway waits — with #84 v2 the watchdog will
-        # eventually catch a true zombie at its own threshold.
-        max_extensions = 3
-        extension_seconds = max(300.0, wait_timeout / 2.0)
-        extensions = 0
-        while extensions < max_extensions:
-            if not first_pane_target:
-                break
-            # Diff probe: a single call after the priming snapshot left by
-            # the main poll loop. If the main loop never primed (e.g. very
-            # short --timeout that exited before the 30s grace period),
-            # prime here with one extra capture so the second one can
-            # actually compare.
-            if first_pane_target not in _PANE_CONTENT_LAST:
-                _pane_changed(first_pane_target)  # discard, just prime
-            still_busy = _pane_changed(first_pane_target)
-            if not still_busy:
-                break
-            extensions += 1
-            deadline = time.time() + extension_seconds
-            click.echo(
-                f"Warning: task {task_id!r} hit {wait_timeout}s budget but pane "
-                f"still active. Extending deadline by {extension_seconds:.0f}s "
-                f"(extension {extensions}/{max_extensions})."
-            )
-            while time.time() < deadline:
-                result = _retry_locked_queue_read(queue.get_result, task_id)
-                if result is not None:
-                    return result
-                time.sleep(2.0)
         # Either the pane never showed activity again or we exhausted the
         # extension budget. Auto-submit a failure with a watchdog-shaped
         # summary so the rate-limit fallback policy reroutes to the next
         # agent in the chain instead of stranding the loop (#87).
         reason = (
             f"watchdog timeout: crew run wrapper exited after {wait_timeout}s "
-            f"({extensions} extension(s)) without a result POST for task {task_id!r}. "
+            f"without a result POST for task {task_id!r}. "
             f"Auto-failed for queue cleanup."
         )
         click.echo(f"Warning: {reason}")
         _auto_submit_failed(task_id, reason)
         raise click.ClickException(
             f"task {task_id!r} timed out after {wait_timeout}s "
-            f"({extensions} extension(s)) — auto-failed for queue cleanup. "
+            f"— auto-failed for queue cleanup. "
             f"Inspect with `crew status {project}` and re-dispatch if needed."
         )
 
@@ -3578,37 +3227,21 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
 
     wait_timeout = float(timeout)
 
-    def _wait_all(task_ids: list[str], timeout: float = 0.0) -> tuple[dict, list[str], dict]:
-        """Poll for all task results. On timeout, return (partial_done, missing_ids, idle_status)
-        where idle_status maps agent names to idle/active state.
-        The caller decides whether partial results are actionable or if idle agents
-        need escalation."""
+    def _wait_all(task_ids: list[str], timeout: float = 0.0) -> tuple[dict, list[str]]:
+        """Wait for all results and report the tasks still pending at the deadline."""
         effective_timeout = timeout if timeout > 0 else wait_timeout
         deadline = time.time() + effective_timeout
         done: dict = {}
-        idle_status: dict[str, bool] = {}  # agent -> is_idle
-
         while time.time() < deadline:
             for tid in task_ids:
                 if tid not in done:
-                    r = queue.get_result(tid)
-                    if r is not None:
-                        done[tid] = r
+                    result = queue.get_result(tid)
+                    if result is not None:
+                        done[tid] = result
             if len(done) == len(task_ids):
-                return done, [], idle_status
+                return done, []
             time.sleep(0.1)
-
-        missing = [tid for tid in task_ids if tid not in done]
-
-        # Check pane state for missing tasks to distinguish idle vs. still working
-        if missing and _pane_map and _session_name:
-            for agent in agent_list:
-                pane_id = _pane_map.get(agent)
-                if pane_id:
-                    pane_out = _capture_pane(pane_id)
-                    idle_status[agent] = bool(pane_out and _pane_looks_idle(pane_out))
-
-        return done, missing, idle_status
+        return done, [tid for tid in task_ids if tid not in done]
 
     if nowait:
         # Fire-and-forget: enqueue round 1 only, emit task_ids, exit.
@@ -3663,19 +3296,11 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
             port=_run_port, perspectives=perspectives_map,
             branch=branch, project=project,
         )
-        results_map, missing, idle_status = _wait_all(task_ids)
+        results_map, missing = _wait_all(task_ids)
 
         if missing:
             partial_hit = True
             missing_by_round[round_num] = missing
-            # Report idle agents for debugging
-            idle_agents = [a for a in agent_list if idle_status.get(a, False)]
-            active_agents = [a for a in agent_list if not idle_status.get(a, False) and a in missing]
-            if idle_agents:
-                click.echo(f"  Idle agents (no pane activity): {', '.join(idle_agents)}", err=True)
-            if active_agents:
-                click.echo(f"  Still working: {', '.join(active_agents)}", err=True)
-
         # Build synthesis from whoever completed. If nobody completed, skip
         # this round's synthesis entirely rather than writing an empty file.
         panel_results = []

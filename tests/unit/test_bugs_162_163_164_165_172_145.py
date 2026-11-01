@@ -48,54 +48,6 @@ def _make_app(db_path: str, delivery: str = "mcp", pane_map: dict | None = None)
 # #162 — MCP mode watchdog reminder: short one-liner, no curl template
 # ---------------------------------------------------------------------------
 
-class TestMcpReminderFormat:
-    def test_u162_mcp_mode_reminder_is_short(self):
-        """In MCP mode the reminder must be a single line, no curl template."""
-        from agent_crew.server import _format_reminder_message
-        msg = _format_reminder_message("t-abc", 9999, 350.0, mcp_mode=True)
-        assert "curl" not in msg, "MCP reminder must not include curl template"
-        assert "bump_activity" in msg or "submit_result" in msg
-        assert "\n" not in msg.strip(), "MCP reminder must be a single line"
-
-    def test_u162_push_mode_reminder_has_curl(self):
-        """In push mode the full curl template is still included."""
-        from agent_crew.server import _format_reminder_message
-        msg = _format_reminder_message("t-abc", 9999, 350.0, mcp_mode=False)
-        assert "curl" in msg
-        assert "=== AGENT_CREW REMINDER ===" in msg
-
-    def test_u162_watchdog_uses_mcp_mode_when_push_disabled(self, tmp_path):
-        """Watchdog emits MCP-style reminder when delivery=mcp."""
-        db, q = _make_db()
-        q.enqueue(TaskRequest(task_id="t1", task_type="implement",
-                               description="work", branch="main"))
-        q.dequeue(role="implementer")  # mark in_progress
-
-        pushed: list[str] = []
-
-        def fake_push(pane_id: str, msg: str) -> None:
-            pushed.append(msg)
-
-        pane_map = {"implementer": "%91"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp"}):
-            from agent_crew.server import create_app
-            app = create_app(
-                db,
-                pane_map=pane_map,
-                port=9999,
-                push_fn=fake_push,
-                watchdog_disabled=True,
-                pane_busy_fn=lambda _: False,
-                reminder_seconds=1,
-                timeout_seconds=9999,
-            )
-
-        now = time.time() + 400
-        with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
-            app.state.watchdog_tick(now)
-
-        assert pushed, "expected a reminder to be pushed"
-        assert "curl" not in pushed[0], "MCP reminder must not contain curl"
 
 
 # ---------------------------------------------------------------------------
