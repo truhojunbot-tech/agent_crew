@@ -219,6 +219,33 @@ def test_hybrid_dispatch_uses_ranked_memory_and_records_receipt(
     assert events[0]["fleet"] == "fleet"
 
 
+def test_hybrid_dispatch_reserves_limit_for_six_predecessor_decisions(
+        tmp_path, monkeypatch, *, unused_tcp_port):
+    from agent_crew.memory_hybrid import HybridMemoryStorage
+
+    path = tmp_path / "ranked.db"
+    storage = HybridMemoryStorage(str(path))
+    predecessors = tuple(f"review-{index}" for index in range(6))
+    for task_id in predecessors:
+        storage.put(MemoryRecord("decision", f"task:{task_id}:decision",
+                                 {"text": "prior decision"},
+                                 MemoryScope(project="project-a", task_id=task_id)))
+        storage.put(MemoryRecord("episodic", f"task_outcome:project-a:{task_id}",
+                                 {"text": "prior outcome"},
+                                 MemoryScope(project="project-a")))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
+    monkeypatch.setattr("agent_crew.server.task_lineage",
+                        lambda *_: (predecessors, None))
+    _, context, events, _ = _dispatch_snapshot(
+        tmp_path / "dispatch", monkeypatch, _MustNotBeCalledProvider(),
+        shadow_memory_enabled=False, unused_tcp_port=unused_tcp_port)
+    assert len(events) == 1
+    expected = {f"task:{task_id}:decision" for task_id in predecessors}
+    assert expected <= set(events[0]["result_ids"])
+    assert expected <= set(context["shadow_memory"]["result_ids"])
+
+
 def test_hybrid_dispatch_without_fleet_env_records_unscoped_head(
         tmp_path, monkeypatch, *, unused_tcp_port):
     from agent_crew.memory_hybrid import HybridMemoryStorage
