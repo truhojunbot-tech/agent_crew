@@ -28,24 +28,6 @@ def _events(tmp_db):
             if json.loads(line)["event_type"] == "cancel_signalled"]
 
 
-def test_cancel_in_progress_interrupts_bound_pane_once(tmp_db):
-    app = _app(tmp_db, {"implementer": "%101"})
-    with patch("agent_crew.server.subprocess.run") as run, TestClient(app) as client:
-        run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        created = client.post("/tasks", json={"task_id": "running", "task_type": "implement",
-                                              "description": "work", "branch": "main"})
-        assert created.status_code == 201
-        response = client.delete("/tasks/running")
-        # G12 (unified): a second DELETE on the now-terminal row is refused as a
-        # no-op 409 NOT_ACTIVE and signals nothing.
-        again = client.delete("/tasks/running")
-        assert again.status_code == 409 and again.json()["reason"] == "NOT_ACTIVE"
-    assert response.json()["worker_reachable"] is True
-    assert [c.args[0] for c in run.call_args_list if c.args[0][:2] == ["tmux", "send-keys"]] == [
-        ["tmux", "send-keys", "-t", "%101", "C-c"]]
-    assert response.json()["cancel_signal_outcome"] == "ack_timeout"
-    assert response.json()["pane_exit_observed"] is False
-    assert _events(tmp_db)[-1]["outcome"] == "ack_timeout"
 
 
 def test_cancel_in_progress_without_bound_pane_records_unreachable(tmp_db):

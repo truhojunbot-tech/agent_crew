@@ -144,7 +144,7 @@ def test_setup_records_listener_pid_behind_sg(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.setup_module, "create_worktrees", lambda *_args, **_kwargs:
                         {"codex": str(tmp_path / "wt")})
     for name in ("write_port_file", "write_instruction_files", "write_sessions_json",
-                 "write_mcp_configs", "pretrust_claude_worktree", "start_agents_in_panes"):
+                 "write_mcp_configs", "pretrust_claude_worktree"):
         monkeypatch.setattr(cli.setup_module, name, lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli.subprocess, "run", lambda args, **_kwargs:
                         SimpleNamespace(returncode=0, stdout=(

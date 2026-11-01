@@ -39,7 +39,6 @@ def _app(tmp_path, monkeypatch, worker, pushed, *, role="implementer"):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__DEMO", "off")
     monkeypatch.setattr(sv, "_resolve_tmux_pane_target", lambda pane: pane)
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
-    monkeypatch.setattr(sv, "_pane_process_kind", lambda pane: ("agent", "codex"))
     monkeypatch.setattr(sv, "_ensure_role_protocol", lambda *a, **kw: True)
     db = str(tmp_path / "tasks.db")
     app = sv.create_app(
@@ -59,6 +58,22 @@ def _timeout(*args, **kwargs):
     raise subprocess.CalledProcessError(128, ["git", "fetch", "origin"])
 
 
+def _dispatch_pending(app, queue, role, task_id, monkeypatch):
+    """Drive prep through dispatcher, stopping just before provider launch."""
+    class ProviderBoundary(Exception):
+        pass
+
+    task = queue.dequeue(role=role)
+    assert task is not None and task.task_id == task_id
+    with monkeypatch.context() as patcher:
+        patcher.setattr(sv, "_ensure_role_protocol", lambda *a, **kw: (_ for _ in ()).throw(ProviderBoundary()))
+        try:
+            asyncio.run(app.state.dispatch_task(task, role))
+        except ProviderBoundary:
+            return True
+    return False
+
+
 def test_fetch_timeout_uses_head_and_descendant_completion_passes(
         tmp_path, monkeypatch):
     worker, base = _repo(tmp_path)
@@ -72,11 +87,12 @@ def test_fetch_timeout_uses_head_and_descendant_completion_passes(
             "branch": "feature", "project": "demo", "context": {},
         })
         assert admitted.status_code == 201
+        launched = _dispatch_pending(app, queue, "implementer", "impl-812-head", monkeypatch)
         context = queue.get_task_context("impl-812-head")
         assert context["worktree_base_sha"] == base
         assert context["worktree_base_status"] == "head_after_prep_error"
         assert context["prep_error"] == "CalledProcessError"
-        assert pushed
+        assert launched
 
         _git(worker, "checkout", "-b", "feature")
         (worker / "change.txt").write_text("change\n")
@@ -110,13 +126,14 @@ def test_caller_base_precedes_head_after_prep_error(tmp_path, monkeypatch):
             "branch": "feature", "project": "demo",
             "context": {"worktree_base_sha": base},
         })
+        launched = _dispatch_pending(app, queue, "implementer", "impl-812-caller", monkeypatch)
 
     assert admitted.status_code == 201
     context = queue.get_task_context("impl-812-caller")
     assert context["worktree_base_sha"] == base
     assert context["worktree_base_status"] == "caller_after_prep_error"
     assert context["prep_error"] == "CalledProcessError"
-    assert pushed
+    assert launched
 
 
 def test_unresolvable_caller_base_uses_head_after_timeout(tmp_path, monkeypatch):
@@ -131,12 +148,13 @@ def test_unresolvable_caller_base_uses_head_after_timeout(tmp_path, monkeypatch)
             "description": "fix", "branch": "feature", "project": "demo",
             "context": {"worktree_base_sha": "a" * 40},
         })
+        launched = _dispatch_pending(app, queue, "implementer", "impl-812-unfetched", monkeypatch)
 
     assert admitted.status_code == 201
     context = queue.get_task_context("impl-812-unfetched")
     assert context["worktree_base_sha"] == head
     assert context["worktree_base_status"] == "head_after_prep_error"
-    assert pushed
+    assert launched
 
 
 def test_review_prep_error_never_pins_unrelated_worktree_head(tmp_path, monkeypatch):
@@ -151,6 +169,7 @@ def test_review_prep_error_never_pins_unrelated_worktree_head(tmp_path, monkeypa
             "description": "review PR", "branch": "main", "project": "demo",
             "context": {"pr_number": 999},
         })
+        launched = _dispatch_pending(app, queue, "reviewer", "review-812-unrelated", monkeypatch)
 
     assert admitted.status_code == 201
     context = queue.get_task_context("review-812-unrelated")
@@ -159,7 +178,7 @@ def test_review_prep_error_never_pins_unrelated_worktree_head(tmp_path, monkeypa
     assert context["worktree_base_status"] == "unknown"
     assert queue.get_task_status("review-812-unrelated") == "needs_human"
     assert queue.get_result("review-812-unrelated").error_info["reason"] == "prepared_base_not_recorded"
-    assert pushed == []
+    assert not launched
 
 
 def test_unknown_prepared_sha_never_clears_a_valid_caller_base(tmp_path, monkeypatch):
@@ -190,9 +209,10 @@ def test_unreadable_head_after_prep_error_stops_before_provider(tmp_path, monkey
             "task_id": "impl-812-unreadable", "task_type": "implement",
             "description": "fix", "branch": "feature", "project": "demo", "context": {},
         })
+        launched = _dispatch_pending(app, queue, "implementer", "impl-812-unreadable", monkeypatch)
 
     assert admitted.status_code == 201
-    assert pushed == []
+    assert not launched
     assert queue.get_task_status("impl-812-unreadable") == "needs_human"
     context = queue.get_task_context("impl-812-unreadable")
     assert context["worktree_base_sha"] is None
@@ -214,6 +234,7 @@ def test_unverified_caller_is_not_recorded_when_prep_and_head_fail(tmp_path, mon
             "description": "fix", "branch": "feature", "project": "demo",
             "context": {"worktree_base_sha": "a" * 40},
         })
+        launched = _dispatch_pending(app, queue, "implementer", "impl-812-unverified", monkeypatch)
 
     assert admitted.status_code == 201
     assert queue.get_task_status("impl-812-unverified") == "needs_human"
@@ -221,7 +242,7 @@ def test_unverified_caller_is_not_recorded_when_prep_and_head_fail(tmp_path, mon
     assert context.get("worktree_base_sha") is None
     assert context["worktree_base_status"] == "unknown"
     assert queue.get_result("impl-812-unverified").error_info["reason"] == "prepared_base_not_recorded"
-    assert pushed == []
+    assert not launched
 
 
 def test_successful_second_prep_clears_stale_error_label(tmp_path, monkeypatch):
@@ -326,8 +347,8 @@ def test_dispatcher_stops_when_empty_reprep_follows_prep_error(tmp_path, monkeyp
             "description": "fix", "branch": "feature", "project": "demo", "context": {},
         })
         assert admitted.status_code == 201
+        assert _dispatch_pending(app, queue, "implementer", "impl-812-reprep-stop", monkeypatch)
         assert queue.get_task_context("impl-812-reprep-stop")["worktree_base_sha"] == head_a
-        assert len(pushed) == 1
 
         (worker / "moved.txt").write_text("moved\n")
         _git(worker, "add", "moved.txt")
@@ -337,7 +358,6 @@ def test_dispatcher_stops_when_empty_reprep_follows_prep_error(tmp_path, monkeyp
         task = queue.get_task("impl-812-reprep-stop")
         asyncio.run(app.state.dispatch_task(task, "implementer"))
 
-    assert len(pushed) == 1
     context = queue.get_task_context("impl-812-reprep-stop")
     assert context["worktree_base_sha"] is None
     assert context["worktree_base_status"] == "unknown"

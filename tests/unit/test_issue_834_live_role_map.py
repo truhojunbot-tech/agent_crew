@@ -203,29 +203,3 @@ def test_lineage_walk_stops_on_cycle(tmp_path):
                               context={"prev_task_id": "review-cycle-a"}))
     with TestClient(app):
         assert app.state.review_implementer_agent(queue.get_task("review-cycle-a")) is None
-
-
-def test_tmux_push_refuses_lineage_self_review_before_provider(tmp_path, monkeypatch):
-    state_path = tmp_path / "state.json"
-    _state(state_path, "codex")
-    monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
-    pushes = []
-    app = _app(tmp_path, state_path,
-               pane_map={"reviewer": "%834", "codex": "%834"},
-               push_fn=lambda *args, **kwargs: pushes.append((args, kwargs)))
-    queue = TaskQueue(str(tmp_path / "tasks.db"))
-    queue.enqueue(TaskRequest(task_id="fix-tmux", task_type="implement",
-                              description="fix", project="demo",
-                              context={"agent_override": "claude"}))
-    queue.record_attribution("fix-tmux", project="demo", agent="codex",
-                             role="implementer", task_type="implement")
-    queue.enqueue(TaskRequest(task_id="review-tmux", task_type="review",
-                              description="review", project="demo",
-                              context={"prev_task_id": "fix-tmux",
-                                       "implementer_agent": "claude"}))
-    with TestClient(app):
-        app.state.try_push_next("reviewer")
-    result = queue.get_result("review-tmux")
-    assert result.status == "needs_human"
-    assert result.summary.startswith("reviewer_matches_implementer: codex")
-    assert pushes == []

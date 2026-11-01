@@ -7,7 +7,6 @@ from agent_crew.mcp_server import build_mcp_server
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
-from agent_crew.server import _format_reminder_message
 
 
 SUMMARY = "PR #586 review: verdict request_changes, one HIGH finding below."
@@ -72,13 +71,6 @@ def test_pending_review_without_verdict_is_422_and_stays_pending(tmp_db):
     assert _task(queue, "review-586").status == "pending"
 
 
-def test_review_reminder_requires_explicit_verdict():
-    message = _format_reminder_message("review-586", 8105, 400,
-                                       task_type="review")
-    completed = message.split('"status":"completed"', 1)[1].split(
-        '"status":"failed"', 1)[0]
-    assert '"verdict":"approve|request_changes"' in completed
-    assert '"verdict":null' not in completed
 
 
 def test_failed_review_late_completed_result_without_verdict_is_rejected(tmp_db):

@@ -64,8 +64,9 @@ def test_unknown_verdict_string_is_invalid():
 
 
 def test_dispatcher_failure_still_never_silently_approves():
-    """⛔#301 의 계약은 유지한다 — 안 끝난 리뷰를 승인으로 바꾸지 않는다."""
-    assert _resolve_verdict(_r("approve", [], status="timed_out")) == "request_changes"
+    """An unfinished review is a failure, regardless of its claimed verdict."""
+    assert _resolve_verdict(_r("approve", [], status="timed_out")) == "review_failed"
+    assert _resolve_verdict(_r("request_changes", [ACTIONABLE], status="failed")) == "review_failed"
 
 
 def test_invalid_is_not_one_of_the_two_verdicts():

@@ -4,14 +4,12 @@ import os
 from agent_crew import setup as setup_api
 
 from agent_crew.setup import (
-    _CLI_READY_MARKERS,
     _port_claims,
     _is_port_listening,
     create_worktrees,
     find_free_port,
     pretrust_claude_worktree,
     validate_git_repo,
-    start_agents_in_panes,
     start_log_viewers_in_panes,
     write_instruction_files,
     write_port_file,
@@ -122,31 +120,6 @@ def test_u_se07_create_worktrees_custom_agents():
 
 # U-SE08: start_agents_in_panes launches the CLI and sends a kickoff prompt.
 # The kickoff tells agents to start polling get_next_task every 30 seconds.
-def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
-    mock_result = MagicMock(returncode=0)
-    with patch("agent_crew.setup.subprocess.run", return_value=mock_result) as mock_run, \
-         patch("agent_crew.setup.time.sleep"):
-        start_agents_in_panes("crew_proj", ["claude"])
-
-    all_args = [call[0][0] for call in mock_run.call_args_list]
-    # Escape sequence: first two calls send C-c and then q/Enter
-    assert any("C-c" in " ".join(a) for a in all_args), "Ctrl+C escape not sent"
-    assert any("q" in a for a in all_args), "q escape not sent"
-    # Launch cmd: literal send with agent cmd
-    literal_calls = [a for a in all_args if "-l" in a]
-    assert literal_calls, "no literal send found"
-    assert any("claude" in " ".join(a) for a in literal_calls)
-    # Enter to submit launch
-    assert any("Enter" in a for a in all_args)
-    # capture-pane to verify CLI started
-    assert any("capture-pane" in " ".join(a) for a in all_args), "capture-pane verify not sent"
-    # Must NOT reference the AGENT_CREW TASK push block (push is server-driven)
-    for call in mock_run.call_args_list:
-        args = call[0][0]
-        last = args[-1] if args else ""
-        assert "AGENT_CREW TASK" not in last
-        assert "while true" not in last
-        assert "mktemp" not in last
 
 
 def test_u_se08b_log_viewer_panes_respawn_on_death(tmp_path):
@@ -170,6 +143,10 @@ def test_u_se08b_log_viewer_panes_respawn_on_death(tmp_path):
     assert "while true" in cmd
     assert "crew-log-viewer" in cmd
     assert "submit task results through the dispatcher" in cmd
+    all_args = [call[0][0] for call in mock_run.call_args_list]
+    assert ["tmux", "respawn-pane", "-k", "-t", "%91", "-c", str(tmp_path)] in all_args
+    assert not any(a[:2] == ["tmux", "send-keys"] and
+                   any(key in a for key in ("C-c", "q")) for a in all_args)
 
 
 # U-SE09: _get_agent_cmd — claude omits --continue when .claude/projects/ absent
@@ -187,23 +164,6 @@ def test_u_se10_get_agent_cmd_claude_keeps_continue_when_projects_exist(tmp_path
 
 
 # U-SE11: start_agents_in_panes sends trust response "1" after codex startup
-def test_u_se11_codex_trust_prompt_auto_answered():
-    mock_result = MagicMock(returncode=0)
-    with patch("agent_crew.setup.subprocess.run", return_value=mock_result) as mock_run, \
-         patch("agent_crew.setup.time.sleep"):
-        start_agents_in_panes("crew", ["codex"])
-
-    # Codex trust dialog: two Enter keys sent (cursor already on option 1).
-    # Since commit 39a4e7e the code uses _send_enter twice, not literal "1".
-    all_send_args = [
-        call[0][0]
-        for call in mock_run.call_args_list
-        if "send-keys" in call[0][0]
-    ]
-    enter_sends = [a for a in all_send_args if "Enter" in a]
-    assert len(enter_sends) >= 2, (
-        f"Expected >= 2 Enter sends for codex trust dialog, got {len(enter_sends)}"
-    )
 
 
 # U-SE12: pretrust_claude_worktree writes hasTrustDialogAccepted for claude worktree
@@ -334,37 +294,9 @@ def test_u_se20_is_port_listening_returns_false():
 
 
 # U-SE21: start_agents_in_panes warns when pane shows no CLI-ready indicator (#146)
-def test_u_se21_start_agents_warns_when_cli_not_detected():
-    """If the capture-pane output contains none of the expected markers, a
-    WARNING must be logged so the operator can inspect the pane before pushing."""
-    empty_capture = MagicMock(returncode=0)
-    empty_capture.stdout = "bash-5.1$ "  # no CLI marker in raw output
-
-    with patch("agent_crew.setup.subprocess.run", return_value=empty_capture), \
-         patch("agent_crew.setup.time.sleep"), \
-         patch("agent_crew.setup._logger") as mock_log:
-        start_agents_in_panes("crew", ["claude"])
-
-    # warning.call_count should be 1 — one per agent that failed the check
-    assert mock_log.warning.call_count >= 1
-    warning_msg = mock_log.warning.call_args_list[0][0][0]
-    # The warning must indicate the pane wasn't ready before the kickoff was sent.
-    assert "not ready" in warning_msg or "kickoff" in warning_msg
 
 
 # U-SE22: start_agents_in_panes does NOT warn when CLI-ready indicator found (#146)
-def test_u_se22_start_agents_no_warn_when_cli_detected():
-    """When the pane contains a known CLI marker, no warning should be emitted."""
-    marker = _CLI_READY_MARKERS["claude"][0]  # e.g. "bypass permissions"
-    good_capture = MagicMock(returncode=0)
-    good_capture.stdout = f"some preamble\n{marker}\n❯ "
-
-    with patch("agent_crew.setup.subprocess.run", return_value=good_capture), \
-         patch("agent_crew.setup.time.sleep"), \
-         patch("agent_crew.setup._logger") as mock_log:
-        start_agents_in_panes("crew", ["claude"])
-
-    assert mock_log.warning.call_count == 0
 
 
 # U-SE23: start_agents_in_panes sends a kickoff prompt after CLI boots
@@ -379,33 +311,6 @@ def _kickoff_from_buffer(mock_run):
     return loads[0].kwargs["input"]
 
 
-def test_u_se23_start_agents_sends_kickoff_prompt():
-    """After the CLI boots, start_agents_in_panes must send a kickoff prompt
-    telling the agent to start polling get_next_task every 30 seconds."""
-    good_capture = MagicMock(returncode=0)
-    good_capture.stdout = "bypass permissions\n❯ "
-
-    with patch("agent_crew.setup.subprocess.run", return_value=good_capture) as mock_run, \
-         patch("agent_crew.setup.time.sleep"):
-        start_agents_in_panes("crew", ["claude"])
-
-    # Kickoff prompt must reference polling / get_next_task
-    kickoff_text = _kickoff_from_buffer(mock_run)
-    assert "get_next_task" in kickoff_text
-    assert "30 seconds" in kickoff_text
 
 
 # U-SE24: kickoff prompt explicitly mentions GET /tasks/next fallback polling
-def test_u_se24_start_agents_kickoff_mentions_http_polling():
-    """The kickoff prompt should name the HTTP polling endpoint explicitly so
-    agents can recover even when the MCP loop is unavailable."""
-    good_capture = MagicMock(returncode=0)
-    good_capture.stdout = "bypass permissions\n❯ "
-
-    with patch("agent_crew.setup.subprocess.run", return_value=good_capture) as mock_run, \
-         patch("agent_crew.setup.time.sleep"):
-        start_agents_in_panes("crew", ["claude"])
-
-    kickoff_text = _kickoff_from_buffer(mock_run)
-    assert "/tasks/next" in kickoff_text
-    assert "30 seconds" in kickoff_text

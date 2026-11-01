@@ -19,7 +19,7 @@ from agent_crew.pipeline import auto_enqueue_test
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 
-from tests.unit.test_issue_812_prep_error_base import _app, _git, _repo, _timeout
+from tests.unit.test_issue_812_prep_error_base import _app, _dispatch_pending, _git, _repo, _timeout
 
 
 def _tester_app(tmp_path, monkeypatch, worker, pushed):
@@ -33,7 +33,6 @@ def _tester_app(tmp_path, monkeypatch, worker, pushed):
     monkeypatch.setattr(sv, "create_app", lambda db, **kw: real_create_app(
         db, state_path=str(state), project="demo", **kw))
     app, queue = _app(tmp_path, monkeypatch, worker, pushed, role="tester")
-    monkeypatch.setattr(sv, "_pane_process_kind", lambda pane: ("agent", "gemini"))
     return app, queue
 
 
@@ -107,6 +106,7 @@ def test_tester_prep_error_keeps_and_checks_out_the_review_pin(tmp_path, monkeyp
             "description": "test PR", "branch": "fix/824", "project": "demo",
             "context": {"pr_number": 824, "reviewed_sha": pin, "fix_round": 2},
         })
+        launched = _dispatch_pending(app, queue, "tester", "test-review-824", monkeypatch)
 
     assert admitted.status_code == 201
     context = queue.get_task_context("test-review-824")
@@ -115,7 +115,7 @@ def test_tester_prep_error_keeps_and_checks_out_the_review_pin(tmp_path, monkeyp
     assert context["prep_error"] == _prep_error_name()
     assert _git(worker, "rev-parse", "HEAD") == pin
     assert queue.get_task_status("test-review-824") != "needs_human"
-    assert pushed
+    assert launched
 
 
 def test_reviewer_prefers_requeue_expected_head_over_stale_pin(tmp_path, monkeypatch):
@@ -142,9 +142,10 @@ def test_unresolvable_tester_pin_still_refuses_after_prep_error(tmp_path, monkey
             "description": "test PR", "branch": "fix/824", "project": "demo",
             "context": {"pr_number": 824, "reviewed_sha": "d" * 40},
         })
+        launched = _dispatch_pending(app, queue, "tester", "test-review-824-missing", monkeypatch)
 
     assert admitted.status_code == 201
-    assert pushed == []
+    assert not launched
     assert queue.get_task_status("test-review-824-missing") == "needs_human"
     assert queue.get_task_context("test-review-824-missing").get("reviewed_sha") != head
     assert _git(worker, "rev-parse", "HEAD") == head

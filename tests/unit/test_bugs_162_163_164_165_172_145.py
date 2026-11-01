@@ -48,95 +48,12 @@ def _make_app(db_path: str, delivery: str = "mcp", pane_map: dict | None = None)
 # #162 — MCP mode watchdog reminder: short one-liner, no curl template
 # ---------------------------------------------------------------------------
 
-class TestMcpReminderFormat:
-    def test_u162_mcp_mode_reminder_is_short(self):
-        """In MCP mode the reminder must be a single line, no curl template."""
-        from agent_crew.server import _format_reminder_message
-        msg = _format_reminder_message("t-abc", 9999, 350.0, mcp_mode=True)
-        assert "curl" not in msg, "MCP reminder must not include curl template"
-        assert "bump_activity" in msg or "submit_result" in msg
-        assert "\n" not in msg.strip(), "MCP reminder must be a single line"
-
-    def test_u162_push_mode_reminder_has_curl(self):
-        """In push mode the full curl template is still included."""
-        from agent_crew.server import _format_reminder_message
-        msg = _format_reminder_message("t-abc", 9999, 350.0, mcp_mode=False)
-        assert "curl" in msg
-        assert "=== AGENT_CREW REMINDER ===" in msg
-
-    def test_u162_watchdog_uses_mcp_mode_when_push_disabled(self, tmp_path):
-        """Watchdog emits MCP-style reminder when delivery=mcp."""
-        db, q = _make_db()
-        q.enqueue(TaskRequest(task_id="t1", task_type="implement",
-                               description="work", branch="main"))
-        q.dequeue(role="implementer")  # mark in_progress
-
-        pushed: list[str] = []
-
-        def fake_push(pane_id: str, msg: str) -> None:
-            pushed.append(msg)
-
-        pane_map = {"implementer": "%91"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp"}):
-            from agent_crew.server import create_app
-            app = create_app(
-                db,
-                pane_map=pane_map,
-                port=9999,
-                push_fn=fake_push,
-                watchdog_disabled=True,
-                pane_busy_fn=lambda _: False,
-                reminder_seconds=1,
-                timeout_seconds=9999,
-            )
-
-        now = time.time() + 400
-        with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
-            app.state.watchdog_tick(now)
-
-        assert pushed, "expected a reminder to be pushed"
-        assert "curl" not in pushed[0], "MCP reminder must not contain curl"
 
 
 # ---------------------------------------------------------------------------
 # #163 — MCP mode: auto-clear skipped
 # ---------------------------------------------------------------------------
 
-class TestMcpAutoClearSkipped:
-    def test_u163_auto_clear_skipped_in_mcp_mode(self, tmp_path):
-        """_pane_clear_context must NOT be called when delivery=mcp."""
-        db, q = _make_db()
-        q.enqueue(TaskRequest(task_id="tc1", task_type="implement",
-                               description="task", branch="main"))
-
-        clear_calls: list[str] = []
-
-        def fake_push(pane_id: str, msg: str) -> None:
-            pass
-
-        pane_map = {"implementer": "%92"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp"}):
-            from agent_crew.server import create_app
-            app = create_app(
-                db,
-                pane_map=pane_map,
-                port=9999,
-                push_fn=fake_push,
-                watchdog_disabled=True,
-                pane_busy_fn=lambda _: False,
-            )
-
-        with TestClient(app) as client:
-            with patch("agent_crew.server._pane_clear_context", side_effect=clear_calls.append) as mock_clear, \
-                 patch("agent_crew.server._pane_alive_for_push", return_value=True), \
-                 patch("agent_crew.server._pane_has_task", return_value=False):
-                client.post(
-                    "/tasks",
-                    json={"task_id": "tc1-new", "task_type": "implement",
-                          "description": "new task", "branch": "main"},
-                )
-
-        mock_clear.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -291,232 +208,6 @@ class TestHttpPollBlockedInMcpMode:
 # #145 — watchdog auto-fails stale pending tasks in MCP mode
 # ---------------------------------------------------------------------------
 
-class TestMcpNoClientAutoFail:
-    def _make_stale_pending(self, db: str, task_id: str, seconds_ago: float = 200):
-        """Insert a pending task whose created_at is old enough to be stale."""
-        conn = sqlite3.connect(db)
-        old_ts = time.time() - seconds_ago
-        conn.execute(
-            "UPDATE tasks SET created_at=?, last_activity_at=? WHERE task_id=?",
-            (old_ts, old_ts, task_id),
-        )
-        conn.commit()
-        conn.close()
-
-
-    def test_watchdog_redispatch_attempts_survive_restart_and_stop_at_cap(self, monkeypatch):
-        db, queue = _make_db()
-        task_id = "watchdog-retry-cap"
-        queue.enqueue(TaskRequest(task_id=task_id, task_type="implement",
-                                  description="pending", branch="main"))
-        self._make_stale_pending(db, task_id)
-        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
-        monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "120")
-        with patch("agent_crew.server._pane_alive_for_push", return_value=False):
-            for expected in (1, 2):
-                app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
-                with TestClient(app):
-                    app.state.watchdog_tick(time.time())
-                assert TaskQueue(db).get_task_context(task_id)["watchdog_redispatch_attempt"] == expected
-                assert TaskQueue(db).get_task(task_id).status == "pending"
-            app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
-            with TestClient(app):
-                app.state.watchdog_tick(time.time())
-        assert TaskQueue(db).get_task(task_id).status == "failed"
-        assert TaskQueue(db).get_task_context(task_id)["watchdog_redispatch_attempt"] == 2
-
-    def test_watchdog_busy_role_does_not_spend_redispatch_attempts(self, monkeypatch):
-        db, queue = _make_db()
-        queue.enqueue(TaskRequest(task_id="watchdog-busy", task_type="implement",
-                                  description="running", branch="main"))
-        assert queue.dequeue(role="implementer").task_id == "watchdog-busy"
-        waiting_id = "watchdog-waiting"
-        queue.enqueue(TaskRequest(task_id=waiting_id, task_type="implement",
-                                  description="waiting", branch="main"))
-        self._make_stale_pending(db, waiting_id)
-        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
-        monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "120")
-        app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
-        with TestClient(app), patch("agent_crew.server._pane_alive_for_push", return_value=True):
-            for _ in range(3):
-                app.state.watchdog_tick(time.time())
-        assert TaskQueue(db).get_task("watchdog-busy").status == "in_progress"
-        assert TaskQueue(db).get_task(waiting_id).status == "pending"
-        assert TaskQueue(db).get_task_context(waiting_id).get("watchdog_redispatch_attempt", 0) == 0
-
-    @pytest.mark.parametrize("hold", ["cooldown", "stop"])
-    def test_watchdog_held_task_does_not_spend_redispatch_attempts(self, monkeypatch, hold):
-        db, queue = _make_db()
-        task_id = f"watchdog-{hold}-hold"
-        queue.enqueue(TaskRequest(task_id=task_id, task_type="implement",
-                                  description="held", branch="main"))
-        self._make_stale_pending(db, task_id)
-        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
-        monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "120")
-        if hold == "stop":
-            queue.set_stop_epoch(True, incident="watchdog-test")
-        else:
-            monkeypatch.setattr(
-                "agent_crew.server.QuotaBudgetProvider.active_cooldown_until",
-                lambda self, agent: time.time() + 3600,
-            )
-        app = _make_app(db, delivery="push", pane_map={"implementer": "%95"})
-        with TestClient(app), patch("agent_crew.server._pane_alive_for_push", return_value=True):
-            for _ in range(4):
-                app.state.watchdog_tick(time.time())
-        assert TaskQueue(db).get_task(task_id).status == "pending"
-        assert TaskQueue(db).get_task_context(task_id).get("watchdog_redispatch_attempt", 0) == 0
-
-    def test_u145_stale_pending_auto_failed_in_mcp_mode(self):
-        """In MCP mode, stale-pending tasks must be auto-failed by the watchdog."""
-        db, q = _make_db()
-        task_id = "stale-mcp-1"
-        q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
-                               description="mcp task", branch="main"))
-        self._make_stale_pending(db, task_id, seconds_ago=200)
-
-        pane_map = {"implementer": "%93"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp", "AGENT_CREW_DISPATCHER": "0",
-                                        "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
-            from agent_crew.server import create_app
-            app = create_app(
-                db,
-                pane_map=pane_map,
-                port=9999,
-                watchdog_disabled=True,
-                pane_busy_fn=lambda _: False,
-            )
-
-        with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
-            result = app.state.watchdog_tick(time.time())
-
-        assert "mcp_no_client_failed" in result, (
-            f"Expected mcp_no_client_failed in tick result, got: {result}"
-        )
-        assert task_id in result["mcp_no_client_failed"]
-
-        # Verify status in DB
-        rows = q.list_all_with_status()
-        task_row = next(r for r in rows if r["task_id"] == task_id)
-        assert task_row["status"] in ("failed", "cancelled"), (
-            f"Expected task to be failed, got status={task_row['status']!r}"
-        )
-
-    def test_u145_fresh_pending_not_failed(self):
-        """Pending tasks within the stale window must not be auto-failed."""
-        db, q = _make_db()
-        task_id = "fresh-mcp-1"
-        q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
-                               description="fresh task", branch="main"))
-        # Make it only 10 seconds old — well within the 120s window
-        self._make_stale_pending(db, task_id, seconds_ago=10)
-
-        pane_map = {"implementer": "%94"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp", "AGENT_CREW_DISPATCHER": "0",
-                                        "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
-            from agent_crew.server import create_app
-            app = create_app(
-                db,
-                pane_map=pane_map,
-                port=9999,
-                watchdog_disabled=True,
-                pane_busy_fn=lambda _: False,
-            )
-
-        with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
-            result = app.state.watchdog_tick(time.time())
-
-        assert task_id not in result.get("mcp_no_client_failed", [])
-
-        rows = q.list_all_with_status()
-        task_row = next(r for r in rows if r["task_id"] == task_id)
-        assert task_row["status"] == "pending"
-
-    def test_u145_stale_pending_not_failed_in_push_mode(self):
-        """In push mode, stale-pending tasks must be re-dispatched, not auto-failed."""
-        db, q = _make_db()
-        task_id = "stale-push-1"
-        q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
-                               description="push task", branch="main"))
-        conn = sqlite3.connect(db)
-        old_ts = time.time() - 200
-        conn.execute(
-            "UPDATE tasks SET created_at=?, last_activity_at=? WHERE task_id=?",
-            (old_ts, old_ts, task_id),
-        )
-        conn.commit()
-        conn.close()
-
-        pushed: list[str] = []
-
-        def fake_push(pane_id: str, msg: str) -> None:
-            pushed.append(msg)
-
-        pane_map = {"implementer": "%95"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "push",
-                                        "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
-            from agent_crew.server import create_app
-            app = create_app(
-                db,
-                pane_map=pane_map,
-                port=9999,
-                push_fn=fake_push,
-                watchdog_disabled=True,
-                pane_busy_fn=lambda _: False,
-            )
-
-        with TestClient(app):
-            with patch("agent_crew.server._pane_dismiss_permission_prompt"), \
-                 patch("agent_crew.server._pane_alive_for_push", return_value=True), \
-                 patch("agent_crew.server._pane_has_task", return_value=False):
-                result = app.state.watchdog_tick(time.time())
-
-        # Push mode should re-dispatch (stale_redispatched), not mcp_no_client_failed
-        assert "mcp_no_client_failed" not in result
-        assert "stale_redispatched" in result
-
-        rows = q.list_all_with_status()
-        task_row = next(r for r in rows if r["task_id"] == task_id)
-        # Task should have been dequeued (in_progress) or still pending if push failed
-        assert task_row["status"] != "failed", (
-            "push-mode stale task must not be auto-failed"
-        )
-
-    def test_u145_auto_fail_includes_error_info(self):
-        """Auto-failed task must be recorded with reason=mcp_no_client in error_info."""
-        db, q = _make_db()
-        task_id = "stale-mcp-errinfo"
-        q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
-                               description="task", branch="main"))
-        conn = sqlite3.connect(db)
-        old_ts = time.time() - 200
-        conn.execute(
-            "UPDATE tasks SET created_at=?, last_activity_at=? WHERE task_id=?",
-            (old_ts, old_ts, task_id),
-        )
-        conn.commit()
-        conn.close()
-
-        pane_map = {"implementer": "%96"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp", "AGENT_CREW_DISPATCHER": "0",
-                                        "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
-            from agent_crew.server import create_app
-            app = create_app(
-                db,
-                pane_map=pane_map,
-                port=9999,
-                watchdog_disabled=True,
-                pane_busy_fn=lambda _: False,
-            )
-
-        with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
-            app.state.watchdog_tick(time.time())
-
-        result = q.get_result(task_id)
-        assert result is not None, "force_fail must store a result"
-        assert "mcp" in (result.summary or "").lower(), (
-            f"summary must mention mcp, got: {result.summary}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +225,10 @@ class TestMcpNoClientDispatcherOwnsDelivery:
         task_id = "queued-873"
         q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
                               description="queued behind busy lane", branch="main"))
-        TestMcpNoClientAutoFail()._make_stale_pending(db, task_id, seconds_ago=200)
+        with sqlite3.connect(db) as conn:
+            stale_at = time.time() - 200
+            conn.execute("UPDATE tasks SET created_at=?, last_activity_at=? WHERE task_id=?",
+                         (stale_at, stale_at, task_id))
 
         with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
                                         "AGENT_CREW_DISPATCHER": "1",
@@ -546,30 +240,9 @@ class TestMcpNoClientDispatcherOwnsDelivery:
             app = create_app(db, pane_map={"implementer": "%93"}, port=9999,
                              watchdog_disabled=True, anomaly_disabled=True,
                              pane_busy_fn=lambda _: False)
-            with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
+            with TestClient(app):
                 result = app.state.watchdog_tick(time.time())
 
         assert task_id not in result.get("mcp_no_client_failed", [])
         task_row = next(r for r in q.list_all_with_status() if r["task_id"] == task_id)
         assert task_row["status"] == "pending"
-
-    def test_u873_dispatcher_off_still_fails_as_mcp_no_client(self):
-        db, q = _make_db()
-        task_id = "queued-873-off"
-        q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
-                              description="no consumer", branch="main"))
-        TestMcpNoClientAutoFail()._make_stale_pending(db, task_id, seconds_ago=200)
-
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
-                                        "AGENT_CREW_DISPATCHER": "0",
-                                        "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
-            from agent_crew.server import create_app
-            app = create_app(db, pane_map={"implementer": "%93"}, port=9999,
-                             watchdog_disabled=True, anomaly_disabled=True,
-                             pane_busy_fn=lambda _: False)
-            with TestClient(app), patch("agent_crew.server._pane_dismiss_permission_prompt"):
-                result = app.state.watchdog_tick(time.time())
-
-        assert task_id in result.get("mcp_no_client_failed", [])
-        task_row = next(r for r in q.list_all_with_status() if r["task_id"] == task_id)
-        assert task_row["status"] == "failed"

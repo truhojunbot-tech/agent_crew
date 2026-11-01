@@ -541,6 +541,32 @@ def _post_rereview(client, *, pr=7, sha=SHA_A):
     })
 
 
+def _dispatch_canary_review(app, db_path, task_id):
+    """Run the real dispatcher gate; stop before launching a provider."""
+    import asyncio
+    from pathlib import Path
+    from unittest.mock import patch
+    from agent_crew import server as sv
+
+    queue = TaskQueue(db_path)
+    task = queue.dequeue(role="reviewer")
+    assert task is not None and task.task_id == task_id
+    worktree = Path(db_path).parent / "canary-review-worktree"
+    worktree.mkdir(exist_ok=True)
+    provider_boundary = RuntimeError("provider would launch")
+    with patch.object(sv, "_WORKTREE_SYNC_DISABLED", True), patch.object(
+        sv, "_ensure_role_protocol", side_effect=provider_boundary
+    ):
+        try:
+            asyncio.run(app.state.dispatch_task(
+                task, "reviewer", dispatch_agent="codex",
+                dispatch_worktree=str(worktree)))
+        except RuntimeError as exc:
+            assert exc is provider_boundary
+            return True
+    return False
+
+
 @pytest.mark.parametrize("artifact_kind,expected_reason", [
     ("report", "report_artifact_no_commit_identity"),
     ("commit", "standing_review_other_lineage"),
@@ -573,8 +599,8 @@ def test_branch_review_dispatches_for_distinct_lineage_at_shared_head(
             description="Review second artifact", branch="main", project="demo",
             context={"prev_task_id": "impl-second", "reviewed_sha": SHA_A,
                      "allow_duplicate_review": True}))
-        app.state.try_push_next("reviewer")
-    assert len(push.calls) == 1
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-second")
+    assert dispatched
     assert queue.get_result("review-second") is None
     receipt = queue.get_tokenomics_shadow_receipt("review-second")
     assert receipt["canary_applied"] == 0
@@ -619,8 +645,8 @@ def test_branch_fix_round_uses_root_artifact_and_pin_in_dispatch(
             description="Review fix", branch="feature", project="demo",
             context={"prev_task_id": "fix-root", "reviewed_sha": SHA_A,
                      "allow_duplicate_review": True}))
-        app.state.try_push_next("reviewer")
-    assert len(push.calls) == (0 if expected_applied else 1)
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-fix")
+    assert dispatched is not expected_applied
     result = queue.get_result("review-fix")
     if expected_applied:
         assert result is not None and result.summary == canary.SUPPRESSED_REASON
@@ -643,8 +669,9 @@ def test_armed_canary_does_not_push_the_identical_sha_rereview(monkeypatch, tmp_
                      push_fn=push)
     with TestClient(app) as client:
         assert _post_rereview(client).status_code == 201
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-impl-77-r1")
 
-    assert push.calls == [], "the reviewer was spent on an unchanged sha"
+    assert not dispatched, "the reviewer was spent on an unchanged sha"
     result = queue.get_result("review-impl-77-r1")
     assert result is not None and result.status == "completed", (
         "a suppression is a reused verdict, not a dead review")
@@ -680,6 +707,7 @@ def test_a_suppression_settles_its_authorization_receipt(monkeypatch, tmp_db):
                      push_fn=_RecordingPush())
     with TestClient(app) as client:
         assert _post_rereview(client).status_code == 201
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-impl-77-r1")
 
     receipt_id = queue.task_receipt_id("review-impl-77-r1")
     assert receipt_id, "the review was admitted without a receipt — nothing to settle"
@@ -739,6 +767,7 @@ def test_a_suppression_drives_the_fix_cascade_like_a_real_review(monkeypatch, tm
                         push_fn=_RecordingPush())
     with TestClient(app) as client:
         assert _post_rereview(client).status_code == 201
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-impl-77-r1")
 
     assert asked == ["review-impl-77-r1"]
 
@@ -811,6 +840,7 @@ def test_exactly_one_applied_canary_receipt_per_suppression(monkeypatch, tmp_db)
                      push_fn=_RecordingPush())
     with TestClient(app) as client:
         assert _post_rereview(client).status_code == 201
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-impl-77-r1")
 
     conn = sqlite3.connect(tmp_db)
     try:
@@ -838,8 +868,9 @@ def test_failed_canary_promotion_rolls_back_suppression_and_dispatches(monkeypat
                      push_fn=push)
     with TestClient(app) as client:
         assert _post_rereview(client).status_code == 201
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-impl-77-r1")
 
-    assert len(push.calls) == 1
+    assert dispatched
     queue = TaskQueue(tmp_db)
     assert queue.get_result("review-impl-77-r1") is None
     row = queue.get_tokenomics_shadow_receipt("review-impl-77-r1")
@@ -887,8 +918,9 @@ def test_post_commit_side_effect_failure_cannot_unsuppress(monkeypatch, tmp_db):
                         push_fn=push)
     with TestClient(app) as client:
         assert _post_rereview(client).status_code == 201
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-impl-77-r1")
 
-    assert push.calls == []
+    assert not dispatched
     row = TaskQueue(tmp_db).get_tokenomics_shadow_receipt("review-impl-77-r1")
     assert row["canary_applied"] == 1
 
@@ -908,6 +940,7 @@ def test_shadow_recommendation_is_byte_identical_to_the_decision(monkeypatch, tm
                      push_fn=_RecordingPush())
     with TestClient(app) as client:
         assert _post_rereview(client).status_code == 201
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-impl-77-r1")
 
     row = TaskQueue(tmp_db).get_tokenomics_shadow_receipt("review-impl-77-r1")
     assert row["canary_recommendation_json"] == expected
@@ -924,8 +957,9 @@ def test_unset_env_pushes_the_same_rereview_and_records_shadow(monkeypatch, tmp_
                      push_fn=push)
     with TestClient(app) as client:
         assert _post_rereview(client).status_code == 201
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-impl-77-r1")
 
-    assert len(push.calls) == 1 and push.calls[0][0] == "%200"
+    assert dispatched
     row = queue.get_tokenomics_shadow_receipt("review-impl-77-r1")
     assert row["canary_applied"] == 0
     assert row["canary_reason"] == "condition_holds_canary_unarmed"
@@ -942,8 +976,9 @@ def test_a_pin_on_another_task_leaves_this_rereview_alone(monkeypatch, tmp_db):
                      push_fn=push)
     with TestClient(app) as client:
         assert _post_rereview(client).status_code == 201
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-impl-77-r1")
 
-    assert len(push.calls) == 1
+    assert dispatched
     row = queue.get_tokenomics_shadow_receipt("review-impl-77-r1")
     assert row["canary_applied"] == 0
     assert row["canary_reason"] == "condition_holds_not_the_pinned_task"
@@ -960,8 +995,9 @@ def test_armed_canary_still_pushes_when_the_sha_moved(monkeypatch, tmp_db):
                      push_fn=push)
     with TestClient(app) as client:
         assert _post_rereview(client, sha=SHA_B).status_code == 201
+        dispatched = _dispatch_canary_review(app, tmp_db, "review-impl-77-r1")
 
-    assert len(push.calls) == 1, "a real new commit must still be reviewed"
+    assert dispatched, "a real new commit must still be reviewed"
     row = queue.get_tokenomics_shadow_receipt("review-impl-77-r1")
     assert row["canary_applied"] == 0
     assert row["canary_reason"] == "no_prior_verdict_on_this_sha"

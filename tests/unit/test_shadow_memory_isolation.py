@@ -57,6 +57,10 @@ def test_inherited_live_style_memory_db_remains_untouched(tmp_path):
                AGENT_CREW_ADR001_MEMORY_ENABLED="1",
                AGENT_CREW_TEST_SHADOW_CHILD="1",
                AGENT_CREW_TEST_ORIGINAL_HOME=os.environ["HOME"])
+    # This fixture tests the legacy shadow controls, independent of the
+    # host's optional ranked-memory backend configuration.
+    env.pop("AGENT_CREW_MEMORY_BACKEND", None)
+    env.pop("AGENT_CREW_MEMORY_DB", None)
     root = Path(__file__).resolve().parents[2]
     # HOME isolation hides user-site packages from the child interpreter.
     env["PYTHONPATH"] = os.pathsep.join((str(root / "src"),

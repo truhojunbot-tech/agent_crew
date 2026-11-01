@@ -1,12 +1,4 @@
-"""Unit tests for server push model (Option B: server pushes tasks to panes).
-
-The server's contract:
-- On POST /tasks: if the role's pane is registered and the role is idle (no
-  in_progress task of that type), dequeue the task and push it to the pane.
-- On POST /tasks/{id}/result: if the role has more pending tasks, push the
-  next one to the same pane.
-- push_fn is injectable so these tests don't actually run tmux.
-"""
+"""Result and cascade behavior with dispatcher-owned delivery."""
 from fastapi.testclient import TestClient
 import pytest
 
@@ -48,561 +40,66 @@ class RecordingPush:
         self.calls.append((pane_id, text))
 
 
-def test_busy_queue_head_does_not_block_free_override_pane(tmp_db, monkeypatch):
-    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
-    queue = TaskQueue(tmp_db)
-    queue.enqueue(TaskRequest(**_task_payload("busy_claude")))
-    assert queue.dequeue(role="implementer").task_id == "busy_claude"
+def test_task_enqueue_never_writes_to_a_pane(tmp_db):
     push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={
-            "implementer": "%100", "reviewer": "%101", "tester": "%102",
-            "claude": "%100", "codex": "%101", "gemini": "%102",
-        },
-        worktree_map={}, port=8100, push_fn=push,
-        watchdog_disabled=True, anomaly_disabled=True,
-    )
+    app = create_app(db_path=tmp_db, pane_map={"implementer": "%91"}, push_fn=push)
     with TestClient(app) as client:
-        assert client.post("/tasks", json=_task_payload("older_default")).status_code == 201
-        override = _task_payload("younger_override")
-        override["context"] = {"risk_tier": 1, "agent_override": "codex"}
-        assert client.post("/tasks", json=override).status_code == 201
-        assert client.get("/tasks/younger_override").json()["status"] == "in_progress"
-    assert len(push.calls) == 1
-    assert push.calls[0][0] == "%101"
-
-
-# U-SP01: POST /tasks on idle role → push fires to the role's pane
-def test_u_sp01_post_task_pushes_when_role_idle(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100"},
-        port=9999,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        resp = client.post("/tasks", json=_task_payload("t1", "implement"))
-        assert resp.status_code == 201
-
-    assert len(push.calls) == 1
-    pane_id, text = push.calls[0]
-    assert pane_id == "%100"
-    assert "t1" in text
-    assert "implement" in text
-    assert "9999" in text  # port embedded in result POST URL
-
-
-# U-SP02: Second POST /tasks for the same role while first is in-progress → no push
-def test_u_sp02_second_task_queues_when_role_busy(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100"},
-        port=8100,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("t1", "implement"))
-        # t1 now in_progress; second post should NOT push
-        client.post("/tasks", json=_task_payload("t2", "implement", priority=1))
-
-    assert len(push.calls) == 1
-    assert "t1" in push.calls[0][1]
-
-
-# U-SP03: POST /result → next pending task is pushed automatically
-def test_u_sp03_result_submission_triggers_next_push(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100"},
-        port=8100,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("t1", "implement"))
-        client.post("/tasks", json=_task_payload("t2", "implement"))
-        assert len(push.calls) == 1  # only t1 pushed so far
-
-        resp = client.post("/tasks/t1/result", json=_result_payload("t1"))
-        assert resp.status_code == 200
-
-    assert len(push.calls) == 2
-    assert "t2" in push.calls[1][1]
-
-
-# U-SP04: No pane_map configured → no push, task stays pending
-def test_u_sp04_no_pane_map_no_push(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map=None,
-        port=8100,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        resp = client.post("/tasks", json=_task_payload("t1", "implement"))
-        assert resp.status_code == 201
-
+        assert client.post("/tasks", json=_task_payload("pane-free")).status_code == 201
     assert push.calls == []
+    assert TaskQueue(tmp_db).get_task_status("pane-free") == "pending"
 
 
-# U-SP05: Role not in pane_map → no push for that role
-def test_u_sp05_role_without_pane_no_push(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100"},  # reviewer has no pane
-        port=8100,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("r1", "review"))
-
-    assert push.calls == []
-
-
-# U-SP06: Different roles are independent — implement push doesn't block review push
-def test_u_sp06_different_roles_push_independently(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100", "reviewer": "%200"},
-        port=8100,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("t1", "implement"))
-        client.post("/tasks", json=_task_payload("r1", "review"))
-
-    assert len(push.calls) == 2
-    pane_ids = {c[0] for c in push.calls}
-    assert pane_ids == {"%100", "%200"}
-
-
-def _discuss_payload(task_id, agent, topic="some topic", priority=3):
-    return {
-        "task_id": task_id,
-        "task_type": "discuss",
-        "description": f"Discuss: {topic}",
-        "branch": "main",
-        "priority": priority,
-        "context": {"risk_tier": 1, "agent": agent, "round": 1},
-    }
-
-
-# U-SP07: discuss task routes to the pane keyed by context.agent (Bug #2 fix)
-def test_u_sp07_discuss_pushes_to_agent_specific_pane(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={
-            "implementer": "%100", "reviewer": "%200", "tester": "%300",
-            "claude": "%100", "codex": "%200", "gemini": "%300",
-        },
-        port=9000,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_discuss_payload("d-claude", "claude"))
-
-    assert len(push.calls) == 1
-    pane_id, text = push.calls[0]
-    assert pane_id == "%100"
-    assert "d-claude" in text
-    assert "discuss" in text
-
-
-# U-SP08: three concurrent discuss tasks fan out to three panes simultaneously
-def test_u_sp08_discuss_fans_out_across_panels(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={
-            "claude": "%100", "codex": "%200", "gemini": "%300",
-        },
-        port=9000,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_discuss_payload("d-claude", "claude"))
-        client.post("/tasks", json=_discuss_payload("d-codex", "codex"))
-        client.post("/tasks", json=_discuss_payload("d-gemini", "gemini"))
-
-    assert len(push.calls) == 3
-    routed = {c[0]: c[1] for c in push.calls}
-    assert "d-claude" in routed["%100"]
-    assert "d-codex" in routed["%200"]
-    assert "d-gemini" in routed["%300"]
-
-
-# U-SP09: two discuss tasks for the SAME agent → first pushes, second waits
-def test_u_sp09_same_agent_discuss_serializes(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"claude": "%100", "codex": "%200"},
-        port=9000,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_discuss_payload("d-claude-1", "claude"))
-        client.post("/tasks", json=_discuss_payload("d-claude-2", "claude", priority=1))
-
-    assert len(push.calls) == 1
-    assert "d-claude-1" in push.calls[0][1]
-
-
-# U-SP10: result submission for a discuss task triggers the next discuss for the same agent
-def test_u_sp10_discuss_result_triggers_next_for_same_agent(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"claude": "%100"},
-        port=9000,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_discuss_payload("d-claude-1", "claude"))
-        client.post("/tasks", json=_discuss_payload("d-claude-2", "claude"))
-        assert len(push.calls) == 1  # only first pushed
-
-        resp = client.post(
-            "/tasks/d-claude-1/result",
-            json=_result_payload("d-claude-1"),
-        )
-        assert resp.status_code == 200
-
-    assert len(push.calls) == 2
-    assert "d-claude-2" in push.calls[1][1]
-    assert push.calls[1][0] == "%100"
-
-
-# U-SP11: discuss task for an agent not in pane_map → no push (graceful skip)
-def test_u_sp11_discuss_unknown_agent_no_push(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"claude": "%100"},
-        port=9000,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        resp = client.post(
-            "/tasks", json=_discuss_payload("d-unknown", "rando-agent"),
-        )
-        assert resp.status_code == 201
-
-    assert push.calls == []
-
-
-# U-SP12: discuss task without context.agent → no push (malformed, graceful)
-def test_u_sp12_discuss_missing_agent_no_push(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"claude": "%100"},
-        port=9000,
-        push_fn=push,
-    )
-    payload = _discuss_payload("d-noagent", "claude")
-    payload["context"] = {"risk_tier": 1}  # no agent key
-    with TestClient(app) as client:
-        resp = client.post("/tasks", json=payload)
-        assert resp.status_code == 201
-
-    assert push.calls == []
-
-
-# U-SP13: _default_push uses tmux load-buffer + paste-buffer -p so multi-line
-# task text is delivered as a single bracketed paste (one Enter to submit).
-# Before this fix, send-keys -l turned each \n in the task block into a
-# separate Enter keystroke, which codex would submit prematurely and then hit
-# its upstream rate limit.
-def test_u_sp13_default_push_uses_bracketed_paste(monkeypatch):
-    from unittest.mock import MagicMock
-    from agent_crew.server import _default_push
-
-    # capture-pane returns empty (task marker absent) → no retry Enter needed.
-    mock_run = MagicMock(return_value=MagicMock(returncode=0, stdout=""))
-    monkeypatch.setattr("agent_crew.server.subprocess.run", mock_run)
-    monkeypatch.setattr("agent_crew.server.time.sleep", lambda _: None)
-
-    text = "line1\nline2\nline3"
-    _default_push("%942", text)
-
-    # 4 subprocess calls: load-buffer, paste-buffer -p -d, send-keys Enter,
-    # capture-pane (verify Enter was processed). No retry because marker absent.
-    assert mock_run.call_count == 4
-    load_args = mock_run.call_args_list[0][0][0]
-    paste_args = mock_run.call_args_list[1][0][0]
-    enter_args = mock_run.call_args_list[2][0][0]
-    capture_args = mock_run.call_args_list[3][0][0]
-
-    assert load_args[:3] == ["tmux", "load-buffer", "-b"]
-    assert load_args[-1] == "-"
-    load_kwargs = mock_run.call_args_list[0][1]
-    assert load_kwargs.get("input") == text
-
-    assert "paste-buffer" in paste_args
-    assert "-p" in paste_args  # bracketed paste mode
-    assert "-d" in paste_args  # delete buffer after paste
-    assert "%942" in paste_args
-    assert paste_args[paste_args.index("-b") + 1] == load_args[3]  # same named buffer
-
-    assert enter_args == ["tmux", "send-keys", "-t", "%942", "Enter"]
-    assert "capture-pane" in capture_args
-
-
-# U-SP13b: _pane_has_task detects collapsed `[Pasted text` placeholder so a
-# stuck large paste isn't mistaken for a successfully submitted task.
-# Background: Claude Code collapses long pastes into `[Pasted text #N +X lines]`,
-# so the raw `=== AGENT_CREW TASK ===` marker isn't visible — the previous
-# detection logic returned False (false positive of success).
-def test_u_sp13b_pane_has_task_detects_collapsed_paste(monkeypatch):
-    from unittest.mock import MagicMock
-    from agent_crew.server import _pane_has_task
-
-    mock_run = MagicMock(return_value=MagicMock(
-        returncode=0,
-        stdout="❯ [Pasted text #2 +42 lines]\n",
-    ))
-    monkeypatch.setattr("agent_crew.server.subprocess.run", mock_run)
-
-    assert _pane_has_task("%942") is True
-
-
-# U-SP13c: _default_push retries Enter with backoff when the marker stays
-# visible — covers the rapid-task-succession race where the first Enter is
-# consumed by Claude's post-completion UI transition (issue #74).
-def test_u_sp13c_default_push_retries_with_backoff(monkeypatch):
-    from unittest.mock import MagicMock
-    from agent_crew.server import _default_push
-
-    # Simulate marker visible for the first 2 capture-pane calls, gone on the
-    # 3rd. Each iteration: send-keys Enter + capture-pane (2 subprocess calls).
-    captures = [
-        MagicMock(returncode=0, stdout="=== AGENT_CREW TASK ==="),  # 1st check
-        MagicMock(returncode=0, stdout="=== AGENT_CREW TASK ==="),  # 2nd check
-        MagicMock(returncode=0, stdout=""),                          # 3rd check (clear)
-    ]
-    capture_iter = iter(captures)
-
-    def fake_run(cmd, *args, **kwargs):
-        if "capture-pane" in cmd:
-            return next(capture_iter)
-        return MagicMock(returncode=0, stdout="", stderr=b"")
-
-    sleeps: list[float] = []
-    monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
-    monkeypatch.setattr("agent_crew.server.time.sleep", lambda s: sleeps.append(s))
-
-    _default_push("%942", "=== AGENT_CREW TASK ===\ntask_id: t-074\nbody")
-
-    # Expected sequence: paste-settle sleep, then per-attempt (send Enter, sleep,
-    # capture-pane). 3 attempts to reach success, so 3 post-Enter sleeps.
-    # Total sleeps = 1 (paste settle) + 3 (per attempt) = 4.
-    assert len(sleeps) == 4
-    # Backoff increases monotonically across attempts.
-    assert sleeps[1] < sleeps[2] < sleeps[3]
-
-
-# U-SP13d: _default_push gives up after the configured max attempts and logs
-# an error — keeps the server from spinning forever on a wedged pane.
-def test_u_sp13d_default_push_gives_up_after_max_attempts(monkeypatch, caplog):
-    import logging
-    from unittest.mock import MagicMock
-    from agent_crew.server import _default_push
-
-    # Marker stays visible forever — every capture-pane returns it.
-    def fake_run(cmd, *args, **kwargs):
-        if "capture-pane" in cmd:
-            return MagicMock(returncode=0, stdout="=== AGENT_CREW TASK ===")
-        return MagicMock(returncode=0, stdout="", stderr=b"")
-
-    monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
-    monkeypatch.setattr("agent_crew.server.time.sleep", lambda _: None)
-
-    with caplog.at_level(logging.ERROR, logger="agent_crew.server"):
-        _default_push("%942", "=== AGENT_CREW TASK ===\ntask_id: t-074\nbody")
-
-    assert any("PUSH FAILED" in rec.message for rec in caplog.records)
-
-
-# U-SP14: impl task completed → auto-enqueue review task
 def test_u_sp14_impl_completed_auto_enqueue_review(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100", "reviewer": "%200"},
-        port=8100,
-        push_fn=push,
-    )
+    app = create_app(db_path=tmp_db, pane_map={})
     with TestClient(app) as client:
         impl = _task_payload("impl-001", "implement", "Add feature X")
         impl["context"]["crew_run_branch"] = True
-        client.post("/tasks", json=impl)
-        assert len(push.calls) == 1
-        assert "impl-001" in push.calls[0][1]
+        assert client.post("/tasks", json=impl).status_code == 201
+        assert client.post("/tasks/impl-001/result", json=_result_payload("impl-001")).status_code == 200
+    reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
+    assert len(reviews) == 1
+    assert reviews[0].context["prev_task_id"] == "impl-001"
 
-        resp = client.post("/tasks/impl-001/result", json=_result_payload("impl-001"))
-        assert resp.status_code == 200
-
-    assert len(push.calls) == 2
-    review_push = push.calls[1]
-    assert review_push[0] == "%200"  # review pane
-    assert "review" in review_push[1]
-    assert "impl-001" in review_push[1]  # prev_task_id in description or context
 
 
 # U-SP15: impl task failed → no auto review enqueue
 def test_u_sp15_impl_failed_no_auto_review(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100", "reviewer": "%200"},
-        port=8100,
-        push_fn=push,
-    )
+    app = create_app(db_path=tmp_db, pane_map={})
     with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("impl-002", "implement"))
-        assert len(push.calls) == 1
+        assert client.post("/tasks", json=_task_payload("impl-002")).status_code == 201
+        assert client.post("/tasks/impl-002/result", json=_result_payload("impl-002", status="failed")).status_code == 200
+    assert [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"] == []
 
-        resp = client.post(
-            "/tasks/impl-002/result",
-            json=_result_payload("impl-002", status="failed")
-        )
-        assert resp.status_code == 200
-
-    # An untyped self-reported failure is deterministic, so it does not retry.
-    assert len(push.calls) == 1
-    # Verify no review or retry task was pushed.
-    for _, msg in push.calls:
-        assert "task_type: implement" in msg
 
 
 # U-SP16: impl task needs_human → no auto review enqueue
 def test_u_sp16_impl_needs_human_no_auto_review(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100", "reviewer": "%200"},
-        port=8100,
-        push_fn=push,
-    )
+    app = create_app(db_path=tmp_db, pane_map={})
     with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("impl-003", "implement"))
-        assert len(push.calls) == 1
+        assert client.post("/tasks", json=_task_payload("impl-003")).status_code == 201
+        assert client.post("/tasks/impl-003/result", json=_result_payload("impl-003", status="needs_human")).status_code == 200
+    assert [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"] == []
 
-        resp = client.post(
-            "/tasks/impl-003/result",
-            json=_result_payload("impl-003", status="needs_human")
-        )
-        assert resp.status_code == 200
-
-    assert len(push.calls) == 1  # no review task pushed
 
 
 # U-SP17: auto-enqueued review task can be queried via /tasks (it gets pushed, so check in_progress)
 def test_u_sp17_auto_review_task_queryable(tmp_db):
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100", "reviewer": "%200"},
-        port=8100,
-        push_fn=push,
-    )
+    app = create_app(db_path=tmp_db, pane_map={})
     with TestClient(app) as client:
         impl = _task_payload("impl-004", "implement", "Fix bug Y")
         impl["context"]["crew_run_branch"] = True
-        client.post("/tasks", json=impl)
-        client.post("/tasks/impl-004/result", json=_result_payload("impl-004"))
+        assert client.post("/tasks", json=impl).status_code == 201
+        assert client.post("/tasks/impl-004/result", json=_result_payload("impl-004")).status_code == 200
+        reviews = [t for t in client.get("/tasks").json() if t["task_type"] == "review"]
+    assert len(reviews) == 1
+    assert reviews[0]["context"]["prev_task_id"] == "impl-004"
 
-        # Auto-enqueued review task gets pushed immediately, so it's in_progress
-        tasks = client.get("/tasks").json()
-        review_tasks = [t for t in tasks if t["task_type"] == "review"]
-        assert len(review_tasks) >= 1
-        review = review_tasks[0]
-        assert "impl-004" in str(review.get("context", {}))
-        # #164: review description is now compact (task ID reference, not full spec)
-        assert "impl-004" in review["description"]
 
 
 # U-SP18: dead pane before push → task rolled back to queued, push_fn not called
-def test_u_sp18_dead_pane_rolls_back_task_to_queued(tmp_db, monkeypatch):
-    """If the target pane is dead, the dequeued task must be put back to 'queued'
-    and push_fn must NOT be called."""
-    from unittest.mock import MagicMock
-    from agent_crew.server import _pane_alive_for_push
-
-    # Patch pane liveness check to always return False (dead pane)
-    monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda pane_id: False)
-
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        # Canonical tmux pane IDs are numeric.  A symbolic target cannot be
-        # resolved by the ownership guard, so it never reaches this test's
-        # intentionally-dead-pane liveness branch.
-        pane_map={"implementer": "%10018"},
-        port=8100,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("t-dead", "implement"))
-
-    # push_fn must NOT have been called
-    assert push.calls == []
-
-    # Task must be back in queued state (not in_progress or lost)
-    from agent_crew.queue import TaskQueue
-    q = TaskQueue(tmp_db)
-    tasks = q.list_tasks(status="pending")
-    task_ids = [t.task_id for t in tasks]
-    assert "t-dead" in task_ids
 
 
 # U-SP19: dead pane on result submission → next task rolled back, push_fn not called
-def test_u_sp19_dead_pane_on_result_next_task_requeued(tmp_db, monkeypatch):
-    """When a result triggers the next push but the pane is now dead, the next
-    task must be rolled back to queued and push_fn not called again."""
-    from agent_crew.server import _pane_alive_for_push
-
-    call_count = {"n": 0}
-
-    def pane_alive_side_effect(pane_id):
-        # First call (for t1 initial push) → alive; subsequent calls → dead
-        call_count["n"] += 1
-        return call_count["n"] == 1
-
-    monkeypatch.setattr("agent_crew.server._pane_alive_for_push", pane_alive_side_effect)
-
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100"},
-        port=8100,
-        push_fn=push,
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("t1", "implement"))
-        client.post("/tasks", json=_task_payload("t2", "implement"))
-        assert len(push.calls) == 1  # only t1 pushed (pane alive)
-
-        # Submit t1 result; pane now dead when trying to push t2
-        resp = client.post("/tasks/t1/result", json=_result_payload("t1"))
-        assert resp.status_code == 200
-
-    # t2 must NOT have been pushed
-    assert len(push.calls) == 1
-
-    # t2 must be back in queued/pending state
-    from agent_crew.queue import TaskQueue
-    q = TaskQueue(tmp_db)
-    tasks = q.list_tasks(status="pending")
-    assert any(t.task_id == "t2" for t in tasks)
 
 
 # U-SP20: _auto_enqueue_review inherits project from impl task context
@@ -636,170 +133,14 @@ def test_u_sp20_auto_enqueue_review_inherits_project(tmp_db):
 
 
 # U-SP22: POST /gates/{id}/resolve approved → _try_push_next fires for all roles
-def test_u_sp22_gate_approve_triggers_push_next(tmp_db):
-    """When a gate is resolved as 'approved', the server must attempt _try_push_next
-    for implementer, reviewer, and tester — dispatching any pending tasks."""
-    from unittest.mock import patch
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%200"},
-        port=9999,
-        push_fn=push,
-        watchdog_disabled=True,
-    )
-    with TestClient(app) as client:
-        # Create a gate
-        resp = client.post("/gates", json={"id": "gate-sp22", "type": "approval", "message": "approve me"})
-        assert resp.status_code == 201
-
-        # Enqueue a pending implement task while role is idle
-        resp = client.post("/tasks", json=_task_payload("t-sp22", "implement"))
-        assert resp.status_code == 201
-        # task was pushed immediately (role idle); now in_progress
-        push.calls.clear()
-
-        # Enqueue another task that stays pending (role is busy)
-        resp = client.post("/tasks", json=_task_payload("t-sp22b", "implement"))
-        assert resp.status_code == 201
-        push.calls.clear()  # no push fired (role busy)
-
-        # Submit result for t-sp22 → role becomes idle
-        client.post("/tasks/t-sp22/result", json=_result_payload("t-sp22"))
-        # _try_push_next fires here and pushes t-sp22b
-        push.calls.clear()
-
-        # Enqueue a third task that stays pending (role now busy with t-sp22b)
-        resp = client.post("/tasks", json=_task_payload("t-sp22c", "implement"))
-        assert resp.status_code == 201
-        push.calls.clear()
-
-        # Approve the gate: _try_push_next is called for all 3 roles.
-        # t-sp22c is pending but t-sp22b is in_progress, so no additional push
-        # occurs here. We verify _try_push_next was CALLED (gate approval fires it).
-        called_roles = []
-        original_try_push = app.state  # not used; we patch the inner function
-
-        # Use push_fn call count before vs after to infer _try_push_next activity
-        resp = client.post("/gates/gate-sp22/resolve", json={"status": "approved"})
-        assert resp.status_code == 200
-        assert resp.json() == {"status": "resolved"}
 
 
 # U-SP22b: gate approval with idle role and pending task → task dispatched
-def test_u_sp22b_gate_approve_dispatches_pending_when_idle(tmp_db):
-    """Approving a gate when a role is idle and has a pending task must push it."""
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%200"},
-        port=9999,
-        push_fn=push,
-        watchdog_disabled=True,
-    )
-    with TestClient(app) as client:
-        # Create gate
-        client.post("/gates", json={"id": "gate-sp22b", "type": "approval", "message": "go"})
-
-        # Enqueue a task but mark role busy by dequeuing it manually via the API
-        client.post("/tasks", json=_task_payload("t-sp22b-impl", "implement"))
-        # Role is now in_progress (task was pushed immediately)
-        client.post("/tasks/t-sp22b-impl/result", json=_result_payload("t-sp22b-impl"))
-        # Role is now idle; no more pending tasks
-
-        # Enqueue a new task → it stays pending because role got busy between
-        # submit and this call? Actually role IS idle, so posting enqueues + pushes
-        push.calls.clear()
-        client.post("/tasks", json=_task_payload("t-sp22b-next", "implement"))
-        # was auto-pushed (role idle), now in_progress
-        push.calls.clear()
-
-        # Submit to make role idle again, then enqueue pending task
-        client.post("/tasks/t-sp22b-next/result", json=_result_payload("t-sp22b-next"))
-        push.calls.clear()
-
-        # Now role is idle. Enqueue a task while gate is pending — auto-push fires
-        client.post("/tasks", json=_task_payload("t-sp22b-gate", "implement"))
-        push.calls.clear()  # t-sp22b-gate was auto-pushed; now in_progress
-
-        # Enqueue one more that stays pending (role busy)
-        client.post("/tasks", json=_task_payload("t-sp22b-pending", "implement"))
-        push.calls.clear()
-
-        # Submit t-sp22b-gate to make role idle; t-sp22b-pending auto-pushed
-        client.post("/tasks/t-sp22b-gate/result", json=_result_payload("t-sp22b-gate"))
-        # t-sp22b-pending is now in_progress; role busy again
-        push.calls.clear()
-
-        # Approve the gate — _try_push_next fires but role is busy → no new push
-        resp = client.post("/gates/gate-sp22b/resolve", json={"status": "approved"})
-        assert resp.status_code == 200
-
-    # The gate resolved correctly — key check is status, not push count
-    assert resp.json() == {"status": "resolved"}
 
 
-def test_u_sp22c_gate_approve_dispatches_all_roles_once_panes_recover(tmp_db):
-    """If tasks piled up while panes were unavailable, approving a gate should
-    advance the crew by dispatching one pending task per idle role."""
-    from unittest.mock import patch
-
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%100", "reviewer": "%200", "tester": "%300"},
-        port=9999,
-        push_fn=push,
-        watchdog_disabled=True,
-    )
-
-    gate_payload = {"id": "gate-sp22c", "type": "approval", "message": "resume"}
-
-    # #772: the test task goes to the script runner, which probes no pane.
-    dead_then_alive = [False, False, True, True]
-
-    with patch("agent_crew.server._pane_alive_for_push", side_effect=dead_then_alive):
-        with TestClient(app) as client:
-            client.post("/gates", json=gate_payload)
-            client.post("/tasks", json=_task_payload("impl-sp22c", "implement"))
-            client.post("/tasks", json=_task_payload("review-sp22c", "review"))
-            client.post("/tasks", json=_task_payload("test-sp22c", "test"))
-
-            assert push.calls == []
-
-            resp = client.post("/gates/gate-sp22c/resolve", json={"status": "approved"})
-            assert resp.status_code == 200
-            assert resp.json() == {"status": "resolved"}
-
-    pushed_ids = {pane_id: text for pane_id, text in push.calls}
-    # #772: the default tester is the script runner; a test task is never
-    # pushed to a provider pane, even when one is mapped.
-    assert len(push.calls) == 2
-    assert "impl-sp22c" in pushed_ids["%100"]
-    assert "review-sp22c" in pushed_ids["%200"]
-    assert "%300" not in pushed_ids
 
 
 # U-SP23: POST /gates/{id}/resolve rejected → _try_push_next NOT called
-def test_u_sp23_gate_reject_no_push(tmp_db):
-    """Rejecting a gate must NOT trigger _try_push_next."""
-    push = RecordingPush()
-    app = create_app(
-        db_path=tmp_db,
-        pane_map={"implementer": "%201"},
-        port=9999,
-        push_fn=push,
-        watchdog_disabled=True,
-    )
-    with TestClient(app) as client:
-        client.post("/gates", json={"id": "gate-sp23", "type": "approval", "message": "reject me"})
-        push.calls.clear()
-
-        resp = client.post("/gates/gate-sp23/resolve", json={"status": "rejected"})
-        assert resp.status_code == 200
-
-    # No push on rejection (no pending tasks anyway, and loop shouldn't fire)
-    assert len(push.calls) == 0, "gate rejection must not trigger push"
 
 
 # U-SP21: _auto_enqueue_review rejects cross-project impl tasks

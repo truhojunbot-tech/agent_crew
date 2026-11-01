@@ -853,7 +853,9 @@ def test_approved_review_cascades_into_a_script_test(project, server, monkeypatc
                                  "summary": "Approved: the change is small and covered by tests.",
                                  "verdict": "approve", "findings": []})
         assert resp.status_code == 200, resp.text
-        app.state.script_test_thread.join(timeout=120)
+        task = queue.dequeue(agent="script", role="tester")
+        assert task is not None and task.task_id == f"test-{review}"
+        asyncio.run(app.state.dispatch_task(task, "tester"))
     test = queue.get_task(f"test-{review}")
     assert test.status == "completed"
     assert queue.get_task_context(test.task_id)["script_test"]["counts"] == {"passed": 2}

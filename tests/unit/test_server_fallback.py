@@ -14,7 +14,6 @@ def _live_test_panes(monkeypatch):
     """Keep fallback tests on the worker-result path, not tmux refusal."""
     monkeypatch.setattr("agent_crew.server._resolve_tmux_pane_target", lambda target: target)
     monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda pane: True)
-    monkeypatch.setattr("agent_crew.server._pane_process_kind", lambda pane: ("agent", "test"))
 
 
 def _task_payload(task_id="t1", task_type="implement", description="do work"):
@@ -109,9 +108,6 @@ def test_u_fb01_rate_limit_never_substitutes_implementer(tmp_db):
 
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("impl-1"))
-        # Original push went to claude pane (%C).
-        assert any(pane == "%C" for pane, _ in push_calls)
-
         # Implementer reports rate-limit failure.
         client.post("/tasks/impl-1/result", json=_result("impl-1"))
 

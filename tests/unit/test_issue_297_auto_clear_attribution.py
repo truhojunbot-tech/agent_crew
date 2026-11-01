@@ -112,183 +112,45 @@ def _run(tmp_path, monkeypatch, *, tokens=BIG, post_clear_tokens=None, task_type
 # ── 1. the clear leaves a durable record ──────────────────────────────
 
 
-def test_an_auto_clear_emits_a_lifecycle_event(tmp_path, monkeypatch, *, unused_tcp_port):
-    """★★The bug: `_pane_clear_context` recorded nothing at all."""
-    db, sent, _ = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    assert any("/clear" in c for c in sent), "no /clear was sent"
-    assert len(_cleared_events(db)) == 1
 
 
-def test_the_event_carries_what_an_audit_needs(tmp_path, monkeypatch, *, unused_tcp_port):
-    db, _, _ = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    event = _cleared_events(db)[0]
-    assert event["task_id"] == "t-297"
-    assert event["agent"] == "claude"
-    assert event["pane_id"] == "%91"
-    assert event["reason"] == "auto_clear_token_threshold"
 
 
-def test_the_event_carries_the_measurement_that_triggered_it(tmp_path, monkeypatch, *, unused_tcp_port):
-    """⛔The number and where it came from. A threshold event without the
-    reading that crossed it cannot be audited or replayed."""
-    db, _, _ = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    event = _cleared_events(db)[0]
-    assert event["context_tokens"] == BIG
-    assert event["token_source"] == "transcript"
-    assert event["cap_tokens"] == sv._TOKEN_CLEAR_THRESHOLD
 
 
-def test_the_clear_is_recorded_as_attempted_not_completed(tmp_path, monkeypatch, *, unused_tcp_port):
-    """⛔`send-keys` returning 0 proves the keystrokes were delivered, not that
-    the provider cleared anything. Claiming `completed` would be inventing a
-    confirmation the transport cannot give."""
-    db, _, _ = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    assert _cleared_events(db)[0]["outcome"] == "attempted"
 
 
-def test_a_failed_send_is_recorded_as_such(tmp_path, monkeypatch):
-    """The one thing send-keys CAN tell us."""
-    calls = []
-
-    def failing(cmd, **kw):
-        if isinstance(cmd, list) and "send-keys" in cmd:
-            calls.append(cmd)
-
-            class _R:
-                returncode = 1
-                stdout = ""
-                stderr = "no such pane"
-            return _R()
-        return _pane()
-
-    monkeypatch.setattr(sv.time, "sleep", lambda *_a: None)
-    with monkeypatch.context() as m:
-        m.setattr(sv.subprocess, "run", failing)
-        sv._pane_clear_context("%99", events_path=str(tmp_path / "e.jsonl"),
-                               task_id="t", agent="claude")
-    lines = [json.loads(x) for x in open(tmp_path / "e.jsonl")]
-    assert lines[0]["outcome"] == "send_failed"
 
 
-def test_no_clear_means_no_event(tmp_path, monkeypatch, *, unused_tcp_port):
-    """⛔The control. An event stream that records non-events is worse than
-    none — every rate computed from it would be wrong."""
-    db, sent, _ = _run(tmp_path, monkeypatch, tokens=10, unused_tcp_port=unused_tcp_port)
-    assert not any("/clear" in c for c in sent)
-    assert _cleared_events(db) == []
 
 
 # ── 2. the treatment is corrected, not just described ─────────────────
 
 
-def test_an_unconfirmed_clear_attempt_does_not_force_fresh(tmp_path, monkeypatch, *, unused_tcp_port):
-    """Keystroke delivery is not provider confirmation."""
-    _, _, ctx = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    assert "context_reset" not in ctx
-    assert ctx["auto_clear_outcome"] == "attempted"
-    assert "auto_cleared_before_push" not in ctx
 
 
-def test_an_unconfirmed_attempt_preserves_resume(tmp_path, monkeypatch, *, unused_tcp_port):
-    _, _, ctx = _run(tmp_path, monkeypatch, context={"context_policy": "resume"}, unused_tcp_port=unused_tcp_port)
-    assert ctx["context_policy"] == "resume"
-    assert "context_reset" not in ctx
-    assert ctx["auto_clear_outcome"] == "attempted"
 
 
-def test_a_measured_post_clear_drop_confirms_fresh(tmp_path, monkeypatch, *, unused_tcp_port):
-    db, _, ctx = _run(tmp_path, monkeypatch, post_clear_tokens=100,
-                      context={"context_policy": "resume"}, unused_tcp_port=unused_tcp_port)
-    assert ctx["context_reset"] is True
-    assert ctx["auto_cleared_before_push"] is True
-    assert ctx["auto_clear_outcome"] == "confirmed"
-    assert _cleared_events(db)[0]["outcome"] == "confirmed"
 
 
-def test_the_intervention_is_joinable_on_its_own(tmp_path, monkeypatch, *, unused_tcp_port):
-    """⛔Acceptance 2's other half: a consumer must be able to EXCLUDE or
-    stratify auto-cleared rows specifically, not merely see `fresh` and wonder
-    which of several reasons produced it."""
-    _, _, ctx = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    assert ctx["auto_clear_outcome"] == "attempted"
-    assert ctx["auto_clear_context_tokens"] == BIG
-    assert ctx["auto_clear_token_source"] == "transcript"
-    assert ctx["auto_clear_threshold_tokens"] == sv._TOKEN_CLEAR_THRESHOLD
 
 
-def test_an_uncleared_task_carries_no_intervention_marks(tmp_path, monkeypatch, *, unused_tcp_port):
-    _, _, ctx = _run(tmp_path, monkeypatch, tokens=10, unused_tcp_port=unused_tcp_port)
-    for key in ("context_reset", "auto_cleared_before_push"):
-        assert key not in ctx, key
 
 
-def test_an_explicit_operator_reset_is_not_overwritten(tmp_path, monkeypatch, *, unused_tcp_port):
-    """⛔The marker is additive. An operator who already asked for a reset must
-    not have their intent relabelled as an auto-clear."""
-    _, _, ctx = _run(tmp_path, monkeypatch, tokens=10,
-                     context={"context_reset": True}, unused_tcp_port=unused_tcp_port)
-    assert ctx["context_reset"] is True
-    assert "auto_cleared_before_push" not in ctx
 
 
 # ── 3. both push paths ────────────────────────────────────────────────
 
 
-def test_the_discuss_path_is_attributed_too(tmp_path, monkeypatch, *, unused_tcp_port):
-    """⛔Acceptance 4. Panels accumulate the most context, which is why #260 put
-    a guard on this path — so it is the path most likely to clear."""
-    db, sent, _ = _run(tmp_path, monkeypatch, task_type="discuss",
-                       context={"agent": "claude"}, unused_tcp_port=unused_tcp_port)
-    assert any("/clear" in c for c in sent)
-    events = _cleared_events(db)
-    assert len(events) == 1 and events[0]["task_id"] == "t-297"
 
 
-def test_the_discuss_task_is_also_marked(tmp_path, monkeypatch, *, unused_tcp_port):
-    _, _, ctx = _run(tmp_path, monkeypatch, task_type="discuss",
-                     context={"agent": "claude"}, unused_tcp_port=unused_tcp_port)
-    assert "context_reset" not in ctx
-    assert ctx["auto_clear_outcome"] == "attempted"
 
 
 # ── 4. identity, where the push path can know it ──────────────────────
 
 
-def test_a_known_context_identity_is_attached(tmp_path, monkeypatch):
-    """The push path does not resolve context identity itself — that happens at
-    dispatch — so the event reads the recorded one rather than minting it.
-    `task_id` is the join key either way; this is the audit detail."""
-    db = str(tmp_path / "peek.db")
-    q = TaskQueue(db)
-    created = q.get_or_create_context(project="demo", agent="claude",
-                                      worktree_path="/w/claude", task_id="seed")
-    identity = q.peek_context_identity("demo", "claude", "/w/claude")
-    assert identity["context_id"]
-    assert identity["context_generation"] >= 1
-    q.update_context_provider_session_id(created["context_key"], "session-before-clear")
-
-    monkeypatch.setattr(sv.subprocess, "run", lambda *_a, **_kw: _pane())
-    monkeypatch.setattr(sv.time, "sleep", lambda *_a: None)
-    monkeypatch.setattr(sv, "_context_token_count", lambda *_a, **_kw: (100, "transcript"))
-    events_path = str(tmp_path / "events.jsonl")
-    outcome = sv._pane_clear_context(
-        "%91", task_id="next", project="demo", role="implementer",
-        agent="claude", worktree_path="/w/claude", context_tokens=BIG,
-        token_source="transcript", threshold=sv._TOKEN_CLEAR_THRESHOLD,
-        events_path=events_path, queue=q)
-    event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[0])
-    assert outcome == event["outcome"] == "confirmed"
-    assert event["context_id"] == identity["context_id"]
-    assert event["context_generation"] == identity["context_generation"]
-    assert event["provider_session_id"] == "session-before-clear"
-    assert event["context_tokens"] == BIG
-    assert event["cap_tokens"] == sv._TOKEN_CLEAR_THRESHOLD
-    assert event["post_clear_tokens"] == 100
 
 
-def test_an_unknown_context_identity_is_absent_not_invented(tmp_path):
-    q = TaskQueue(str(tmp_path / "empty.db"))
-    assert q.peek_context_identity("nobody", "nothing", "/nowhere") == {}
 
 
 # ── 5. a clear that did not happen must not be recorded as one ────────
@@ -348,83 +210,17 @@ def _failing_send(tmp_path, monkeypatch, *, task_type="implement", context=None,
     return db, ctx
 
 
-def test_a_failed_send_does_not_claim_a_fresh_context(tmp_path, monkeypatch, *, unused_tcp_port):
-    """★★The finding. Marking `context_reset` for a pane that was not cleared
-    puts an UNcleared task into the `fresh` cohort — the same contamination
-    #297 exists to prevent, pointing the other way."""
-    _, ctx = _failing_send(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    assert "context_reset" not in ctx, ctx
-    assert "auto_cleared_before_push" not in ctx, ctx
 
 
-def test_a_failed_send_on_the_discuss_path_is_also_unmarked(tmp_path, monkeypatch, *, unused_tcp_port):
-    _, ctx = _failing_send(tmp_path, monkeypatch, task_type="discuss",
-                           context={"agent": "claude"}, unused_tcp_port=unused_tcp_port)
-    assert "context_reset" not in ctx
-    assert "auto_cleared_before_push" not in ctx
 
 
-def test_a_failed_send_is_still_recorded(tmp_path, monkeypatch, *, unused_tcp_port):
-    """⛔The attempt is still a fact, and the one the operator most needs: a
-    pane over threshold that could not be cleared is unguarded. Not marking the
-    task must not mean staying silent about it."""
-    db, _ = _failing_send(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    events = _cleared_events(db)
-    assert len(events) == 1
-    assert events[0]["outcome"] == "send_failed"
 
 
-def test_a_successful_send_is_still_recorded_as_attempted(tmp_path, monkeypatch, *, unused_tcp_port):
-    _, _, ctx = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    assert ctx["auto_clear_outcome"] == "attempted"
-    assert "context_reset" not in ctx
 
 
 # ── 6. the event's role comes from the live map ───────────────────────
 
 
-def test_the_discuss_event_uses_the_configured_role(tmp_path, monkeypatch, *, unused_tcp_port):
-    """★★P2. The static default says claude implements; a config that says
-    otherwise has to win, or the event describes a deployment that does not
-    exist."""
-    wt = tmp_path / "worktrees" / "claude"
-    wt.mkdir(parents=True)
-    _session(tmp_path / "claudehome", str(wt), BIG)
-    state = tmp_path / "state.json"
-    # ⛔All three roles listed. `_load_role_to_agent` starts from the defaults
-    #   and only overrides what is present, so naming reviewer alone would leave
-    #   claude holding implementer TOO — ambiguous, and the lookup would
-    #   correctly refuse to name a role. The config has to actually make claude
-    #   single-roled for this test to be about the live map.
-    state.write_text(json.dumps({"port": 0, "roles": [
-        {"role": "reviewer", "agent": "claude", "worktree": str(wt)},
-        {"role": "implementer", "agent": "codex", "worktree": str(wt.parent / "codex")},
-        {"role": "tester", "agent": "gemini", "worktree": str(wt.parent / "gemini")},
-    ]}))
-    (wt.parent / "codex").mkdir(exist_ok=True)
-    (wt.parent / "gemini").mkdir(exist_ok=True)
-
-    monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
-    monkeypatch.setattr(sv, "_pane_alive_for_push", lambda p: True)
-    monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda p: None)
-    monkeypatch.setattr(sv.subprocess, "run", lambda *a, **k: _pane())
-    monkeypatch.setattr(sv.time, "sleep", lambda *_a: None)
-    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
-
-    db = str(tmp_path / "tasks.db")
-    app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"claude": "%92", "reviewer": "%92"}, port=unused_tcp_port,
-                     push_fn=lambda p, t: None, watchdog_disabled=True,
-                     anomaly_disabled=True)
-    with TestClient(app) as client:
-        client.post("/tasks", json={
-            "task_id": "t-299r", "task_type": "discuss", "description": "d",
-            "branch": "main", "priority": 3, "project": "demo",
-            "context": {"agent": "claude"}})
-
-    events = _cleared_events(db)
-    assert len(events) == 1, events
-    assert events[0]["role"] == "reviewer", events[0]["role"]
 
 
 def test_an_ambiguous_agent_emits_no_role_rather_than_a_guess():

@@ -14,6 +14,7 @@ from agent_crew.port_validation import require_project_port
 from agent_crew.role_mapping import resolve_agent_role
 from agent_crew.worktree_default_branch import remote_default_branch
 
+# write_sessions_json records commands for session metadata.
 _AGENT_CMDS = {
     "claude": "claude --dangerously-skip-permissions --continue --model claude-sonnet-5",
     "codex": "codex --dangerously-bypass-approvals-and-sandbox",
@@ -28,15 +29,6 @@ _AGENT_CMDS = {
     "gemini": "gemini --approval-mode yolo --model gemini-2.5-flash",
 }
 _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue --model claude-sonnet-5"
-
-# Substrings expected in pane output after a successful CLI boot.
-# Used by start_agents_in_panes to warn when the CLI doesn't appear to have started.
-_CLI_READY_MARKERS: dict[str, tuple[str, ...]] = {
-    "claude": ("bypass permissions", "skip permissions"),
-    "codex": ("gpt-", "codex>", "enter your task", "explain this codebase"),
-    "gemini": ("gemini", "yolo"),
-}
-
 
 def _get_agent_cmd(agent: str, worktree_path: str | None = None) -> str:
     """Return the shell command that launches the agent CLI in its worktree.
@@ -65,107 +57,6 @@ def _get_agent_cmd(agent: str, worktree_path: str | None = None) -> str:
     return cmd
 
 
-def start_agents_in_panes(
-    session_name: str,
-    agents: list[str],
-    pane_targets: list[str] | None = None,
-    worktrees: dict[str, str] | None = None,
-) -> None:
-    """Start agent CLIs in tmux panes.
-
-    Hybrid model: the server delivers tasks via tmux send-keys (push), and
-    agents also poll ``get_next_task`` via MCP every 30 seconds as a fallback
-    so no task is missed if a push is delayed or the pane was briefly busy.
-
-    After CLI boot, a kickoff prompt is sent to each agent instructing them to
-    start calling ``get_next_task(agent=...)`` every 30 seconds. This prompt
-    starts the polling loop without waiting for a push to arrive.
-
-    pane_targets (optional): explicit tmux targets per agent (e.g. pane_ids
-    like ``%42``). When omitted, falls back to ``<session>:0.<i>`` which
-    assumes a fresh session where pane 0 is the first agent.
-    """
-    def _send_enter(target: str) -> None:
-        subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], capture_output=True)
-
-    if pane_targets is None:
-        pane_targets = [f"{session_name}:0.{i}" for i in range(len(agents))]
-    if len(pane_targets) != len(agents):
-        raise ValueError(
-            f"pane_targets length {len(pane_targets)} != agents length {len(agents)}"
-        )
-
-    for agent, target in zip(agents, pane_targets):
-        wt_path = worktrees.get(agent) if worktrees else None
-        cmd = _get_agent_cmd(agent, wt_path)
-        # #142: ensure the pane is at a shell prompt before launching.
-        # If an old agent process (e.g. gemini without --approval-mode yolo) is
-        # still running, send-keys -l feeds the cmd as chat input instead of
-        # executing it in the shell. Ctrl+C interrupts any interactive process;
-        # 'q' + Enter covers CLIs that catch Ctrl+C and present a quit prompt.
-        # Safe on fresh panes: Ctrl+C on an idle shell is a no-op.
-        subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], capture_output=True)
-        time.sleep(0.3)
-        subprocess.run(["tmux", "send-keys", "-t", target, "q", "Enter"], capture_output=True)
-        time.sleep(0.3)
-        # #888: a shell command is verified too — it is pending while the
-        # screen still ends with it (#142: it can land in a chat box instead).
-        pane_submit.submit(target, cmd, paste=False, settle=0.2,
-                           pending=pane_submit.shell_line_pending(cmd),
-                           label=f"{agent} launch")
-        if agent == "codex":
-            # codex shows a two-step trust dialog after launch:
-            # 1) "1. Yes / 2. No" — cursor already on 1, Enter accepts
-            # 2) "Press enter to continue" — needs a second Enter
-            # The dialog takes ~3s to appear so we wait before responding.
-            time.sleep(3)
-            _send_enter(target)   # accept option 1 (already highlighted)
-            time.sleep(0.5)
-            _send_enter(target)   # dismiss "Press enter to continue"
-    # Wait for each agent CLI to become ready, then send kickoff.
-    # Per-agent polling replaces the hardcoded sleep(5): each agent gets up to
-    # _KICKOFF_MAX_WAIT seconds to show a CLI-ready marker so the kickoff prompt
-    # always lands at an active input cursor rather than mid-startup noise.
-    _KICKOFF_POLL_INTERVAL = 2
-    _KICKOFF_MAX_WAIT = 30
-
-    for agent, target in zip(agents, pane_targets):
-        markers = _CLI_READY_MARKERS.get(agent)
-        if markers:
-            deadline = time.time() + _KICKOFF_MAX_WAIT
-            ready = False
-            while time.time() < deadline:
-                r = subprocess.run(
-                    ["tmux", "capture-pane", "-p", "-t", target],
-                    capture_output=True, text=True,
-                )
-                if r.returncode == 0 and any(m.lower() in r.stdout.lower() for m in markers):
-                    ready = True
-                    break
-                time.sleep(_KICKOFF_POLL_INTERVAL)
-            if not ready:
-                _logger.warning(
-                    "start_agents_in_panes: pane %s (%s) not ready after %ss — "
-                    "kickoff sent anyway but agent may not receive it correctly.",
-                    target, agent, _KICKOFF_MAX_WAIT,
-                )
-        else:
-            time.sleep(5)
-        kickoff = (
-            f"Start your task loop now: call get_next_task(agent=\"{agent}\") "
-            f"via the agent_crew MCP server every 30 seconds. "
-            f"If MCP is unavailable, poll GET /tasks/next every 30 seconds. "
-            f"If either returns None, wait 30 seconds and try again. "
-            f"When a task arrives, branch on task_type, do the work, "
-            f"then call submit_result. Loop indefinitely."
-        )
-        # Bracketed paste (load-buffer + paste-buffer): tmux send-keys -l can
-        # silently drop characters while the pane is processing startup
-        # output. Verified submit (#888): Enter is retried until the kickoff
-        # has left the input line.
-        pane_submit.submit(target, kickoff, label=f"{agent} kickoff")
-
-
 def start_log_viewers_in_panes(
     agents: list[str],
     pane_targets: list[str],
@@ -189,8 +80,8 @@ def start_log_viewers_in_panes(
         log_path = os.path.join(log_dir, f"dispatch_{role}.log")
         # Ensure the file exists before tail starts.
         subprocess.run(["touch", log_path], capture_output=True)
-        subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], capture_output=True)
-        time.sleep(0.2)
+        subprocess.run(["tmux", "respawn-pane", "-k", "-t", target,
+                        "-c", log_dir], capture_output=True, check=True)
         # Wrapped in a respawn loop, not launched bare: these panes have
         # repeatedly been hijacked by other agents (e.g. alpha_engine's own
         # session `pkill -f crew-log-viewer`-ing this pane to run an

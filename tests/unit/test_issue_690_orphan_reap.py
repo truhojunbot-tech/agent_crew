@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import time
 
 from fastapi.testclient import TestClient
 
@@ -37,9 +38,9 @@ def _app(db, *, busy, panes=None):
 def test_dispatcher_orphan_expires_without_reminder(tmp_db, monkeypatch, caplog):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)
-    _claimed(queue, "orphan")
     app = _app(tmp_db, busy=True)
     with TestClient(app):
+        _claimed(queue, "orphan")
         actions = app.state.watchdog_tick(now=4000.0)
     assert actions["timed_out"] == ["orphan"]
     assert queue.get_task_status("orphan") == "timed_out"
@@ -50,9 +51,9 @@ def test_dispatcher_orphan_expires_without_reminder(tmp_db, monkeypatch, caplog)
 def test_dispatcher_with_fresh_heartbeat_survives_alive_pane(tmp_db, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)
-    _claimed(queue, "active", heartbeat_at=3990.0)
     app = _app(tmp_db, busy=True)
     with TestClient(app):
+        _claimed(queue, "active", heartbeat_at=3990.0)
         actions = app.state.watchdog_tick(now=4000.0)
     assert actions["timed_out"] == []
     assert queue.get_task_status("active") == "in_progress"
@@ -61,9 +62,9 @@ def test_dispatcher_with_fresh_heartbeat_survives_alive_pane(tmp_db, monkeypatch
 def test_dispatcher_with_fresh_heartbeat_survives_without_pane(tmp_db, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)
-    _claimed(queue, "active", heartbeat_at=3990.0)
     app = _app(tmp_db, busy=False, panes={})
     with TestClient(app):
+        _claimed(queue, "active", heartbeat_at=3990.0)
         actions = app.state.watchdog_tick(now=4000.0)
     assert actions["timed_out"] == []
     assert queue.get_task_status("active") == "in_progress"
@@ -72,9 +73,9 @@ def test_dispatcher_with_fresh_heartbeat_survives_without_pane(tmp_db, monkeypat
 def test_dispatcher_with_stale_heartbeat_expires(tmp_db, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)
-    _claimed(queue, "stale", heartbeat_at=1100.0)
     app = _app(tmp_db, busy=True)
     with TestClient(app):
+        _claimed(queue, "stale", heartbeat_at=1100.0)
         actions = app.state.watchdog_tick(now=4000.0)
     assert actions["timed_out"] == ["stale"]
     assert queue.get_task_status("stale") == "timed_out"
@@ -83,10 +84,10 @@ def test_dispatcher_with_stale_heartbeat_expires(tmp_db, monkeypatch):
 def test_later_dispatch_on_same_role_pane_expires_earlier_at_once(tmp_db, monkeypatch, caplog):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)
-    _claimed(queue, "old")
-    _claimed(queue, "new", dispatched_at=1100.0)
     app = _app(tmp_db, busy=True)
     with TestClient(app):
+        _claimed(queue, "old")
+        _claimed(queue, "new", dispatched_at=1100.0)
         actions = app.state.watchdog_tick(now=1200.0)
     assert actions["timed_out"] == ["old"]
     assert queue.get_task_status("old") == "timed_out"
@@ -98,25 +99,31 @@ def test_later_dispatch_on_same_role_pane_expires_earlier_at_once(tmp_db, monkey
 def test_later_dispatch_on_another_pane_does_not_expire_earlier(tmp_db, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)
-    _claimed(queue, "old")
-    _claimed(queue, "other-pane", dispatched_at=1100.0)
-    with sqlite3.connect(tmp_db) as db:
-        db.execute("UPDATE tasks SET context=? WHERE task_id='other-pane'",
-                   (json.dumps({"agent_override": "gemini"}),))
     app = _app(tmp_db, busy=True,
                panes={"tester": "%2915", "gemini": "%2999"})
     with TestClient(app):
+        _claimed(queue, "old")
+        _claimed(queue, "other-pane", dispatched_at=1100.0)
+        with sqlite3.connect(tmp_db) as db:
+            db.execute("UPDATE tasks SET context=? WHERE task_id='other-pane'",
+                       (json.dumps({"agent_override": "gemini"}),))
         actions = app.state.watchdog_tick(now=1200.0)
     assert actions["timed_out"] == []
     assert queue.get_task_status("old") == "in_progress"
 
 
-def test_tmux_pane_still_requires_reminder_before_timeout(tmp_db, monkeypatch):
+def test_background_watchdog_loop_expires_idle_dispatcher_claim(tmp_db, monkeypatch):
+    """The periodic loop runs and stops with app lifespan in dispatcher mode."""
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     queue = TaskQueue(tmp_db)
-    _claimed(queue, "pane-task", source="tmux_push")
-    app = _app(tmp_db, busy=False)
+    app = create_app(tmp_db, pane_map={}, timeout_seconds=0.05,
+                     watchdog_interval=0.05, watchdog_disabled=False,
+                     anomaly_disabled=True)
     with TestClient(app):
-        actions = app.state.watchdog_tick(now=4000.0)
-    assert actions["timed_out"] == []
-    assert queue.get_task_status("pane-task") == "in_progress"
+        _claimed(queue, "loop-idle")
+        deadline = time.monotonic() + 2
+        while queue.get_task_status("loop-idle") == "in_progress" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert queue.get_task_status("loop-idle") == "timed_out"
+    assert app.state.watchdog_expiry_counts["dispatcher_idle"] == 1

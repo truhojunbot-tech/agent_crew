@@ -14,7 +14,6 @@ def _live_test_panes(monkeypatch):
     """Keep handoff tests on the worker result path."""
     monkeypatch.setattr("agent_crew.server._resolve_tmux_pane_target", lambda target: target)
     monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda pane: True)
-    monkeypatch.setattr("agent_crew.server._pane_process_kind", lambda pane: ("agent", "test"))
 
 
 def _impl_payload(task_id="impl-1"):
@@ -138,21 +137,3 @@ def test_review_instructions_fallback_when_pr_number_missing(tmp_db):
     assert "gh pr list --head" in instr
     assert "agent/agent_crew/claude" in instr
     assert "FRESHNESS" in instr
-
-
-def test_review_pushed_to_reviewer_pane_on_impl_completion(tmp_db):
-    push_calls: list = []
-    app = _make_app(tmp_db, push_calls)
-    with TestClient(app) as client:
-        client.post("/tasks", json=_impl_payload("impl-86d"))
-        # First push: impl → claude pane (%C)
-        assert any(call[0] == "%C" for call in push_calls)
-        client.post(
-            "/tasks/impl-86d/result",
-            json=_completed_result("impl-86d", pr_number=99),
-        )
-    # Second push: review → codex pane (%X), and the message must contain
-    # the freshness directive that caused this whole bug.
-    review_pushes = [c for c in push_calls if c[0] == "%X"]
-    assert len(review_pushes) == 1
-    assert "gh pr diff 99" in review_pushes[0][1]

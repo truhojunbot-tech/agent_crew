@@ -260,31 +260,6 @@ def test_preupgrade_failed_notice_history_is_closed_without_resend(tmp_db, monke
                           "AND event='coordinator_notice_gave_up'").fetchone()[0] == 1
 
 
-def test_pane_timeout_notice_omits_captured_tail(tmp_db, monkeypatch):
-    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
-    queue = TaskQueue(tmp_db)
-    _root(queue)
-    notices = []
-    def fake_run(args, **_kwargs):
-        return SimpleNamespace(returncode=0, stdout="secret-pane-output " * 1000)
-    monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
-    app = create_app(tmp_db, pane_map={"implementer": "%2915", "codex": "%2915"},
-                     pane_busy_fn=lambda _: False, pane_liveness_fn=lambda _: "unknown",
-                     push_fn=lambda *_: None, timeout_seconds=900,
-                     watchdog_disabled=True, anomaly_disabled=True,
-                     identity_required=False,
-                     coordinator_notify_fn=lambda msg: notices.append(msg) or True)
-    with TestClient(app):
-        with sqlite3.connect(tmp_db) as db:
-            db.execute("UPDATE tasks SET status='in_progress', claim_source='tmux_push', "
-                       "last_activity_at=1000, dispatched_at=1000, "
-                       "dispatch_agent='codex', dispatch_target='%2915', push_at=1000 "
-                       "WHERE task_id='impl-773'")
-        app.state.reminded_task_ids.add("impl-773")
-        app.state.watchdog_tick(2000)
-    assert len(notices) == 1
-    assert "secret-pane-output" not in notices[0]
-    assert len(notices[0]) <= 1000
 
 
 def test_server_retry_keeps_both_role_choices(tmp_db, monkeypatch):

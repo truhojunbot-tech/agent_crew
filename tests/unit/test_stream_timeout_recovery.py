@@ -11,7 +11,7 @@ Three behaviours pinned here:
 from fastapi.testclient import TestClient
 
 from agent_crew.queue import TaskQueue
-from agent_crew.server import _format_reminder_message, create_app
+from agent_crew.server import create_app
 
 
 # ---------------------------------------------------------------------------
@@ -19,30 +19,6 @@ from agent_crew.server import _format_reminder_message, create_app
 # ---------------------------------------------------------------------------
 
 
-class TestReminderMessage:
-    def test_reminder_contains_three_options(self):
-        msg = _format_reminder_message("t-101", port=8200, idle_seconds=400)
-        assert "FINISHED" in msg
-        assert "STREAM/API TIMEOUT" in msg
-        assert "STILL WORKING" in msg
-
-    def test_reminder_includes_failed_status_curl(self):
-        """Path 2 must hand the agent a copy-pasteable POST that submits
-        status="failed" so the fallback policy can pick up the pieces."""
-        msg = _format_reminder_message("t-101", port=8200, idle_seconds=400)
-        assert '"status":"failed"' in msg
-        assert "API stream timeout" in msg
-
-    def test_reminder_includes_completed_status_curl(self):
-        msg = _format_reminder_message("t-101", port=8200, idle_seconds=400)
-        assert '"status":"completed"' in msg
-
-    def test_reminder_carries_task_id_and_port(self):
-        msg = _format_reminder_message("t-uniqueid", port=9123, idle_seconds=315.4)
-        assert "t-uniqueid" in msg
-        assert "9123" in msg
-        # Idle seconds rendered as integer (no fractional)
-        assert "315s" in msg or "315 s" in msg or "315" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -75,39 +51,3 @@ class _Push:
 
     def __call__(self, pane_id, text):
         self.calls.append((pane_id, text))
-
-
-def test_watchdog_timeout_does_not_substitute_provider(tmp_db):
-    """A watchdog failure must not resurrect the retired provider chain."""
-    push = _Push()
-    panes = {
-        # Canonical tmux pane IDs are numeric.  These fixtures exercise the
-        # watchdog timeout/fallback path, not named-target resolution.
-        "implementer": "%10101", "claude": "%10101",
-        "reviewer": "%10102", "codex": "%10102",
-        "tester": "%10103", "gemini": "%10103",
-    }
-    app = create_app(
-        db_path=tmp_db,
-        pane_map=panes,
-        port=8200,
-        push_fn=push,
-        pane_busy_fn=_Idle(),
-        reminder_seconds=300.0,
-        timeout_seconds=900.0,
-        watchdog_disabled=True,  # drive ticks manually
-    )
-    with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("impl-stream"))
-        # Force last_activity_at to a known value.
-        TaskQueue(tmp_db).bump_activity("impl-stream", ts=1000.0)
-        # First tick: fire reminder (idle_for=400s ≥ reminder=300s, #152).
-        app.state.watchdog_tick(now=1400.0)
-        # Second tick: fire timeout (idle_for=1500s ≥ timeout=900s).
-        result = app.state.watchdog_tick(now=2500.0)
-
-    assert result["timed_out"] == ["impl-stream"]
-
-    tasks = TaskQueue(tmp_db).list_tasks()
-    assert next(t for t in tasks if t.task_id == "impl-stream").status == "failed"
-    assert not any(t.task_id.startswith("fallback-") for t in tasks)

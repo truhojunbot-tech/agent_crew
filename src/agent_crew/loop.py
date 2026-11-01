@@ -373,7 +373,7 @@ INVALID_REVIEW_RESULT = "invalid_review_result"
 
 
 def _resolve_verdict(result: TaskResult) -> str:
-    """Map a TaskResult to one of {"approve", "request_changes"}.
+    """Map a TaskResult to an explicit verdict or a typed failure.
 
     Reviewer agents have been observed posting ``verdict=None`` with empty
     ``findings`` when they have nothing to flag. The literal CLI rule
@@ -382,8 +382,7 @@ def _resolve_verdict(result: TaskResult) -> str:
     null/[] and the loop ran 4 unnecessary iterations).
 
     Fail-closed contract (owner 2026-09-23):
-    - dispatcher failure (timeout/exit_X/no_result) → ``request_changes``
-      (NEVER silently approve a crashed/quota-exhausted review)
+    - dispatcher failure (timeout/exit_X/no_result) → ``review_failed``
     - explicit ``approve`` with no findings → ``approve``
     - explicit ``request_changes`` with at least one finding → ``request_changes``
     - anything else → ``invalid_review_result``: missing/None/unknown verdict,
@@ -394,8 +393,11 @@ def _resolve_verdict(result: TaskResult) -> str:
     about the work, so it cannot authorize a successor.
     """
     status = getattr(result, "status", None)
-    if status and status != "completed":
+    if status == "blocked" and getattr(result, "summary", None) == SUPPRESSED_REASON:
+        # Legacy canary rows carry the reused rejection in this typed marker.
         return "request_changes"
+    if status and status != "completed":
+        return "review_failed"
 
     findings = result.findings or []
     verdict = result.verdict
@@ -432,36 +434,9 @@ def handle_review_result(
     branch: str = "",
     port: int = 0,
 ) -> str:
-    # #301: a review that did not finish has not said anything about the work.
-    # ⛔`_resolve_verdict` maps every non-completed status to `request_changes`,
-    #   which reads "the reviewer rejected this" — so a reviewer that crashed
-    #   produced a fix round carrying `build_feedback`'s bare header and no
-    #   findings. Measured 2026-09-13: five implement dispatches against four
-    #   `exit_1` reviews in fifteen minutes, zero changes requested, the
-    #   deliverable byte-identical throughout. The round cap did not help,
-    #   because those were never `fix` rounds.
-    #
-    #   It must not consume an escalation round either: `iteration >= max_iter`
-    #   would turn an infrastructure fault into a verdict about the work.
-    # A canary suppression is an intentional policy outcome, not a reviewer
-    # crash: the review was skipped because a `request_changes` already stands
-    # on this exact commit, and the suppression carries that verdict and its
-    # findings forward. So it takes the ORDINARY `request_changes` path — the
-    # fix round runs exactly as it would have after a real re-review, and the
-    # only thing that did not happen is the reviewer invocation.
-    #
-    # ⛔Never `review_failed`. That retried the suppression twice and then gave
-    #   up, and `enqueue_review` treats the retry's dead task as unusable and
-    #   mints a fresh `review-<uuid8>` at the same head — suppressed again,
-    #   another canary receipt each round. The status test is skipped rather
-    #   than the verdict: a suppression written before §11 item B landed is
-    #   `blocked` with no verdict, and `_resolve_verdict` reads a non-completed
-    #   status as `request_changes`, so both shapes agree here.
-    _suppressed = getattr(result, "summary", None) == SUPPRESSED_REASON
-    if not _suppressed and getattr(result, "status", None) not in (None, "completed"):
-        return "review_failed"
-
     verdict = _resolve_verdict(result)
+    if verdict == "review_failed":
+        return verdict
     if verdict == INVALID_REVIEW_RESULT:
         # A malformed review authorizes no successor or escalation round.
         return INVALID_REVIEW_RESULT

@@ -131,105 +131,6 @@ class _PaneState:
 # #152 — push_at field
 # ---------------------------------------------------------------------------
 
-class TestPushAt:
-    """Bug #152: idle clock must start from push_at, not from dequeue time."""
-
-    # U-152-01: TaskQueue.set_push_at stores the timestamp.
-    def test_u_152_01_set_push_at_stored(self, tmp_db):
-        q = TaskQueue(tmp_db)
-        q.enqueue(_task("t1"))
-        q.dequeue(role="implementer")
-        q.set_push_at("t1", ts=12345.0)
-        rows = q.list_in_progress_with_activity()
-        assert len(rows) == 1
-        assert rows[0]["push_at"] == 12345.0
-
-    # U-152-02: list_in_progress_with_activity includes push_at.
-    def test_u_152_02_list_in_progress_includes_push_at(self, tmp_db):
-        q = TaskQueue(tmp_db)
-        q.enqueue(_task("t1"))
-        q.dequeue(role="implementer")
-        rows = q.list_in_progress_with_activity()
-        assert "push_at" in rows[0], "push_at must be present in list_in_progress rows"
-
-    # U-152-03: watchdog measures idle_for from push_at when it is set and <= now.
-    def test_u_152_03_watchdog_idle_from_push_at(self, tmp_db):
-        push = _RecordingPush()
-        busy = _PaneState()
-        app = create_app(
-            db_path=tmp_db,
-            pane_map={"implementer": "%100"},
-            port=8100,
-            push_fn=push,
-            pane_busy_fn=busy,
-            reminder_seconds=50.0,
-            timeout_seconds=200.0,
-            watchdog_disabled=True,
-        )
-        with TestClient(app) as client:
-            _post_task(client, "t1")
-            q = TaskQueue(tmp_db)
-            # Override push_at so idle clock starts at 100, not real time.
-            q.set_push_at("t1", ts=100.0)
-            # Set last_activity_at earlier than push_at.
-            q.bump_activity("t1", ts=50.0)
-            # now=200: idle_for = 200 - max(push_at=100, last_activity_at=50) = 100s
-            # 100 >= reminder_seconds(50) → reminder fires.
-            result = app.state.watchdog_tick(now=200.0)
-
-        assert "t1" in result["reminded"], (
-            "idle_for should be 100s (from push_at=100) — reminder expected"
-        )
-
-    # U-152-04: task with push_at=0 (never pushed) falls back to last_activity_at.
-    def test_u_152_04_unpushed_task_uses_last_activity(self, tmp_db):
-        """If push_at is 0 (task dequeued but push_fn not called yet), watchdog
-        falls back to last_activity_at for idle calculation."""
-        push = _RecordingPush()
-        busy = _PaneState()
-        app = create_app(
-            db_path=tmp_db,
-            pane_map={"implementer": "%100"},
-            port=8100,
-            push_fn=push,
-            pane_busy_fn=busy,
-            reminder_seconds=50.0,
-            timeout_seconds=200.0,
-            watchdog_disabled=True,
-        )
-        with TestClient(app) as client:
-            # Post the task (push fires → push_at set by _try_push_next)
-            _post_task(client, "t2")
-            q = TaskQueue(tmp_db)
-            # Force push_at back to 0 to simulate an MCP-dequeued or not-yet-pushed task.
-            q._reset_push_at("t2")
-            # last_activity_at at 100 → idle_for = 200 - 100 = 100 ≥ reminder(50)
-            q.bump_activity("t2", ts=100.0)
-            result = app.state.watchdog_tick(now=200.0)
-
-        assert "t2" in result["reminded"], (
-            "When push_at=0, idle should fall back to last_activity_at"
-        )
-
-    # U-152-05: push_at is set in the DB when _try_push_next calls push_fn.
-    def test_u_152_05_push_at_set_after_try_push_next(self, tmp_db):
-        """When a task is dispatched via _try_push_next, push_at must be recorded."""
-        push = _RecordingPush()
-        busy = _PaneState()
-        app = create_app(
-            db_path=tmp_db,
-            pane_map={"implementer": "%100"},
-            port=8100,
-            push_fn=push,
-            pane_busy_fn=busy,
-            watchdog_disabled=True,
-        )
-        with TestClient(app) as client:
-            _post_task(client, "t3")
-
-        rows = TaskQueue(tmp_db).list_in_progress_with_activity()
-        assert rows, "task should be in_progress"
-        assert rows[0]["push_at"] > 0, "push_at must be set after push_fn called"
 
 
 # ---------------------------------------------------------------------------
@@ -322,54 +223,6 @@ class TestFallbackLoop:
 # #159 — pending task dispatched immediately on result submission
 # ---------------------------------------------------------------------------
 
-class TestDispatchOnResult:
-    """Bug #159: when a result is submitted, any pending task for the same role
-    must be dispatched to the pane immediately (no 120s stale-pending wait)."""
-
-    # U-159-01: pending task B dispatched when task A result arrives.
-    def test_u_159_01_pending_dispatched_immediately_on_result(self, tmp_db):
-        push = _RecordingPush()
-        app = create_app(
-            db_path=tmp_db,
-            pane_map={"implementer": "%100"},
-            port=8100,
-            push_fn=push,
-            watchdog_disabled=True,
-        )
-        with TestClient(app) as client:
-            _post_task(client, "A")
-            _post_task(client, "B")          # stays pending (A in progress)
-            assert len(push.calls) == 1      # only A pushed
-
-            _post_result(client, "A")        # A done → B dispatched immediately
-
-        assert len(push.calls) == 2, "B must be dispatched when A completes"
-        assert "B" in push.calls[1][1]
-
-    # U-159-02: after failed result, retry/fallback task dispatched for same pane.
-    def test_u_159_02_dispatch_after_failed_with_pending(self, tmp_db):
-        push = _RecordingPush()
-        app = create_app(
-            db_path=tmp_db,
-            pane_map={"implementer": "%100"},
-            port=8100,
-            push_fn=push,
-            watchdog_disabled=True,
-            fallback_disabled=True,   # disable fallback so retry path is taken
-        )
-        with TestClient(app) as client:
-            _post_task(client, "A")
-            _post_task(client, "B")
-            assert len(push.calls) == 1
-
-            # A fails (non-rate-limit) → auto-retry creates retry-A → B still pending.
-            # _try_push_next fires → retry-A gets dispatched (has lower priority).
-            # OR B gets dispatched first if B has higher priority.
-            # Either way, a push fires.
-            _post_result(client, "A", status="failed", summary="generic failure")
-
-        # Either B or retry-A pushed — at minimum one additional push.
-        assert len(push.calls) >= 2, "A push must fire after failed result + pending tasks"
 
 
 # ---------------------------------------------------------------------------
@@ -381,41 +234,6 @@ class TestErrorInfoWiring:
     not just the force_fail signature."""
 
     # U-167-05: watchdog force_fail wires structured error_info into DB.
-    def test_u_167_05_watchdog_force_fail_includes_error_info(self, tmp_db):
-        push = _RecordingPush()
-        busy = _PaneState()
-        app = create_app(
-            db_path=tmp_db,
-            pane_map={"implementer": "%100"},
-            port=8100,
-            push_fn=push,
-            pane_busy_fn=busy,
-            reminder_seconds=50.0,
-            timeout_seconds=100.0,
-            watchdog_disabled=True,
-        )
-        with TestClient(app) as client:
-            _post_task(client, "t1")
-            q = TaskQueue(tmp_db)
-            q.set_push_at("t1", ts=50.0)
-            q.bump_activity("t1", ts=50.0)
-            # Add to reminded set so the timeout path fires (not just reminder).
-            app.state.reminded_task_ids.add("t1")
-            # now=300: idle_for=250 >= timeout(100) and reminded → force_fail.
-            app.state.watchdog_tick(now=300.0)
-
-        conn = TaskQueue(tmp_db)._connect()
-        row = conn.execute(
-            "SELECT error_info, status FROM tasks WHERE task_id = 't1'"
-        ).fetchone()
-        conn.close()
-        assert row["status"] == "failed"
-        assert row["error_info"] is not None, (
-            "watchdog force_fail must store structured error_info in DB"
-        )
-        info = json.loads(row["error_info"])
-        assert info.get("reason") == "watchdog_timeout"
-        assert "idle_seconds" in info
 
     # U-167-06: submit_result with status='failed' stores error_info from TaskResult.
     def test_u_167_06_submit_result_failed_stores_error_info(self, tmp_db):

@@ -10,6 +10,7 @@ it, 23 s into the running review. The pane-busy check looked at the codex pane,
 so nothing saw that the worktree it was about to move belonged to another one.
 """
 from fastapi.testclient import TestClient
+import asyncio
 
 import agent_crew.server as server
 from agent_crew.queue import TaskQueue
@@ -57,6 +58,25 @@ def _app(tmp_db, tmp_path, monkeypatch, push_calls, prepared, protocols,
     return app, wts
 
 
+def _dispatch_for_prep(app, queue, task_id, monkeypatch, protocols):
+    class ProviderBoundary(Exception):
+        pass
+
+    task = queue.dequeue(role="implementer")
+    assert task is not None and task.task_id == task_id
+
+    def protocol(role, wt, *args, **kwargs):
+        protocols.append((role, wt))
+        raise ProviderBoundary()
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(server, "_ensure_role_protocol", protocol)
+        try:
+            asyncio.run(app.state.dispatch_task(task, "implementer"))
+        except ProviderBoundary:
+            pass
+
+
 def test_override_task_is_prepared_in_the_override_agents_worktree(tmp_db, tmp_path, monkeypatch):
     # A review is running in the claude worktree (override claude).
     queue = TaskQueue(tmp_db)
@@ -67,13 +87,13 @@ def test_override_task_is_prepared_in_the_override_agents_worktree(tmp_db, tmp_p
     app, wts = _app(tmp_db, tmp_path, monkeypatch, push_calls, prepared, protocols)
     with TestClient(app) as client:
         assert client.post("/tasks", json=_payload("impl-543efd2a", "implement", "codex")).status_code == 201
+        _dispatch_for_prep(app, queue, "impl-543efd2a", monkeypatch, protocols)
 
     touched = [wt for _, wt in prepared] + [wt for _, wt in protocols]
     assert wts["claude"] not in touched, (
         "the implement task (override codex) moved the claude worktree a running review is pinned to")
     assert prepared == [("impl-543efd2a", wts["codex"])]
     assert protocols == [("implementer", wts["codex"])]
-    assert push_calls and push_calls[0][0] == "%101"
 
 
 def test_task_without_override_still_uses_its_role_worktree(tmp_db, tmp_path, monkeypatch):
@@ -83,10 +103,10 @@ def test_task_without_override_still_uses_its_role_worktree(tmp_db, tmp_path, mo
     payload["context"].pop("agent_override")
     with TestClient(app) as client:
         assert client.post("/tasks", json=payload).status_code == 201
+        _dispatch_for_prep(app, TaskQueue(tmp_db), "impl-plain", monkeypatch, protocols)
 
     assert prepared == [("impl-plain", wts["claude"])]
     assert protocols == [("implementer", wts["claude"])]
-    assert push_calls and push_calls[0][0] == "%100"
 
 
 def test_override_agent_without_a_role_worktree_is_not_prepared_in_another_agents_tree(

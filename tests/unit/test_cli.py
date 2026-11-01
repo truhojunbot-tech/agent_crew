@@ -5,8 +5,6 @@ from unittest.mock import MagicMock, patch
 from click.testing import CliRunner
 
 from agent_crew.cli import (
-    _capture_pane,
-    _pane_looks_idle,
     crew,
 )
 
@@ -58,42 +56,6 @@ def test_u_c06_crew_teardown():
     result = runner.invoke(crew, ["teardown", "nonexistent", "--base", "/tmp/_crew_no_such_base"])
     assert result.exit_code != 0
     assert len(result.output.strip()) > 0
-
-
-# U-C07: _pane_looks_idle — shell prompt detected
-def test_u_c07_pane_looks_idle_shell_prompt():
-    assert _pane_looks_idle("some output\n$ ") is True
-    assert _pane_looks_idle("some output\n$") is True
-    assert _pane_looks_idle("some output\n❯ ") is True
-    assert _pane_looks_idle("some output\n>>> ") is True
-    assert _pane_looks_idle("Completed task") is True
-
-
-# U-C08: _pane_looks_idle — agent still working
-def test_u_c08_pane_looks_idle_active():
-    assert _pane_looks_idle("Running tests...\ntest_foo PASSED") is False
-    assert _pane_looks_idle("Writing file src/main.py") is False
-    assert _pane_looks_idle("") is False
-
-
-# U-C09: _capture_pane — successful capture
-def test_u_c09_capture_pane_success():
-    mock_result = MagicMock(returncode=0, stdout="line1\nline2\n$ ")
-    with patch("agent_crew.cli.subprocess.run", return_value=mock_result) as mock_run:
-        output = _capture_pane("%942")
-    assert output == "line1\nline2\n$ "
-    args = mock_run.call_args[0][0]
-    assert "tmux" in args
-    assert "capture-pane" in args
-    assert "%942" in args
-
-
-# U-C10: _capture_pane — tmux not available
-def test_u_c10_capture_pane_failure():
-    mock_result = MagicMock(returncode=1, stdout="")
-    with patch("agent_crew.cli.subprocess.run", return_value=mock_result):
-        output = _capture_pane("%942")
-    assert output is None
 
 
 # U-C16: discuss --nowait enqueues tasks and returns immediately (no polling)
@@ -271,7 +233,7 @@ def test_u_c20_recover_all_panes_alive_noop(tmp_path):
          patch("agent_crew.cli.os.path.isdir", return_value=True), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
          patch("agent_crew.cli.setup_module.write_instruction_files"), \
-         patch("agent_crew.cli.setup_module.start_agents_in_panes") as mock_start:
+         patch("agent_crew.cli.setup_module.start_log_viewers_in_panes") as mock_start:
         result = runner.invoke(crew, ["recover", "rcproj", "--base", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
@@ -321,7 +283,7 @@ def test_u_c21_recover_recreates_only_dead_panes(tmp_path):
          patch("agent_crew.cli.os.path.isdir", return_value=True), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
          patch("agent_crew.cli.setup_module.write_instruction_files"), \
-         patch("agent_crew.cli.setup_module.start_agents_in_panes") as mock_start:
+         patch("agent_crew.cli.setup_module.start_log_viewers_in_panes") as mock_start:
         result = runner.invoke(crew, ["recover", "rcproj", "--base", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
@@ -332,8 +294,8 @@ def test_u_c21_recover_recreates_only_dead_panes(tmp_path):
     mock_start.assert_called_once()
     pos = mock_start.call_args[0]
     kw = mock_start.call_args[1]
-    assert pos[1] == ["codex"]
-    assert kw.get("pane_targets") == ["%99"]
+    assert pos[0] == ["codex"]
+    assert pos[1] == ["%99"]
 
     new_state = json.loads((proj_dir / "state.json").read_text())
     assert new_state["pane_ids"] == ["%91", "%99"]
@@ -380,7 +342,7 @@ def test_u_c22_recover_all_panes_dead_recreates_all(tmp_path):
          patch("agent_crew.cli.os.path.isdir", return_value=True), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
          patch("agent_crew.cli.setup_module.write_instruction_files"), \
-         patch("agent_crew.cli.setup_module.start_agents_in_panes") as mock_start:
+         patch("agent_crew.cli.setup_module.start_log_viewers_in_panes") as mock_start:
         result = runner.invoke(crew, ["recover", "rcproj", "--base", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
@@ -391,8 +353,8 @@ def test_u_c22_recover_all_panes_dead_recreates_all(tmp_path):
     mock_start.assert_called_once()
     pos = mock_start.call_args[0]
     kw = mock_start.call_args[1]
-    assert pos[1] == ["claude", "codex"]
-    assert kw.get("pane_targets") == ["%97", "%98"]
+    assert pos[0] == ["claude", "codex"]
+    assert pos[1] == ["%97", "%98"]
 
     new_state = json.loads((proj_dir / "state.json").read_text())
     assert new_state["pane_ids"] == ["%97", "%98"]
@@ -816,7 +778,7 @@ def test_u_c49_setup_prints_tip_after_completion(tmp_path):
          patch("agent_crew.cli.subprocess.Popen", return_value=mock_proc), \
          patch("agent_crew.cli._port_listening", return_value=True), \
          patch("agent_crew.cli.setup_module.pretrust_claude_worktree"), \
-         patch("agent_crew.cli.setup_module.start_agents_in_panes"), \
+         patch("agent_crew.cli.setup_module.start_log_viewers_in_panes"), \
          patch("agent_crew.cli._write_state"), \
          patch("os.getcwd", return_value=str(tmp_path)):
         result = runner.invoke(crew, ["setup", "myproj", "--base", str(tmp_path)])
@@ -865,17 +827,14 @@ def test_u_c50_single_agent_setup_fills_all_roles(tmp_path):
          patch("agent_crew.cli.subprocess.Popen", return_value=mock_proc), \
          patch("agent_crew.cli._port_listening", return_value=True), \
          patch("agent_crew.cli.setup_module.pretrust_claude_worktree"), \
-         patch("agent_crew.cli.setup_module.start_agents_in_panes"), \
+         patch("agent_crew.cli.setup_module.start_log_viewers_in_panes"), \
          patch("agent_crew.cli._write_state"), \
          patch("os.getcwd", return_value=str(tmp_path)):
         result = runner.invoke(crew, ["setup", "soloproj", "--agents", "codex", "--base", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
     pane_map = json.loads((tmp_path / "soloproj" / "pane_map.json").read_text())
-    assert pane_map["codex"] == "%999"
-    assert pane_map["implementer"] == "%999"
-    assert pane_map["reviewer"] == "%999"
-    assert pane_map["tester"] == "%999"
+    assert pane_map == {}  # dispatcher delivery never targets a pane
 
 
 # U-C51: recover --agents <single> backfills missing standard roles in pane_map
@@ -913,7 +872,7 @@ def test_u_c51_single_agent_recover_fills_all_roles(tmp_path):
          patch("agent_crew.cli._pane_alive", side_effect=_fake_pane_alive), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
          patch("agent_crew.cli.setup_module.write_instruction_files"), \
-         patch("agent_crew.cli.setup_module.start_agents_in_panes"):
+         patch("agent_crew.cli.setup_module.start_log_viewers_in_panes"):
         result = runner.invoke(crew, ["recover", "soloproj", "--base", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
@@ -1278,7 +1237,6 @@ def test_u_c59_recover_dead_session_uses_log_viewers_in_dispatcher_mode(tmp_path
     (tmp_path / "wt_claude").mkdir(parents=True, exist_ok=True)
     (tmp_path / "deadproj" / "pane_map.json").write_text("{}")
 
-    agents_started = []
     log_viewers_started = []
 
     def _fake_run(args, **_kw):
@@ -1304,8 +1262,6 @@ def test_u_c59_recover_dead_session_uses_log_viewers_in_dispatcher_mode(tmp_path
          patch("agent_crew.cli.subprocess.Popen"), \
          patch("agent_crew.cli.setup_module.write_instruction_files"), \
          patch("agent_crew.cli.setup_module.write_mcp_configs"), \
-         patch("agent_crew.cli.setup_module.start_agents_in_panes",
-               side_effect=lambda *a, **kw: agents_started.append(a)), \
          patch("agent_crew.cli.setup_module.start_log_viewers_in_panes",
                side_effect=lambda agents, pids, proj, **kw: log_viewers_started.append(pids)), \
          patch("agent_crew.cli._write_state"), \
@@ -1313,9 +1269,6 @@ def test_u_c59_recover_dead_session_uses_log_viewers_in_dispatcher_mode(tmp_path
         result = runner.invoke(crew, ["recover", "deadproj", "--base", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
-    assert agents_started == [], (
-        f"start_agents_in_panes must NOT be called in dispatcher mode, got: {agents_started}"
-    )
     assert log_viewers_started, "start_log_viewers_in_panes must be called in dispatcher mode"
 
     # pane_map.json must remain {} after recovery in dispatcher mode.
@@ -1373,7 +1326,7 @@ def test_u_c60_unknown_agents_are_refused(tmp_path):
          patch("agent_crew.cli.subprocess.Popen", return_value=mock_proc), \
          patch("agent_crew.cli._port_listening", return_value=True), \
          patch("agent_crew.cli.setup_module.pretrust_claude_worktree"), \
-         patch("agent_crew.cli.setup_module.start_agents_in_panes"), \
+         patch("agent_crew.cli.setup_module.start_log_viewers_in_panes"), \
          patch("agent_crew.cli._write_state", side_effect=_fake_write_state), \
          patch("os.getcwd", return_value=str(tmp_path)):
         result = runner.invoke(crew, [
