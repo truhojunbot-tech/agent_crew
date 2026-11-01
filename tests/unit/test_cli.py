@@ -230,6 +230,7 @@ def test_u_c20_recover_all_panes_alive_noop(tmp_path):
     runner = CliRunner()
     with patch("agent_crew.cli._port_listening", return_value=True), \
          patch("agent_crew.cli._pane_alive", return_value=True), \
+         patch("agent_crew.cli._pane_in_window", return_value=True), \
          patch("agent_crew.cli.os.path.isdir", return_value=True), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
          patch("agent_crew.cli.setup_module.write_instruction_files"), \
@@ -280,6 +281,7 @@ def test_u_c21_recover_recreates_only_dead_panes(tmp_path):
     runner = CliRunner()
     with patch("agent_crew.cli._port_listening", return_value=True), \
          patch("agent_crew.cli._pane_alive", side_effect=_fake_pane_alive), \
+         patch("agent_crew.cli._pane_in_window", return_value=True), \
          patch("agent_crew.cli.os.path.isdir", return_value=True), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
          patch("agent_crew.cli.setup_module.write_instruction_files"), \
@@ -1200,6 +1202,7 @@ def test_u_c58_recover_passes_dispatcher_env_to_server(tmp_path):
          patch("agent_crew.cli.setup_module.write_mcp_configs"), \
          patch("agent_crew.cli._write_state"), \
          patch("agent_crew.cli._pane_alive", return_value=True), \
+         patch("agent_crew.cli._pane_in_window", return_value=True), \
          patch("os.path.isdir", return_value=True):
         result = runner.invoke(crew, ["recover", "recproj", "--base", str(tmp_path)])
 
@@ -1244,6 +1247,8 @@ def test_u_c59_recover_dead_session_uses_log_viewers_in_dispatcher_mode(tmp_path
         joined = " ".join(str(a) for a in args)
         if cmd == "has-session":
             return MagicMock(returncode=1)  # session gone
+        if cmd == "new-session":
+            return MagicMock(returncode=0, stdout="%400\n", stderr="")
         if cmd == "display-message":
             if "#S:#I" in joined:
                 return MagicMock(returncode=0, stdout="alfred:0\n")
