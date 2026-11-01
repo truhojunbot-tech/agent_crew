@@ -81,7 +81,7 @@ class _TimeoutProvider:
 
 def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled=True,
                        shadow_memory_timeout_seconds=None, unused_tcp_port,
-                       on_dispatch_return=None):
+                       on_dispatch_return=None, memory_backend=None):
     """Run the production dispatch seam and return its actual provider prompt."""
     tmp_path.mkdir()
     wt = tmp_path / "claude"
@@ -109,7 +109,10 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled
 
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
-    monkeypatch.delenv("AGENT_CREW_MEMORY_BACKEND", raising=False)
+    if memory_backend is None:
+        monkeypatch.delenv("AGENT_CREW_MEMORY_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", memory_backend)
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.delenv("AGENT_CREW_CONTEXT_PACK", raising=False)
     ids = iter(range(1, 1000))
@@ -201,12 +204,11 @@ def test_hybrid_dispatch_uses_ranked_memory_and_records_receipt(
     storage.put(MemoryRecord(
         "decision", "standing:project", {"kind": "standing_decision", "text": "make a change"},
         MemoryScope(project="project-a")))
-    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
     monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
     monkeypatch.setenv("AGENT_CREW_MEMORY_FLEET", "fleet")
     _, context, events, _ = _dispatch_snapshot(
         tmp_path / "dispatch", monkeypatch, _MustNotBeCalledProvider(),
-        shadow_memory_enabled=False,
+        shadow_memory_enabled=False, memory_backend="hybrid",
         unused_tcp_port=unused_tcp_port)
     assert len(events) == 1
     assert events[0]["retrieval_mode"] == "lexical_only"
@@ -230,12 +232,11 @@ def test_hybrid_dispatch_without_fleet_env_records_unscoped_head(
     storage.put(MemoryRecord(
         "decision", "standing:project", {"kind": "standing_decision", "text": "make a change"},
         MemoryScope(project="project-a")))
-    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
     monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
     monkeypatch.delenv("AGENT_CREW_MEMORY_FLEET", raising=False)
     _, context, events, _ = _dispatch_snapshot(
         tmp_path / "dispatch", monkeypatch, _MustNotBeCalledProvider(),
-        shadow_memory_enabled=False, unused_tcp_port=unused_tcp_port)
+        shadow_memory_enabled=False, memory_backend="hybrid", unused_tcp_port=unused_tcp_port)
     assert len(events) == 1
     assert events[0]["fleet"] == ""
     assert context["shadow_memory"]["fleet"] == ""
@@ -252,7 +253,6 @@ def test_hybrid_dispatch_timeout_records_fallback_without_blocking(
     storage = HybridMemoryStorage(str(path))
     storage.put(MemoryRecord("episodic", "slow", {"text": "make a change"},
                              MemoryScope(project="project-a")))
-    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
     monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
     original_rank = HybridMemoryStorage._rank_middle
     started, release, finished = threading.Event(), threading.Event(), threading.Event()
@@ -276,7 +276,7 @@ def test_hybrid_dispatch_timeout_records_fallback_without_blocking(
     try:
         _, context, events, _ = _dispatch_snapshot(
             tmp_path / "dispatch", monkeypatch, _MustNotBeCalledProvider(),
-            unused_tcp_port=unused_tcp_port,
+            unused_tcp_port=unused_tcp_port, memory_backend="hybrid",
             on_dispatch_return=assert_dispatch_returned_while_rank_blocked)
     finally:
         release.set()
