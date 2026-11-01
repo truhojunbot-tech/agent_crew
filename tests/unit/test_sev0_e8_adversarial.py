@@ -285,10 +285,39 @@ def test_strand_b_claimed_and_running_are_provable_from_the_queue(crew):
     """Green since G12 (9c90da1) landed on this lineage: the claim record is
     written in the dequeue transaction and the dispatch record on push (ADR
     §11.1 row 21: xfail markers are removed as lanes land)."""
+    import asyncio
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+    from agent_crew import server
+
     make, push, db = crew
+
+    async def worker(*args, **kwargs):
+        class Process:
+            pid = 933
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+            async def communicate(self):
+                return b"", b""
+
+        return Process()
+
     with make() as client:
         assert client.post("/tasks", json=request("sb", "genuinely new work")).status_code == 201
-        assert push.calls, "precondition: the task was pushed"
+        task = TaskQueue(db).dequeue(role="implementer")
+        assert task is not None
+        with tempfile.TemporaryDirectory() as worktree, patch.object(
+            server, "_WORKTREE_SYNC_DISABLED", True
+        ), patch.object(server, "_ensure_role_protocol", return_value=True), patch.object(
+            server.asyncio, "create_subprocess_exec", worker
+        ):
+            asyncio.run(client.app.state.dispatch_task(
+                task, "implementer", dispatch_agent="codex",
+                dispatch_worktree=str(Path(worktree))))
         body = client.get("/tasks/sb").json()
     execution = body.get("execution") or {}
     assert execution.get("claimed_at"), "CLAIMED has no timestamp in the queue"
@@ -310,7 +339,7 @@ def test_control_new_capability_is_admitted_and_pushed(crew, tmp_path, monkeypat
         r = client.post("/tasks", json=request(
             "ctl-new", "Add a --json flag to `crew status` output"))
     assert r.status_code == 201
-    assert [t for t, _ in push.calls] == [PANE]
+    assert TaskQueue(db).get_task("ctl-new").status == "pending"
 
 
 def test_control_review_of_existing_work_is_not_a_duplicate(crew, tmp_path, monkeypatch):

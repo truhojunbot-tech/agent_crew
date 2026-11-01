@@ -9,6 +9,29 @@ from agent_crew.pipeline import verify_implement_artifact
 from agent_crew.protocol import TaskRequest, TaskResult
 
 
+def _dispatch_for_prep(app, db_path, task_id, worktree, monkeypatch):
+    """Run dispatcher prep and stop at the provider boundary."""
+    import asyncio
+    from agent_crew import server
+    from agent_crew.queue import TaskQueue
+
+    class ProviderBoundary(Exception):
+        pass
+
+    task = TaskQueue(db_path).dequeue(role="implementer")
+    assert task is not None and task.task_id == task_id
+    with monkeypatch.context() as patcher:
+        patcher.setattr(server, "_ensure_role_protocol",
+                        lambda *a, **k: (_ for _ in ()).throw(ProviderBoundary()))
+        try:
+            asyncio.run(app.state.dispatch_task(
+                task, "implementer", dispatch_agent="codex",
+                dispatch_worktree=str(worktree)))
+        except ProviderBoundary:
+            return True
+    return False
+
+
 SHA_REQUESTED = "a" * 40
 SHA_DEFAULT = "b" * 40
 
@@ -152,10 +175,11 @@ def test_dispatch_records_actual_or_unknown_worktree_base_without_blocking(
             "task_id": "sync-unknown", "task_type": "implement", "description": "x",
             "branch": "unpushed", "priority": 3, "context": {}, "project": "demo",
         })
+        launched = _dispatch_for_prep(app, tmp_db, "sync-unknown", worktree, monkeypatch)
         stored = client.get("/tasks/sync-unknown").json()
 
     assert response.status_code == 201
-    assert pushed, "sync uncertainty must not block dispatch"
+    assert launched, "sync uncertainty must not block dispatch"
     assert stored["context"]["worktree_base_sha"] is None
     assert stored["context"]["worktree_base_status"] == "unknown"
 
@@ -183,6 +207,7 @@ def test_dispatch_records_the_exact_prepared_worktree_base(monkeypatch, tmp_db, 
             "task_id": "sync-known", "task_type": "implement", "description": "x",
             "branch": "main", "priority": 3, "context": {}, "project": "demo",
         })
+        _dispatch_for_prep(app, tmp_db, "sync-known", worktree, monkeypatch)
         stored = client.get("/tasks/sync-known").json()
 
     assert response.status_code == 201
@@ -250,6 +275,7 @@ def test_implement_dispatch_ignores_prior_pr_branch_head(
             "context": {"base_branch": explicit_base} if explicit_base else {},
             "project": "demo",
         })
+        _dispatch_for_prep(app, tmp_db, "impl-397", worker, monkeypatch)
         stored = client.get("/tasks/impl-397").json()
     assert response.status_code == 201
     assert stored["context"]["worktree_base_sha"] == expected_sha

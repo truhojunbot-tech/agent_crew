@@ -135,22 +135,6 @@ def test_non_transient_prep_error_is_unchanged(tmp_path, monkeypatch):
     assert queue.get_result("review-896-broken").error_info["reason"] == "prepared_base_not_recorded"
 
 
-def test_push_path_retries_transient_prep_once(tmp_path, monkeypatch):
-    pushed = []
-    monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
-    app, queue = _app(tmp_path, monkeypatch, pushed)
-
-    with TestClient(app) as client:
-        admitted = client.post("/tasks", json={
-            "task_id": "review-896-push", "task_type": "review",
-            "description": "review PR", "branch": "main", "project": "demo",
-            "context": {"pr_number": 999},
-        })
-
-    assert admitted.status_code == 201
-    assert queue.get_task_status("review-896-push") == "pending"
-    assert queue.get_task_context("review-896-push")["prep_retry_count"] == 1
-    assert pushed == []
 
 
 # ── §8 re-admission: the retry moves the receipt, never strands the row ────────
@@ -250,24 +234,6 @@ def test_implementer_head_fallback_still_retries_on_dispatcher_path(tmp_path, mo
     assert ctx.get("worktree_base_sha") is None
 
 
-def test_implementer_head_fallback_still_retries_on_push_path(tmp_path, monkeypatch):
-    worker, head = _impl_repo(tmp_path)
-    pushed = []
-    monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
-    app, queue = _impl_app(tmp_path, monkeypatch, pushed, worker)
-
-    with TestClient(app) as client:
-        admitted = client.post("/tasks", json={
-            "task_id": "impl-896-push", "task_type": "implement", "description": "fix",
-            "branch": "feature", "project": "demo", "context": {},
-        })
-
-    assert admitted.status_code == 201
-    assert pushed == []
-    assert queue.get_task_status("impl-896-push") == "pending"
-    ctx = queue.get_task_context("impl-896-push")
-    assert ctx["prep_retry_count"] == 1
-    assert ctx.get("worktree_base_sha") is None
 
 
 def _assert_exhausted_needs_human(queue, task_id):
@@ -280,25 +246,6 @@ def _assert_exhausted_needs_human(queue, task_id):
     assert queue.get_task_context(task_id).get("worktree_base_sha") is None
 
 
-def test_implementer_second_timeout_needs_human_on_push_path(tmp_path, monkeypatch):
-    """review-fix-review-impl-896p-r0-r1-r1: a nonempty HEAD fallback must not
-    turn an exhausted transient prep failure into a push on a stale base."""
-    worker, head = _impl_repo(tmp_path)
-    pushed = []
-    monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
-    app, queue = _impl_app(tmp_path, monkeypatch, pushed, worker)
-
-    with TestClient(app) as client:
-        client.post("/tasks", json={
-            "task_id": "impl-896-twice", "task_type": "implement", "description": "fix",
-            "branch": "feature", "project": "demo", "context": {},
-        })
-        assert pushed == []
-        queue.merge_task_context("impl-896-twice", {"push_not_before": 0})
-        app.state.try_push_next("implementer")
-
-    assert pushed == []
-    _assert_exhausted_needs_human(queue, "impl-896-twice")
 
 
 def test_implementer_second_timeout_needs_human_on_dispatcher_path(tmp_path, monkeypatch):

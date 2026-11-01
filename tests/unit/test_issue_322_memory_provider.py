@@ -109,6 +109,7 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled
 
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.delenv("AGENT_CREW_MEMORY_BACKEND", raising=False)
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.delenv("AGENT_CREW_CONTEXT_PACK", raising=False)
     ids = iter(range(1, 1000))

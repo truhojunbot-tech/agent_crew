@@ -387,7 +387,7 @@ def open_review_pr(monkeypatch):
                         lambda *a, **k: SimpleNamespace(publish=True, status="current", reason=""))
 
 
-def test_http_request_changes_result_enqueues_and_pushes_a_fix(tmp_db, open_review_pr):
+def test_http_request_changes_result_enqueues_a_fix(tmp_db, open_review_pr):
     """★★End to end through the real handler — the layer #244 reported.
 
     The cascade functions could be perfect and the feature still absent if the
@@ -403,9 +403,7 @@ def test_http_request_changes_result_enqueues_and_pushes_a_fix(tmp_db, open_revi
     fixes = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "implement"]
     assert len(fixes) == 1
     assert FINDING in fixes[0].description
-    # ...and it was pushed to the implementer pane, not left sitting in the queue.
-    assert any(pane == "%91" and fixes[0].task_id in text
-               for pane, text in push.calls)
+    assert fixes[0].status == "pending", "the dispatcher must be able to claim the fix"
 
 
 def test_http_coordinator_managed_review_enqueues_fix(tmp_db, open_review_pr):

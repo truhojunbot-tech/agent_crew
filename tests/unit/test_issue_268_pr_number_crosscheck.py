@@ -494,7 +494,7 @@ def test_http_a_bool_pr_number_is_never_stored_as_a_pr(tmp_db, monkeypatch, valu
     assert stored["pr_number"] == REQUESTED, \
         "a rejected result must leave the review's requested PR intact"
     assert stored["pr_number"] != 1, "`true` was stored as PR #1"
-    assert stored["status"] == "in_progress", "a rejected request still wrote a result"
+    assert stored["status"] == "pending", "a rejected request still wrote a result"
 
 
 def test_http_a_bool_is_not_silently_turned_into_a_mismatch(tmp_db, monkeypatch, github_writes):

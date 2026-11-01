@@ -108,9 +108,6 @@ def test_u_fb01_rate_limit_never_substitutes_implementer(tmp_db):
 
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("impl-1"))
-        # Original push went to claude pane (%C).
-        assert any(pane == "%C" for pane, _ in push_calls)
-
         # Implementer reports rate-limit failure.
         client.post("/tasks/impl-1/result", json=_result("impl-1"))
 

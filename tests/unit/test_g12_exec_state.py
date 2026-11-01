@@ -392,30 +392,6 @@ class RecordingPush:
         self.calls.append((target, message))
 
 
-def test_push_path_records_claim_push_and_dispatch(tmp_db, tmp_path):
-    state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps({"project": "p", "pane_ids": ["%101"]}))
-    push = RecordingPush()
-    app = create_app(tmp_db, pane_map={"implementer": "%101"}, state_path=str(state_file),
-                     port=8100, push_fn=push, watchdog_disabled=True, anomaly_disabled=True)
-    with TestClient(app) as client:
-        client.post("/tasks", json={"task_id": "p1", "task_type": "implement",
-                                    "description": "w", "branch": "main", "priority": 3,
-                                    "context": {}, "project": "p"})
-        execution = client.get("/tasks/p1").json()["execution"]
-
-    assert len(push.calls) == 1
-    assert execution["claimed_via"] == "tmux_push"
-    assert execution["push_at"] > 0                    # the column #152 already had
-    assert execution["dispatch_channel"] == "tmux_pane"
-    assert execution["dispatch_target"] == "%101"
-    assert execution["lease_owner"] == "pane:%101"
-    # #887: a pane claim carries the claim lease as the orphan backstop.
-    assert execution["lease_expires_at"] > execution["dispatched_at"]
-    # `dispatched` precedes `pushed`: record_dispatch mints the nonce that has to
-    # be *inside* the pushed message, so the dispatch is recorded before the pane
-    # ever sees it, and set_push_at follows the push (server.py _try_push_*).
-    assert [e["event"] for e in execution["events"]] == ["claimed", "dispatched", "pushed"]
 
 
 def test_http_poll_records_an_api_dispatch(tmp_db):

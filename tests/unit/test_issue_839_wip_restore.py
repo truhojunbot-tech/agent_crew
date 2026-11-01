@@ -66,6 +66,23 @@ def _task(task_id, context=None):
                        branch="main", project="demo", context=context or {})
 
 
+def _dispatch_one(app, queue, monkeypatch, task_id):
+    """Exercise the headless prep and restore path without launching a worker."""
+    class ProviderBoundary(Exception):
+        pass
+
+    task = queue.dequeue(role="implementer")
+    assert task is not None and task.task_id == task_id
+    with monkeypatch.context() as patcher:
+        patcher.setattr(server, "_ensure_role_protocol",
+                        lambda *a, **k: (_ for _ in ()).throw(ProviderBoundary()))
+        try:
+            asyncio.run(app.state.dispatch_task(task, "implementer"))
+        except ProviderBoundary:
+            return True
+    return False
+
+
 def test_hold_resume_restores_tracked_and_untracked_before_push(tmp_path, monkeypatch):
     wt = _worktree(tmp_path)
     sha = _stash(wt, "impl-held")
@@ -75,9 +92,9 @@ def test_hold_resume_restores_tracked_and_untracked_before_push(tmp_path, monkey
     queue.annotate_error_info("impl-held", {"wip_stash": sha})
 
     with TestClient(app):
-        app.state.try_push_next("implementer")
+        launched = _dispatch_one(app, queue, monkeypatch, "impl-held")
 
-    assert len(pushes) == 1
+    assert launched
     assert (wt / "app.py").read_text() == "value = 2\n"
     assert (wt / "new_test.py").read_text() == "assert True\n"
     assert queue.get_task("impl-held").error_info["wip_restored"] == sha
@@ -97,13 +114,13 @@ def test_restore_conflict_fails_without_push_and_keeps_stash(tmp_path, monkeypat
     queue.annotate_error_info("impl-conflict", {"wip_stash": sha})
 
     with TestClient(app):
-        app.state.try_push_next("implementer")
+        launched = _dispatch_one(app, queue, monkeypatch, "impl-conflict")
 
     row = queue.get_task("impl-conflict")
     assert row.status == "failed"
     assert row.error_info["reason"] == "wip_restore_conflict"
     assert row.error_info["wip_stash"] == sha
-    assert pushes == []
+    assert not launched
     assert len(notices) == 1
     assert "wip_restore_conflict" in notices[0]
     assert (wt / "app.py").read_text() == "value = 3\n"
@@ -118,9 +135,9 @@ def test_no_stash_still_pushes(tmp_path, monkeypatch):
     queue.enqueue(_task("impl-clean"))
 
     with TestClient(app):
-        app.state.try_push_next("implementer")
+        launched = _dispatch_one(app, queue, monkeypatch, "impl-clean")
 
-    assert len(pushes) == 1
+    assert launched
     assert queue.get_task("impl-clean").error_info is None
 
 
@@ -139,9 +156,9 @@ def test_retry_restores_source_task_stash(tmp_path, monkeypatch):
         _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
 
     with TestClient(app):
-        app.state.try_push_next("implementer")
+        launched = _dispatch_one(app, queue, monkeypatch, "opaque-retry-1")
 
-    assert len(pushes) == 1
+    assert launched
     assert (wt / "app.py").read_text() == "value = 2\n"
     assert (wt / "new_test.py").exists()
     assert queue.get_task("opaque-retry-1").error_info["wip_restored"] == sha
@@ -168,9 +185,9 @@ def test_retry_does_not_reapply_source_stash_already_restored(tmp_path, monkeypa
         _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
 
     with TestClient(app):
-        app.state.try_push_next("implementer")
+        launched = _dispatch_one(app, queue, monkeypatch, "retry-impl-source-a1")
 
-    assert len(pushes) == 1
+    assert launched
     assert queue.get_task("retry-impl-source-a1").status == "in_progress"
     assert (wt / "app.py").read_text() == "value = 2\n"
     assert (wt / "new_test.py").exists()
@@ -186,10 +203,10 @@ def test_restored_stash_is_not_applied_twice(tmp_path, monkeypatch):
     queue.annotate_error_info("impl-once", {"wip_stash": sha})
 
     with TestClient(app):
-        app.state.try_push_next("implementer")
+        launched = _dispatch_one(app, queue, monkeypatch, "impl-once")
         server._restore_task_wip(queue, queue.get_task("impl-once"), str(wt))
 
-    assert len(pushes) == 1
+    assert launched
     assert (wt / "app.py").read_text() == "value = 2\n"
     assert (wt / "new_test.py").exists()
 

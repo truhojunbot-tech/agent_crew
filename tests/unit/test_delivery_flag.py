@@ -47,38 +47,10 @@ class _RecordingPush:
 PANE_MAP = {"implementer": "%100", "claude": "%100"}
 
 
-class TestDefaultIsBoth:
-    def test_no_env_pushes_normally(self, tmp_db, monkeypatch):
-        monkeypatch.delenv("AGENT_CREW_DELIVERY", raising=False)
-        push = _RecordingPush()
-        app = create_app(
-            db_path=tmp_db, pane_map=PANE_MAP, port=8100, push_fn=push,
-        )
-        with TestClient(app) as client:
-            client.post("/tasks", json=_task_payload("t1"))
-        assert len(push.calls) == 1
 
 
 class TestExplicitValues:
-    def test_both_pushes(self, tmp_db, monkeypatch):
-        monkeypatch.setenv("AGENT_CREW_DELIVERY", "both")
-        push = _RecordingPush()
-        app = create_app(
-            db_path=tmp_db, pane_map=PANE_MAP, port=8100, push_fn=push,
-        )
-        with TestClient(app) as client:
-            client.post("/tasks", json=_task_payload("t-both"))
-        assert len(push.calls) == 1
 
-    def test_push_pushes(self, tmp_db, monkeypatch):
-        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
-        push = _RecordingPush()
-        app = create_app(
-            db_path=tmp_db, pane_map=PANE_MAP, port=8100, push_fn=push,
-        )
-        with TestClient(app) as client:
-            client.post("/tasks", json=_task_payload("t-push"))
-        assert len(push.calls) == 1
 
     def test_mcp_does_not_push(self, tmp_db, monkeypatch):
         monkeypatch.setenv("AGENT_CREW_DELIVERY", "mcp")
@@ -92,17 +64,6 @@ class TestExplicitValues:
             assert resp.status_code == 201
         assert push.calls == []
 
-    def test_unrecognized_value_falls_back_to_default(self, tmp_db, monkeypatch):
-        monkeypatch.setenv("AGENT_CREW_DELIVERY", "bogus")
-        push = _RecordingPush()
-        app = create_app(
-            db_path=tmp_db, pane_map=PANE_MAP, port=8100, push_fn=push,
-        )
-        with TestClient(app) as client:
-            client.post("/tasks", json=_task_payload("t-bogus"))
-        # An invalid value must not silently disable push — that would
-        # be a config-typo footgun. Default = push enabled.
-        assert len(push.calls) == 1
 
 
 class TestMcpStillCascadesAfterSubmit:

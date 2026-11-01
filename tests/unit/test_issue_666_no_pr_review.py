@@ -181,6 +181,6 @@ def test_http_result_pushes_pr_opening_retry_to_implementer(tmp_path, monkeypatc
             "branch": "agent/work", "commit": "a" * 40,
         })
         assert result.status_code == 200
-    assert [pane for pane, _ in pushed] == ["%100", "%100"]
-    assert "retry-impl-http-666-a1" in pushed[1][1]
-    assert _reviews(TaskQueue(str(tmp_path / "http.db"))) == []
+    queue = TaskQueue(str(tmp_path / "http.db"))
+    assert queue.get_task("retry-impl-http-666-a1").status == "pending"
+    assert _reviews(queue) == []
