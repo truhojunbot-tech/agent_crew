@@ -23,7 +23,7 @@ from agent_crew.server import _stash_dirty_worktree
 
 @pytest.fixture(autouse=True)
 def _declared_base_branch(monkeypatch):
-    """These #482 tests exercise WIP preservation without a remote."""
+    """These #482 tests exercise WIP preservation on main."""
     monkeypatch.setenv("AGENT_CREW_MAIN_BRANCH", "main")
 
 
@@ -41,6 +41,12 @@ def _repo(path):
     (path / "AGENTS.md").write_text("project agents\n")
     _git(path, "add", ".")
     _git(path, "commit", "-q", "-m", "init")
+    # Dispatcher prep now requires a fetchable declared base. These tests
+    # exercise WIP preservation, so give the local repository its own origin.
+    origin = path.parent / f"{path.name}-origin.git"
+    _git(path.parent, "init", "-q", "--bare", str(origin))
+    _git(path, "remote", "add", "origin", str(origin))
+    _git(path, "push", "-q", "origin", "main")
     return path
 
 
@@ -209,7 +215,7 @@ def test_failed_task_leaves_a_named_stash_and_a_clean_tree(tmp_path, monkeypatch
     wt, row = _dispatch(tmp_path, monkeypatch, unused_tcp_port, outcome="exit_1")
 
     assert row.status == "failed"
-    assert _stashes(wt) == ["stash@{0}: On main: agent_crew wip t-1"]
+    assert _stashes(wt) == ["stash@{0}: On (no branch): agent_crew wip t-1"]
     assert _is_clean(wt), "the reset must still run so the next task starts clean"
     assert row.error_info["reason"] == "exit_1"
     assert row.error_info["wip_stash"] == _git(wt, "rev-parse", "refs/stash").strip()

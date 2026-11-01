@@ -1323,13 +1323,17 @@ def _prepare_worktree_for_task_inner(
             task_context.get("prev_task_id") and task_context.get("fix_round"))
         if continuing_branch or task_context.get("crew_run_branch"):
             branch_fetch = git_fetch_origin(worktree_path, branch)
-            if continuing_branch and branch_fetch.returncode != 0 and not pinned_base:
+            # A task may name a new output branch that has not been pushed.
+            # In that case prep uses the declared base, never an old ref.
+            if (continuing_branch and branch_fetch.returncode != 0 and not pinned_base
+                    and "couldn't find remote ref" not in (branch_fetch.stderr or "")):
                 raise WorktreeFetchFailed(
                     f"implementer {task_id}: could not fetch origin/{branch}: "
                     f"{branch_fetch.stderr.strip()}"
                 )
         remote_branch = (_branch_ref(worktree_path, f"refs/remotes/origin/{branch}")
-                         if task_type in ("", "implement") and continuing_branch else "")
+                         if task_type in ("", "implement") and continuing_branch
+                         and branch_fetch.returncode == 0 else "")
         branch_start = ""
         if task_context.get("crew_run_branch"):
             # The caller's existing branch supplies its own content. Only a
@@ -1347,7 +1351,10 @@ def _prepare_worktree_for_task_inner(
                 fetch = git_fetch_origin(worktree_path, main_branch)
         # A pinned commit or freshly fetched PR branch is already a proven
         # base. A failed main fetch matters only when checkout needs main.
-        if fetch.returncode != 0 and not pinned_base and not remote_branch:
+        if (fetch.returncode != 0 and not pinned_base and not remote_branch
+                and not branch_start
+                and (_pre_stash.returncode == 0 or
+                     (_is_repo.returncode == 0 and _is_repo.stdout.strip() == "true"))):
             raise WorktreeFetchFailed(
                 f"implementer {task_id}: could not fetch origin/{main_branch}: "
                 f"{fetch.stderr.strip()}"
@@ -1488,7 +1495,9 @@ def _prepare_worktree_for_task_inner(
 
         if pr_branch and pr_branch != main_branch:
             branch_fetch = git_fetch_origin(worktree_path, pr_branch)
-            if branch_fetch.returncode != 0 and not _pinned_sha:
+            if (branch_fetch.returncode != 0 and not _pinned_sha
+                    and not (task_type == "discuss" and "couldn't find remote ref"
+                             in (branch_fetch.stderr or ""))):
                 raise WorktreeTargetUnresolved(
                     f"{role} {task_id}: could not fetch origin/{pr_branch}: "
                     f"{branch_fetch.stderr.strip()}"
