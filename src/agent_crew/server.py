@@ -3058,16 +3058,8 @@ def create_app(
             "1", "true", "yes",
         )
 
-    # Phase 6a of the tmux→MCP cutover (Issue #119). The flag selects
-    # whether the server actively pushes new tasks via tmux paste-buffer
-    # (legacy ``push``), relies entirely on the agent's MCP pull loop
-    # (``mcp``), or runs both paths concurrently (``both`` — default;
-    # safe because MCP get_next_task is atomic and a task already
-    # delivered via push transitions to in_progress before MCP could
-    # return it).
-    #
-    # Anything unrecognized falls back to ``both`` so a config typo
-    # never silently disables delivery.
+    # Keep the legacy delivery setting for HTTP pull compatibility. Task
+    # delivery itself is owned by the dispatcher and MCP claim paths.
     _delivery_raw = os.getenv("AGENT_CREW_DELIVERY", "both").strip().lower()
     if _delivery_raw not in ("push", "mcp", "both"):
         _delivery_raw = "both"
@@ -7656,23 +7648,6 @@ def create_app(
                 "error": "admission held", "reason": "OWNER_CONFLICT",
                 "task_id": task_id, "receipt_id": q().task_receipt_id(task_id)})
         logger.info(f"POST /tasks: enqueued task_id={task_id}")
-        if not _push_enabled:
-            logger.warning(
-                f"POST /tasks: AGENT_CREW_DELIVERY={_delivery_raw!r} — task {task_id} enqueued "
-                "but tmux push is disabled; an MCP client must poll GET /tasks/next to receive it"
-            )
-        if task.task_type == "discuss":
-            agent = task.context.get("agent") if isinstance(task.context, dict) else None
-            logger.info(f"POST /tasks: discuss task, calling _try_push_discuss with agent={agent}")
-            _try_push_discuss(agent)
-        else:
-            role = _TYPE_TO_ROLE.get(task.task_type)
-            logger.info(f"POST /tasks: task_type={task.task_type} -> role={role}")
-            if role:
-                logger.info(f"POST /tasks: calling _try_push_next for role={role}")
-                _try_push_next(role)
-            else:
-                logger.warning(f"POST /tasks: no role found for task_type={task.task_type}")
         return {"task_id": task_id}
 
     @app.get("/tasks/next")
