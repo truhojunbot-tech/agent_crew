@@ -141,7 +141,6 @@ def test_dispatch_records_actual_or_unknown_worktree_base_without_blocking(
     monkeypatch.setattr("agent_crew.server._prepare_worktree_for_task", lambda *_a, **_k: "")
     monkeypatch.setattr("agent_crew.server._resolve_tmux_pane_target", lambda pane: pane)
     monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda pane: True)
-    monkeypatch.setattr("agent_crew.server._pane_process_kind", lambda pane: ("agent", "codex"))
     monkeypatch.setattr("agent_crew.server._ensure_role_protocol", lambda *args, **kwargs: True)
     app = create_app(
         tmp_db, state_path=str(state), pane_map={"implementer": "%91"},

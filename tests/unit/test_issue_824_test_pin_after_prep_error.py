@@ -33,7 +33,6 @@ def _tester_app(tmp_path, monkeypatch, worker, pushed):
     monkeypatch.setattr(sv, "create_app", lambda db, **kw: real_create_app(
         db, state_path=str(state), project="demo", **kw))
     app, queue = _app(tmp_path, monkeypatch, worker, pushed, role="tester")
-    monkeypatch.setattr(sv, "_pane_process_kind", lambda pane: ("agent", "gemini"))
     return app, queue
 
 

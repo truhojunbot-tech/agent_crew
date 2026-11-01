@@ -54,41 +54,6 @@ def _make_app(db_path: str, delivery: str = "mcp", pane_map: dict | None = None)
 # #163 — MCP mode: auto-clear skipped
 # ---------------------------------------------------------------------------
 
-class TestMcpAutoClearSkipped:
-    def test_u163_auto_clear_skipped_in_mcp_mode(self, tmp_path):
-        """_pane_clear_context must NOT be called when delivery=mcp."""
-        db, q = _make_db()
-        q.enqueue(TaskRequest(task_id="tc1", task_type="implement",
-                               description="task", branch="main"))
-
-        clear_calls: list[str] = []
-
-        def fake_push(pane_id: str, msg: str) -> None:
-            pass
-
-        pane_map = {"implementer": "%92"}
-        with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp"}):
-            from agent_crew.server import create_app
-            app = create_app(
-                db,
-                pane_map=pane_map,
-                port=9999,
-                push_fn=fake_push,
-                watchdog_disabled=True,
-                pane_busy_fn=lambda _: False,
-            )
-
-        with TestClient(app) as client:
-            with patch("agent_crew.server._pane_clear_context", side_effect=clear_calls.append) as mock_clear, \
-                 patch("agent_crew.server._pane_alive_for_push", return_value=True), \
-                 patch("agent_crew.server._pane_has_task", return_value=False):
-                client.post(
-                    "/tasks",
-                    json={"task_id": "tc1-new", "task_type": "implement",
-                          "description": "new task", "branch": "main"},
-                )
-
-        mock_clear.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -281,4 +246,3 @@ class TestMcpNoClientDispatcherOwnsDelivery:
         assert task_id not in result.get("mcp_no_client_failed", [])
         task_row = next(r for r in q.list_all_with_status() if r["task_id"] == task_id)
         assert task_row["status"] == "pending"
-

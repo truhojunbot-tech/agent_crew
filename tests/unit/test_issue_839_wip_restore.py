@@ -41,7 +41,6 @@ def _dispatch_app(tmp_path, monkeypatch, wt, pushes, notices=None):
     monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
     monkeypatch.setattr(server, "_resolve_tmux_pane_target", lambda target: target)
     monkeypatch.setattr(server, "_pane_alive_for_push", lambda pane: True)
-    monkeypatch.setattr(server, "_pane_process_kind", lambda pane: ("agent", "test"))
     monkeypatch.setattr(server, "_ensure_role_protocol", lambda *args, **kwargs: True)
 
     def prepare(*args, **kwargs):
