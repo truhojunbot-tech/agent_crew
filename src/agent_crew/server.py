@@ -1323,7 +1323,7 @@ def _prepare_worktree_for_task_inner(
             task_context.get("prev_task_id") and task_context.get("fix_round"))
         if continuing_branch or task_context.get("crew_run_branch"):
             branch_fetch = git_fetch_origin(worktree_path, branch)
-            if continuing_branch and branch_fetch.returncode != 0:
+            if continuing_branch and branch_fetch.returncode != 0 and not pinned_base:
                 raise WorktreeFetchFailed(
                     f"implementer {task_id}: could not fetch origin/{branch}: "
                     f"{branch_fetch.stderr.strip()}"
@@ -1345,7 +1345,9 @@ def _prepare_worktree_for_task_inner(
             if discovered != main_branch:
                 main_branch = discovered
                 fetch = git_fetch_origin(worktree_path, main_branch)
-        if fetch.returncode != 0:
+        # A pinned commit or freshly fetched PR branch is already a proven
+        # base. A failed main fetch matters only when checkout needs main.
+        if fetch.returncode != 0 and not pinned_base and not remote_branch:
             raise WorktreeFetchFailed(
                 f"implementer {task_id}: could not fetch origin/{main_branch}: "
                 f"{fetch.stderr.strip()}"
@@ -1416,12 +1418,9 @@ def _prepare_worktree_for_task_inner(
                         f"_prepare_worktree_for_task: implementer checkout {branch} "
                         f"from {checkout_base} failed: {r.stderr.strip()}"
                     )
-        # #358: a failed or unresolvable prep has no proven base. Returning the
-        # old HEAD here made an unrelated PR branch look like the dispatch base
-        # (#397). Dispatch continues with explicit unknown; the artifact gate
-        # already refuses a completed implementation with no known base.
-        fresh_base = bool(pinned_base) or fetch.returncode == 0
-        return (base_sha if fresh_base and checkout_ok
+        # #358: the selected base must be the commit actually checked out.
+        # The old shared HEAD cannot stand in for an unresolved base (#397).
+        return (base_sha if checkout_ok
                 and _worktree_head(worktree_path) == base_sha else "")
     else:
         # ⛔The roles have different input commits: an implementer starts from

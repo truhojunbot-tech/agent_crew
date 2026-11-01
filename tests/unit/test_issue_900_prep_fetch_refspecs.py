@@ -3,6 +3,7 @@
 import asyncio
 import subprocess
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew import pipeline, server
@@ -128,3 +129,66 @@ def test_failed_implement_fetch_refuses_dispatch_without_using_head(tmp_path, mo
     assert git(worker, "rev-parse", "HEAD") == unrelated_head
     assert len(notices) == 1
     assert "prep_fetch_failed" in notices[0]
+
+
+@pytest.mark.parametrize("continuing", [False, True])
+def test_pinned_implement_base_survives_unavailable_origin(tmp_path, continuing):
+    origin = tmp_path / "origin.git"
+    worker = tmp_path / "worker"
+    def git(cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, check=True,
+                              capture_output=True, text=True).stdout.strip()
+    git(tmp_path, "init", "--bare", "-b", "main", str(origin))
+    git(tmp_path, "clone", str(origin), str(worker))
+    git(worker, "config", "user.email", "crew@example.test")
+    git(worker, "config", "user.name", "Crew Test")
+    (worker / "base.txt").write_text("base\n")
+    git(worker, "add", ".")
+    git(worker, "commit", "-m", "base")
+    pinned = git(worker, "rev-parse", "HEAD")
+    git(worker, "remote", "set-url", "origin", str(tmp_path / "missing.git"))
+    context = {"base_branch": "main", "worktree_base_sha": pinned}
+    if continuing:
+        context["pr_number"] = 900
+
+    prepared = server._prepare_worktree_for_task(
+        str(worker), "impl-900-pinned", "fix/new", "implementer",
+        context, "implement",
+    )
+    assert prepared == pinned
+    assert git(worker, "rev-parse", "HEAD") == pinned
+
+
+def test_fetched_continuing_branch_survives_base_fetch_failure(tmp_path, monkeypatch):
+    origin = tmp_path / "origin.git"
+    worker = tmp_path / "worker"
+    real_run = subprocess.run
+    def git(cwd, *args):
+        return real_run(["git", *args], cwd=cwd, check=True,
+                        capture_output=True, text=True).stdout.strip()
+    git(tmp_path, "init", "--bare", "-b", "main", str(origin))
+    git(tmp_path, "clone", str(origin), str(worker))
+    git(worker, "config", "user.email", "crew@example.test")
+    git(worker, "config", "user.name", "Crew Test")
+    (worker / "base.txt").write_text("base\n")
+    git(worker, "add", ".")
+    git(worker, "commit", "-m", "base")
+    git(worker, "push", "origin", "main")
+    git(worker, "switch", "-c", "fix/work")
+    (worker / "work.txt").write_text("work\n")
+    git(worker, "add", ".")
+    git(worker, "commit", "-m", "work")
+    expected = git(worker, "rev-parse", "HEAD")
+    git(worker, "push", "origin", "fix/work")
+    actual_fetch = server.git_fetch_origin
+    def fetch(repo, branch):
+        if branch == "main":
+            return subprocess.CompletedProcess([], 128, "", "origin/main unavailable")
+        return actual_fetch(repo, branch)
+    monkeypatch.setattr(server, "git_fetch_origin", fetch)
+
+    prepared = server._prepare_worktree_for_task(
+        str(worker), "impl-900-fix", "fix/work", "implementer",
+        {"base_branch": "main", "pr_number": 900}, "implement",
+    )
+    assert prepared == expected
