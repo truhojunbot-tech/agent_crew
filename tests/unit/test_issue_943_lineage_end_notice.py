@@ -94,7 +94,8 @@ def test_D_retry_suppresses_end_until_exhaustion(harness):
     app, queue, notices = harness
     _task(queue, "impl-retry-943", "implement")
     with TestClient(app) as client:
-        assert _result(client, "impl-retry-943", "failed").status_code == 200
+        assert _result(client, "impl-retry-943", "failed",
+                       error_info={"kind": "transient"}).status_code == 200
     assert queue.get_task("retry-impl-retry-943-a1") is not None
     assert notices == []
     _task(queue, "exhausted-943", "implement", retry_attempt=2)

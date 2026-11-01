@@ -219,8 +219,8 @@ def test_finding3_reproduction_hangs_forever_without_a_budget(q):
             os.environ[cc._ENV_STALE_SECONDS] = old
 
 
-def test_finding3_stale_dispatch_requeues_once(q, monkeypatch):
-    """Past the budget, the first unobservable dispatch frees its slot and retries."""
+def test_finding3_stale_dispatch_fails_without_same_input_retry(q, monkeypatch):
+    """Past the budget, an unobservable dispatch closes without repeating work."""
     monkeypatch.setenv(cc._ENV_STALE_SECONDS, "1")
     task_id, branch = _enqueue_implement(q)
     q.dequeue(role="implementer")
@@ -241,11 +241,9 @@ def test_finding3_stale_dispatch_requeues_once(q, monkeypatch):
         pr_number_for_branch_fn=lambda branch, repo=None: None,
         commit_message_fn=lambda branch, repo=None: None,
     )
-    assert outcome.action == "requeued"
+    assert outcome.action == "failed"
     assert q.get_task(task_id).status == "failed"
-    retry = q.get_task(f"retry-{task_id}-a1")
-    assert retry is not None and retry.status == "pending"
-    assert retry.context["cloud_stale_retry"] is True
+    assert q.get_task(f"retry-{task_id}-a1") is None
     assert not [t for t in q.list_tasks(status="in_progress") if t.task_id == task_id]
 
 

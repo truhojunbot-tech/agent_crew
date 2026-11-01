@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from agent_crew import github as _github
+from agent_crew.failure_kind import FailureKind
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import (AdmissionRefused, TaskAlreadyExistsError, TaskQueue,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
@@ -838,6 +839,7 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
     logger.warning("claude_cloud: dispatch failed closed for %s — %s", task.task_id, reason)
     context = queue.get_task_context(task.task_id)
     ended = time.time()
+    retryable = retryable and failure_kind in {FailureKind.TRANSIENT.value, FailureKind.TIMEOUT.value}
     queue.patch_context(task.task_id, {"cloud_ended_at": ended,
                                        "cloud_terminal_error": reason,
                                        "cloud_submit_retryable": retryable,
@@ -891,19 +893,15 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
 
 def _requeue_stale_cloud_once(queue: TaskQueue, task: TaskRequest,
                               reason: str) -> Optional[str]:
-    """Free one stale cloud slot and create one same-role lineage retry."""
-    context = task.context if isinstance(task.context, dict) else {}
-    if context.get("cloud_stale_retry"):
-        return None
-    from agent_crew.pipeline import MAX_TASK_RETRIES
-    try:
-        attempt = int(context.get("retry_attempt") or 0)
-    except (TypeError, ValueError):
-        return None
-    if attempt >= MAX_TASK_RETRIES:
-        return None
+    """A stale cloud run has no changed input, so close it without a retry."""
     _fail_closed_dispatch(queue, task, task.task_type, reason)
-    return _enqueue_cloud_retry_once(queue, task, reason, stale=True)
+    from agent_crew.server import coordinator_notice_once
+    context = task.context if isinstance(task.context, dict) else {}
+    coordinator_notice_once(
+        queue, task.task_id, "cloud_stale_no_retry",
+        f"branch={task.branch or ''} session_url={context.get('cloud_session_url') or ''}",
+    )
+    return ""
 
 
 def _enqueue_cloud_retry_once(queue: TaskQueue, task: TaskRequest,
@@ -1708,7 +1706,9 @@ def _reconcile_cloud_review(
                     acknowledgement = submit_review_result_fn(task.task_id, result)
                 except Exception:
                     logger.exception("claude_cloud: review result handler failed for %s", task.task_id)
-                    retry_detail = "result handler failed; will retry"
+                    _fail_closed_dispatch(queue, task, "review", "cloud_review_handler_failed")
+                    return CloudReconciliationOutcome(task.task_id, "failed", pr_number=pr_number,
+                                                      detail="result handler failed")
                 else:
                     if isinstance(acknowledgement, dict) and acknowledgement.get("held"):
                         retry_detail = f"result held: {acknowledgement['held']}"

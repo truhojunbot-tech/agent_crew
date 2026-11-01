@@ -40,31 +40,15 @@ def _stale(queue, task, monkeypatch):
 
 
 @pytest.mark.parametrize("role", ["reviewer", "implementer"])
-def test_first_stale_reenqueues_once_and_second_is_terminal(queue, monkeypatch, role):
+def test_stale_cloud_task_ends_without_same_input_retry(queue, monkeypatch, role):
     context = ({"pr_number": 829, "reviewed_sha": "a" * 40}
                if role == "reviewer" else {})
     original = _dispatched(queue, f"{role}-829", role, context)
     first = _stale(queue, original, monkeypatch)
-    retry_id = f"retry-{original.task_id}-a1"
-    retry = queue.get_task(retry_id)
-    assert first.action == "requeued"
-    assert retry is not None and retry.status == "pending"
-    assert retry.context["prev_task_id"] == original.task_id
-    assert retry.context["cloud_stale_retry"] is True
-    assert retry.context["retry_attempt"] == 1
-    assert cloud._resolve_resume_session_id(queue, retry) is None
+    assert first.action == "failed"
     assert queue.get_task(original.task_id).status == "failed"
     assert queue.count_in_progress_by_dispatch_channel(cloud.DISPATCH_CHANNEL) == 0
-    assert len([t for t in queue.list_tasks() if t.task_id.startswith("retry-")]) == 1
-
-    queue.dequeue(role=role)
-    queue.record_dispatch(retry_id, channel=cloud.DISPATCH_CHANNEL,
-                          agent=cloud.CLOUD_PROVIDER_NAME, target="pending")
-    second = _stale(queue, queue.get_task(retry_id), monkeypatch)
-    assert second.action == ("failed" if role == "reviewer" else "needs_decision")
-    assert queue.get_task(retry_id).status == (
-        "failed" if role == "reviewer" else "needs_human")
-    assert len([t for t in queue.list_tasks() if t.task_id.startswith("retry-")]) == 1
+    assert not [t for t in queue.list_tasks() if t.task_id.startswith("retry-")]
 
 
 @pytest.mark.parametrize("role", ["reviewer", "implementer"])

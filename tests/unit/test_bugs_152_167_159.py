@@ -64,8 +64,8 @@ class _RecordingPush:
 @pytest.mark.parametrize(
     ("task_type", "error_info", "retry_flag", "expected_retry"),
     [
-        ("implement", None, None, True),
-        ("implement", None, "1", True),
+        ("implement", None, None, False),
+        ("implement", None, "1", False),
         ("implement", None, "0", False),
         ("implement", {"kind": "transient", "reason": "infrastructure_failure"}, "0", True),
         ("review", None, "0", True),

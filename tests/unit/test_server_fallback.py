@@ -38,7 +38,7 @@ def _result(task_id, status="failed", summary="rate limit reached", findings=Non
         "verdict": None,
         "findings": findings or [],
         "pr_number": None,
-        "error_info": error_info or {},
+        "error_info": error_info if error_info is not None else {"kind": "transient"},
     }
 
 

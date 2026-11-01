@@ -5396,19 +5396,50 @@ def create_app(
                 except Exception:
                     logger.exception(f"watchdog #145: force_fail_pending raised for task {tid}")
             return actions
+        # STOP prevents dequeue altogether. Time spent paused is not a failed
+        # delivery attempt and must not exhaust the pending-task retry cap.
+        if stale and q().get_stop_epoch()["paused"]:
+            return actions
         # Collect unique roles so we only fire _try_push_next once per role.
         stale_roles: set[str] = set()
+        busy_roles = {
+            f"discuss:{row['context'].get('agent')}"
+            if row["task_type"] == "discuss" else _TYPE_TO_ROLE.get(row["task_type"])
+            for row in rows
+        }
         for sp in stale:
             task_type = sp.get("task_type", "")
             ctx = sp.get("context") or {}
+            task_id = sp.get("task_id")
             if task_type == "discuss":
                 agent = ctx.get("agent") if isinstance(ctx, dict) else None
-                if agent and agent in (pane_map or {}):
-                    stale_roles.add(f"discuss:{agent}")
+                role_key = f"discuss:{agent}" if agent and agent in (pane_map or {}) else None
             else:
-                role = _TYPE_TO_ROLE.get(task_type)
-                if role:
-                    stale_roles.add(role)
+                role_key = _TYPE_TO_ROLE.get(task_type)
+            # A pending task behind an occupied lane has had no delivery
+            # attempt. Only the first stale task for a free lane can be tried
+            # by the single _try_push_next call below.
+            if not role_key or role_key in busy_roles or role_key in stale_roles:
+                continue
+            if task_type in ("implement", "review", "test"):
+                agent = ctx.get("agent_override") or _DISPATCH_ROLE_TO_AGENT.get(role_key)
+                if not agent or QuotaBudgetProvider().active_cooldown_until(agent) is not None:
+                    # _try_push_next holds this task before it reaches a pane.
+                    continue
+            attempt = int(ctx.get("watchdog_redispatch_attempt") or 0)
+            if attempt >= MAX_TASK_RETRIES:
+                if task_id:
+                    failed_type = q().force_fail_pending(
+                        task_id, "watchdog redispatch cap reached",
+                        error_info={"kind": FailureKind.TIMEOUT.value,
+                                    "reason": "watchdog_redispatch_cap"})
+                    if failed_type:
+                        _coordinator_notice(task_id, "watchdog_redispatch_cap",
+                                            "pending task was not dispatched after bounded retries")
+                continue
+            stale_roles.add(role_key)
+            if task_id:
+                q().patch_context(task_id, {"watchdog_redispatch_attempt": attempt + 1})
         for role_key in stale_roles:
             try:
                 if role_key.startswith("discuss:"):
@@ -5624,10 +5655,7 @@ def create_app(
 
     app.state.drain_script_tests = _drain_script_tests
 
-    # task_id → transient retry count, used to decide whether an upstream
-    # 429 (claude throttle / gemini capacity-exhausted) gets requeued or
-    # finally failed. In-memory; resets on server restart.
-    _transient_retries: dict[str, int] = {}
+    # Transient retry counts live in task context and survive a server restart.
     try:
         _MAX_TRANSIENT_RETRY = int(os.getenv("AGENT_CREW_TRANSIENT_RETRY_MAX", "3"))
     except ValueError:
@@ -7134,10 +7162,10 @@ def create_app(
                     return
                 _fail_if_active(task.task_id, "codex_quota_park_failed")
             elif _failure_kind in {FailureKind.TRANSIENT.value, FailureKind.TIMEOUT.value}:
-                _n = _transient_retries.get(task.task_id, 0) + 1
-                _transient_retries[task.task_id] = _n
+                _n = int((q().get_task_context(task.task_id) or {}).get("transient_retry_attempt") or 0) + 1
                 if _n <= _MAX_TRANSIENT_RETRY:
                     try:
+                        q().patch_context(task.task_id, {"transient_retry_attempt": _n})
                         q().requeue(task.task_id)
                         logger.warning(
                             f"dispatcher: transient {_provider_failure['provider_code']} on "
@@ -7210,13 +7238,6 @@ def create_app(
             # teardown can raise — a leaked flock would block every later test
             # on this worktree until the process exits.
             _lock_stack.close()
-            # Pop the per-task transient-retry counter once the task reaches
-            # a terminal outcome, so the in-memory dict doesn't grow
-            # unbounded across long-running servers (#194). Left in place
-            # (_terminal=False) across a successful requeue so the count
-            # actually accumulates across retries (#201).
-            if _terminal:
-                _transient_retries.pop(task.task_id, None)
             # Rotate dispatch logs and the attribution ledger when they cross
             # the cap (#193). Append-only paths grew to >100MB in production.
             try:
@@ -8081,21 +8102,12 @@ def create_app(
                         task_id, result.commit,
                     )
                     return False
-            # Opt-in for projects where repeating an agent-reported implement
-            # failure has proved wasteful. Read per call so the default retry
-            # behavior remains unchanged when the flag is unset.
-            error_info = original_task.error_info
-            if (
-                os.getenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", "1") == "0"
-                and task_type == "implement"
-                and not failure_kind(error_info)
-            ):
-                logger.info(
-                    "_auto_retry_failed_task: skipping retry for %s: agent-reported implement failure; retry would repeat the same work",
-                    task_id,
-                )
+            kind = failure_kind(result.error_info) or failure_kind(original_task.error_info)
+            if (task_type == "implement" and kind not in {
+                    FailureKind.TRANSIENT.value, FailureKind.TIMEOUT.value,
+                    FailureKind.CAPACITY.value, FailureKind.PROVIDER_LIMIT.value}):
+                logger.info("_auto_retry_failed_task: no typed transient cause for %s", task_id)
                 return False
-
             # #167: use the DB context retry_attempt, not result.retry_count.
             # Agents always submit retry_count=0 (they don't track it); the DB
             # context is the authoritative source of how many times this chain

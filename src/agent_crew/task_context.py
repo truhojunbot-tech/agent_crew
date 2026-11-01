@@ -176,6 +176,8 @@ TASK_CONTEXT_KEYS = frozenset({
     'result_commit',
     'retry',
     'retry_attempt',
+    'transient_retry_attempt',
+    'watchdog_redispatch_attempt',
     'retry_of',
     'retry_reason',
     'retry_skipped_reason',
