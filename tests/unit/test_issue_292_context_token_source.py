@@ -189,7 +189,7 @@ def test_the_push_path_clears_on_a_saturated_transcript(tmp_path, monkeypatch, *
     state.write_text(json.dumps({"port": unused_tcp_port,
                                  "worktrees": {"claude": str(wt)}, "pane_ids": ["%91"],
                                  "role_agents": {"implementer": "claude", "reviewer": "codex",
-                                                 "tester": "gemini"}}))
+                                                 "tester": "script"}}))
 
     cleared = []
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")

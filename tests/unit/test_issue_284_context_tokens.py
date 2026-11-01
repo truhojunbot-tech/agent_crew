@@ -334,7 +334,7 @@ def test_the_cap_event_carries_the_window_and_the_cause(tmp_path, monkeypatch, *
     state = tmp_path / "state.json"
     state.write_text(_json.dumps({"port": 0, "worktrees": {"claude": str(wt)},
                                   "role_agents": {"implementer": "claude", "reviewer": "codex",
-                                                  "tester": "gemini"}}))
+                                                  "tester": "script"}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)

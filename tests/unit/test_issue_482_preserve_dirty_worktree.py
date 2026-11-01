@@ -157,7 +157,7 @@ def _dispatch(tmp_path, monkeypatch, unused_tcp_port, *, outcome, stash_failure=
     wt = _repo(tmp_path / "claude")
     state = tmp_path / "state.json"
     state.write_text(json.dumps({
-        "role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "gemini"},
+        "role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "script"},
         "worktrees": {"claude": str(wt)}}))
     db = str(tmp_path / "t.db")
 

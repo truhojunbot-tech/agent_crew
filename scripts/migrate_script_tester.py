@@ -23,7 +23,10 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from agent_crew.role_mapping import effective_role_mapping  # noqa: E402
+from agent_crew.role_mapping import (  # noqa: E402
+    DEFAULT_SOURCE, EXPLICIT_SOURCE, LEGACY_SOURCE, default_role_mapping,
+    effective_role_mapping,
+)
 
 
 def _read(path: Path) -> tuple[bytes, dict]:
@@ -46,11 +49,12 @@ def plan_migration(crew_home: Path, *, test_timeout_s: float | None = None,
     projects = []
     for path in sorted(crew_home.glob("*/state.json")):
         raw, state = _read(path)
-        mapping, source = effective_role_mapping(state, project=path.parent.name)
-        # The runtime now coerces legacy provider testers to script. Inventory
-        # the stored value so a dry-run still reports state that needs cleanup.
-        old = mapping["tester"]
+        # Inventory the stored tester directly. Historical provider testers are
+        # invalid for runtime dispatch, but the migration must still read them.
+        old = "script"
         explicit = state.get("role_agents")
+        source = (EXPLICIT_SOURCE if isinstance(explicit, dict) else
+                  LEGACY_SOURCE if isinstance(state.get("roles"), list) else DEFAULT_SOURCE)
         if isinstance(explicit, dict) and isinstance(explicit.get("tester"), str):
             old = explicit["tester"]
         elif isinstance(state.get("roles"), list):
@@ -123,7 +127,18 @@ def apply_migration(crew_home: Path, accepted_sha256: str, *,
         raw, state = _read(path)
         if hashlib.sha256(raw).hexdigest() != row["state_sha256"]:
             raise ValueError(f"{path}: state changed since the dry-run")
-        mapping, _ = effective_role_mapping(state, project=row["project"])
+        candidate = default_role_mapping()
+        declared = state.get("role_agents")
+        if isinstance(declared, dict):
+            candidate.update(declared)
+        elif isinstance(state.get("roles"), list):
+            candidate.update({entry["role"]: entry["agent"]
+                              for entry in state["roles"]
+                              if isinstance(entry, dict)
+                              and entry.get("role") in ("implementer", "reviewer")
+                              and isinstance(entry.get("agent"), str)})
+        candidate["tester"] = "script"
+        mapping, _ = effective_role_mapping({"role_agents": candidate}, project=row["project"])
         if row["old_tester"] != row["new_tester"]:
             state["role_agents"] = {**mapping, "tester": "script"}
         if test_timeout_s is not None:

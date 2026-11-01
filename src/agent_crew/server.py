@@ -100,8 +100,9 @@ from agent_crew import script_tester as _script_tester
 from agent_crew import contract_emit as _contract_emit
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import (
-    DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, ROLE_BOUND_PROVIDERS,
-    TASK_TYPE_TO_ROLE, anonymous_pull_refusal, effective_role_mapping, provider_family,
+    EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, ROLE_BOUND_PROVIDERS,
+    TASK_TYPE_TO_ROLE, RoleResolutionError, anonymous_pull_refusal,
+    default_role_mapping, effective_role_mapping, provider_family, resolve_agent_role,
     provider_task_types, role_policy, role_policy_refusal,
 )
 from agent_crew.risk_tier import risk_declaration as _risk_declaration
@@ -1654,10 +1655,6 @@ def _review_result_is_actionable(result) -> bool:
     return bool(result.findings or [])
 
 
-_DEFAULT_ROLE_TO_AGENT = dict(DEFAULT_ROLE_TO_AGENT)
-_DEFAULT_AGENT_TO_ROLE = dict(LEGACY_AGENT_TO_ROLE)
-
-
 # Tags that mean "retryable in the next few minutes" (server-side load-shed).
 #: Statuses a task can hold when a result still arrives afterwards. Both mean
 #: "the dispatcher stopped watching", not "the work is over" (#265).
@@ -2498,7 +2495,10 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
                     )
         else:
             for agent, path in worktrees.items():
-                role = _DEFAULT_AGENT_TO_ROLE.get(agent)
+                try:
+                    role = resolve_agent_role(agent)
+                except RoleResolutionError:
+                    continue
                 if role and path and not (role == "tester" and
                                           mapping["tester"] == _script_tester.SCRIPT_TESTER):
                     result[role] = path
@@ -2540,9 +2540,10 @@ def _load_role_to_agent_with_source(state_path: Optional[str]) -> tuple[dict[str
         with open(state_path) as f:
             state = json.load(f)
         return effective_role_mapping(state, project=state.get("project", "unknown"))
-    except Exception:
-        logger.exception("_load_role_to_agent: failed to read state.json")
-        return effective_role_mapping(None)
+    except RoleResolutionError:
+        raise
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        raise RoleResolutionError("unreadable_state", str(state_path)) from exc
 
 
 def _load_role_to_agent(state_path: Optional[str]) -> dict[str, str]:
@@ -2831,7 +2832,7 @@ def _roles_for_agent(agent: str, role_to_agent=None) -> list:
       be invisible until one of them described a deployment that does not
       exist — which is exactly how both of these got the static default wrong.
     """
-    mapping = role_to_agent or _DEFAULT_ROLE_TO_AGENT
+    mapping = default_role_mapping() if role_to_agent is None else role_to_agent
     return [r for r, a in mapping.items() if a == agent]
 
 
@@ -4549,6 +4550,8 @@ def create_app(
     def _try_push_next(role: str) -> None:
         """If the role has an available pane and is idle, dequeue and push the next task."""
         _refresh_role_map()
+        if _notice_role_map_refusal():
+            return
         # #314 §4 P0: replay 중에는 queue push 금지 — push는 다른 pending task를 claim/start하므로
         # replay가 ACK 전 죽으면 다음 replay가 또 다른 task를 claim/start(중복). replay는 successor
         # enqueue(durable transition)만; dispatch는 resume 후 정상 push 사이클/watchdog이 담당.
@@ -5462,9 +5465,24 @@ def create_app(
             return
 
     # ── Headless dispatcher (subprocess-per-task model) ──────────────────────
-    # Built from state.json's role assignment, with the hardcoded fallback.
+    # Built from state.json's role assignment. A broken state blocks dispatch.
     # Recheck its mtime before dispatch so a live role change takes effect.
-    _DISPATCH_ROLE_TO_AGENT: dict[str, str] = _load_role_to_agent(state_path)
+    try:
+        _DISPATCH_ROLE_TO_AGENT: dict[str, str] = _load_role_to_agent(state_path)
+        _ROLE_MAP_REFUSAL: RoleResolutionError | None = None
+    except RoleResolutionError as exc:
+        _DISPATCH_ROLE_TO_AGENT = {}
+        _ROLE_MAP_REFUSAL = exc
+        logger.error("dispatcher: role configuration refused: %s", exc)
+
+    def _notice_role_map_refusal() -> bool:
+        if _ROLE_MAP_REFUSAL is None:
+            return False
+        for pending in q().list_tasks():
+            if pending.status == "pending" and pending.task_type in TASK_TYPE_TO_ROLE:
+                coordinator_notice_once(q(), pending.task_id, "role_resolution_refused",
+                                        f"reason={_ROLE_MAP_REFUSAL.reason}")
+        return True
     def _role_map_stamp():
         if not state_path:
             return None
@@ -5478,11 +5496,18 @@ def create_app(
     logger.info("dispatcher: effective role map at startup: %s", _DISPATCH_ROLE_TO_AGENT)
 
     def _refresh_role_map() -> None:
-        nonlocal _role_map_cached_stamp
+        nonlocal _role_map_cached_stamp, _ROLE_MAP_REFUSAL
         stamp = _role_map_stamp()
         if stamp == _role_map_cached_stamp:
+            _notice_role_map_refusal()
             return
-        mapping = _load_role_to_agent(state_path)
+        try:
+            mapping = _load_role_to_agent(state_path)
+            _ROLE_MAP_REFUSAL = None
+        except RoleResolutionError as exc:
+            mapping = {}
+            _ROLE_MAP_REFUSAL = exc
+            logger.error("dispatcher: role configuration refused: %s", exc)
         _role_map_cached_stamp = stamp
         if _state_worktree_map and not _WORKTREE_SYNC_DISABLED:
             refreshed_worktrees = _load_worktree_map(state_path)
@@ -5496,6 +5521,7 @@ def create_app(
                 if role not in mapping:
                     _DISPATCH_ROLE_TO_AGENT.pop(role)
         logger.info("dispatcher: state changed; effective role map: %s", mapping)
+        _notice_role_map_refusal()
 
     _DISPATCH_DISCUSS_WORKTREES = _load_discuss_worktrees(state_path)
 
@@ -7377,6 +7403,9 @@ def create_app(
             while True:
                 await asyncio.sleep(interval)
                 try:
+                    _refresh_role_map()
+                    if _notice_role_map_refusal():
+                        continue
                     _reroute_stale_bindings()
                     _AGENT_TO_ROLES, _workers, _discuss_workers = _worker_role_map()
                     try:
@@ -7623,7 +7652,14 @@ def create_app(
                                                               claim_source="dispatcher")
                         if task is None:
                             continue
-                        role = _AGENT_TO_ROLES.get(agent, [_DEFAULT_AGENT_TO_ROLE.get(agent, "")])[0]
+                        assigned_roles = _AGENT_TO_ROLES.get(agent) or []
+                        if assigned_roles:
+                            role = assigned_roles[0]
+                        else:
+                            try:
+                                role = resolve_agent_role(agent)
+                            except RoleResolutionError:
+                                role = ""  # Discussion can use a checkout-only provider.
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
                         _slot = _target_agent or agent
                         if _slot in active_workers:
@@ -8966,6 +9002,10 @@ def create_app(
     def get_next_task(role: str = "", agent: str = "",
                       x_agent_crew_project: Optional[str] = Header(default=None)):
         _require_project_identity(x_agent_crew_project)
+        _refresh_role_map()
+        if _notice_role_map_refusal():
+            raise HTTPException(status_code=409,
+                                detail=f"role_resolution_refused: {_ROLE_MAP_REFUSAL.reason}")
         # #172: in MCP-only mode the LLM must use the get_next_task MCP tool,
         # not curl-poll this HTTP endpoint — block to prevent idle token burn.
         if not _push_enabled:

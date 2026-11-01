@@ -19,7 +19,7 @@ def _dispatch_pair(tmp_path, monkeypatch, unused_tcp_port, *, related=False,
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({
         "worktrees": {"claude": str(worktree)},
-        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"},
+        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "script"},
     }))
     db_path = str(tmp_path / "tasks.db")
     spawned = []

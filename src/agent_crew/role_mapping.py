@@ -21,9 +21,38 @@ DEFAULT_ROLE_TO_AGENT = {
 #: A legacy gemini worktree can still be read as a tester worktree; the
 #: effective role mapping refuses that provider for general test work (#924).
 LEGACY_AGENT_TO_ROLE = {"codex": "implementer", "claude": "reviewer", "gemini": "tester"}
+KNOWN_ROLE_AGENTS = frozenset((*LEGACY_AGENT_TO_ROLE, "claude_cloud", "script", "agy"))
 EXPLICIT_SOURCE = "explicit project config"
 LEGACY_SOURCE = "legacy state.json.roles"
 DEFAULT_SOURCE = "hardcoded default"
+
+
+class RoleResolutionError(ValueError):
+    """Typed refusal to select a provider from unusable role configuration."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = reason
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+
+
+def default_role_mapping() -> dict[str, str]:
+    """The baseline map, used only when a project has no role configuration."""
+    return dict(DEFAULT_ROLE_TO_AGENT)
+
+
+def default_agent_for_role(role: str) -> str:
+    try:
+        return DEFAULT_ROLE_TO_AGENT[role]
+    except KeyError as exc:
+        raise RoleResolutionError("unknown_agent", f"unknown role {role!r}") from exc
+
+
+def resolve_agent_role(agent: str) -> str:
+    """Resolve a legacy agent worktree key without guessing its role."""
+    try:
+        return LEGACY_AGENT_TO_ROLE[agent]
+    except KeyError as exc:
+        raise RoleResolutionError("unknown_agent", f"unknown agent {agent!r}") from exc
 
 
 def provider_family(agent: object) -> str:
@@ -122,6 +151,8 @@ def validate_explicit_role_agents(mapping: Mapping[str, object]) -> dict[str, st
         agent = mapping[role]
         if not isinstance(agent, str) or not agent.strip():
             raise ValueError(f"agent for {role!r} must be a non-empty string")
+        if agent.strip() not in KNOWN_ROLE_AGENTS:
+            raise ValueError(f"unknown agent {agent!r} for {role!r}")
         if role == "tester" and role_policy_refusal(role, agent):
             raise ValueError(role_policy_refusal(role, agent))
         result[role] = agent.strip()
@@ -131,34 +162,21 @@ def validate_explicit_role_agents(mapping: Mapping[str, object]) -> dict[str, st
 def effective_role_mapping(
     state: Mapping[str, object] | None, *, project: str = "unknown",
 ) -> tuple[dict[str, str], str]:
-    """Resolve explicit, legacy, then hardcoded mappings without migration."""
+    """Resolve a project role map, refusing malformed declared assignments."""
     if not isinstance(state, Mapping):
-        return dict(DEFAULT_ROLE_TO_AGENT), DEFAULT_SOURCE
+        return default_role_mapping(), DEFAULT_SOURCE
 
     explicit = state.get("role_agents")
     if explicit is not None:
         try:
             if not isinstance(explicit, Mapping):
                 raise ValueError("role_agents must be an object")
-            normalized = dict(explicit)
-            tester = normalized.get("tester")
-            refusal = role_policy_refusal("tester", tester)
-            if refusal:
-                normalized["tester"] = DEFAULT_ROLE_TO_AGENT["tester"]
-            mapping = validate_explicit_role_agents(normalized)
-            if refusal:
-                logger.warning(
-                    "project %s has refused explicit tester %r (%s); using script tester",
-                    project, tester, refusal,
-                )
+            mapping = validate_explicit_role_agents(explicit)
             return mapping, EXPLICIT_SOURCE
         except ValueError as exc:
-            logger.warning(
-                "project %s has invalid role_agents (%s); retaining legacy/default mapping",
-                project, exc,
-            )
+            raise RoleResolutionError("invalid_role_agents", str(exc)) from exc
 
-    result = dict(DEFAULT_ROLE_TO_AGENT)
+    result = default_role_mapping()
     legacy = state.get("roles")
     if isinstance(legacy, list):
         found = False

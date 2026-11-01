@@ -1325,14 +1325,9 @@ def test_u_c59_recover_dead_session_uses_log_viewers_in_dispatcher_mode(tmp_path
     )
 
 
-# U-C60: _AGENT_TO_ROLE fallback — non-standard agents get 'implementer' role
-def test_u_c60_agent_to_role_fallback_for_unknown_agents(tmp_path):
-    """When agents list contains names not in _AGENT_TO_ROLE (e.g. 'analyst', 'critic'),
-    role assignment must fall back to 'implementer' — not crash or assign a wrong role.
-
-    This validates the .get(a, 'implementer') fallback used in setup and recover
-    pane_map building, and that the pane_map is still written correctly.
-    """
+# U-C60: unknown agents must not acquire the implementer role.
+def test_u_c60_unknown_agents_are_refused(tmp_path):
+    """An unknown setup agent cannot acquire an implementer pane."""
     import json
 
     split_pane_calls = []
@@ -1386,13 +1381,5 @@ def test_u_c60_agent_to_role_fallback_for_unknown_agents(tmp_path):
             "--agents", "analyst,critic"
         ])
 
-    assert result.exit_code == 0, result.output
-
-    pane_map = captured_state.get("pane_map", {})
-    # Both unknown agents must be mapped — role fallback to 'implementer'
-    assert "analyst" in pane_map, f"'analyst' must be in pane_map, got: {pane_map}"
-    assert "critic" in pane_map, f"'critic' must be in pane_map, got: {pane_map}"
-    # Role fallback: 'implementer' must be in the map (first unknown agent maps to it)
-    assert "implementer" in pane_map, (
-        f"'implementer' role key must be in pane_map via fallback, got: {pane_map}"
-    )
+    assert result.exit_code != 0
+    assert "implementer" not in captured_state.get("pane_map", {})

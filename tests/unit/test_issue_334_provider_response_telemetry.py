@@ -284,7 +284,7 @@ def test_dispatch_exit_refreshes_usage_after_result_submission(tmp_path, monkeyp
     (wt / ".git").mkdir()
     state = tmp_path / "state.json"
     state.write_text(json.dumps({
-        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"},
+        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "script"},
         "worktrees": {"codex": str(wt)},
     }))
     db = str(tmp_path / "tasks.db")

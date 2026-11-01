@@ -39,7 +39,7 @@ def test_u_b188_reviewer_override_routes_to_override_agent(tmp_db, tmp_path, *, 
         (wt / ".git").mkdir()
 
     state = {
-        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}, "worktrees": {
+        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "script"}, "worktrees": {
             "claude": str(wt_claude),
             "codex": str(wt_codex),
             "gemini": str(wt_gemini),
@@ -109,7 +109,7 @@ def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path, *, unused_tcp_p
         (wt / ".git").mkdir()
 
     state = {
-        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}, "worktrees": {
+        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "script"}, "worktrees": {
             "claude": str(wt_claude),
             "codex": str(wt_codex),
             "gemini": str(wt_gemini),

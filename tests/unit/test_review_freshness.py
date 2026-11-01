@@ -61,7 +61,7 @@ def _make_app(tmp_db, push_calls):
     state_path.write_text(json.dumps({
         "project": "review-freshness-test",
         "role_agents": {"implementer": "claude", "reviewer": "codex",
-                        "tester": "gemini"},
+                        "tester": "script"},
     }))
     panes = {
         "implementer": "%C", "claude": "%C",

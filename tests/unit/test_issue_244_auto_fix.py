@@ -281,7 +281,7 @@ def test_the_cap_is_read_at_call_time_and_survives_garbage(monkeypatch):
 # ── 4. the cap must bound the REAL loop, not one call ─────────────────
 
 
-def test_the_counter_survives_the_round_trip_through_a_new_review(q):
+def test_the_counter_survives_the_round_trip_through_a_new_review(q, monkeypatch):
     """★★The test that makes the cap real.
 
     Each round mints new task ids, so the counter has to ride the lineage:
@@ -290,6 +290,9 @@ def test_the_counter_survives_the_round_trip_through_a_new_review(q):
     stubborn reviewer loops forever. Driving the actual cascade functions is
     the only way to catch that — a single `auto_enqueue_fix` call cannot.
     """
+    # This test exercises the review-to-fix cap, independently of the newer
+    # per-provider review admission cap.
+    monkeypatch.delenv("AGENT_CREW_REVIEW_MAX_ROUNDS_CLAUDE", raising=False)
     review_id = _review(q, pr_number=241)
     rounds = []
 

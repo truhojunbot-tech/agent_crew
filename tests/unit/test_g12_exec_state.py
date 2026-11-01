@@ -434,7 +434,7 @@ def test_dispatcher_path_records_pid_lease_and_heartbeat(tmp_path, monkeypatch):
     wt.mkdir()
     (wt / ".git").mkdir()
     state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps({"role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}, "worktrees": {"claude": str(wt)}}))
+    state_file.write_text(json.dumps({"role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "script"}, "worktrees": {"claude": str(wt)}}))
     db = str(tmp_path / "t.db")
 
     class _Proc:
