@@ -122,16 +122,16 @@ def test_u_se07_create_worktrees_custom_agents():
 
 # U-SE08: start_agents_in_panes launches the CLI and sends a kickoff prompt.
 # The kickoff tells agents to start polling get_next_task every 30 seconds.
-def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
-    mock_result = MagicMock(returncode=0)
+def test_u_se08_start_agents_in_panes_uses_respawn():
+    mock_result = MagicMock(returncode=0, stdout="Claude Code")
     with patch("agent_crew.setup.subprocess.run", return_value=mock_result) as mock_run, \
          patch("agent_crew.setup.time.sleep"):
         start_agents_in_panes("crew_proj", ["claude"])
 
     all_args = [call[0][0] for call in mock_run.call_args_list]
-    # Escape sequence: first two calls send C-c and then q/Enter
-    assert any("C-c" in " ".join(a) for a in all_args), "Ctrl+C escape not sent"
-    assert any("q" in a for a in all_args), "q escape not sent"
+    assert ["tmux", "respawn-pane", "-k", "-t", "crew_proj:0.0"] in all_args
+    assert not any(a[:2] == ["tmux", "send-keys"] and
+                   any(key in a for key in ("C-c", "q")) for a in all_args)
     # Launch cmd: literal send with agent cmd
     literal_calls = [a for a in all_args if "-l" in a]
     assert literal_calls, "no literal send found"
@@ -170,6 +170,10 @@ def test_u_se08b_log_viewer_panes_respawn_on_death(tmp_path):
     assert "while true" in cmd
     assert "crew-log-viewer" in cmd
     assert "submit task results through the dispatcher" in cmd
+    all_args = [call[0][0] for call in mock_run.call_args_list]
+    assert ["tmux", "respawn-pane", "-k", "-t", "%91", "-c", str(tmp_path)] in all_args
+    assert not any(a[:2] == ["tmux", "send-keys"] and
+                   any(key in a for key in ("C-c", "q")) for a in all_args)
 
 
 # U-SE09: _get_agent_cmd — claude omits --continue when .claude/projects/ absent

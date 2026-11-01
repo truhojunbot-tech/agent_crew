@@ -1635,20 +1635,7 @@ class _DispatchSlot:
 
 
 def _review_result_is_actionable(result) -> bool:
-    """Did this review actually review anything?
-
-    ⛔`_resolve_verdict` maps every non-completed status to `request_changes`,
-      so a reviewer that crashed asks for changes nobody requested — and
-      `build_feedback` fills the fix task with its bare header, because a review
-      that did not run has no findings. Measured 2026-09-13 (#301): four `exit_1`
-      reviews drove five implement dispatches in fifteen minutes against a
-      deliverable that never changed.
-
-      A skipped cascade is recoverable; the provider invocations those rounds
-      spent are not. That asymmetry is the whole argument (#250).
-    """
-    if getattr(result, "status", None) not in (None, "completed"):
-        return False
+    """A completed rejection needs findings that an implementer can act on."""
     # ⛔#5676: a completed review used to be "actionable" on status alone, so a
     #   `request_changes` with nothing to change still enqueued a fix. A fix
     #   round needs something to fix.
@@ -9193,6 +9180,7 @@ def create_app(
         # Never inferred from the summary text.
         if (not _REPLAYING.get() and _task is not None
                 and _task.task_type == "review"
+                and result.status == "completed"
                 and (_task.status in ("pending", "in_progress")
                      or (_task.status == "failed" and result.status == "completed"))
                 and _resolve_verdict(result) not in ("approve", "request_changes")):

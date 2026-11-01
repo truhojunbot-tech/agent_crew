@@ -98,16 +98,11 @@ def start_agents_in_panes(
     for agent, target in zip(agents, pane_targets):
         wt_path = worktrees.get(agent) if worktrees else None
         cmd = _get_agent_cmd(agent, wt_path)
-        # #142: ensure the pane is at a shell prompt before launching.
-        # If an old agent process (e.g. gemini without --approval-mode yolo) is
-        # still running, send-keys -l feeds the cmd as chat input instead of
-        # executing it in the shell. Ctrl+C interrupts any interactive process;
-        # 'q' + Enter covers CLIs that catch Ctrl+C and present a quit prompt.
-        # Safe on fresh panes: Ctrl+C on an idle shell is a no-op.
-        subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], capture_output=True)
-        time.sleep(0.3)
-        subprocess.run(["tmux", "send-keys", "-t", target, "q", "Enter"], capture_output=True)
-        time.sleep(0.3)
+        # Replace any old interactive process with a fresh shell (#962).
+        respawn = ["tmux", "respawn-pane", "-k", "-t", target]
+        if wt_path:
+            respawn += ["-c", wt_path]
+        subprocess.run(respawn, capture_output=True, check=True)
         # #888: a shell command is verified too — it is pending while the
         # screen still ends with it (#142: it can land in a chat box instead).
         pane_submit.submit(target, cmd, paste=False, settle=0.2,
@@ -189,8 +184,8 @@ def start_log_viewers_in_panes(
         log_path = os.path.join(log_dir, f"dispatch_{role}.log")
         # Ensure the file exists before tail starts.
         subprocess.run(["touch", log_path], capture_output=True)
-        subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], capture_output=True)
-        time.sleep(0.2)
+        subprocess.run(["tmux", "respawn-pane", "-k", "-t", target,
+                        "-c", log_dir], capture_output=True, check=True)
         # Wrapped in a respawn loop, not launched bare: these panes have
         # repeatedly been hijacked by other agents (e.g. alpha_engine's own
         # session `pkill -f crew-log-viewer`-ing this pane to run an

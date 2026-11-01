@@ -1764,13 +1764,6 @@ def auto_enqueue_fix(
                     or not (review_result.findings or
                             (isinstance(script, dict) and script.get("new_failures")))):
                 return None
-        elif getattr(review_result, "status", None) != "completed":
-            logger.info(
-                f"auto_enqueue_fix: review {review_task_id} did not complete "
-                f"(status={getattr(review_result, 'status', None)!r}) — leaving it "
-                f"to the retry/fallback path, not enqueueing a fix"
-            )
-            return None
         if not failed_test and _resolve_verdict(review_result) != "request_changes":
             return None
 
