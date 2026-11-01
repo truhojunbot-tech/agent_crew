@@ -107,26 +107,37 @@ def test_e_rc01_recover_tmux(monkeypatch, git_repo, base_dir, e2e_project, isola
     subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
     assert not _tmux_session_exists(session_name)
 
-    # In production, `crew recover` is run from wherever the operator's own
-    # tmux session currently is — necessarily a *different*, still-alive
-    # session from the one that just died. Simulate that "operator session"
-    # with a second disposable session, isolated the same way, so recover's
-    # fallback (`_resolve_tmux_window`) has somewhere real to land instead
-    # of retargeting the session we just killed.
+    # Give recover an operator session to prove it recreates the saved project
+    # session without adding a pane to the caller's session.
     operator_session = f"crew-test-{uuid.uuid4().hex[:10]}"
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", operator_session, "-x", "220", "-y", "50"],
         check=True,
     )
     try:
+        operator_panes = subprocess.run(
+            ["tmux", "list-panes", "-t", operator_session, "-F", "#{pane_id}"],
+            capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
         monkeypatch.setenv("AGENT_CREW_TMUX_SESSION", operator_session)
         result = runner.invoke(crew, ["recover", "rcproj", "--base", base_dir])
         assert result.exit_code == 0, result.output
         assert "tmux" in result.output.lower()
 
         state2 = _read_state(base_dir, "rcproj")
-        assert state2["session"] == operator_session
+        assert state2["session"] == session_name
+        assert _tmux_session_exists(session_name)
         assert _tmux_session_exists(operator_session)
+        assert subprocess.run(
+            ["tmux", "list-panes", "-t", operator_session, "-F", "#{pane_id}"],
+            capture_output=True, text=True, check=True,
+        ).stdout.splitlines() == operator_panes
+        assert len(state2["pane_ids"]) == 1
+        assert subprocess.run(
+            ["tmux", "display-message", "-t", state2["pane_ids"][0],
+             "-p", "#{session_name}"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip() == session_name
 
         _kill_server(state2["server_pid"])
     finally:
