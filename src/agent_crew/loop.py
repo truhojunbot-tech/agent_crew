@@ -172,7 +172,7 @@ def _existing_successor_id(queue, task_type: str, prev_task_id: str,
                     if queue.get_task_status(task.task_id) in _DEAD_REVIEW_STATUSES:
                         continue
                 except Exception:
-                    pass
+                    return None  # Status unknown: never adopt a possibly dead review.
                 try:
                     _patch_adopted_review_context(queue, task.task_id, context)
                 except Exception:

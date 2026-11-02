@@ -2845,6 +2845,7 @@ _LINEAGE_REASON_CODES = frozenset({
     "codex_quota_exhausted", "script_test_timeout",
     "script_test_rerun_unjudged", "script_test_new_failures", "script_test_ci_red",
     "ci_infra_unavailable", "script_test_ci_infra_unavailable",
+    "cascade_enqueue_failed",
 })
 
 
@@ -6562,7 +6563,7 @@ def create_app(
     def _auto_enqueue_fix(review_task_id: str, repo: str = "") -> Optional[str]:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
         See ``_auto_enqueue_review`` for the rationale (#123, #244)."""
-        # The cascade swallows its own errors, but the invariant it is
+        # The cascade records its own errors, but the invariant it is
         # protecting belongs here: a result submission must never 500 because
         # a FOLLOW-UP failed. The agent has already done the work, and an
         # agent that cannot POST its result is a task the dispatcher marks
@@ -6591,11 +6592,14 @@ def create_app(
         except _PausedError:
             # #314 §4 P0-2: pipeline이 이미 outbox reopen했음 — handler suppressed 200 위해 전파.
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 f"_auto_enqueue_fix: cascade failed for {review_task_id} — "
                 f"the review result stands, the fix was not enqueued"
             )
+            from agent_crew.pipeline import record_cascade_enqueue_failure
+            record_cascade_enqueue_failure(q(), review_task_id, "fix", exc,
+                                           coordinator_notify_fn)
         return None
 
     def _auto_enqueue_conflict_rebase(test_task_id: str, result: TaskResult) -> Optional[str]:
