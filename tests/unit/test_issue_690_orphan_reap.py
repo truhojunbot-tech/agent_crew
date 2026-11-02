@@ -48,7 +48,7 @@ def test_dispatcher_orphan_expires_without_reminder(tmp_db, monkeypatch, caplog)
     assert "reason=dispatcher_idle" in caplog.text
 
 
-def test_unknown_pane_liveness_does_not_expire_claim(tmp_db, monkeypatch):
+def test_unknown_pane_liveness_uses_bounded_grace(tmp_db, monkeypatch, caplog):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)
     app = create_app(tmp_db, pane_map={"tester": "%2915"},
@@ -59,9 +59,29 @@ def test_unknown_pane_liveness_does_not_expire_claim(tmp_db, monkeypatch):
         _claimed(queue, "unknown-pane")
         with sqlite3.connect(tmp_db) as db:
             db.execute("UPDATE tasks SET dispatch_target='%2915' WHERE task_id='unknown-pane'")
-        actions = app.state.watchdog_tick(now=4000.0)
-    assert actions["timed_out"] == []
-    assert queue.get_task_status("unknown-pane") == "in_progress"
+        first = app.state.watchdog_tick(now=3000.0)
+        second = app.state.watchdog_tick(now=4000.0)
+    assert first["timed_out"] == []
+    assert second["timed_out"] == ["unknown-pane"]
+    assert queue.get_task_status("unknown-pane") == "timed_out"
+    assert "pane liveness unknown" in caplog.text
+
+
+def test_superseded_dispatch_is_reaped_even_when_pane_liveness_unknown(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    queue = TaskQueue(tmp_db)
+    app = create_app(tmp_db, pane_map={"tester": "%2915"},
+                     pane_liveness_fn=lambda _: "unknown",
+                     timeout_seconds=900, watchdog_disabled=True,
+                     anomaly_disabled=True)
+    with TestClient(app):
+        _claimed(queue, "old", dispatched_at=1000.0)
+        _claimed(queue, "new", dispatched_at=2000.0)
+        with sqlite3.connect(tmp_db) as db:
+            db.execute("UPDATE tasks SET dispatch_target='%2915' WHERE task_id='old'")
+        actions = app.state.watchdog_tick(now=2100.0)
+    assert actions["timed_out"] == ["old"]
+    assert queue.get_task("old").error_info["reason"] == "watchdog_dispatcher_superseded"
 
 
 def test_dispatcher_with_fresh_heartbeat_survives_alive_pane(tmp_db, monkeypatch):

@@ -313,6 +313,32 @@ def test_an_unlocked_worktree_still_dispatches_its_test(tmp_path, monkeypatch, *
     assert spawned is True
 
 
+@pytest.mark.parametrize("failure, expected_reason", [
+    ("session", "context_probe_unavailable"),
+    ("lock", "test_stage_lock_unavailable"),
+])
+def test_dispatch_probe_failure_is_typed_and_never_spawns(
+        tmp_path, monkeypatch, unused_tcp_port, failure, expected_reason):
+    from agent_crew import server as sv
+    from agent_crew.queue import TaskQueue
+
+    if failure == "session":
+        monkeypatch.setattr(sv, "agy_context_exceeds_cap",
+                            lambda *_: (_ for _ in ()).throw(OSError("unreadable session")))
+    else:
+        monkeypatch.setattr(sv, "test_stage_lock",
+                            lambda *_: (_ for _ in ()).throw(
+                                tp.TestStageLockUnavailable("lock unavailable")))
+    spawned, status, _ = _dispatch(
+        tmp_path, monkeypatch, "test", lock_base=str(tmp_path / "lockbase"),
+        unused_tcp_port=unused_tcp_port)
+    info = TaskQueue(str(tmp_path / "tasks.db")).get_task("t-1").error_info
+    assert spawned is False
+    assert status == "failed"
+    assert info["reason"] == expected_reason
+    assert info["kind"] == "config_error"
+
+
 def test_a_non_test_task_is_not_gated_by_the_test_lock(tmp_path, monkeypatch, *, unused_tcp_port):
     """The lock is scoped to the test stage. Gating implement/review on it
     would serialise the whole crew behind a slow test run."""

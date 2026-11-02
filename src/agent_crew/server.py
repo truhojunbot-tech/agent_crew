@@ -2321,28 +2321,23 @@ def agy_conversation_size(cwd: str, *, home=None) -> tuple:
     ``antigravity-cli/cache/last_conversations.json``; that is the join key
     between a worktree and the conversation `--continue` would resume.
 
-    Sums the ``.db`` plus its ``-wal``/``-shm`` siblings — a conversation
-    being actively written holds real bytes in the WAL, and ignoring it
-    under-reports exactly the case we care about. ``(0, "")`` when anything
-    is missing or unreadable; this must never break dispatch.
+    Sums the ``.db`` plus its ``-wal``/``-shm`` siblings. Missing data is an
+    empty session; unreadable data raises so dispatch cannot assume that.
     """
     import json as _json
-    try:
-        cache = _agy_home(home) / "antigravity-cli" / "cache" / "last_conversations.json"
-        if not cache.exists():
-            return (0, "")
-        conv = (_json.loads(cache.read_text()) or {}).get(cwd) or ""
-        if not conv:
-            return (0, "")
-        d = _agy_home(home) / "antigravity-cli" / "conversations"
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            f = d / f"{conv}.db{suffix}"
-            if f.exists():
-                total += f.stat().st_size
-        return (total, conv)
-    except Exception:
-        raise  # An unreadable resume store is unknown, not an empty session.
+    cache = _agy_home(home) / "antigravity-cli" / "cache" / "last_conversations.json"
+    if not cache.exists():
+        return (0, "")
+    conv = (_json.loads(cache.read_text()) or {}).get(cwd) or ""
+    if not conv:
+        return (0, "")
+    d = _agy_home(home) / "antigravity-cli" / "conversations"
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        f = d / f"{conv}.db{suffix}"
+        if f.exists():
+            total += f.stat().st_size
+    return (total, conv)
 
 
 def agy_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
@@ -2355,10 +2350,7 @@ def agy_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
     info = {"bytes": 0, "conversation_id": "", "cap_mb": cap}
     if cap <= 0:
         return (False, info)
-    try:
-        size, conv = agy_conversation_size(cwd, home=home)
-    except Exception:
-        raise  # Unknown size cannot authorize resuming a capped context.
+    size, conv = agy_conversation_size(cwd, home=home)
     info["bytes"], info["conversation_id"] = size, conv
     return (size > cap * 1024 * 1024, info)
 
@@ -2847,6 +2839,7 @@ _LINEAGE_REASON_CODES = frozenset({
     "cascade_enqueue_failed",
     "guard_unavailable",
     "test_stage_lock_unavailable",
+    "context_probe_unavailable",
 })
 
 
@@ -4133,10 +4126,12 @@ def create_app(
                     if _pane_state == "alive":
                         effective_timeout *= alive_timeout_multiplier
                     elif _pane_state != "dead":
-                        continue  # Unknown liveness cannot justify expiry.
+                        logger.warning("watchdog: pane liveness unknown task=%s pane=%s",
+                                       task_id, pane_id)
+                        effective_timeout *= alive_timeout_multiplier
                 except Exception:
                     logger.exception("watchdog: dispatcher pane liveness failed for %s", pane_id)
-                    continue
+                    effective_timeout *= alive_timeout_multiplier
             reason = ("dispatcher_superseded" if later else
                       "dispatcher_idle" if idle_for >= effective_timeout else "")
             if not reason:
@@ -4561,9 +4556,6 @@ def create_app(
             if (isinstance(exc, sqlite3.OperationalError) and
                     "database is locked" in str(exc).lower()):
                 await _recover_unspawned_dispatch(task_id, "dispatch_exception_locked")
-            elif isinstance(exc, TestStageLockUnavailable):
-                _fail_if_active(task_id, "test_stage_lock_unavailable",
-                                kind=FailureKind.CONFIG_ERROR.value)
             else:
                 _fail_if_active(task_id, "dispatch_exception")
 
@@ -4638,7 +4630,14 @@ def create_app(
         _lock_stack = contextlib.ExitStack()
         _lock_wait_seconds, _lock_defer_count = 0.0, 0
         if task.task_type == "test":
-            if not _lock_stack.enter_context(test_stage_lock(wt)):
+            try:
+                _test_lock_acquired = _lock_stack.enter_context(test_stage_lock(wt))
+            except TestStageLockUnavailable:
+                logger.exception("dispatcher: test-stage lock unavailable task=%s", task.task_id)
+                _fail_if_active(task.task_id, "test_stage_lock_unavailable",
+                                kind=FailureKind.CONFIG_ERROR.value)
+                return
+            if not _test_lock_acquired:
                 _lock_stack.close()
                 try:
                     _defers, _first_at = q().note_test_lock_defer(task.task_id)
@@ -4713,7 +4712,14 @@ def create_app(
         _codex_planned = ""      # the session a codex resume would use, if any
         _renew_previous_session = ""
         if agent == "gemini":
-            _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
+            try:
+                _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
+            except Exception:
+                logger.exception("dispatcher: context probe unavailable task=%s", task.task_id)
+                _lock_stack.close()
+                _fail_if_active(task.task_id, "context_probe_unavailable",
+                                kind=FailureKind.CONFIG_ERROR.value)
+                return
         elif agent == "codex":
             # #260 review: measurable now that #262 binds a resume to one
             # session. The rollout file is the conversation that resume
@@ -5926,10 +5932,6 @@ def create_app(
                 # not "the work failed".
                 _fail_if_active(task.task_id, "no_result_submitted", status="timed_out",
                                 details=_codex_no_result_details)
-        except TestStageLockUnavailable:
-            logger.exception("dispatcher: test-stage lock unavailable task=%s", task.task_id)
-            _fail_if_active(task.task_id, "test_stage_lock_unavailable",
-                            kind=FailureKind.CONFIG_ERROR.value)
         except Exception:
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
@@ -6875,6 +6877,8 @@ def create_app(
                     _has_pr = branch_has_pr(original_task.branch)
                     if _has_pr is None:
                         q().patch_context(task_id, {"retry_skipped_reason": "pr_lookup_unknown"})
+                        logger.warning("_auto_retry_failed_task: PR lookup unknown for %s; "
+                                       "ending lineage without a retry", task_id)
                         return False
                     if _has_pr is False:
                         logger.warning(

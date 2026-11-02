@@ -388,7 +388,7 @@ def _retry_ids_for(queue: TaskQueue, original_task_id: str) -> list:
 
 
 class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
-    def test_u216_unknown_pr_lookup_blocks_retry(self, tmp_db, github_writes):
+    def test_u216_unknown_pr_lookup_blocks_retry(self, tmp_db, github_writes, caplog):
         from agent_crew.protocol import TaskRequest
         queue = TaskQueue(tmp_db)
         queue.enqueue(TaskRequest(task_id="review-216-unknown", task_type="review",
@@ -402,6 +402,7 @@ class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
         assert response.status_code == 200
         assert _retry_ids_for(queue, "review-216-unknown") == []
         assert queue.get_task("review-216-unknown").context["retry_skipped_reason"] == "pr_lookup_unknown"
+        assert "ending lineage without a retry" in caplog.text
 
     def test_u216_no_retry_enqueued_when_branch_has_no_pr(self, tmp_db):
         app = create_app(db_path=tmp_db, watchdog_disabled=True)
