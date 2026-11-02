@@ -191,3 +191,62 @@ def test_public_task_cannot_claim_owed_merge(merge_case):
         }, headers={"X-Agent-Crew-Project": "project"})
     assert response.status_code == 422
     assert response.json()["detail"] == "reserved_context_key:suppressed_merge"
+
+
+def _submit_unknown_merge(client):
+    response = client.post("/tasks/test-959/result", json={
+        "task_id": "test-959", "status": "completed", "summary": "PASS",
+        "pr_number": 959, "error_info": {"script_test": {
+            "outcome": "PASSED", "head_sha": "a" * 40}},
+    }, headers={"X-Agent-Crew-Project": "project"})
+    assert response.status_code == 200, response.text
+
+
+def test_unknown_pr_state_is_owed_then_replays_merge_and_publishes_status(
+        merge_case, monkeypatch):
+    queue, app, head, merges, notices = merge_case
+    publications = []
+    monkeypatch.setattr(github, "publish_independent_review_status",
+                        lambda *a, **k: publications.append(1) or True)
+    head["state"] = "unknown"
+    with TestClient(app) as client:
+        _submit_unknown_merge(client)
+        assert merges == [] and publications == []
+        assert queue.outbox_get("test-959")["state"] == "pending"
+        assert queue.external_op_get("merge:pr:959")["attempt"] == 1
+        assert "kind=transient" in queue.external_op_get("merge:pr:959")["last_error"]
+        head["state"] = "open"
+        client.post("/admin/replay-suppressed")
+        client.post("/admin/replay-suppressed")
+    assert merges == [1] and publications == [1]
+    assert queue.outbox_get("test-959")["state"] == "applied"
+    assert queue.external_op_get("merge:pr:959")["state"] == "done"
+
+
+def test_unknown_pr_state_replay_stops_at_attempt_cap_and_notices_once(
+        merge_case):
+    queue, app, head, merges, notices = merge_case
+    head["state"] = "unknown"
+    with TestClient(app) as client:
+        _submit_unknown_merge(client)
+        for _ in range(5):
+            client.post("/admin/replay-suppressed")
+    assert merges == []
+    assert queue.external_op_get("merge:pr:959")["attempt"] == 3
+    assert queue.outbox_get("test-959")["state"] == "applied"
+    assert len([notice for notice in notices if "merge_replay_refused" in notice]) == 1
+    assert "reason_code=merge_attempt_cap" in notices[0]
+
+
+@pytest.mark.parametrize("state", ["closed", "merged"])
+def test_unknown_pr_state_then_terminal_state_ends_owed_merge(
+        merge_case, state):
+    queue, app, head, merges, notices = merge_case
+    head["state"] = "unknown"
+    with TestClient(app) as client:
+        _submit_unknown_merge(client)
+        head["state"] = state
+        client.post("/admin/replay-suppressed")
+    assert merges == []
+    assert queue.outbox_get("test-959")["state"] == "applied"
+    assert queue.external_op_get("merge:pr:959")["state"] == ("done" if state == "merged" else "failed")
