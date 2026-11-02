@@ -11,9 +11,9 @@ So this reports four things together, and refuses to report any of them alone:
   1. what each running dispatcher ACTUALLY imported — commit and source
      fingerprint straight off ``GET /provenance``, plus which ports do not
      answer it at all (those predate #248 and are therefore older still);
-  2. provider store / rollout sizes measured with the SAME functions the
-     dispatcher uses to decide a cap trip, so "over cap" here means what it
-     means there;
+  2. provider store / rollout sizes measured with the dispatcher's own
+     functions. Claude and Codex retain cap decisions; agy is uncapped and
+     starts a fresh conversation on every dispatch (#982);
   3. how the durable attribution rows are populated — policy mix and, per
      agent, what fraction carries a ``provider_session_id``. This is the
      column quota-core/quota-ops need to form a resume-vs-fresh cohort, and
@@ -143,8 +143,8 @@ def cap_functions() -> dict:
     try:
         import agent_crew  # noqa: PLC0415 — resolution is what we are checking
         from agent_crew.server import (  # noqa: PLC0415
-            AGY_CONTEXT_MAX_MB, CLAUDE_CONTEXT_MAX_MB, CODEX_CONTEXT_MAX_MB,
-            agy_context_exceeds_cap, claude_context_exceeds_cap,
+            CLAUDE_CONTEXT_MAX_MB, CODEX_CONTEXT_MAX_MB,
+            agy_conversation_size, claude_context_exceeds_cap,
             codex_context_exceeds_cap, codex_session_for_cwd,
         )
     except ImportError as e:
@@ -162,10 +162,10 @@ def cap_functions() -> dict:
             f"warning. {hint}")
     return {
         "caps": {"claude": CLAUDE_CONTEXT_MAX_MB, "codex": CODEX_CONTEXT_MAX_MB,
-                 "gemini": AGY_CONTEXT_MAX_MB},
+                 "gemini": None, "agy": None},
         "claude": claude_context_exceeds_cap,
         "codex": codex_context_exceeds_cap,
-        "gemini": agy_context_exceeds_cap,
+        "agy_size": agy_conversation_size,
         "codex_session_for_cwd": codex_session_for_cwd,
         "measured_with": resolved,
     }
@@ -190,7 +190,7 @@ def _provider_sizes() -> list[dict]:
     fns = cap_functions()
     claude_context_exceeds_cap = fns["claude"]
     codex_context_exceeds_cap = fns["codex"]
-    agy_context_exceeds_cap = fns["gemini"]
+    agy_conversation_size = fns["agy_size"]
     codex_session_for_cwd = fns["codex_session_for_cwd"]
     caps = fns["caps"]
     rows = []
@@ -212,7 +212,9 @@ def _provider_sizes() -> list[dict]:
             elif agent == "claude":
                 over, info = claude_context_exceeds_cap(wt)
             else:
-                over, info = agy_context_exceeds_cap(wt)
+                size, conversation_id = agy_conversation_size(wt)
+                over = False
+                info = {"bytes": size, "conversation_id": conversation_id}
             rows.append({"project": project, "agent": agent,
                          "mb": round(info["bytes"] / MB, 2),
                          "cap_mb": caps[agent], "over": bool(over),
@@ -319,11 +321,12 @@ def main() -> int:
                  if "fingerprint" in d else "")
         print(f"  {d['project']:<20} :{d['port']}  {d['commit']:<26} {extra}")
 
-    print("\n## provider store / rollout size vs the cap the dispatcher applies")
+    print("\n## provider store / rollout size and active caps")
     for r in sorted(snapshot["provider_sizes"], key=lambda r: -r["mb"]):
         flag = "  ← OVER CAP" if r["over"] else ""
+        cap = f"{r['cap_mb']:.0f} MB" if r["cap_mb"] is not None else "uncapped (fresh each dispatch)"
         print(f"  {r['project']:<20} {r['agent']:<7} {r['mb']:9.2f} MB / "
-              f"{r['cap_mb']:.0f} MB{flag}")
+              f"{cap}{flag}")
 
     print("\n## context policy mix")
     for r in snapshot["attribution"]:

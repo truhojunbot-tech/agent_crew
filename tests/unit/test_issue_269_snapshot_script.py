@@ -69,7 +69,7 @@ def test_provider_sizes_restores_the_callers_logging_disable_level(snap, monkeyp
     """Snapshot collection must not suppress warnings from later unit tests."""
     monkeypatch.setattr(snap, "cap_functions", lambda: {
         "claude": lambda *_: (False, {}), "codex": lambda *_: (False, {}),
-        "gemini": lambda *_: (False, {}), "codex_session_for_cwd": lambda *_: None,
+        "agy_size": lambda *_: (0, ""), "codex_session_for_cwd": lambda *_: None,
         "caps": {},
     })
     monkeypatch.setattr(snap.glob, "glob", lambda *_: [])
@@ -147,6 +147,30 @@ def test_a_healthy_run_still_produces_a_snapshot(snap, monkeypatch, capsys, tmp_
     body = json.loads(capsys.readouterr().out)
     assert body["provider_sizes"] == []      # empty fleet, not a broken import
     assert body["measured_with"] == snap.expected_package_dir()
+
+
+def test_agy_store_is_measured_and_reported_uncapped(snap, monkeypatch, capsys, tmp_path):
+    from agent_crew import server
+
+    project = tmp_path / "crew"
+    worktree = project / "gemini"
+    worktree.mkdir(parents=True)
+    (project / "state.json").write_text(json.dumps({"worktrees": {"gemini": str(worktree)}}))
+    home = tmp_path / ".gemini"
+    cache = home / "antigravity-cli" / "cache"
+    store = home / "antigravity-cli" / "conversations"
+    cache.mkdir(parents=True)
+    store.mkdir(parents=True)
+    (cache / "last_conversations.json").write_text(json.dumps({str(worktree): "conv-new"}))
+    (store / "conv-new.db").write_bytes(b"abc")
+    monkeypatch.setattr(server, "_agy_home", lambda _home=None: home)
+    monkeypatch.setattr(snap, "BASE", str(tmp_path))
+    rows = snap.provider_sizes()
+    assert rows == [{"project": "crew", "agent": "gemini", "mb": 0.0,
+                     "cap_mb": None, "over": False, "session": "conv-new"}]
+    monkeypatch.setattr(sys, "argv", ["ces"])
+    assert snap.main() == 0
+    assert "uncapped (fresh each dispatch)" in capsys.readouterr().out
 
 
 def test_the_snapshot_records_which_code_measured_it(snap, monkeypatch, capsys, tmp_path):

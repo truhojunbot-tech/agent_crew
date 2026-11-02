@@ -123,13 +123,12 @@ def _dispatch(tmp_path, monkeypatch, *, agent="claude", cap_info=None, over=Fals
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
-    for name in ("agy_context_exceeds_cap", "codex_context_exceeds_cap",
-                 "claude_context_exceeds_cap"):
+    for name in ("codex_context_exceeds_cap", "claude_context_exceeds_cap"):
         monkeypatch.setattr(sv, name, lambda *a, **k: (False, {}))
-    target = {"claude": "claude_context_exceeds_cap",
-              "codex": "codex_context_exceeds_cap",
-              "gemini": "agy_context_exceeds_cap"}[agent]
-    monkeypatch.setattr(sv, target, lambda *a, **k: (over, dict(cap_info or {})))
+    if agent != "gemini":
+        target = {"claude": "claude_context_exceeds_cap",
+                  "codex": "codex_context_exceeds_cap"}[agent]
+        monkeypatch.setattr(sv, target, lambda *a, **k: (over, dict(cap_info or {})))
 
     role = {"claude": "implementer", "codex": "reviewer", "gemini": "tester"}[agent]
     task_type = {"implementer": "implement", "reviewer": "review",
@@ -215,7 +214,6 @@ def test_the_cap_event_keeps_its_own_meaning(tmp_path, monkeypatch, *, unused_tc
 
 
 @pytest.mark.parametrize("agent, info", [
-    ("gemini", {"provider": "agy", "bytes": 20_874_035, "conversation_id": "0aff70cb"}),
     ("codex", {"provider": "codex", "bytes": 6_617_088, "conversation_id": "01a02294"}),
 ])
 def test_the_other_providers_are_observed_too(tmp_path, monkeypatch, agent, info, *, unused_tcp_port):
@@ -227,6 +225,12 @@ def test_the_other_providers_are_observed_too(tmp_path, monkeypatch, agent, info
     assert event["provider"] == info["provider"]
     assert event["context_bytes"] == info["bytes"]
     assert event["context_tokens"] is None
+
+
+def test_fresh_agy_dispatch_has_no_resumed_context_measurement(tmp_path, monkeypatch, *, unused_tcp_port):
+    events = _dispatch(tmp_path, monkeypatch, agent="gemini", unused_tcp_port=unused_tcp_port)
+    assert _of(events, "provider_context_capped") == []
+    assert _of(events, "provider_context_observed") == []
 
 
 def test_nothing_is_emitted_when_no_measurement_was_attempted(tmp_path, monkeypatch, *, unused_tcp_port):

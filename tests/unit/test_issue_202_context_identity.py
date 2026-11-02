@@ -205,10 +205,8 @@ def test_u_i202_detect_context_compaction_false():
 # Full-dispatch acceptance tests
 # ---------------------------------------------------------------------------
 
-def test_u_i202_two_sequential_tasks_share_context_and_increment_index(tmp_db, tmp_path, *, unused_tcp_port):
-    """Acceptance criterion: two sequential tasks using the same resumed
-    provider conversation share the same context_id and have increasing
-    session_task_index."""
+def test_u_i202_two_sequential_agy_tasks_get_fresh_contexts(tmp_db, tmp_path, *, unused_tcp_port):
+    """Agy creates a new provider conversation and context for each task."""
     state, _ = _worktree_state(tmp_path)
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps(state))
@@ -242,10 +240,10 @@ def test_u_i202_two_sequential_tasks_share_context_and_increment_index(tmp_db, t
     row1 = _attribution_row(tmp_db, "test-1")
     row2 = _attribution_row(tmp_db, "test-2")
     assert row1 and row2, "both tasks should have attribution rows"
-    assert row1["context_id"] == row2["context_id"]
+    assert row1["context_id"] != row2["context_id"]
     assert row1["context_policy"] == "fresh"
-    assert row2["context_policy"] == "resume"
-    assert row2["session_task_index"] > row1["session_task_index"]
+    assert row2["context_policy"] == "fresh"
+    assert row2["context_generation"] > row1["context_generation"]
     assert row2["previous_task_id"] == "test-1"
 
 
@@ -374,9 +372,8 @@ def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path, *, u
     assert fallback_row["fallback_of"] == "review-1"
 
 
-def test_u_i202_context_survives_restart(tmp_db, tmp_path, *, unused_tcp_port):
-    """Acceptance criterion: context/task lifecycle survives Agent Crew
-    restart because the relevant metadata is persisted."""
+def test_u_i202_agy_starts_fresh_after_restart(tmp_db, tmp_path, *, unused_tcp_port):
+    """Agy starts a fresh conversation even after Agent Crew restarts."""
     state, _ = _worktree_state(tmp_path)
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps(state))
@@ -420,15 +417,14 @@ def test_u_i202_context_survives_restart(tmp_db, tmp_path, *, unused_tcp_port):
     row_before = _attribution_row(tmp_db, "before-restart")
     row_after = _attribution_row(tmp_db, "after-restart")
     assert row_before and row_after
-    assert row_before["context_id"] == row_after["context_id"], (
-        "context identity must survive an Agent Crew restart"
-    )
-    assert row_after["session_task_index"] > row_before["session_task_index"]
+    assert row_before["context_id"] != row_after["context_id"]
+    assert row_after["context_generation"] > row_before["context_generation"]
+    assert row_after["context_policy"] == "fresh"
 
     events = _read_jsonl(os.path.join(tmp_path.__str__(), "context_events.jsonl"))
-    recovered = [e for e in events if e["event_type"] == "context_recovered" and e.get("task_id") == "after-restart"]
-    assert recovered, (
-        f"expected a context_recovered event on the first dispatch of the new "
+    reset = [e for e in events if e["event_type"] == "context_reset" and e.get("task_id") == "after-restart"]
+    assert reset, (
+        f"expected a context_reset event on the first dispatch of the new "
         f"process, got event types {[e['event_type'] for e in events]}"
     )
 

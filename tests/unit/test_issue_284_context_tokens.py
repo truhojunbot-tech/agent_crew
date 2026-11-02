@@ -338,7 +338,6 @@ def test_the_cap_event_carries_the_window_and_the_cause(tmp_path, monkeypatch, *
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
-    monkeypatch.setattr(sv, "agy_context_exceeds_cap", lambda cwd, *a, **k: (False, {}))
     monkeypatch.setattr(
         sv, "claude_context_exceeds_cap",
         lambda cwd, *a, **k: (True, {"bytes": 9_781_828, "conversation_id": "627091a5",

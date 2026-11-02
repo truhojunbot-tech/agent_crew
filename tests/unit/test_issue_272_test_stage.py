@@ -314,7 +314,6 @@ def test_an_unlocked_worktree_still_dispatches_its_test(tmp_path, monkeypatch, *
 
 
 @pytest.mark.parametrize("failure, expected_reason", [
-    ("session", "context_probe_unavailable"),
     ("lock", "test_stage_lock_unavailable"),
 ])
 def test_dispatch_probe_failure_is_typed_and_never_spawns(
@@ -322,13 +321,9 @@ def test_dispatch_probe_failure_is_typed_and_never_spawns(
     from agent_crew import server as sv
     from agent_crew.queue import TaskQueue
 
-    if failure == "session":
-        monkeypatch.setattr(sv, "agy_context_exceeds_cap",
-                            lambda *_: (_ for _ in ()).throw(OSError("unreadable session")))
-    else:
-        monkeypatch.setattr(sv, "test_stage_lock",
-                            lambda *_: (_ for _ in ()).throw(
-                                tp.TestStageLockUnavailable("lock unavailable")))
+    monkeypatch.setattr(sv, "test_stage_lock",
+                        lambda *_: (_ for _ in ()).throw(
+                            tp.TestStageLockUnavailable("lock unavailable")))
     spawned, status, _ = _dispatch(
         tmp_path, monkeypatch, "test", lock_base=str(tmp_path / "lockbase"),
         unused_tcp_port=unused_tcp_port)

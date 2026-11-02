@@ -145,7 +145,6 @@ def _dispatch_cmd(tmp_path, monkeypatch, agent, *, policy="resume", over=False, 
                                                      "conversation_id": "sess",
                                                      "cap_mb": 64,
                                                      "provider": "claude"}))
-    monkeypatch.setattr(sv, "agy_context_exceeds_cap", lambda cwd, *a, **k: (False, {}))
 
     role = {"claude": "implementer", "codex": "reviewer"}[agent]
     ttype = {"claude": "implement", "codex": "review"}[agent]
@@ -268,8 +267,6 @@ def _capped_event(tmp_path, monkeypatch, agent, cap_info, *, unused_tcp_port):
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
     monkeypatch.setattr(sv, "claude_context_exceeds_cap",
                         lambda cwd, *a, **k: (agent == "claude", cap_info))
-    monkeypatch.setattr(sv, "agy_context_exceeds_cap",
-                        lambda cwd, *a, **k: (agent == "gemini", cap_info))
     monkeypatch.setattr(sv, "_known_gemini_model", lambda *a, **k: "m") \
         if hasattr(sv, "_known_gemini_model") else None
 
@@ -302,14 +299,3 @@ def test_a_claude_cap_trip_is_attributed_to_claude(tmp_path, monkeypatch, *, unu
     assert event["provider"] == "claude"
     assert event["conversation_id"] == "sess-c"
     assert event["bytes"] == 99 * 1048576
-
-
-def test_an_agy_cap_trip_is_still_attributed_to_agy(tmp_path, monkeypatch, *, unused_tcp_port):
-    """⛔The fix must not swing the other way: gemini trips keep their label."""
-    event = _capped_event(tmp_path, monkeypatch, "gemini",
-                          {"bytes": 200 * 1048576, "conversation_id": "conv-g",
-                           "cap_mb": 64, "provider": "agy"}, unused_tcp_port=unused_tcp_port)
-
-    assert event is not None
-    assert event["provider"] == "agy"
-    assert event["conversation_id"] == "conv-g"
