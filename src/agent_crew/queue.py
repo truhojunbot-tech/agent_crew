@@ -43,7 +43,7 @@ from agent_crew.protocol import (
     validate_review_result,
 )
 from agent_crew.role_mapping import (
-    ROLE_BOUND_PROVIDERS, effective_role_mapping, provider_task_types,
+    ROLE_BOUND_PROVIDERS, effective_role_mapping, provider_family, provider_task_types,
 )
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
@@ -5328,19 +5328,42 @@ class TaskQueue:
             conn.close()
 
     def reroute_stale_provider_bindings(self, provider: str,
-                                        held_task_types: tuple[str, ...]) -> list[str]:
+                                        held_task_types: tuple[str, ...],
+                                        reviewer_holder: Optional[str] = None) -> list[str]:
         """Clear ``agent_override=provider`` from pending tasks whose type the
         provider no longer holds, so the current role holder claims them (#891).
+
+        #986: a review is never rerouted onto its own implementer's provider.
+        When ``reviewer_holder`` is the implementer's family, rerouting turns an
+        independent review into a guaranteed ``reviewer_matches_implementer``
+        refusal. Such a review keeps its override and is stamped once with
+        ``reroute_held_reason`` naming the missing independent reviewer.
         """
         held = tuple(held_task_types)
         held_sql = f" AND task_type NOT IN ({','.join('?' for _ in held)})" if held else ""
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            ids = [row[0] for row in conn.execute(
-                "SELECT task_id FROM tasks WHERE status = 'pending'"
-                " AND json_extract(context, '$.agent_override') = ?" + held_sql,
-                (provider, *held))]
+            ids = []
+            for task_id, task_type, implementer, held_reason in conn.execute(
+                    "SELECT task_id, task_type, json_extract(context, '$.implementer_agent'),"
+                    " json_extract(context, '$.reroute_held_reason')"
+                    " FROM tasks WHERE status = 'pending'"
+                    " AND json_extract(context, '$.agent_override') = ?" + held_sql,
+                    (provider, *held)).fetchall():
+                if (task_type == "review" and reviewer_holder and implementer
+                        and provider_family(implementer) == provider_family(reviewer_holder)):
+                    if held_reason is None:
+                        reason = (f"no_independent_reviewer: reviewer role holder "
+                                  f"{reviewer_holder} matches implementer {implementer}; "
+                                  f"kept agent_override={provider}")
+                        logger.warning("reroute: keeping review %s bound — %s", task_id, reason)
+                        conn.execute(
+                            "UPDATE tasks SET context = json_set(context,"
+                            " '$.reroute_held_reason', ?) WHERE task_id = ?",
+                            (reason, task_id))
+                    continue
+                ids.append(task_id)
             for task_id in ids:
                 conn.execute(
                     "UPDATE tasks SET context = json_set(json_remove(context, '$.agent_override'),"

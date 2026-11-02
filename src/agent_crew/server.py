@@ -4229,7 +4229,8 @@ def create_app(
         moved: list[str] = []
         for provider in ROLE_BOUND_PROVIDERS:
             moved += q().reroute_stale_provider_bindings(
-                provider, provider_task_types(provider, _DISPATCH_ROLE_TO_AGENT))
+                provider, provider_task_types(provider, _DISPATCH_ROLE_TO_AGENT),
+                reviewer_holder=_DISPATCH_ROLE_TO_AGENT.get("reviewer"))
         if moved:
             logger.warning("dispatcher: rerouted %s off a provider that no longer holds "
                            "their role (role map: %s)", moved, _DISPATCH_ROLE_TO_AGENT)
