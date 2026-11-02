@@ -1026,6 +1026,36 @@ class ReviewRoundCapReached:
     lineage_root: str
 
 
+def _approved_test_fix_sha(queue: TaskQueue, fix: TaskRequest) -> str:
+    """Return the approved base only for a fix of a failed post-approval test."""
+    context = fix.context if isinstance(fix.context, dict) else {}
+    fix_round = context.get("fix_round")
+    if (type(fix_round) is not int or fix_round < 1
+            or fix_round > review_fix_max_rounds()):
+        return ""
+    parent_id = context.get("prev_task_id")
+    test = queue.get_task(parent_id) if isinstance(parent_id, str) else None
+    if test is None or test.task_type != "test":
+        return ""
+    test_result = queue.get_result(test.task_id)
+    if test_result is None or handle_test_result(test_result) != "failed":
+        return ""
+    test_context = test.context if isinstance(test.context, dict) else {}
+    if test_context.get("fix_round", 0) != fix_round - 1:
+        return ""
+    review_id = test_context.get("prev_task_id")
+    review = queue.get_task(review_id) if isinstance(review_id, str) else None
+    if review is None or review.task_type != "review":
+        return ""
+    approval = queue.get_result(review.task_id)
+    if approval is None or _resolve_verdict(approval) != "approve":
+        return ""
+    review_context = review.context if isinstance(review.context, dict) else {}
+    approved_sha = test_context.get("reviewed_sha") or review_context.get("reviewed_sha")
+    return approved_sha if isinstance(approved_sha, str) and re.fullmatch(
+        r"[0-9a-fA-F]{40}", approved_sha) else ""
+
+
 def _review_round_cap(queue: TaskQueue, predecessor: TaskRequest, review_id: str,
                       provider: str, pr_number, head_sha: str,
                       coordinator_notify_fn=None) -> ReviewRoundCapReached | None:
@@ -1059,6 +1089,21 @@ def _review_round_cap(queue: TaskQueue, predecessor: TaskRequest, review_id: str
         if resolved == provider:
             count += 1
     if count < cap:
+        return None
+    # A failed test may require one extra review of a changed approved head.
+    # Only the first delta in this lineage may bypass the provider cap.
+    prior_delta = any(
+        task.task_type == "review" and task.status != "cancelled"
+        and isinstance(task.context, dict) and task.context.get("delta_review") is True
+        and (task.context.get("lineage_root_task_id")
+             or _lineage_root_task_id(tasks, task)) == root
+        for task in tasks.values()
+    )
+    approved_sha = (_approved_test_fix_sha(queue, predecessor)
+                    if predecessor.task_type == "implement" else "")
+    if (not prior_delta and approved_sha and isinstance(head_sha, str)
+            and re.fullmatch(r"[0-9a-fA-F]{40}", head_sha)
+            and head_sha.lower() != approved_sha.lower()):
         return None
     outcome = ReviewRoundCapReached("review_round_cap", provider, count, cap, str(root))
     queue.patch_context(predecessor.task_id, {
@@ -2703,6 +2748,17 @@ def auto_enqueue_review(
         #   a junk pin there would read as "the head moved" forever.
         if _pushed_commit:
             review_context["reviewed_sha"] = _pushed_commit
+
+        approved_sha = _approved_test_fix_sha(queue, impl_task)
+        if (approved_sha and _pushed_commit
+                and _pushed_commit.lower() != approved_sha.lower()):
+            review_context["delta_review"] = True
+            review_context["approved_sha"] = approved_sha
+            review_context["instructions"] += (
+                f"\n\nReview only the delta {approved_sha}..{_pushed_commit}. "
+                "Verify the test fix and its "
+                "regression risk; the earlier approval covers the unchanged code."
+            )
 
         # #164: compact review description — avoid re-injecting the full
         # original spec into the reviewer's context. The reviewer should
