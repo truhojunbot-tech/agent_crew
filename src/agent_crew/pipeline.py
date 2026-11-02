@@ -34,6 +34,7 @@ from typing import Optional
 from agent_crew.fallback import (
     default_agent_for_role,
 )
+from agent_crew.failure_kind import FailureKind
 from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.role_mapping import default_agent_for_role as baseline_agent_for_role
 from agent_crew.protocol import (
@@ -1392,6 +1393,34 @@ def _record_successor_refused(queue: TaskQueue, task_id: str, reason: str,
         logger.exception("successor refusal notice failed for %s", task_id)
 
 
+def record_cascade_enqueue_failure(queue: TaskQueue, task_id: str, step: str,
+                                   exc: Exception, coordinator_notify_fn=None) -> None:
+    """Keep a failed successor visible on its predecessor and in the notice sink."""
+    try:
+        if queue.has_successor(task_id):
+            return  # A later side effect failed; the lineage itself continued.
+    except Exception:
+        logger.exception("cascade successor lookup failed for %s", task_id)
+    locked = False
+    try:
+        context = queue.get_task_context(task_id)
+        locked = isinstance(context, dict) and bool(context.get("cascade_enqueue_failure"))
+    except Exception:
+        logger.exception("cascade lock marker lookup failed for %s", task_id)
+    try:
+        queue.annotate_error_info(task_id, {
+            "kind": FailureKind.TRANSIENT.value if locked else FailureKind.CONFIG_ERROR.value,
+            "reason": "cascade_enqueue_failed",
+            "cascade_step": step,
+            "cascade_error_type": type(exc).__name__,
+        })
+        if not locked:  # The lock path already sent its one coordinator notice.
+            from agent_crew.server import notify_lineage_end
+            notify_lineage_end(queue, task_id, notify_fn=coordinator_notify_fn)
+    except Exception:
+        logger.exception("cascade failure marker or notice failed for %s", task_id)
+
+
 def _round_cap_pinned(tasks_by_id: dict, review_task, queue: TaskQueue,
                       server_project: Optional[str] = None) -> bool:
     return _tokenomics_canary._is_pinned(
@@ -2190,6 +2219,8 @@ def auto_enqueue_fix(
         raise
     except Exception as e:
         logger.warning(f"auto_enqueue_fix: unexpected error: {e}")
+        record_cascade_enqueue_failure(queue, review_task_id, "fix", e,
+                                       coordinator_notify_fn)
         return None
 
 
@@ -2387,9 +2418,8 @@ def auto_enqueue_review(
     that differs from the task's, THAT is where the work is and the review is
     routed there — see ``_review_target`` below.
 
-    Returns the new review task_id, or ``None`` when no review is created
-    (cross-project guard, missing impl task, exception). Callers swallow
-    the None — auto-enqueue must never crash a result submission.
+    Returns the new review task_id, or ``None`` when no review is created.
+    Unexpected failures are recorded on the predecessor and noticed.
     """
     try:
         impl_task = queue.get_task(impl_task_id)
@@ -2729,6 +2759,8 @@ def auto_enqueue_review(
         raise
     except Exception as e:
         logger.warning(f"auto_enqueue_review: unexpected error: {e}")
+        record_cascade_enqueue_failure(queue, impl_task_id, "review", e,
+                                       coordinator_notify_fn)
         return None
 
 
@@ -2914,6 +2946,8 @@ def auto_enqueue_test(
         raise
     except Exception as e:
         logger.warning(f"auto_enqueue_test: unexpected error: {e}")
+        record_cascade_enqueue_failure(queue, review_task_id, "test", e,
+                                       coordinator_notify_fn)
         return None
 
 
