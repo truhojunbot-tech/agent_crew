@@ -342,10 +342,14 @@ def _shadow_dispatch(tmp_path, monkeypatch, port, *, live=False, shadow=False, b
     }))
     db = str(tmp_path / "t.db")
     commands = []
+    inputs = []
     patches = []
     recalled = []
 
     async def fake_exec(*cmd, **kwargs):
+        from tests.dispatch_stdin import CapturedStdin
+        stdin = CapturedStdin()
+        inputs.append(stdin)
         commands.append(cmd)
 
         class Process:
@@ -358,7 +362,9 @@ def _shadow_dispatch(tmp_path, monkeypatch, port, *, live=False, shadow=False, b
             async def wait(self):
                 return 0
 
-        return Process()
+        proc = Process()
+        proc.stdin = stdin
+        return proc
 
     real_patch = TaskQueue.patch_context
     real_recalled = TaskQueue.record_required_context_recalled
@@ -404,7 +410,7 @@ def _shadow_dispatch(tmp_path, monkeypatch, port, *, live=False, shadow=False, b
     built = [event for event in events if event["event_type"] == "context_pack_built"]
     assert commands
     command = commands[0]
-    result = {"message": command[command.index("-p") + 1], "events": built,
+    result = {"message": inputs[0].text(), "events": built,
               "patches": patches, "recalled": recalled, "row_context": row_context}
     monkeypatch.undo()
     return result
