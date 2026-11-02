@@ -98,6 +98,19 @@ def queue(tmp_db):
 # ── 1. discovery → enqueue, exactly once ──────────────────────────────
 
 
+def test_unknown_pr_lookup_does_not_claim_issue(queue, ledger):
+    class BrokenPrLookup(FakeGitHub):
+        def issue_has_open_pr(self, repo, number):
+            raise OSError("GitHub unavailable")
+
+    gh = BrokenPrLookup([make_issue(7, "Fix crash on startup", ["bug"])])
+    result = run_cycle(queue=queue, ledger=ledger, repo=REPO, gh=gh)
+    assert result["enqueued"] == []
+    assert result["skipped"] == [7]
+    assert result["error"] == "pr_lookup_unknown"
+    assert ledger.get(REPO, 7) is None
+
+
 def test_actionable_issue_is_discovered_and_enqueued_once(queue, ledger):
     """★The whole point of #224 — an open issue becomes queued work."""
     gh = FakeGitHub([make_issue(7, "Fix crash on startup", ["bug"])])

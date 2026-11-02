@@ -112,6 +112,7 @@ from agent_crew.testing_policy import (
     load_scope as _load_test_scope,
     scope_fingerprint as _scope_fingerprint,
     test_stage_lock,
+    TestStageLockUnavailable,
 )
 from agent_crew.telemetry_response import response_log_telemetry
 from agent_crew.worktree_default_branch import remote_default_branch
@@ -2320,46 +2321,36 @@ def agy_conversation_size(cwd: str, *, home=None) -> tuple:
     ``antigravity-cli/cache/last_conversations.json``; that is the join key
     between a worktree and the conversation `--continue` would resume.
 
-    Sums the ``.db`` plus its ``-wal``/``-shm`` siblings — a conversation
-    being actively written holds real bytes in the WAL, and ignoring it
-    under-reports exactly the case we care about. ``(0, "")`` when anything
-    is missing or unreadable; this must never break dispatch.
+    Sums the ``.db`` plus its ``-wal``/``-shm`` siblings. Missing data is an
+    empty session; unreadable data raises so dispatch cannot assume that.
     """
     import json as _json
-    try:
-        cache = _agy_home(home) / "antigravity-cli" / "cache" / "last_conversations.json"
-        if not cache.exists():
-            return (0, "")
-        conv = (_json.loads(cache.read_text()) or {}).get(cwd) or ""
-        if not conv:
-            return (0, "")
-        d = _agy_home(home) / "antigravity-cli" / "conversations"
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            f = d / f"{conv}.db{suffix}"
-            if f.exists():
-                total += f.stat().st_size
-        return (total, conv)
-    except Exception:  # noqa: BLE001 — sizing must never break a dispatch
+    cache = _agy_home(home) / "antigravity-cli" / "cache" / "last_conversations.json"
+    if not cache.exists():
         return (0, "")
+    conv = (_json.loads(cache.read_text()) or {}).get(cwd) or ""
+    if not conv:
+        return (0, "")
+    d = _agy_home(home) / "antigravity-cli" / "conversations"
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        f = d / f"{conv}.db{suffix}"
+        if f.exists():
+            total += f.stat().st_size
+    return (total, conv)
 
 
 def agy_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
     """Is the conversation `--continue` would resume past the cap (#236)?
 
-    Returns ``(exceeded, info)``. ⛔Fail-soft in the *resume* direction: if
-    the size cannot be read we report False. Wrongly forcing a reset throws
-    away a healthy conversation; wrongly resuming is merely the status quo
-    that this cap exists to bound.
+    Returns ``(exceeded, info)``. An unreadable size blocks dispatch rather
+    than authorizing a resume with an unknown context window.
     """
     cap = AGY_CONTEXT_MAX_MB if max_mb is None else float(max_mb)
     info = {"bytes": 0, "conversation_id": "", "cap_mb": cap}
     if cap <= 0:
         return (False, info)
-    try:
-        size, conv = agy_conversation_size(cwd, home=home)
-    except Exception:  # noqa: BLE001
-        return (False, info)
+    size, conv = agy_conversation_size(cwd, home=home)
     info["bytes"], info["conversation_id"] = size, conv
     return (size > cap * 1024 * 1024, info)
 
@@ -2846,6 +2837,9 @@ _LINEAGE_REASON_CODES = frozenset({
     "script_test_rerun_unjudged", "script_test_new_failures", "script_test_ci_red",
     "ci_infra_unavailable", "script_test_ci_infra_unavailable",
     "cascade_enqueue_failed",
+    "guard_unavailable",
+    "test_stage_lock_unavailable",
+    "context_probe_unavailable",
 })
 
 
@@ -4128,10 +4122,16 @@ def create_app(
             effective_timeout = timeout_seconds
             if pane_id:
                 try:
-                    if pane_liveness_fn(pane_id) == "alive":
+                    _pane_state = pane_liveness_fn(pane_id)
+                    if _pane_state == "alive":
+                        effective_timeout *= alive_timeout_multiplier
+                    elif _pane_state != "dead":
+                        logger.warning("watchdog: pane liveness unknown task=%s pane=%s",
+                                       task_id, pane_id)
                         effective_timeout *= alive_timeout_multiplier
                 except Exception:
                     logger.exception("watchdog: dispatcher pane liveness failed for %s", pane_id)
+                    effective_timeout *= alive_timeout_multiplier
             reason = ("dispatcher_superseded" if later else
                       "dispatcher_idle" if idle_for >= effective_timeout else "")
             if not reason:
@@ -4630,7 +4630,14 @@ def create_app(
         _lock_stack = contextlib.ExitStack()
         _lock_wait_seconds, _lock_defer_count = 0.0, 0
         if task.task_type == "test":
-            if not _lock_stack.enter_context(test_stage_lock(wt)):
+            try:
+                _test_lock_acquired = _lock_stack.enter_context(test_stage_lock(wt))
+            except TestStageLockUnavailable:
+                logger.exception("dispatcher: test-stage lock unavailable task=%s", task.task_id)
+                _fail_if_active(task.task_id, "test_stage_lock_unavailable",
+                                kind=FailureKind.CONFIG_ERROR.value)
+                return
+            if not _test_lock_acquired:
                 _lock_stack.close()
                 try:
                     _defers, _first_at = q().note_test_lock_defer(task.task_id)
@@ -4705,7 +4712,14 @@ def create_app(
         _codex_planned = ""      # the session a codex resume would use, if any
         _renew_previous_session = ""
         if agent == "gemini":
-            _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
+            try:
+                _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
+            except Exception:
+                logger.exception("dispatcher: context probe unavailable task=%s", task.task_id)
+                _lock_stack.close()
+                _fail_if_active(task.task_id, "context_probe_unavailable",
+                                kind=FailureKind.CONFIG_ERROR.value)
+                return
         elif agent == "codex":
             # #260 review: measurable now that #262 binds a resume to one
             # session. The rollout file is the conversation that resume
@@ -6860,7 +6874,13 @@ def create_app(
                 # PR the whole time.
                 if original_task.branch and not task_ctx.get("pr_number"):
                     from agent_crew.github import branch_has_pr
-                    if not branch_has_pr(original_task.branch):
+                    _has_pr = branch_has_pr(original_task.branch)
+                    if _has_pr is None:
+                        q().patch_context(task_id, {"retry_skipped_reason": "pr_lookup_unknown"})
+                        logger.warning("_auto_retry_failed_task: PR lookup unknown for %s; "
+                                       "ending lineage without a retry", task_id)
+                        return False
+                    if _has_pr is False:
                         logger.warning(
                             f"_auto_retry_failed_task: skipping review retry for {task_id} "
                             f"— branch {original_task.branch!r} has no PR (open or closed); "

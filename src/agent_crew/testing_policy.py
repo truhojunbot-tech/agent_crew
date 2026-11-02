@@ -35,6 +35,10 @@ import re
 
 logger = logging.getLogger(__name__)
 
+
+class TestStageLockUnavailable(RuntimeError):
+    """The worktree test lock could not be checked or acquired."""
+
 #: Where the config may live, most authoritative first. The operator override
 #: outranks the in-repo file on purpose: turning the scope down is an urgent
 #: response to a loaded host, and it must not require a commit to the repo
@@ -258,11 +262,7 @@ def test_stage_lock(worktree: str, *, base: str | None = None):
     how to put a task back and retry in two seconds; parking a role slot on a
     blocking acquire would trade a concurrency bug for a stall.
 
-    ⛔Yields the boolean rather than raising, so "someone else is testing" and
-      "the lock is broken" stay distinguishable — an unwritable lock directory
-      yields True and lets the dispatch proceed. Refusing to test because a
-      lock file could not be created would turn a hygiene mechanism into an
-      outage.
+    A broken lock raises: testing without exclusion would treat unknown as free.
     """
     path = lock_path(worktree, base=base)
     handle = None
@@ -270,9 +270,7 @@ def test_stage_lock(worktree: str, *, base: str | None = None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         handle = open(path, "a+")
     except OSError as e:
-        logger.warning(f"test_stage_lock: cannot open {path} ({e}); proceeding unlocked")
-        yield True
-        return
+        raise TestStageLockUnavailable(f"test_stage_lock_unavailable: {path}") from e
     try:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

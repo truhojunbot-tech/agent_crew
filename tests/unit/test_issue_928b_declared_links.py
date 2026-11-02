@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import pytest
 
 from agent_crew import context_pack, triage, watch
 from agent_crew.protocol import TaskRequest
@@ -26,6 +27,13 @@ def test_open_pr_uses_closing_references_not_body_or_branch(monkeypatch):
     assert not gh.issue_has_open_pr("owner/repo", 123)
     prs[0]["closingIssuesReferences"] = [{"number": 123}]
     assert gh.issue_has_open_pr("owner/repo", 123)
+
+
+def test_open_pr_lookup_error_is_unknown(monkeypatch):
+    monkeypatch.setattr(watch.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "unavailable"))
+    with pytest.raises(RuntimeError, match="open PR lookup failed"):
+        watch.GhCli().issue_has_open_pr("owner/repo", 123)
 
 
 def test_description_never_supplies_issue_identity():

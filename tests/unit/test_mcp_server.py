@@ -55,6 +55,18 @@ class TestBuild:
 
 
 class TestGetNextTask:
+    def test_guard_error_refuses_delivery_with_typed_reason(self, tmp_db, monkeypatch):
+        from agent_crew import server
+        TaskQueue(tmp_db).enqueue(_make_task("t-guard", task_type="review"))
+        monkeypatch.setattr(server, "_guard_description",
+                            lambda task: (_ for _ in ()).throw(RuntimeError("guard broke")))
+        mcp = build_mcp_server(tmp_db)
+        result = _call_tool(mcp, "get_next_task", role="reviewer", agent="claude")
+        assert result == {"task_id": "t-guard", "dispatch_refused": "guard_unavailable"}
+        task = TaskQueue(tmp_db).get_task("t-guard")
+        assert task.status == "needs_human"
+        assert task.error_info["kind"] == "config_error"
+
     def test_returns_dict_for_pending_task(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-impl"))
         mcp = build_mcp_server(tmp_db)

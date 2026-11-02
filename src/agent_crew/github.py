@@ -434,7 +434,7 @@ def post_discussion_comment(
         return False
 
 
-def branch_has_pr(branch: str, repo: Optional[str] = None) -> bool:
+def branch_has_pr(branch: str, repo: Optional[str] = None) -> Optional[bool]:
     """Return True iff `branch` has an open OR closed GitHub PR (#216).
 
     Used to decide whether a review retry is even winnable before spending
@@ -442,16 +442,14 @@ def branch_has_pr(branch: str, repo: Optional[str] = None) -> bool:
     deterministic check the dispatcher can run itself, instead of
     dispatching a whole review task only for the agent to independently
     rediscover "no PR exists for this branch" for the second or third time
-    in a row. Fails open (returns True — "assume a retry might help") on
-    any gh/network error, since the goal here is only to skip a provably
-    futile retry, never to block a legitimate one on an unrelated hiccup.
+    in a row. ``None`` means the lookup is unknown; callers must defer.
     """
     if not branch or not check_gh_installed():
-        return True
+        return None
     if not repo:
         repo = get_repo()
     if not repo:
-        return True
+        return None
     try:
         result = subprocess.run(
             ["gh", "pr", "list", "--repo", repo, "--head", branch,
@@ -459,10 +457,10 @@ def branch_has_pr(branch: str, repo: Optional[str] = None) -> bool:
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
-            return True
+            return None
         return bool(json.loads(result.stdout or "[]"))
     except Exception:
-        return True
+        return None
 
 
 def pr_number_for_branch(branch: str, repo: Optional[str] = None,

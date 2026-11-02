@@ -206,15 +206,13 @@ def test_different_worktrees_do_not_block_each_other(tmp_path):
         assert first and second
 
 
-def test_an_unwritable_lock_directory_does_not_stop_testing(worktree, monkeypatch, caplog):
-    """⛔A hygiene mechanism must not become an outage. If the lock cannot be
-    taken at all, run — unlocked and loudly — rather than refuse to test."""
+def test_an_unwritable_lock_directory_blocks_testing(worktree, monkeypatch):
+    """An unavailable lock must never authorize an unlocked test."""
     monkeypatch.setattr(tp.os, "makedirs",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("read-only fs")))
-    with caplog.at_level("WARNING"):
-        with tp.test_stage_lock(worktree, base="/nope") as ok:
-            assert ok is True
-    assert "proceeding unlocked" in caplog.text
+    with pytest.raises(RuntimeError, match="test_stage_lock_unavailable"):
+        with tp.test_stage_lock(worktree, base="/nope"):
+            pytest.fail("test ran without its lock")
 
 
 def test_a_second_PROCESS_is_refused(worktree, tmp_path):
@@ -313,6 +311,32 @@ def test_an_unlocked_worktree_still_dispatches_its_test(tmp_path, monkeypatch, *
     spawned, _, _ = _dispatch(tmp_path, monkeypatch, "test",
                               lock_base=str(tmp_path / "lockbase"), unused_tcp_port=unused_tcp_port)
     assert spawned is True
+
+
+@pytest.mark.parametrize("failure, expected_reason", [
+    ("session", "context_probe_unavailable"),
+    ("lock", "test_stage_lock_unavailable"),
+])
+def test_dispatch_probe_failure_is_typed_and_never_spawns(
+        tmp_path, monkeypatch, unused_tcp_port, failure, expected_reason):
+    from agent_crew import server as sv
+    from agent_crew.queue import TaskQueue
+
+    if failure == "session":
+        monkeypatch.setattr(sv, "agy_context_exceeds_cap",
+                            lambda *_: (_ for _ in ()).throw(OSError("unreadable session")))
+    else:
+        monkeypatch.setattr(sv, "test_stage_lock",
+                            lambda *_: (_ for _ in ()).throw(
+                                tp.TestStageLockUnavailable("lock unavailable")))
+    spawned, status, _ = _dispatch(
+        tmp_path, monkeypatch, "test", lock_base=str(tmp_path / "lockbase"),
+        unused_tcp_port=unused_tcp_port)
+    info = TaskQueue(str(tmp_path / "tasks.db")).get_task("t-1").error_info
+    assert spawned is False
+    assert status == "failed"
+    assert info["reason"] == expected_reason
+    assert info["kind"] == "config_error"
 
 
 def test_a_non_test_task_is_not_gated_by_the_test_lock(tmp_path, monkeypatch, *, unused_tcp_port):
