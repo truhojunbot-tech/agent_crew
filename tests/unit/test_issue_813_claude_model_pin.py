@@ -33,7 +33,9 @@ def _harness(tmp_path, monkeypatch, unused_tcp_port):
     seen = []
 
     async def fake_exec(*cmd, **kwargs):
-        seen.append((list(cmd), kwargs["env"]))
+        from tests.dispatch_stdin import CapturedStdin
+        stdin = CapturedStdin()
+        seen.append((list(cmd), kwargs["env"], stdin))
 
         class Process:
             pid = 1
@@ -45,7 +47,9 @@ def _harness(tmp_path, monkeypatch, unused_tcp_port):
             async def wait(self):
                 return 0
 
-        return Process()
+        proc = Process()
+        proc.stdin = stdin
+        return proc
 
     # These tests claim and dispatch explicitly; a background dispatcher can
     # race the test's dequeue and claim its task first.
@@ -77,9 +81,11 @@ def test_claude_model_pin_and_model_change_reset_once(tmp_path, monkeypatch, unu
         second = _dispatch(app, queue, "impl-813-b")
         assert "--model" not in seen[0][0]
         assert seen[1][0] == [
-            "claude", "-p", seen[1][0][2], "--continue",
+            "claude", "-p", "--continue",
             "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json",
         ]
+        assert "do it" in seen[0][2].text()
+        assert "do it" in seen[1][2].text()
         assert first["model"] == second["model"] == ""
 
         monkeypatch.setenv("AGENT_CREW_CLAUDE_MODEL", "claude-fable-5-1")

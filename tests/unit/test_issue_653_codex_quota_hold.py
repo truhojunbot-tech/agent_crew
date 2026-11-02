@@ -179,6 +179,8 @@ def test_dispatcher_parks_real_quota_failure_without_fallback(tmp_path, monkeypa
         kwargs["stdout"].write(_real_codex_quota_stream().encode())
         kwargs["stdout"].flush()
         proc = MagicMock(returncode=1, pid=os.getpid())
+        from tests.dispatch_stdin import CapturedStdin
+        proc.stdin = CapturedStdin()
         proc.wait = AsyncMock(return_value=1)
         return proc
 
