@@ -1848,18 +1848,6 @@ def _record_exit_response_telemetry(queue: TaskQueue, task_id: str,
             logger.exception("quota contract emit scheduling failed for task=%s", task_id)
 
 
-#: Cap on the agy/Antigravity conversation the tester resumes with
-#: `--continue` (#236). 0 disables.
-#:
-#: ⛔`_cap_gemini_session_size` below guards `~/.gemini/tmp/<proj>/chats`,
-#:   which is the **gemini-cli** store. The tester runs `agy`, which keeps
-#:   conversations in `~/.gemini/antigravity-cli/conversations/<id>.db`, so
-#:   that guard never covered this path. #232 measured the consequence:
-#:   alpha_engine's resumed conversation reached ~30k steps / 137 MB, every
-#:   dispatch re-sent it, quota hit 429, and agy surfaced only the
-#:   downstream `subscriber fell behind updates` mask.
-AGY_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_AGY_CONTEXT_MAX_MB", "64"))
-
 #: Cap on the Claude Code session the worker resumes with `--continue` (#260).
 #: 0 disables.
 #:
@@ -2278,8 +2266,7 @@ def claude_context_exceeds_cap(cwd: str, max_mb=None, *, home=None,
                                max_tokens=None) -> tuple:
     """Is the Claude Code session `--continue` would resume past the cap (#260)?
 
-    Returns ``(over, info)``. Mirrors `agy_context_exceeds_cap` so both
-    providers trip the same downstream path — a forced fresh context, with
+    Returns ``(over, info)`` for a forced fresh Claude context, with
     nothing on disk deleted or mutated.
     """
     cap = CLAUDE_CONTEXT_MAX_MB if max_mb is None else max_mb
@@ -2319,10 +2306,10 @@ def agy_conversation_size(cwd: str, *, home=None) -> tuple:
 
     agy keeps a plain ``{cwd: conversation_id}`` map in
     ``antigravity-cli/cache/last_conversations.json``; that is the join key
-    between a worktree and the conversation `--continue` would resume.
+    between a worktree and the conversation just created by agy.
 
     Sums the ``.db`` plus its ``-wal``/``-shm`` siblings. Missing data is an
-    empty session; unreadable data raises so dispatch cannot assume that.
+    empty session; unreadable data raises to the caller.
     """
     import json as _json
     cache = _agy_home(home) / "antigravity-cli" / "cache" / "last_conversations.json"
@@ -2338,21 +2325,6 @@ def agy_conversation_size(cwd: str, *, home=None) -> tuple:
         if f.exists():
             total += f.stat().st_size
     return (total, conv)
-
-
-def agy_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
-    """Is the conversation `--continue` would resume past the cap (#236)?
-
-    Returns ``(exceeded, info)``. An unreadable size blocks dispatch rather
-    than authorizing a resume with an unknown context window.
-    """
-    cap = AGY_CONTEXT_MAX_MB if max_mb is None else float(max_mb)
-    info = {"bytes": 0, "conversation_id": "", "cap_mb": cap}
-    if cap <= 0:
-        return (False, info)
-    size, conv = agy_conversation_size(cwd, home=home)
-    info["bytes"], info["conversation_id"] = size, conv
-    return (size > cap * 1024 * 1024, info)
 
 
 def _cap_gemini_session_size(cwd: str, max_mb: int = 50) -> None:
@@ -4677,7 +4649,7 @@ def create_app(
         # #202: resolve the explicit provider model once so attribution and
         # argv cannot drift. An unpinned Claude/Codex model remains unknown.
         _known_model = (
-            _resolve_gemini_model() if agent == "gemini" else
+            _resolve_gemini_model() if agent in ("gemini", "agy") else
             _resolve_claude_model(wt) if agent == "claude" else ""
         )
 
@@ -4687,17 +4659,13 @@ def create_app(
         # agent's worktree and genuinely resume that agent's ongoing
         # conversation (Agent ≠ Role ≠ Context). An explicit
         # task.context["context_reset"] forces a new context/generation;
-        # otherwise the very first dispatch into a (project, agent,
-        # worktree) triple is automatically "fresh" and every later one
-        # "resume"s it.
-        _force_context_reset = bool(_ctx.get("context_reset")) if isinstance(_ctx, dict) else False
-        # #236: an agy conversation resumed by `--continue` grows without
-        # bound; alpha_engine's reached ~30k steps / 137 MB and every
-        # dispatch re-sent it until quota 429'd. Trip a context reset at the
-        # cap so the next dispatch starts a fresh provider conversation.
-        # ⛔Nothing in agy's store is deleted or mutated — the oversized
-        #   conversation is simply not resumed, so an in-flight context is
-        #   never disturbed and the decision is reversible.
+        # otherwise the first dispatch into a (project, agent, worktree)
+        # triple is "fresh" and later dispatches may resume it. Agy always
+        # starts fresh (#982).
+        # #982: agy starts a new conversation on every dispatch, including
+        # retries in the same worktree. Keep logical context identity aligned.
+        _force_context_reset = (agent in ("gemini", "agy") or
+                                (isinstance(_ctx, dict) and bool(_ctx.get("context_reset"))))
         # ⛔Initialised before the provider branches so the event gate below can
         #   read it for ANY agent, and named for the CONTEXT rather than for agy:
         #   it carries claude's cap decision too, and a name that says otherwise
@@ -4711,16 +4679,7 @@ def create_app(
         _lineage_reset = False
         _codex_planned = ""      # the session a codex resume would use, if any
         _renew_previous_session = ""
-        if agent == "gemini":
-            try:
-                _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
-            except Exception:
-                logger.exception("dispatcher: context probe unavailable task=%s", task.task_id)
-                _lock_stack.close()
-                _fail_if_active(task.task_id, "context_probe_unavailable",
-                                kind=FailureKind.CONFIG_ERROR.value)
-                return
-        elif agent == "codex":
+        if agent == "codex":
             # #260 review: measurable now that #262 binds a resume to one
             # session. The rollout file is the conversation that resume
             # replays, so it is the same measurement as the other two providers.
@@ -5612,12 +5571,19 @@ def create_app(
                     "--verbose", "--output-format", "stream-json"]
             if _known_model:
                 cmd += ["--model", _known_model]
-        elif agent == "gemini":
+        elif agent in ("gemini", "agy"):
+            # Compare agy's cwd mapping before and after this invocation so a
+            # zero-turn failure cannot attribute its predecessor's session.
+            try:
+                _agy_before_conversation_id = agy_conversation_size(wt)[1]
+            except Exception:
+                logger.exception("dispatcher: agy conversation lookup failed before task=%s", task.task_id)
+                _agy_before_conversation_id = None
             # gemini-cli + oauth-personal stopped serving on 2026-06-18
             # (IneligibleTierError) and the replacement, Antigravity CLI
             # (`agy`), now ships a CPU-compat build (1.0.10+) that runs on
             # this host. Switch the dispatched binary accordingly:
-            #   `gemini --resume latest --yolo`  →  `agy --continue --dangerously-skip-permissions`
+            #   `gemini --resume latest --yolo`  →  `agy --dangerously-skip-permissions`
             #   `--output-format stream-json` has no equivalent — agy prints
             #   plain stdout, which the dispatcher captures into the log file
             #   the same way.
@@ -5627,14 +5593,7 @@ def create_app(
             # (_known_model resolved earlier,
             # before dispatch, so the attribution record and this cmd can't
             # drift apart — #202.)
-            # #236: resume only when Agent Crew's own context policy says
-            # "resume". Previously `--continue` was unconditional, so a
-            # freshly-minted context (generation 1, or an explicit
-            # context_reset) still resumed the provider's old conversation —
-            # identity and provider state could disagree. Now they cannot.
             cmd = ["agy", "-p", message]
-            if _ctx_info["context_policy"] == "resume":
-                cmd.append("--continue")
             cmd += ["--dangerously-skip-permissions", "--model", _known_model,
                     "--output-format", "json"]
         else:  # codex — resume last session for context continuity; falls back to fresh if none exists
@@ -5762,6 +5721,15 @@ def create_app(
                     _discovered_session_id = extract_claude_session_id(_task_log_tail)
                     if _discovered_session_id and _discovered_session_id != _ctx_info.get("provider_session_id"):
                         q().update_context_provider_session_id(_context_key, _discovered_session_id)
+                elif agent in ("gemini", "agy"):
+                    # agy's cwd mapping now points to the conversation this
+                    # dispatch created. Bind it to the existing identity rows.
+                    _, _discovered_session_id = agy_conversation_size(wt)
+                    if (_agy_before_conversation_id is not None
+                            and _discovered_session_id
+                            and _discovered_session_id != _agy_before_conversation_id):
+                        q().update_context_provider_session_id(_context_key, _discovered_session_id)
+                        q().update_attribution_provider_session_id(task.task_id, _discovered_session_id)
                 elif agent == "codex":
                     # #262: close the loop. The run just now wrote a rollout for
                     # THIS worktree, so it is at the top of codex's newest day —
