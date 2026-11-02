@@ -6033,6 +6033,7 @@ def create_app(
         refresh_tasks: dict[str, asyncio.Task] = {}
         refresh_skips_logged: set[str] = set()
         cloud_refresh_after = 0.0
+        merge_replay_after = 0.0
 
         def _start_refresh(name: str, fn: Callable, *args, **kwargs) -> None:
             previous = refresh_tasks.get(name)
@@ -6124,6 +6125,9 @@ def create_app(
                             asyncio.create_task(_recheck_merge_ci(int(number), repo, review.task_id))
                     except Exception:
                         logger.exception("CI merge recheck scan failed — continuing dispatch")
+                    if time.monotonic() >= merge_replay_after:
+                        merge_replay_after = time.monotonic() + 10.0
+                        _start_refresh("owed merges", replay_suppressed)
                     # Shadow-only receipt refresh; a slow contract read must not
                     # delay dispatch or HTTP responses.
                     _start_refresh(
@@ -6997,6 +7001,11 @@ def create_app(
         if resv.get("state") == "failed" and int(resv.get("attempt", 0)) >= _MAX_MERGE_ATTEMPTS:
             logger.warning(f"_auto_merge_pr: {op_key} 실패 {resv.get('attempt')}회(≥{_MAX_MERGE_ATTEMPTS}) — "
                            f"자동 재시도 중단, escalation 필요(last_error={resv.get('last_error')})")
+            if test_task_id and "pr_state_unknown" in (resv.get("last_error") or ""):
+                coordinator_notice_once(
+                    q(), test_task_id, "merge_replay_refused",
+                    f"pr_number={pr_number} reason_code=merge_attempt_cap "
+                    f"kind={FailureKind.TRANSIENT.value}", coordinator_notify_fn)
             return
         if not _merge_repo:
             fail("repo identity unresolved (no explicit repo, no "
@@ -7016,9 +7025,21 @@ def create_app(
             logger.warning(f"_auto_merge_pr: PR #{pr_number} closed — 자동 재시도 안 함, escalation 필요")
             return
         if st == "unknown":
-            fail("PR 상태 불명(gh 실패) — 다음 재확인 대기")
+            fail(f"kind={FailureKind.TRANSIENT.value} pr_state_unknown")
+            deferred = False
+            if test_task_id:
+                try:
+                    deferred = q().defer_test_merge(test_task_id, {
+                            "pr_number": int(pr_number), "head_sha": head_sha or "",
+                            "review_task_id": review_task_id, "repo": _merge_repo})
+                    if not deferred:
+                        logger.error("_auto_merge_pr: owed merge outbox missing for %s",
+                                     test_task_id)
+                except Exception:
+                    logger.exception("_auto_merge_pr: could not retain owed merge for %s",
+                                     test_task_id)
             logger.warning(f"_auto_merge_pr: PR #{pr_number} 상태 불명 → merge 보류(fail-closed, 재확인)")
-            return
+            return deferred
         from agent_crew.conformance_gate import (_conformance_gate_allows_merge,
                                                  test_pass_for_head)
 
@@ -8507,7 +8528,7 @@ def create_app(
                                         disposition, reason = "merge_refused", "pr_closed"
                                     elif state in ("closed", "merged"):
                                         disposition, reason = "expired", f"pr_{state}"
-                                    elif state != "open":
+                                    elif state != "open" and not isinstance(owed, dict):
                                         disposition, reason = "pending", "pr_state_unknown"
                                     elif isinstance(owed, dict) and owed.get("head_sha"):
                                         from agent_crew.github import pr_head_sha
