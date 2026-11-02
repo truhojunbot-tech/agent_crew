@@ -1090,12 +1090,18 @@ def _review_round_cap(queue: TaskQueue, predecessor: TaskRequest, review_id: str
             count += 1
     if count < cap:
         return None
-    # A failed test may require one more review of the change made to an
-    # already-approved head. The deterministic review id enforces one per fix;
-    # auto_enqueue_fix's fix_round budget bounds the number of such fixes.
+    # A failed test may require one extra review of a changed approved head.
+    # Only the first delta in this lineage may bypass the provider cap.
+    prior_delta = any(
+        task.task_type == "review" and task.status != "cancelled"
+        and isinstance(task.context, dict) and task.context.get("delta_review") is True
+        and (task.context.get("lineage_root_task_id")
+             or _lineage_root_task_id(tasks, task)) == root
+        for task in tasks.values()
+    )
     approved_sha = (_approved_test_fix_sha(queue, predecessor)
                     if predecessor.task_type == "implement" else "")
-    if (approved_sha and isinstance(head_sha, str)
+    if (not prior_delta and approved_sha and isinstance(head_sha, str)
             and re.fullmatch(r"[0-9a-fA-F]{40}", head_sha)
             and head_sha.lower() != approved_sha.lower()):
         return None
@@ -2748,8 +2754,8 @@ def auto_enqueue_review(
                 and _pushed_commit.lower() != approved_sha.lower()):
             review_context["delta_review"] = True
             review_context["approved_sha"] = approved_sha
-            review_context["instructions"] = (
-                f"Review only the delta {approved_sha}..{_pushed_commit}. "
+            review_context["instructions"] += (
+                f"\n\nReview only the delta {approved_sha}..{_pushed_commit}. "
                 "Verify the test fix and its "
                 "regression risk; the earlier approval covers the unchanged code."
             )

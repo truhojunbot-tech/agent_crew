@@ -143,6 +143,7 @@ def test_post_approval_test_fix_gets_one_delta_review_with_bounded_fix_rounds(
                     "script_test": {"outcome": "FAILED", "reason": "new_failures",
                                     "new_failures": ["tests/test_x.py::test_x"]}}))
     add("fix2", "implement", "test1", fix_round=2)
+    queue.patch_context("fix2", {"review_task_id": "r1"})
     outcome = auto_enqueue_review(queue, "fix2", 7, reviewer_provider="claude",
         pr_state_fn=lambda _: "open", result=TaskResult(
             task_id="fix2", status="completed", summary="fixed", commit=new_head))
@@ -153,6 +154,9 @@ def test_post_approval_test_fix_gets_one_delta_review_with_bounded_fix_rounds(
     assert delta.context["reviewed_sha"] == new_head
     assert approved_sha in delta.context["instructions"]
     assert new_head in delta.context["instructions"]
+    assert "3-layer review" in delta.context["instructions"]
+    assert "FRESHNESS:" in delta.context["instructions"]
+    assert "PRIOR REVIEW FINDINGS" in delta.context["instructions"]
     assert auto_enqueue_review(queue, "fix2", 7, reviewer_provider="claude",
         pr_state_fn=lambda _: "open", result=TaskResult(
             task_id="fix2", status="completed", summary="fixed", commit=new_head)) == outcome
@@ -171,3 +175,69 @@ def test_post_approval_test_fix_gets_one_delta_review_with_bounded_fix_rounds(
                             head_sha_fn=lambda *_a, **_k: new_head) is None
     assert not any(t.task_type == "implement" and t.context.get("fix_round") == 3
                    for t in queue.list_tasks())
+
+
+@pytest.mark.parametrize("case", ["same_sha", "review_changes", "parent_not_test",
+                                   "test_completed", "test_needs_human", "round_mismatch"])
+def test_delta_exemption_requires_failed_post_approval_test_and_new_head(
+        tmp_path, monkeypatch, case):
+    monkeypatch.setenv("AGENT_CREW_REVIEW_MAX_ROUNDS_CLAUDE", "2")
+    queue = _queue(tmp_path)
+    approved_sha, new_head = "a" * 40, "b" * 40
+    review_result = "request_changes" if case == "review_changes" else "approve"
+    queue.submit_result("prior-1", TaskResult(
+        task_id="prior-1", status="completed", summary="review", verdict=review_result,
+        findings=["HIGH x.py:1 - fix"] if review_result == "request_changes" else []))
+    queue.enqueue(TaskRequest(task_id="test1", task_type="test", branch="feature",
+                              description="fixture", context={
+                                  "lineage_root_task_id": "root", "prev_task_id": "prior-1",
+                                  "fix_round": 1, "reviewed_sha": approved_sha}))
+    status = "completed" if case == "test_completed" else "needs_human" if case == "test_needs_human" else "failed"
+    queue.submit_result("test1", TaskResult(
+        task_id="test1", status=status, summary="test",
+        error_info={"kind": "test_failure", "reason": "script_test_new_failures",
+                    "script_test": {"outcome": "FAILED", "reason": "new_failures",
+                                    "new_failures": ["tests/test_x.py::test_x"]}} if status == "failed" else None))
+    queue.enqueue(TaskRequest(task_id="fix2", task_type="implement", branch="feature",
+                              description="fixture", context={
+                                  "risk_tier": 1, "lineage_root_task_id": "root",
+                                  "prev_task_id": "prior-1" if case == "parent_not_test" else "test1",
+                                  "fix_round": 3 if case == "round_mismatch" else 2,
+                                  "crew_run_branch": True, "pr_number": 7}))
+    head = approved_sha if case == "same_sha" else new_head
+    outcome = auto_enqueue_review(queue, "fix2", 7, reviewer_provider="claude",
+        pr_state_fn=lambda _: "open", result=TaskResult(
+            task_id="fix2", status="completed", summary="fixed", commit=head))
+    assert isinstance(outcome, ReviewRoundCapReached)
+
+
+def test_second_delta_review_is_refused_under_default_fix_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_REVIEW_MAX_ROUNDS_CLAUDE", "2")
+    monkeypatch.delenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", raising=False)
+    queue = _queue(tmp_path)
+    approved_sha, new_head = "a" * 40, "b" * 40
+    queue.enqueue(TaskRequest(task_id="delta1", task_type="review", branch="feature",
+                              description="fixture", context={
+                                  "risk_tier": 1, "lineage_root_task_id": "root",
+                                  "prev_task_id": "prior-1", "delta_review": True,
+                                  "reviewed_sha": approved_sha, "agent_override": "claude"}))
+    queue.submit_result("delta1", TaskResult(task_id="delta1", status="completed",
+                                             summary="approved", verdict="approve"))
+    queue.enqueue(TaskRequest(task_id="test2", task_type="test", branch="feature",
+                              description="fixture", context={
+                                  "lineage_root_task_id": "root", "prev_task_id": "delta1",
+                                  "fix_round": 2, "reviewed_sha": approved_sha}))
+    queue.submit_result("test2", TaskResult(
+        task_id="test2", status="failed", summary="test",
+        error_info={"kind": "test_failure", "reason": "script_test_new_failures",
+                    "script_test": {"outcome": "FAILED", "reason": "new_failures",
+                                    "new_failures": ["tests/test_x.py::test_x"]}}))
+    queue.enqueue(TaskRequest(task_id="fix3", task_type="implement", branch="feature",
+                              description="fixture", context={
+                                  "risk_tier": 1, "lineage_root_task_id": "root",
+                                  "prev_task_id": "test2", "fix_round": 3,
+                                  "crew_run_branch": True, "pr_number": 7}))
+    outcome = auto_enqueue_review(queue, "fix3", 7, reviewer_provider="claude",
+        pr_state_fn=lambda _: "open", result=TaskResult(
+            task_id="fix3", status="completed", summary="fixed", commit=new_head))
+    assert isinstance(outcome, ReviewRoundCapReached)
