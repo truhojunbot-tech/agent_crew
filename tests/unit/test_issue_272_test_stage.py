@@ -206,15 +206,13 @@ def test_different_worktrees_do_not_block_each_other(tmp_path):
         assert first and second
 
 
-def test_an_unwritable_lock_directory_does_not_stop_testing(worktree, monkeypatch, caplog):
-    """⛔A hygiene mechanism must not become an outage. If the lock cannot be
-    taken at all, run — unlocked and loudly — rather than refuse to test."""
+def test_an_unwritable_lock_directory_blocks_testing(worktree, monkeypatch):
+    """An unavailable lock must never authorize an unlocked test."""
     monkeypatch.setattr(tp.os, "makedirs",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("read-only fs")))
-    with caplog.at_level("WARNING"):
-        with tp.test_stage_lock(worktree, base="/nope") as ok:
-            assert ok is True
-    assert "proceeding unlocked" in caplog.text
+    with pytest.raises(RuntimeError, match="test_stage_lock_unavailable"):
+        with tp.test_stage_lock(worktree, base="/nope"):
+            pytest.fail("test ran without its lock")
 
 
 def test_a_second_PROCESS_is_refused(worktree, tmp_path):

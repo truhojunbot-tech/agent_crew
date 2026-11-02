@@ -48,6 +48,22 @@ def test_dispatcher_orphan_expires_without_reminder(tmp_db, monkeypatch, caplog)
     assert "reason=dispatcher_idle" in caplog.text
 
 
+def test_unknown_pane_liveness_does_not_expire_claim(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    queue = TaskQueue(tmp_db)
+    app = create_app(tmp_db, pane_map={"tester": "%2915"},
+                     pane_liveness_fn=lambda _: "unknown",
+                     timeout_seconds=900, watchdog_disabled=True,
+                     anomaly_disabled=True)
+    with TestClient(app):
+        _claimed(queue, "unknown-pane")
+        with sqlite3.connect(tmp_db) as db:
+            db.execute("UPDATE tasks SET dispatch_target='%2915' WHERE task_id='unknown-pane'")
+        actions = app.state.watchdog_tick(now=4000.0)
+    assert actions["timed_out"] == []
+    assert queue.get_task_status("unknown-pane") == "in_progress"
+
+
 def test_dispatcher_with_fresh_heartbeat_survives_alive_pane(tmp_db, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)

@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover — surfaced loud at import time
     FastMCP = None  # type: ignore
 
 from agent_crew.loop import _resolve_verdict, handle_test_result
+from agent_crew.failure_kind import FailureKind
 from agent_crew.pipeline import (
     auto_enqueue_fix,
     auto_enqueue_review,
@@ -88,13 +89,7 @@ def _task_to_dict(task: TaskRequest, *, nonce: Optional[str] = None) -> dict[str
 
     payload = asdict(task)
     payload["dispatch_nonce"] = nonce
-    try:
-        payload["description"] = _guard_description(task)
-    except Exception:
-        # If anything goes wrong with the guard logic, fall through with
-        # the unprefixed description. The system prompt's precedence
-        # block is the safety net.
-        pass
+    payload["description"] = _guard_description(task)
     return payload
 
 
@@ -180,7 +175,16 @@ def build_mcp_server(
                                           lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             return {"task_id": task.task_id, "dispatch_refused": str(exc)}
-        return _task_to_dict(task, nonce=nonce)
+        try:
+            return _task_to_dict(task, nonce=nonce)
+        except Exception:
+            logger.exception("MCP task guard failed for %s", task.task_id)
+            queue.submit_result(task.task_id, TaskResult(
+                task_id=task.task_id, status="needs_human", summary="task guard unavailable",
+                error_info={"kind": FailureKind.CONFIG_ERROR.value,
+                            "reason": "guard_unavailable", "final": True}),
+                expected_status="in_progress")
+            return {"task_id": task.task_id, "dispatch_refused": "guard_unavailable"}
 
     @mcp.tool()
     def get_next_discuss_task(agent: str) -> Optional[dict[str, Any]]:
@@ -195,7 +199,16 @@ def build_mcp_server(
                                           lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             return {"task_id": task.task_id, "dispatch_refused": str(exc)}
-        return _task_to_dict(task, nonce=nonce)
+        try:
+            return _task_to_dict(task, nonce=nonce)
+        except Exception:
+            logger.exception("MCP discuss guard failed for %s", task.task_id)
+            queue.submit_result(task.task_id, TaskResult(
+                task_id=task.task_id, status="needs_human", summary="task guard unavailable",
+                error_info={"kind": FailureKind.CONFIG_ERROR.value,
+                            "reason": "guard_unavailable", "final": True}),
+                expected_status="in_progress")
+            return {"task_id": task.task_id, "dispatch_refused": "guard_unavailable"}
 
     @mcp.tool()
     def submit_result(

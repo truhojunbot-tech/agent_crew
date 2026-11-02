@@ -281,21 +281,20 @@ class TestBranchHasPr:
             mock_run.return_value = MagicMock(returncode=0, stdout="[]")
             assert branch_has_pr("agent/claude/4235-auto") is False
 
-    def test_u216_fails_open_true_on_gh_error(self):
-        """A gh/network hiccup must never be mistaken for a confirmed
-        no-PR verdict — fail open so a legitimate retry isn't blocked."""
+    def test_u216_gh_error_is_unknown(self):
+        """An unavailable lookup cannot authorize or reject a retry."""
         with patch("agent_crew.github.check_gh_installed", return_value=True), \
              patch("agent_crew.github.get_repo", return_value="owner/repo"), \
              patch("agent_crew.github.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="")
-            assert branch_has_pr("agent/claude/some-branch") is True
+            assert branch_has_pr("agent/claude/some-branch") is None
 
-    def test_u216_fails_open_true_when_gh_not_installed(self):
+    def test_u216_gh_missing_is_unknown(self):
         with patch("agent_crew.github.check_gh_installed", return_value=False):
-            assert branch_has_pr("agent/claude/some-branch") is True
+            assert branch_has_pr("agent/claude/some-branch") is None
 
-    def test_u216_fails_open_true_on_empty_branch(self):
-        assert branch_has_pr("") is True
+    def test_u216_empty_branch_is_unknown(self):
+        assert branch_has_pr("") is None
 
     def test_u216_queries_the_right_branch_and_repo(self):
         with patch("agent_crew.github.check_gh_installed", return_value=True), \
@@ -389,6 +388,21 @@ def _retry_ids_for(queue: TaskQueue, original_task_id: str) -> list:
 
 
 class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
+    def test_u216_unknown_pr_lookup_blocks_retry(self, tmp_db, github_writes):
+        from agent_crew.protocol import TaskRequest
+        queue = TaskQueue(tmp_db)
+        queue.enqueue(TaskRequest(task_id="review-216-unknown", task_type="review",
+                                  description="review", branch="agent/claude/unknown",
+                                  context={"risk_tier": 1, "repo": "owner/repo"}))
+        app = create_app(db_path=tmp_db, watchdog_disabled=True)
+        with TestClient(app) as client, \
+             patch("agent_crew.github.branch_has_pr", return_value=None):
+            response = client.post("/tasks/review-216-unknown/result",
+                                   json=_failed_result_payload("review-216-unknown"))
+        assert response.status_code == 200
+        assert _retry_ids_for(queue, "review-216-unknown") == []
+        assert queue.get_task("review-216-unknown").context["retry_skipped_reason"] == "pr_lookup_unknown"
+
     def test_u216_no_retry_enqueued_when_branch_has_no_pr(self, tmp_db):
         app = create_app(db_path=tmp_db, watchdog_disabled=True)
         with TestClient(app) as client, \

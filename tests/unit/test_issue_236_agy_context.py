@@ -131,16 +131,14 @@ def test_cap_is_never_tripped_by_an_absent_conversation(agy_home):
     assert info["bytes"] == 0
 
 
-def test_cap_read_failure_defaults_to_resuming(agy_home, monkeypatch):
-    """⛔Fail-soft: if we cannot measure, do not force a reset. Wrongly
-    resetting throws away a healthy conversation; wrongly resuming is the
-    status quo the cap merely bounds."""
+def test_cap_read_failure_blocks_resuming(agy_home, monkeypatch):
+    """Unknown session size cannot authorize a resume."""
     def boom(*a, **k):
         raise OSError("disk gone")
     monkeypatch.setattr("agent_crew.server.agy_conversation_size", boom)
 
-    over, _ = agy_context_exceeds_cap("/wt/gemini", max_mb=64, home=agy_home)
-    assert over is False
+    with pytest.raises(OSError, match="disk gone"):
+        agy_context_exceeds_cap("/wt/gemini", max_mb=64, home=agy_home)
 
 
 def test_cap_disabled_by_zero(agy_home):

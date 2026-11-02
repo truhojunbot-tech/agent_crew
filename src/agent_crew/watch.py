@@ -465,30 +465,22 @@ class GhCli:
             return False
 
     def issue_has_open_pr(self, repo: str, number: int) -> bool:
-        """Best-effort check for an open PR that declares it closes this issue.
-
-        ⛔Fails *open* (returns False, "no PR known") rather than stalling
-        intake on a `gh` hiccup. Duplicate work is already prevented by the
-        ledger, so the cheaper failure mode here is to keep the loop alive.
-        """
-        try:
-            owner, name = repo.split("/", 1)
-            query = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name)"
-                     "{pullRequests(first:100,states:OPEN){nodes{closingIssuesReferences"
-                     "(first:100){nodes{number}}}}}}")
-            result = subprocess.run(
-                ["gh", "api", "graphql", "-f", f"query={query}",
-                 "-F", f"owner={owner}", "-F", f"name={name}"],
-                capture_output=True, text=True, timeout=self._timeout,
-            )
-            if result.returncode != 0:
-                return False
-            payload = json.loads(result.stdout or "{}")
-            if payload.get("errors"):
-                return False
-            prs = payload["data"]["repository"]["pullRequests"]["nodes"]
-        except Exception:  # noqa: BLE001
-            return False
+        """Check declared closing links; a failed lookup is unknown."""
+        owner, name = repo.split("/", 1)
+        query = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name)"
+                 "{pullRequests(first:100,states:OPEN){nodes{closingIssuesReferences"
+                 "(first:100){nodes{number}}}}}}")
+        result = subprocess.run(
+            ["gh", "api", "graphql", "-f", f"query={query}",
+             "-F", f"owner={owner}", "-F", f"name={name}"],
+            capture_output=True, text=True, timeout=self._timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("open PR lookup failed")
+        payload = json.loads(result.stdout or "{}")
+        if payload.get("errors"):
+            raise RuntimeError("open PR lookup returned errors")
+        prs = payload["data"]["repository"]["pullRequests"]["nodes"]
         for pr in prs:
             if any(ref.get("number") == number for ref in
                    ((pr.get("closingIssuesReferences") or {}).get("nodes") or [])
@@ -893,7 +885,10 @@ def run_cycle(
                 out["skipped"].append(number)
                 continue
         except Exception as exc:  # noqa: BLE001
-            logger.info("watch: PR check failed for %s#%s: %s", repo, number, exc)
+            logger.warning("watch: PR check unknown for %s#%s: %s", repo, number, exc)
+            out["skipped"].append(number)
+            out["error"] = "pr_lookup_unknown"
+            continue
 
         if not ledger.try_claim(repo, number, owner=owner, max_attempts=max_attempts):
             out["skipped"].append(number)
