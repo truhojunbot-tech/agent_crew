@@ -678,7 +678,8 @@ def test_enabled_dispatcher_puts_the_ac_into_the_real_dispatched_prompt(
     spawned = {}
 
     async def _fake_exec(*cmd, **kwargs):
-        spawned["cmd"] = cmd
+        from tests.dispatch_stdin import CapturedStdin
+        stdin = spawned["stdin"] = CapturedStdin()
 
         class _P:
             returncode = 0
@@ -690,7 +691,9 @@ def test_enabled_dispatcher_puts_the_ac_into_the_real_dispatched_prompt(
             async def wait(self):
                 return 0
 
-        return _P()
+        proc = _P()
+        proc.stdin = stdin
+        return proc
 
     monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK", "1")
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
@@ -719,7 +722,7 @@ def test_enabled_dispatcher_puts_the_ac_into_the_real_dispatched_prompt(
         assert task is not None
         asyncio.run(app.state.dispatch_task(task, "implementer"))
 
-    blob = " ".join(str(c) for c in spawned.get("cmd", ()))
+    blob = spawned["stdin"].text()
     assert "CONTEXT PACK" in blob, "the pack never reached the dispatched prompt"
 
     # ⛔Assert against the PACK BLOCK, not the whole command. `_format_task_message`
@@ -943,7 +946,8 @@ def test_enabled_dispatcher_ships_the_ac_of_a_capped_issue(tmp_path, monkeypatch
     spawned = {}
 
     async def _fake_exec(*cmd, **kwargs):
-        spawned["cmd"] = cmd
+        from tests.dispatch_stdin import CapturedStdin
+        stdin = spawned["stdin"] = CapturedStdin()
 
         class _P:
             returncode = 0
@@ -955,7 +959,9 @@ def test_enabled_dispatcher_ships_the_ac_of_a_capped_issue(tmp_path, monkeypatch
             async def wait(self):
                 return 0
 
-        return _P()
+        proc = _P()
+        proc.stdin = stdin
+        return proc
 
     monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK", "1")
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
@@ -984,7 +990,7 @@ def test_enabled_dispatcher_ships_the_ac_of_a_capped_issue(tmp_path, monkeypatch
         assert task is not None
         asyncio.run(app.state.dispatch_task(task, "implementer"))
 
-    blob = " ".join(str(c) for c in spawned.get("cmd", ()))
+    blob = spawned["stdin"].text()
     start = blob.index("=== CONTEXT PACK")
     end = blob.index("=== END CONTEXT PACK")
     pack_block = blob[start:end]

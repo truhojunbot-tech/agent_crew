@@ -78,8 +78,12 @@ def test_dispatch_renewal(tmp_path, monkeypatch, unused_tcp_port,
                                  "codex_session_mode": mode}))
     db = str(tmp_path / "tasks.db")
     commands = []
+    inputs = []
 
     async def fake_exec(*cmd, **kwargs):
+        from tests.dispatch_stdin import CapturedStdin
+        stdin = CapturedStdin()
+        inputs.append(stdin)
         commands.append(list(cmd))
         if len(commands) == 2 and not expected_resume:
             session[0] = "new"
@@ -88,7 +92,9 @@ def test_dispatch_renewal(tmp_path, monkeypatch, unused_tcp_port,
             pid = 1
             async def communicate(self): return (b"", b"")
             async def wait(self): return 0
-        return Process()
+        proc = Process()
+        proc.stdin = stdin
+        return proc
 
     # This test claims and dispatches both tasks itself. A background
     # dispatcher races those manual claims under full-suite load.
@@ -126,10 +132,10 @@ def test_dispatch_renewal(tmp_path, monkeypatch, unused_tcp_port,
         cmd = commands[-1]
         assert ("resume" in cmd) == expected_resume
         if not expected_resume:
-            assert ("Previous decisions summary" in cmd[-1]) == bool(summary)
-            assert "ADR-001 7.7 renewal checkpoint" in cmd[-1]
-            assert "feat/test" in cmd[-1]
-            checkpoint = json.loads(cmd[-1].split("\n", 1)[1].split("\n", 1)[0])
+            assert ("Previous decisions summary" in inputs[-1].text()) == bool(summary)
+            assert "ADR-001 7.7 renewal checkpoint" in inputs[-1].text()
+            assert "feat/test" in inputs[-1].text()
+            checkpoint = json.loads(inputs[-1].text().split("\n", 1)[1].split("\n", 1)[0])
             assert checkpoint["owner_authority_facts"] == (
                 [{"source_ref": "session.jsonl", "text": owner_text}]
                 if owner_text else [])
@@ -142,4 +148,4 @@ def test_dispatch_renewal(tmp_path, monkeypatch, unused_tcp_port,
             assert any(event["event_type"] == "context_renewed" and
                        event["previous_session_id"] == "old" for event in events)
         else:
-            assert "Previous decisions summary" not in cmd[-1]
+            assert "Previous decisions summary" not in inputs[-1].text()

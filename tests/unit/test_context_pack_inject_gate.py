@@ -124,6 +124,7 @@ def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=Fals
                                  "role_agents": {"implementer": "claude", "reviewer": "claude",
                                                  "tester": "script"}}))
     commands = []
+    inputs = []
     patches = []
     original_patch = TaskQueue.patch_context
 
@@ -132,6 +133,9 @@ def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=Fals
         return original_patch(self, task_id, patch)
 
     async def fake_exec(*cmd, **kwargs):
+        from tests.dispatch_stdin import CapturedStdin
+        stdin = CapturedStdin()
+        inputs.append(stdin)
         commands.append(cmd)
 
         class Process:
@@ -144,7 +148,9 @@ def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=Fals
             async def wait(self):
                 return 0
 
-        return Process()
+        proc = Process()
+        proc.stdin = stdin
+        return proc
 
     monkeypatch.setattr(TaskQueue, "patch_context", spy_patch)
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", fake_exec)
@@ -173,7 +179,7 @@ def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=Fals
         asyncio.run(app.state.dispatch_task(task, "implementer"))
         row_context = q.get_task_context("gate-t")
     all_events = [json.loads(line) for line in (tmp_path / "context_events.jsonl").read_text().splitlines()]
-    result = {"message": commands[0][commands[0].index("-p") + 1],
+    result = {"message": inputs[0].text(),
               "events": [e for e in all_events if e["event_type"] == "inject_gate"],
               "built": [e for e in all_events if e["event_type"] == "context_pack_built"],
               "memory": [e for e in all_events if e["event_type"] == "memory_served_live"],

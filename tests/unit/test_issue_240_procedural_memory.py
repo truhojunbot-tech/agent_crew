@@ -753,7 +753,8 @@ def test_enabled_dispatcher_puts_a_persisted_procedure_into_the_prompt(
     spawned = {}
 
     async def _fake_exec(*cmd, **kwargs):
-        spawned["cmd"] = cmd
+        from tests.dispatch_stdin import CapturedStdin
+        stdin = spawned["stdin"] = CapturedStdin()
 
         class _P:
             returncode = 0
@@ -765,7 +766,9 @@ def test_enabled_dispatcher_puts_a_persisted_procedure_into_the_prompt(
             async def wait(self):
                 return 0
 
-        return _P()
+        proc = _P()
+        proc.stdin = stdin
+        return proc
 
     monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK", "1")
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
@@ -787,7 +790,7 @@ def test_enabled_dispatcher_puts_a_persisted_procedure_into_the_prompt(
         assert task is not None
         asyncio.run(app.state.dispatch_task(task, "implementer"))
 
-    blob = " ".join(str(c) for c in spawned.get("cmd", ()))
+    blob = spawned["stdin"].text()
     start, end = blob.index("=== CONTEXT PACK"), blob.index("=== END CONTEXT PACK")
     pack_block = blob[start:end]
 
@@ -1059,7 +1062,9 @@ def test_enabled_dispatcher_respects_module_scope(tmp_path, monkeypatch, *, unus
     spawned = {}
 
     async def _fake_exec(*cmd, **kwargs):
-        spawned.setdefault("cmds", []).append(cmd)
+        from tests.dispatch_stdin import CapturedStdin
+        stdin = CapturedStdin()
+        spawned.setdefault("inputs", []).append(stdin)
 
         class _P:
             returncode = 0
@@ -1071,7 +1076,9 @@ def test_enabled_dispatcher_respects_module_scope(tmp_path, monkeypatch, *, unus
             async def wait(self):
                 return 0
 
-        return _P()
+        proc = _P()
+        proc.stdin = stdin
+        return proc
 
     monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK", "1")
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
@@ -1095,10 +1102,10 @@ def test_enabled_dispatcher_respects_module_scope(tmp_path, monkeypatch, *, unus
             asyncio.run(app.state.dispatch_task(task, "implementer"))
 
     def _pack_block(cmd):
-        blob = " ".join(str(c) for c in cmd)
+        blob = cmd.text()
         return blob[blob.index("=== CONTEXT PACK"):blob.index("=== END CONTEXT PACK")]
 
-    out_block, in_block = (_pack_block(c) for c in spawned["cmds"])
+    out_block, in_block = (_pack_block(c) for c in spawned["inputs"])
 
     assert "check the data layer first" not in out_block, \
         "a watcher-scoped procedure was dispatched to a server task"

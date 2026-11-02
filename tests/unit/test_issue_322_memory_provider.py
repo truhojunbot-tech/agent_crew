@@ -93,7 +93,8 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled
     spawned = {}
 
     async def fake_exec(*cmd, **kwargs):
-        spawned["cmd"] = cmd
+        from tests.dispatch_stdin import CapturedStdin
+        stdin = spawned["stdin"] = CapturedStdin()
 
         class Process:
             returncode = 0
@@ -105,7 +106,9 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled
             async def wait(self):
                 return 0
 
-        return Process()
+        proc = Process()
+        proc.stdin = stdin
+        return proc
 
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
@@ -151,7 +154,7 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled
 
     events = [json.loads(line) for line in open(os.path.join(tmp_path, "context_events.jsonl"))]
     shadow = [event for event in events if event["event_type"] == "shadow_memory_retrieval"]
-    return spawned["cmd"], TaskQueue(db).get_task_context("shadow-322"), shadow, dispatch_seconds
+    return spawned["stdin"].text(), TaskQueue(db).get_task_context("shadow-322"), shadow, dispatch_seconds
 
 
 class _MustNotBeCalledProvider:
@@ -306,7 +309,7 @@ def test_existing_shadow_db_wires_runtime_provider_without_live_read_flag(
     ))
     monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", storage.path)
     monkeypatch.delenv("AGENT_CREW_ADR001_MEMORY_ENABLED", raising=False)
-    cmd, _, events, _ = _dispatch_snapshot(
+    prompt, _, events, _ = _dispatch_snapshot(
         tmp_path / "wired", monkeypatch, None, unused_tcp_port=unused_tcp_port)
 
     assert len(events) == 1
@@ -315,7 +318,7 @@ def test_existing_shadow_db_wires_runtime_provider_without_live_read_flag(
     assert events[0]["state"] == "results"
     assert events[0]["result_ids"] == ["episode-1"]
     assert events[0]["dropped_cross_project"] == 1
-    assert "prior result" not in " ".join(map(str, cmd)).lower()
+    assert "prior result" not in prompt.lower()
 
 
 def test_missing_shadow_db_uses_null_provider_and_does_not_create_file(
@@ -347,15 +350,15 @@ def test_runtime_shadow_flag_off_makes_no_retrieval_and_keeps_message_identical(
         return original_retrieve(self, request)
 
     monkeypatch.setattr(RuntimeMemoryProvider, "retrieve", observed_retrieve)
-    off_cmd, off_context, off_events, _ = _dispatch_snapshot(
+    off_prompt, off_context, off_events, _ = _dispatch_snapshot(
         tmp_path / "off", monkeypatch, None, shadow_memory_enabled=False,
         unused_tcp_port=unused_tcp_port)
     assert calls == []
-    on_cmd, on_context, on_events, _ = _dispatch_snapshot(
+    on_prompt, on_context, on_events, _ = _dispatch_snapshot(
         tmp_path / "on", monkeypatch, None, shadow_memory_enabled=True,
         unused_tcp_port=unused_tcp_port)
 
-    assert off_cmd == on_cmd
+    assert off_prompt == on_prompt
     assert calls == ["shadow-322"]
     assert off_events == []
     assert "shadow_memory" not in off_context
@@ -425,8 +428,8 @@ def test_live_memory_flag_serves_rows_into_dispatch(tmp_path, monkeypatch, *, un
         shadow_memory_enabled=False, unused_tcp_port=unused_tcp_port)
 
     assert returned != baseline
-    assert "owner:project-a:decision" in " ".join(map(str, returned))
-    assert "wc1:dispatch" in " ".join(map(str, returned))
+    assert "owner:project-a:decision" in returned
+    assert "wc1:dispatch" in returned
     assert "memory_served" not in baseline_context
     assert returned_context["memory_served"]["authoritative"] > 0
     assert returned_context["memory_served"]["failure_pattern"] > 0

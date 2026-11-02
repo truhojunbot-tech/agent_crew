@@ -1788,7 +1788,7 @@ def _dispatch_idle_timeout() -> float:
 
 async def _wait_for_dispatch_activity(
     proc, log_path: str, initial_offset: int, *, hard_timeout_s: float,
-    idle_timeout_s: float, on_progress,
+    idle_timeout_s: float, on_progress, input_data: Optional[bytes] = None,
 ) -> tuple[Optional[str], float]:
     """Wait for a child while observing growth in its dedicated dispatch log.
 
@@ -1798,6 +1798,29 @@ async def _wait_for_dispatch_activity(
     """
     started = last_output = time.monotonic()
     offset = initial_offset
+
+    async def feed_stdin():
+        try:
+            proc.stdin.write(input_data)
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # A CLI may exit before consuming input; its exit/log handling below
+            # remains authoritative, just as with asyncio.Process.communicate.
+            pass
+        except asyncio.CancelledError:
+            # Discard buffered input on timeout; closing alone would wait for
+            # a child that is not reading before the caller can kill it.
+            proc.stdin.transport.abort()
+            raise
+        finally:
+            proc.stdin.close()
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                await proc.stdin.wait_closed()
+
+    # Feed concurrently so backpressure cannot bypass the existing kill limits.
+    input_task = (asyncio.create_task(feed_stdin())
+                  if input_data is not None and getattr(proc, "stdin", None) is not None
+                  else None)
     wait_task = asyncio.create_task(proc.wait())
     try:
         while True:
@@ -1821,6 +1844,11 @@ async def _wait_for_dispatch_activity(
                         idle_timeout_s - (now - last_output))
             await asyncio.wait({wait_task}, timeout=max(delay, 0.001))
     finally:
+        if input_task is not None:
+            if not input_task.done():
+                input_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await input_task
         if not wait_task.done():
             wait_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -5565,7 +5593,7 @@ def create_app(
             # (generation 1, an operator reset, or a cap trip) still resumed
             # the provider's old session, so identity and provider state
             # disagreed and the session could never rotate.
-            cmd = ["claude", "-p", message]
+            cmd = ["claude", "-p"]
             if _ctx_info["context_policy"] == "resume":
                 cmd.append("--continue")
             cmd += ["--dangerously-skip-permissions",
@@ -5613,10 +5641,10 @@ def create_app(
             #   cross-project content leak.
             if _codex_session:
                 cmd = ["codex", "exec", "resume", _codex_session,
-                       "--dangerously-bypass-approvals-and-sandbox", "--json", message]
+                       "--dangerously-bypass-approvals-and-sandbox", "--json", "-"]
             else:
                 cmd = ["codex", "exec",
-                       "--dangerously-bypass-approvals-and-sandbox", "--json", message]
+                       "--dangerously-bypass-approvals-and-sandbox", "--json", "-"]
 
         logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt} timeout={timeout_secs}s")
         # Only pop the retry counter on a terminal outcome. Flipped to False
@@ -5661,7 +5689,8 @@ def create_app(
                 #   child keeps its own dup, so closing ours on exit is safe.
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
+                        *cmd, stdin=asyncio.subprocess.PIPE if agent not in ("gemini", "agy") else None,
+                        stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
                         start_new_session=True,
                     )
                 except OSError as exc:
@@ -5684,6 +5713,7 @@ def create_app(
             _timeout_reason, _last_output_age = await _wait_for_dispatch_activity(
                 proc, log_path, _task_log_start_offset,
                 hard_timeout_s=timeout_secs, idle_timeout_s=_idle_timeout_secs,
+                input_data=message.encode() if agent not in ("gemini", "agy") else None,
                 on_progress=lambda: q().record_heartbeat(
                     task.task_id, source="output_progress"),
             )
