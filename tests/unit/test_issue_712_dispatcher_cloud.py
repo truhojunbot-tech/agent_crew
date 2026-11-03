@@ -424,7 +424,9 @@ def test_pending_review_reuses_recent_cli_probe(tmp_path, monkeypatch):
     assert len(probes) == 1
 
 
-@pytest.mark.parametrize("reason", ["daily_cap", "at_capacity", "cli_unsupported:probe failed"])
+# #989: daily_cap / usd_cap / at_capacity HOLD the review (see
+# test_issue_989_cloud_usd_cap). Only an unsupported CLI keeps the local path.
+@pytest.mark.parametrize("reason", ["cli_unsupported:probe failed"])
 def test_headless_cloud_skip_dispatches_local_reviewer(tmp_path, monkeypatch, reason):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     _enqueue_review(queue)
@@ -472,7 +474,7 @@ def test_cloud_capacity_without_reviewer_worktree_keeps_review_pending(tmp_path,
         assert queue.get_result("review-cloud") is None
 
 
-@pytest.mark.parametrize("reason", ["daily_cap", "cli_unsupported:probe failed"])
+@pytest.mark.parametrize("reason", ["cli_unsupported:probe failed"])
 def test_nontransient_cloud_skip_without_reviewer_worktree_fails_visibly(
         tmp_path, monkeypatch, reason):
     queue = TaskQueue(str(tmp_path / "tasks.db"))

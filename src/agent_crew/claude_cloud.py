@@ -84,6 +84,10 @@ _ENV_SHADOW = "AGENT_CREW_CLOUD_SHADOW"
 _ENV_CLI_PATH = "AGENT_CREW_CLOUD_CLI_PATH"
 _ENV_CREDIT_FILE = "AGENT_CREW_CLOUD_CREDIT_FILE"
 _ENV_MAX_USD_PER_DAY = "AGENT_CREW_CLOUD_MAX_USD_PER_DAY"
+_ENV_UNKNOWN_SESSION_USD = "AGENT_CREW_CLOUD_UNKNOWN_SESSION_USD"
+#: #989: conservative per-session charge for a cloud session whose cost is
+#: UNKNOWN (observed per-session cost from Alfred's reads).
+DEFAULT_UNKNOWN_SESSION_USD = 2.0
 _ENV_COST_SETTLE_SECONDS = "AGENT_CREW_CLOUD_COST_SETTLE_SECONDS"
 _ENV_SUBMIT_TIMEOUT_SECONDS = "AGENT_CREW_CLOUD_SUBMIT_TIMEOUT_SECONDS"
 _CREDIT_MAX_AGE_SECONDS = 600
@@ -207,6 +211,63 @@ def cloud_max_usd_per_day() -> Optional[float]:
         logger.warning("claude_cloud: invalid %s=%r, ignoring USD cap", _ENV_MAX_USD_PER_DAY, raw)
         return None
     return value
+
+
+def cloud_unknown_session_usd() -> float:
+    """#989: estimate charged for each UNKNOWN-cost session. A malformed or
+    negative value keeps the default: the cap must fail closed, never open."""
+    raw = (os.getenv(_ENV_UNKNOWN_SESSION_USD) or "").strip()
+    if not raw:
+        return DEFAULT_UNKNOWN_SESSION_USD
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1
+    if not math.isfinite(value) or value < 0:
+        logger.warning("claude_cloud: invalid %s=%r, using default %.2f",
+                       _ENV_UNKNOWN_SESSION_USD, raw, DEFAULT_UNKNOWN_SESSION_USD)
+        return DEFAULT_UNKNOWN_SESSION_USD
+    return value
+
+
+def cloud_usd_spent_today(queue: TaskQueue, day_start: float) -> tuple[float, float]:
+    """#989: ``(measured, estimated)`` USD for all cloud sessions of the UTC day."""
+    measured, unknown = queue.cloud_usd_spend_since(day_start)
+    return measured, unknown * cloud_unknown_session_usd()
+
+
+def _usd_cap_tripped(queue: TaskQueue, day_start: float, *, role: str) -> Optional[dict]:
+    """Return the cap receipt when the daily USD cap is reached, else None."""
+    usd_cap = cloud_max_usd_per_day()
+    if usd_cap is None:
+        return None
+    measured, estimated = cloud_usd_spent_today(queue, day_start)
+    spent = measured + estimated
+    if spent < usd_cap:
+        return None
+    logger.warning("claude_cloud: daily USD cap reached role=%s spent_measured=%.2f "
+                   "spent_estimated=%.2f limit=%.2f", role, measured, estimated, usd_cap)
+    return {"spent": spent, "spent_measured": measured,
+            "spent_estimated": estimated, "limit": usd_cap}
+
+
+_REVIEW_HOLD_REASONS = {"daily_cap": "cloud_daily_cap", "usd_cap": "cloud_usd_cap",
+                        "at_capacity": "cloud_at_capacity"}
+
+
+def _hold_cloud_reviews(queue: TaskQueue, skipped_reason: str, detail: str) -> None:
+    """#989: a capped or busy cloud review stays pending for cloud. Record a
+    typed reason and send one notice per task; never hand it to local Claude."""
+    reason = _REVIEW_HOLD_REASONS[skipped_reason]
+    for task in _claimable_cloud_reviews(queue):
+        context = task.context if isinstance(task.context, dict) else {}
+        if (context.get("cloud_review_hold") or {}).get("reason") == reason:
+            continue
+        queue.patch_context(task.task_id, {"cloud_review_hold": {
+            "reason": reason, "detail": detail, "at": time.time()}})
+        from agent_crew.server import coordinator_notice_once
+        coordinator_notice_once(queue, task.task_id, f"{reason}_review_hold",
+                                f"{detail}; review held pending for claude_cloud")
 
 
 def _cloud_cost_overlaps(queue: TaskQueue, task_id: str, started: float,
@@ -853,7 +914,10 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
         error_info.update({"reason": "cloud_launch_interactive_prompt",
                            "retryable": False, "prompt_text": prompt_text[:300]})
     queue.force_fail(task.task_id, reason, error_info=error_info)
-    if queue.get_attribution(task.task_id) is None:
+    # #989: no attribution row yet means no launch was attempted, so this row
+    # must not be charged the UNKNOWN-session estimate.
+    launched = queue.get_attribution(task.task_id) is not None
+    if not launched:
         queue.record_attribution(task_id=task.task_id, project=task.project or "",
                                  agent=CLOUD_PROVIDER_NAME,
                                  role="reviewer" if task_type == "review" else "implementer",
@@ -865,7 +929,8 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
         queue.update_attribution_status(task.task_id, "failed")
     queue.update_attribution_outcome(task.task_id, "failed")
     queue.record_cloud_cost(task.task_id, context.get("cloud_credit_used_before"),
-                            None, None, status="UNKNOWN_NO_FRESH_READING", overlaps=[])
+                            None, None, status=("UNKNOWN_NO_FRESH_READING" if launched
+                                                else "NOT_LAUNCHED"), overlaps=[])
     result = TaskResult(task_id=task.task_id, status="failed", summary=reason[:2000])
     fallback_created = False
     try:
@@ -1040,7 +1105,8 @@ def _local_implementer(task: TaskRequest, state_path: Optional[str]) -> str:
 
 def _route_capped_implement(queue: TaskQueue, *, state_path: Optional[str],
                             metric: str, count: float, limit: float,
-                            role_to_agent: Optional[dict[str, str]] = None) -> None:
+                            role_to_agent: Optional[dict[str, str]] = None,
+                            receipt: Optional[dict] = None) -> None:
     """Claim once through admission, then route the same row off cloud."""
     task = queue.dequeue(agent=CLOUD_PROVIDER_NAME, role="implementer",
                          claimed_via="cloud_push", skip_deferred=True,
@@ -1049,6 +1115,9 @@ def _route_capped_implement(queue: TaskQueue, *, state_path: Optional[str],
         return
     reason = {"reason": "cloud_daily_cap", "metric": metric,
               "count": count, "limit": limit}
+    if receipt:
+        reason.update(spent_measured=receipt["spent_measured"],
+                      spent_estimated=receipt["spent_estimated"])
     queue.annotate_error_info(task.task_id, reason)
     local = _local_implementer(task, state_path)
     if local:
@@ -1132,17 +1201,29 @@ def dispatch_cloud_for_role(
     if in_flight >= cloud_max_concurrency():
         logger.debug("claude_cloud: at capacity (%d/%d) — skipping role=%s",
                      in_flight, cloud_max_concurrency(), role)
+        if task_type == "review":
+            _hold_cloud_reviews(queue, "at_capacity",
+                                f"cloud at capacity {in_flight}/{cloud_max_concurrency()}")
         return CloudDispatchOutcome(False, skipped_reason="at_capacity")
 
+    day_start = int(time.time() // 86400) * 86400
     if task_type == "review":
         daily_cap = cloud_max_per_day()
         if daily_cap is not None:
-            day_start = int(time.time() // 86400) * 86400
-            if queue.count_cloud_reviews_started_since(day_start) >= daily_cap:
-                logger.info("claude_cloud: daily review cap %d reached; local fallback", daily_cap)
+            count = queue.count_cloud_reviews_started_since(day_start)
+            if count >= daily_cap:
+                logger.info("claude_cloud: daily review cap %d reached; review held", daily_cap)
+                _hold_cloud_reviews(queue, "daily_cap",
+                                    f"cloud cap launches={count} limit={daily_cap}")
                 return CloudDispatchOutcome(False, skipped_reason="daily_cap")
+        receipt = _usd_cap_tripped(queue, day_start, role=role)
+        if receipt:
+            _hold_cloud_reviews(queue, "usd_cap",
+                                f"cloud cap usd spent_measured={receipt['spent_measured']:.2f} "
+                                f"spent_estimated={receipt['spent_estimated']:.2f} "
+                                f"limit={receipt['limit']:.2f}")
+            return CloudDispatchOutcome(False, skipped_reason="usd_cap")
     elif role == "implementer":
-        day_start = int(time.time() // 86400) * 86400
         daily_cap = cloud_max_per_day()
         if daily_cap is not None:
             count = queue.count_cloud_implements_started_since(day_start)
@@ -1153,11 +1234,12 @@ def dispatch_cloud_for_role(
                 return CloudDispatchOutcome(False, skipped_reason="daily_cap")
         usd_cap = cloud_max_usd_per_day()
         if usd_cap is not None:
-            spent = queue.cloud_implement_usd_since(day_start)
-            if spent >= usd_cap:
+            receipt = _usd_cap_tripped(queue, day_start, role=role)
+            if receipt:
                 _route_capped_implement(queue, state_path=state_path, role_to_agent=role_to_agent,
                                         metric="usd",
-                                        count=spent, limit=usd_cap)
+                                        count=receipt["spent"], limit=usd_cap,
+                                        receipt=receipt)
                 return CloudDispatchOutcome(False, skipped_reason="usd_cap")
             # An active session has no final credit delta. Reserve the remaining
             # daily budget until reconciliation records its observed cost.
@@ -1186,6 +1268,8 @@ def dispatch_cloud_for_role(
                          skip_task_ids=cloud_review_skip_ids(queue) if task_type == "review" else None)
     if task is None:
         return CloudDispatchOutcome(False, skipped_reason="no_task")
+    if task_type == "review" and (task.context or {}).get("cloud_review_hold"):
+        queue.patch_context(task.task_id, {"cloud_review_hold": None})
     if task_type == "review" and review_guard_fn is not None:
         if review_guard_fn(task, CLOUD_PROVIDER_NAME):
             return CloudDispatchOutcome(False, task_id=task.task_id,
@@ -1431,6 +1515,9 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
         day_start = int(time.time() // 86400) * 86400
         if queue.count_cloud_reviews_started_since(day_start) >= daily_cap:
             return _log_shadow_skip(task, "daily_cap")
+    # #989: a shadow session spends the same daily cloud budget.
+    if _usd_cap_tripped(queue, int(time.time() // 86400) * 86400, role="reviewer"):
+        return _log_shadow_skip(task, "usd_cap")
     context = task.context if isinstance(task.context, dict) else {}
     if not isinstance(context.get("pr_number") or task.pr_number, int) or not re.fullmatch(
             r"[0-9a-fA-F]{40}", str(context.get("reviewed_sha") or "")):

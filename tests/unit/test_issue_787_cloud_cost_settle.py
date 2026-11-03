@@ -220,7 +220,9 @@ def test_preflight_failure_writes_one_unknown_attribution_row(tmp_path, monkeypa
     attr = queue.get_attribution("preflight")
     assert (attr["agent"], attr["role"], attr["outcome"]) == (
         "claude_cloud", "implementer", "failed")
-    assert attr["cloud_cost_status"] == "UNKNOWN_NO_FRESH_READING"
+    # #989: nothing launched, so the USD cap must not charge this row the
+    # UNKNOWN-session estimate.
+    assert attr["cloud_cost_status"] == "NOT_LAUNCHED"
     assert attr["uncached_input_tokens"] is None
     assert attr["output_tokens"] is None
 

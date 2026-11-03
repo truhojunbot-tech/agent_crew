@@ -8005,16 +8005,25 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def cloud_implement_usd_since(self, since: float) -> float:
-        """Observed cloud implement spend in a UTC day; unknown costs stay NULL."""
+    def cloud_usd_spend_since(self, since: float) -> tuple[float, int]:
+        """#989: one cloud budget for every role (implement, review, shadow).
+
+        Returns ``(measured_usd, unknown_sessions)``. A session whose cost is
+        still NULL (in flight, overlapping, or no fresh reading) is counted,
+        not summed as 0; the caller charges it at an estimate. A measured
+        ``cloud_usd`` replaces that estimate for its row. Rows for tasks that
+        failed closed before any launch carry ``NOT_LAUNCHED`` and cost nothing.
+        """
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT COALESCE(SUM(cloud_usd), 0) AS usd FROM task_attribution "
-                "WHERE agent='claude_cloud' AND role='implementer' AND started_at>=?",
+                "SELECT COALESCE(SUM(cloud_usd), 0) AS usd, "
+                "COALESCE(SUM(CASE WHEN cloud_usd IS NULL THEN 1 ELSE 0 END), 0) AS unknown "
+                "FROM task_attribution WHERE agent='claude_cloud' AND started_at>=? "
+                "AND COALESCE(cloud_cost_status, '')<>'NOT_LAUNCHED'",
                 (since,),
             ).fetchone()
-            return float(row["usd"])
+            return float(row["usd"]), int(row["unknown"])
         finally:
             conn.close()
 
