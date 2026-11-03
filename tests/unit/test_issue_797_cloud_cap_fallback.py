@@ -40,7 +40,7 @@ def test_cap_reroutes_one_task_with_durable_reason(tmp_path, monkeypatch, cap_ki
         monkeypatch.setattr(queue, "count_cloud_implements_started_since", lambda _: 1)
     else:
         monkeypatch.setenv("AGENT_CREW_CLOUD_MAX_USD_PER_DAY", "1")
-        monkeypatch.setattr(queue, "cloud_implement_usd_since", lambda _: 1.2)
+        monkeypatch.setattr(queue, "cloud_usd_spend_since", lambda _: (1.2, 0))
     state = _state(tmp_path)
     run = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("cloud launched"))
     first = cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",

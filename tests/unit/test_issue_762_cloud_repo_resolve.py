@@ -233,7 +233,7 @@ def test_cloud_cost_recorded_on_result_cancel_and_fail(tmp_path, monkeypatch):
     assert [queue.get_attribution(task_id)["cloud_usd"] for task_id in
             ("posted", "cancelled", "failed")] == [None] * 3
     day_start = int(time.time() // 86400) * 86400
-    assert queue.cloud_implement_usd_since(day_start) == 0.0
+    assert queue.cloud_usd_spend_since(day_start) == (0.0, 3)
     monkeypatch.setenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "0")
     cloud.reconcile_all_cloud_tasks(queue)
     assert [queue.get_attribution(task_id)["cloud_cost_status"] for task_id in

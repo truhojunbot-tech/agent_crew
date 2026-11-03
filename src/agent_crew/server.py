@@ -6198,7 +6198,6 @@ def create_app(
                         _primary_busy = worker in active_workers
                         _worker_roles = _AGENT_TO_ROLES.get(worker, [])
                         _cloud_local_fallback = False
-                        _cloud_capacity_skip = False
                         if (worker == _claude_cloud.CLOUD_PROVIDER_NAME and
                                 not _claude_cloud.cloud_dispatch_enabled()):
                             # #919: no role of a disabled cloud worker may fall
@@ -6242,14 +6241,12 @@ def create_app(
                                     state_path=state_path, review_guard_fn=_refuse_self_review,
                                     role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
                                 _skip = _cloud_outcome.skipped_reason or ""
-                                if _skip not in ("daily_cap", "at_capacity") and not _skip.startswith("cli_unsupported:"):
+                                # #989: a capped or busy cloud review is HELD
+                                # pending (the adapter records a typed reason and
+                                # one notice). It never falls back to local Claude.
+                                if not _skip.startswith("cli_unsupported:"):
                                     continue
                                 _cloud_local_fallback = True
-                                _cloud_capacity_skip = _skip == "at_capacity"
-                        if _cloud_capacity_skip and not worktree_map.get("reviewer"):
-                            # A busy cloud slot is transient. Keep its review
-                            # pending until that slot opens if no local checkout exists.
-                            continue
                         _default_role = _worker_roles[0] if _worker_roles else ""
                         task = None
                         for _candidate_role in _worker_roles:
