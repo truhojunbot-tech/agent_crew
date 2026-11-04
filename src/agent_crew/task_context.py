@@ -121,6 +121,8 @@ TASK_CONTEXT_KEYS = frozenset({
     'human_gate_required',
     'idempotency_key',
     'implementer_agent',
+    'independent_review_binding',
+    'independent_review_block',
     'incident',
     'instructions',
     'irreversible',

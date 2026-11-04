@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import datetime, timezone
-from typing import Callable, List, Mapping, Optional
+from typing import Callable, List, Mapping, Optional, Sequence
 
 from agent_crew.anomaly import _extract_repo_from_url, auto_detect_expected_repos
 from agent_crew.cea import adapters as _cea_adapters
@@ -545,6 +545,10 @@ def intent_for_task(task: TaskRequest, *, context: Optional[dict] = None,
 
 
 logger = logging.getLogger(__name__)
+
+#: #986: typed terminal reason for a review no independent provider can take.
+INDEPENDENT_REVIEW_UNAVAILABLE = "INDEPENDENT_REVIEW_UNAVAILABLE"
+INDEPENDENT_REVIEW_OWNER = "agent_crew dispatcher (crew operator)"
 
 #: #581 waste reason for a provider capacity refusal (codex "Selected model is
 #: at capacity"). Infra waste, not a task outcome.
@@ -5377,6 +5381,174 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def bind_independent_reviews(
+        self, reviewer_holder: Optional[str], dispatchable: Sequence[str], *,
+        owner: str = INDEPENDENT_REVIEW_OWNER,
+    ) -> dict[str, list[str]]:
+        """Give each pending review an independent, dispatchable reviewer (#986).
+
+        A review needs one when its ``context.implementer_agent`` is the same
+        provider family as its effective reviewer (``agent_override``, else the
+        role-map ``reviewer_holder``). ``dispatchable`` lists the providers the
+        caller can actually dispatch a review to right now, in preference order.
+
+        - An existing override that is already independent AND dispatchable is
+          kept and marked ``independent_review_binding`` (the PR #987 path).
+        - Otherwise the first independent dispatchable provider is bound.
+        - With none, the review is BLOCKED once with ``INDEPENDENT_REVIEW_UNAVAILABLE``
+          (op/task/PR, owner, resume trigger). It is never left for the
+          implementer's provider to claim and refuse into ``needs_human``.
+
+        Returns ``{"bound": [...], "blocked": [...]}`` for this sweep only.
+        """
+        out: dict[str, list[str]] = {"bound": [], "blocked": []}
+        now = time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT task_id, pr_number, context FROM tasks WHERE status = 'pending'"
+                " AND task_type = 'review'"
+                " AND json_extract(context, '$.implementer_agent') IS NOT NULL"
+                " ORDER BY priority ASC, created_at ASC").fetchall()
+            for row in rows:
+                task_id = row["task_id"]
+                context = json.loads(row["context"] or "{}")
+                implementer = context.get("implementer_agent")
+                if not isinstance(implementer, str) or not implementer.strip():
+                    continue
+                family = provider_family(implementer)
+                override = context.get("agent_override")
+                effective = override or reviewer_holder
+                holder_is_impl = bool(reviewer_holder) and provider_family(
+                    reviewer_holder) == family
+                # An independent override only needs checking when dropping it
+                # would land the review on the implementer's family, or when we
+                # bound it ourselves (a retry/reroute stays independent).
+                if not effective or (provider_family(effective) != family and not (
+                        override and (holder_is_impl
+                                      or context.get("independent_review_binding")))):
+                    continue
+                candidates = [p for p in dispatchable
+                              if p and provider_family(p) != family]
+                if override and override in candidates:
+                    target = override
+                else:
+                    target = candidates[0] if candidates else None
+                if target:
+                    binding = context.get("independent_review_binding") or {}
+                    if override == target and binding.get("provider") == target:
+                        continue
+                    context["agent_override"] = target
+                    context["independent_review_binding"] = {
+                        "provider": target, "implementer_agent": implementer,
+                        "replaced": effective if effective != target else None,
+                        "at": now,
+                    }
+                    # Same BEGIN IMMEDIATE that selected it as pending.
+                    conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
+                                 (json.dumps(context), task_id))
+                    self._append_exec_event_on(
+                        conn, task_id, "independent_review_bound", now,
+                        provider=target, implementer_agent=implementer,
+                        replaced=effective if effective != target else None)
+                    out["bound"].append(task_id)
+                    continue
+                block = {
+                    "reason": INDEPENDENT_REVIEW_UNAVAILABLE,
+                    "op": "review", "task_id": task_id,
+                    "pr_number": row["pr_number"] or context.get("pr_number"),
+                    "implementer_agent": implementer,
+                    "reviewer_agent": effective,
+                    "owner": owner,
+                    "resume_trigger": (
+                        f"make a non-{family} reviewer dispatchable on this crew "
+                        "(AGENT_CREW_CLOUD_ENABLED=1 for claude_cloud, or map reviewer "
+                        f"to a non-{family} provider), then re-enqueue this review"),
+                    "at": now,
+                }
+                summary = (f"{INDEPENDENT_REVIEW_UNAVAILABLE}: implementer {implementer}; "
+                           f"reviewer {effective} is the same family and no independent "
+                           "reviewer is dispatchable")
+                context["independent_review_block"] = block
+                conn.execute(
+                    "UPDATE tasks SET status='blocked', claim_source='', summary=?, context=?,"
+                    " error_info=? WHERE task_id=? AND status='pending'",
+                    (summary, json.dumps(context), json.dumps(block), task_id))
+                self._append_exec_event_on(conn, task_id, "independent_review_blocked", now,
+                                           implementer_agent=implementer,
+                                           reviewer_agent=effective)
+                out["blocked"].append(task_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        for task_id in out["blocked"]:
+            logger.warning("review %s blocked: %s", task_id, INDEPENDENT_REVIEW_UNAVAILABLE)
+            self.settle_unused_task_receipt(task_id, note=INDEPENDENT_REVIEW_UNAVAILABLE)
+        return out
+
+    def block_independent_reviews(self, provider: str, detail: str, *,
+                                  owner: str = INDEPENDENT_REVIEW_OWNER) -> list[str]:
+        """End pending reviews bound to ``provider`` for independence when that
+        provider cannot dispatch (#986). Same typed block as above, once."""
+        conn = self._connect()
+        try:
+            ids = [r[0] for r in conn.execute(
+                "SELECT task_id FROM tasks WHERE status='pending' AND task_type='review'"
+                " AND json_extract(context, '$.agent_override') = ?"
+                " AND json_extract(context, '$.independent_review_binding') IS NOT NULL",
+                (provider,)).fetchall()]
+        finally:
+            conn.close()
+        return [task_id for task_id in ids
+                if self._block_one_independent_review(task_id, provider, detail, owner)]
+
+    def _block_one_independent_review(self, task_id: str, provider: str, detail: str,
+                                      owner: str) -> bool:
+        now = time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status, pr_number, context FROM tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] != "pending":
+                conn.execute("ROLLBACK")
+                return False
+            context = json.loads(row["context"] or "{}")
+            implementer = context.get("implementer_agent")
+            family = provider_family(implementer)
+            block = {
+                "reason": INDEPENDENT_REVIEW_UNAVAILABLE, "op": "review", "task_id": task_id,
+                "pr_number": row["pr_number"] or context.get("pr_number"),
+                "implementer_agent": implementer, "reviewer_agent": provider,
+                "detail": detail, "owner": owner,
+                "resume_trigger": (
+                    f"restore dispatch for {provider} (or map reviewer to a non-{family} "
+                    "provider), then re-enqueue this review"),
+                "at": now,
+            }
+            context["independent_review_block"] = block
+            conn.execute(
+                "UPDATE tasks SET status='blocked', claim_source='', summary=?, context=?,"
+                " error_info=? WHERE task_id=? AND status='pending'",
+                (f"{INDEPENDENT_REVIEW_UNAVAILABLE}: {provider} cannot dispatch ({detail})",
+                 json.dumps(context), json.dumps(block), task_id))
+            self._append_exec_event_on(conn, task_id, "independent_review_blocked", now,
+                                       implementer_agent=implementer, reviewer_agent=provider,
+                                       detail=detail)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        logger.warning("review %s blocked: %s (%s)", task_id, INDEPENDENT_REVIEW_UNAVAILABLE, detail)
+        self.settle_unused_task_receipt(task_id, note=INDEPENDENT_REVIEW_UNAVAILABLE)
+        return True
+
     def patch_context(self, task_id: str, extra: dict) -> None:
         """Merge ``extra`` into the existing context of a pending task."""
         conn = self._connect()
@@ -5468,6 +5640,7 @@ class TaskQueue:
         claim_source: str = "", skip_task_ids: Optional[set[str]] = None,
         skip_deferred: bool = False, role_to_agent: Optional[Mapping[str, str]] = None,
         override_task_type: Optional[str] = None,
+        independent_review_only: bool = False,
     ) -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
@@ -5497,6 +5670,12 @@ class TaskQueue:
         let push delivery pass a busy queue head during this scheduling pass.
         ``override_task_type`` limits the override-only claim for checkout
         workers without a default role.
+
+        #986: ``agent`` never claims a review whose ``implementer_agent`` is its
+        own provider family -- that claim could only be refused into
+        ``needs_human``. ``independent_review_only`` lets a role-bound backend
+        that does not hold the reviewer role claim exactly the reviews bound to
+        it for independence (``independent_review_binding``), and nothing else.
         """
         _now = time.time()
         if skip_deferred:
@@ -5523,9 +5702,37 @@ class TaskQueue:
                 conn.execute("ROLLBACK")
                 return None
             row = None
-            skipped = sorted(skip_task_ids or ())
-            skip_sql = f" AND task_id NOT IN ({','.join('?' for _ in skipped)})" if skipped else ""
+            skipped = set(skip_task_ids or ())
             if agent:
+                family = provider_family(agent)
+                skipped.update(
+                    tid for tid, impl in conn.execute(
+                        "SELECT task_id, json_extract(context, '$.implementer_agent') FROM tasks"
+                        " WHERE status = 'pending' AND task_type = 'review'"
+                        " AND json_extract(context, '$.implementer_agent') IS NOT NULL")
+                    if isinstance(impl, str) and impl and provider_family(impl) == family)
+            skipped = sorted(skipped)
+            skip_sql = f" AND task_id NOT IN ({','.join('?' for _ in skipped)})" if skipped else ""
+            if agent and independent_review_only:
+                if role != "reviewer":
+                    conn.execute("ROLLBACK")
+                    return None
+                row = conn.execute(
+                    f"""
+                    SELECT * FROM tasks
+                    WHERE status = 'pending' AND task_type = 'review'
+                      AND json_extract(context, '$.agent_override') = ?
+                      AND json_extract(context, '$.independent_review_binding.provider') = ?
+                      {_defer_sql} {skip_sql}
+                    ORDER BY priority ASC, created_at ASC
+                    LIMIT 1
+                    """,
+                    (agent, agent, *skipped),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    return None
+            elif agent:
                 # Stage 1 — explicit override claim for this agent.
                 # #891: a role-bound backend has no checkout of its own, so its
                 # binding only counts for the role it is claiming as right now.
@@ -5545,7 +5752,7 @@ class TaskQueue:
                 if bound_type and not self._holds_task_type(agent, bound_type, role_to_agent):
                     conn.execute("ROLLBACK")
                     return None
-            if agent and not (role_bound and bound_type is None):
+            if row is None and agent and not (role_bound and bound_type is None):
                 row = conn.execute(
                     f"""
                     SELECT * FROM tasks

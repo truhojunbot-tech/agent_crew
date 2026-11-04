@@ -51,6 +51,7 @@ from typing import Callable, List, Optional
 from agent_crew import github as _github
 from agent_crew.failure_kind import FailureKind
 from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.role_mapping import provider_family
 from agent_crew.queue import (AdmissionRefused, TaskAlreadyExistsError, TaskQueue,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
 
@@ -255,11 +256,12 @@ _REVIEW_HOLD_REASONS = {"daily_cap": "cloud_daily_cap", "usd_cap": "cloud_usd_ca
                         "at_capacity": "cloud_at_capacity"}
 
 
-def _hold_cloud_reviews(queue: TaskQueue, skipped_reason: str, detail: str) -> None:
+def _hold_cloud_reviews(queue: TaskQueue, skipped_reason: str, detail: str, *,
+                        independent_only: bool = False) -> None:
     """#989: a capped or busy cloud review stays pending for cloud. Record a
     typed reason and send one notice per task; never hand it to local Claude."""
     reason = _REVIEW_HOLD_REASONS[skipped_reason]
-    for task in _claimable_cloud_reviews(queue):
+    for task in _claimable_cloud_reviews(queue, independent_only=independent_only):
         context = task.context if isinstance(task.context, dict) else {}
         if (context.get("cloud_review_hold") or {}).get("reason") == reason:
             continue
@@ -1051,12 +1053,26 @@ def _cloud_preflight_reason(task: TaskRequest, repo: str) -> str:
     return ""
 
 
-def _claimable_cloud_reviews(queue: TaskQueue) -> list[TaskRequest]:
+def _independently_bound(context: dict) -> bool:
+    """#986: bound to cloud by the dispatcher's independence sweep."""
+    binding = context.get("independent_review_binding")
+    return (context.get("agent_override") == CLOUD_PROVIDER_NAME and isinstance(binding, dict)
+            and binding.get("provider") == CLOUD_PROVIDER_NAME)
+
+
+def _claimable_cloud_reviews(queue: TaskQueue, *,
+                             independent_only: bool = False) -> list[TaskRequest]:
     now = time.time()
 
     def claimable(task: TaskRequest) -> bool:
         context = task.context if isinstance(task.context, dict) else {}
         if task.task_type != "review" or context.get("agent_override") not in (None, CLOUD_PROVIDER_NAME):
+            return False
+        if independent_only and not _independently_bound(context):
+            return False
+        # #986: cloud never claims a review of a claude-family implementation.
+        implementer = context.get("implementer_agent")
+        if implementer and provider_family(implementer) == provider_family(CLOUD_PROVIDER_NAME):
             return False
         try:
             return float(context.get("push_not_before") or 0) <= now
@@ -1146,9 +1162,9 @@ def _attribution_lineage(task: TaskRequest) -> dict[str, str]:
     return {"retry_of": str(retry_of or ""), "fallback_of": str(fallback_of or "")}
 
 
-def cloud_review_skip_ids(queue: TaskQueue) -> set[str]:
+def cloud_review_skip_ids(queue: TaskQueue, *, independent_only: bool = False) -> set[str]:
     """Prefer the largest claimable review within the highest priority."""
-    pending = _claimable_cloud_reviews(queue)
+    pending = _claimable_cloud_reviews(queue, independent_only=independent_only)
     if not pending:
         return set()
 
@@ -1176,8 +1192,13 @@ def dispatch_cloud_for_role(
     state_path: Optional[str] = None,
     review_guard_fn: Optional[Callable[[TaskRequest, str], bool]] = None,
     role_to_agent: Optional[dict[str, str]] = None,
+    independent_only: bool = False,
 ) -> CloudDispatchOutcome:
     """Hand at most one pending task for ``role`` to a Cloud session.
+
+    ``independent_only`` (#986): claim only reviews the dispatcher bound to
+    cloud for reviewer independence. Cloud need not hold the reviewer role for
+    these; every other gate (capacity, caps, CLI probe, CEA) still applies.
 
     ``role_to_agent`` is the caller's live role map, checked again at claim
     (#891). The server passes it; a direct caller that omits it is asserting
@@ -1194,7 +1215,10 @@ def dispatch_cloud_for_role(
     if role_to_agent is None:
         role_to_agent = {role: CLOUD_PROVIDER_NAME}
 
-    if task_type == "review" and not _claimable_cloud_reviews(queue):
+    if independent_only and task_type != "review":
+        return CloudDispatchOutcome(False, skipped_reason="no_task")
+    if task_type == "review" and not _claimable_cloud_reviews(
+            queue, independent_only=independent_only):
         return CloudDispatchOutcome(False, skipped_reason="no_task")
 
     in_flight = queue.count_in_progress_by_dispatch_channel(DISPATCH_CHANNEL)
@@ -1203,7 +1227,8 @@ def dispatch_cloud_for_role(
                      in_flight, cloud_max_concurrency(), role)
         if task_type == "review":
             _hold_cloud_reviews(queue, "at_capacity",
-                                f"cloud at capacity {in_flight}/{cloud_max_concurrency()}")
+                                f"cloud at capacity {in_flight}/{cloud_max_concurrency()}",
+                                independent_only=independent_only)
         return CloudDispatchOutcome(False, skipped_reason="at_capacity")
 
     day_start = int(time.time() // 86400) * 86400
@@ -1214,14 +1239,16 @@ def dispatch_cloud_for_role(
             if count >= daily_cap:
                 logger.info("claude_cloud: daily review cap %d reached; review held", daily_cap)
                 _hold_cloud_reviews(queue, "daily_cap",
-                                    f"cloud cap launches={count} limit={daily_cap}")
+                                    f"cloud cap launches={count} limit={daily_cap}",
+                                    independent_only=independent_only)
                 return CloudDispatchOutcome(False, skipped_reason="daily_cap")
         receipt = _usd_cap_tripped(queue, day_start, role=role)
         if receipt:
             _hold_cloud_reviews(queue, "usd_cap",
                                 f"cloud cap usd spent_measured={receipt['spent_measured']:.2f} "
                                 f"spent_estimated={receipt['spent_estimated']:.2f} "
-                                f"limit={receipt['limit']:.2f}")
+                                f"limit={receipt['limit']:.2f}",
+                                independent_only=independent_only)
             return CloudDispatchOutcome(False, skipped_reason="usd_cap")
     elif role == "implementer":
         daily_cap = cloud_max_per_day()
@@ -1265,7 +1292,9 @@ def dispatch_cloud_for_role(
 
     task = queue.dequeue(agent=CLOUD_PROVIDER_NAME, role=role,
                          claimed_via="cloud_push", skip_deferred=True, role_to_agent=role_to_agent,
-                         skip_task_ids=cloud_review_skip_ids(queue) if task_type == "review" else None)
+                         skip_task_ids=(cloud_review_skip_ids(queue, independent_only=independent_only)
+                                        if task_type == "review" else None),
+                         independent_review_only=independent_only)
     if task is None:
         return CloudDispatchOutcome(False, skipped_reason="no_task")
     if task_type == "review" and (task.context or {}).get("cloud_review_hold"):

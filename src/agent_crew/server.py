@@ -96,6 +96,7 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               RequestSqliteTiming, request_sqlite_timing)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
 from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
+from agent_crew.queue import INDEPENDENT_REVIEW_UNAVAILABLE
 from agent_crew import claude_cloud as _claude_cloud
 from agent_crew import script_tester as _script_tester
 from agent_crew import contract_emit as _contract_emit
@@ -4264,6 +4265,63 @@ def create_app(
                            "their role (role map: %s)", moved, _DISPATCH_ROLE_TO_AGENT)
         return moved
 
+    def _independent_review_providers() -> list[str]:
+        """#986: providers this dispatcher can actually hand a review to now,
+        in preference order (claude_cloud first when cloud dispatch is on)."""
+        out: list[str] = []
+        if _claude_cloud.cloud_dispatch_enabled():
+            out.append(_claude_cloud.CLOUD_PROVIDER_NAME)
+        for agent in [*_DISPATCH_ROLE_TO_AGENT.values(), *_DISPATCH_DISCUSS_WORKTREES]:
+            if (not agent or agent in out or agent in ROLE_BOUND_PROVIDERS
+                    or agent == _script_tester.SCRIPT_TESTER
+                    or role_policy_refusal("reviewer", agent)):
+                continue
+            # A local provider needs a checkout the dispatcher can resolve.
+            if _DISPATCH_DISCUSS_WORKTREES.get(agent) or any(
+                    worktree_map.get(r) for r, a in _DISPATCH_ROLE_TO_AGENT.items() if a == agent):
+                out.append(agent)
+        return out
+
+    def _bind_independent_reviews() -> dict[str, list[str]]:
+        """#986: before any claim, bind each review whose reviewer would be its
+        implementer's provider to an independent dispatchable provider, or end
+        it once as BLOCKED(INDEPENDENT_REVIEW_UNAVAILABLE) with one notice."""
+        _refresh_role_map()
+        outcome = q().bind_independent_reviews(
+            _DISPATCH_ROLE_TO_AGENT.get("reviewer"), _independent_review_providers())
+        if outcome["bound"]:
+            logger.warning("dispatcher: bound %s to an independent reviewer (role map: %s)",
+                           outcome["bound"], _DISPATCH_ROLE_TO_AGENT)
+        _notice_independent_review_blocks(outcome["blocked"])
+        return outcome
+
+    def _notice_independent_review_blocks(task_ids: list[str]) -> None:
+        for task_id in task_ids:
+            task = q().get_task(task_id)
+            block = ((task.context or {}).get("independent_review_block") or {}) if task else {}
+            _coordinator_notice(
+                task_id, "independent_review_unavailable",
+                f"{INDEPENDENT_REVIEW_UNAVAILABLE} implementer={block.get('implementer_agent')} "
+                f"reviewer={block.get('reviewer_agent')} pr={block.get('pr_number')} "
+                f"owner={block.get('owner')} resume={block.get('resume_trigger')}")
+
+    async def _dispatch_independent_cloud_reviews() -> None:
+        """#986: a review bound to claude_cloud for independence dispatches on
+        the cloud review adapter even when cloud holds no reviewer role. When the
+        cloud CLI cannot run, the bound review ends once with the typed block."""
+        if (not _claude_cloud.cloud_dispatch_enabled()
+                or _DISPATCH_ROLE_TO_AGENT.get("reviewer") == _claude_cloud.CLOUD_PROVIDER_NAME):
+            return
+        outcome = await asyncio.to_thread(
+            _claude_cloud.dispatch_cloud_for_role, q(),
+            role="reviewer", task_type="review", state_path=state_path,
+            review_guard_fn=_refuse_self_review,
+            role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT), independent_only=True)
+        skip = outcome.skipped_reason or ""
+        if skip.startswith("cli_unsupported:"):
+            _notice_independent_review_blocks(q().block_independent_reviews(
+                _claude_cloud.CLOUD_PROVIDER_NAME, skip))
+
 
     # #772: the test stage is a deterministic script, not a provider call.
     # One run at a time per server: suites share the repo's object store and
@@ -6135,7 +6193,9 @@ def create_app(
                     if _notice_role_map_refusal():
                         continue
                     _reroute_stale_bindings()
+                    _bind_independent_reviews()
                     _AGENT_TO_ROLES, _workers, _discuss_workers = _worker_role_map()
+                    await _dispatch_independent_cloud_reviews()
                     try:
                         _resume_codex_quota_holds()
                     except Exception:
@@ -6449,6 +6509,8 @@ def create_app(
     # provider/worktree decision the dispatcher will use.
     app.state.resolve_dispatch_target = _resolve_dispatch_target
     app.state.reroute_stale_bindings = _reroute_stale_bindings
+    app.state.bind_independent_reviews = _bind_independent_reviews
+    app.state.dispatch_independent_cloud_reviews = _dispatch_independent_cloud_reviews
     # The dispatcher loop calls through this attribute, so a test can hold a
     # dispatch open and observe slot/lease decisions (#875).
     app.state.dispatch_task = _dispatch_task
