@@ -134,14 +134,15 @@ def test_cloud_review_guard_stops_before_provider_launch(tmp_path, monkeypatch):
                         lambda *args, **kwargs: cloud.CloudCapability(True, "ok"))
 
     def guard(task, agent):
-        assert agent == "claude_cloud"
-        return queue.mark_needs_human(task.task_id, "reviewer_matches_implementer", {})
+        pytest.fail("#986: a claude-family review must not even be claimed by cloud")
 
     outcome = cloud.dispatch_cloud_for_role(
         queue, role="reviewer", task_type="review", review_guard_fn=guard,
         run_fn=lambda *args, **kwargs: pytest.fail("provider launched"))
-    assert outcome.launch_error == "reviewer_matches_implementer"
-    assert queue.get_result("review-cloud-834").status == "needs_human"
+    # #986: refused before the claim, never claim-then-refuse into needs_human.
+    assert outcome.dispatched is False and outcome.skipped_reason == "no_task"
+    assert queue.get_task("review-cloud-834").status == "pending"
+    assert queue.get_result("review-cloud-834") is None
 
 
 @pytest.mark.asyncio
