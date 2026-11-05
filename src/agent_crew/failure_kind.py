@@ -34,6 +34,9 @@ def failure_kind(error_info: Optional[dict]) -> Optional[str]:
 _CODEX_QUOTA = re.compile(r"^\s*(?:error:\s*)?you['’]ve hit your usage limit\b", re.I)
 _CODEX_CAPACITY = re.compile(r"^\s*(?:error:\s*)?selected model is at capacity\b", re.I)
 _GEMINI_INVALID_MODEL = re.compile(r"^\s*invalid model selection\b", re.I)
+_AGY_QUOTA = re.compile(r"^\s*individual quota reached\b", re.I)
+_AGY_RESET = re.compile(
+    r"\bresets in\s+(?=\d)(?:(?P<h>\d+)h)?(?:(?P<m>\d+)m)?(?:(?P<s>\d+)s)?", re.I)
 _CODEX_RESET = re.compile(
     r"try again at\s+(?:(?P<month>[A-Za-z]{3,9})\s+"
     r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,\s+(?P<year>\d{4})\s+)?"
@@ -62,6 +65,14 @@ def _codex_reset_after(message: str, failed_at: float) -> Optional[float]:
         if reset.timestamp() <= failed_at:
             reset += datetime.timedelta(days=1)
     return reset.timestamp() - failed_at if reset.timestamp() > failed_at else None
+
+
+def _agy_reset_after(message: str) -> Optional[float]:
+    """Seconds from the "Resets in NhNmNs" duration in AGY's own error event."""
+    match = _AGY_RESET.search(message)
+    if not match or not any(match.group(k) for k in ("h", "m", "s")):
+        return None
+    return float(int(match["h"] or 0) * 3600 + int(match["m"] or 0) * 60 + int(match["s"] or 0))
 
 
 def classify_provider_record(agent: str, record: dict, *,
@@ -115,6 +126,11 @@ def classify_provider_record(agent: str, record: dict, *,
         if (record.get("status") == "ERROR" and record.get("num_turns") == 0
                 and isinstance(message, str) and _GEMINI_INVALID_MODEL.match(message)):
             code = "INVALID_MODEL"
+        elif (record.get("status") == "ERROR" and isinstance(message, str)
+                and _AGY_QUOTA.match(message)):
+            code = "QUOTA_EXHAUSTED"
+            if retry_after is None:
+                retry_after = _agy_reset_after(message)
 
     if code in {"MODEL_CAPACITY_EXHAUSTED", "CODEX_CAPACITY"}:
         kind = FailureKind.CAPACITY
