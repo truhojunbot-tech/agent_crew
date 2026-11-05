@@ -214,6 +214,13 @@ def _await_fresh_reading(status: str, after_fetched_at: object, settle_end: floa
     return time.time() < settle_end + cloud_cost_fresh_wait_seconds()
 
 
+def _overlap_window_end(settle_end: float, after_fetched_at: object) -> float:
+    """#989: a reading taken after settle_end also covers sessions run since."""
+    if isinstance(after_fetched_at, (int, float)):
+        return max(settle_end, after_fetched_at)
+    return settle_end
+
+
 def _credit_parts(snapshot: object) -> tuple[Optional[float], Optional[float]]:
     """Accept legacy value-only readings as unknown-date, never measurable."""
     value = getattr(snapshot, "used_dollars", snapshot)
@@ -352,7 +359,8 @@ def _record_reconciled_cloud_cost(queue: TaskQueue, task: TaskRequest) -> None:
     if time.time() < settle_end:
         return
     after, after_fetched_at = _credit_parts(read_cloud_credit_used())
-    overlaps = (_cloud_cost_overlaps(queue, task.task_id, started, settle_end)
+    overlaps = (_cloud_cost_overlaps(queue, task.task_id, started,
+                                     _overlap_window_end(settle_end, after_fetched_at))
                 if isinstance(started, (int, float)) else [])
     status = _cloud_cost_status(before, after, overlaps,
                                 before_fetched_at=context.get("cloud_credit_before_fetched_at"),
@@ -391,7 +399,9 @@ def _record_shadow_review_cost(queue: TaskQueue, task_id: str) -> None:
     if time.time() < settle_end:
         return
     after, after_fetched_at = _credit_parts(read_cloud_credit_used())
-    overlaps = (_cloud_cost_overlaps(queue, task_id, started, settle_end, shadow=True)
+    overlaps = (_cloud_cost_overlaps(queue, task_id, started,
+                                     _overlap_window_end(settle_end, after_fetched_at),
+                                     shadow=True)
                 if isinstance(started, (int, float)) else [])
     status = _cloud_cost_status(before, after, overlaps,
                                 before_fetched_at=context.get("cloud_shadow_credit_before_fetched_at"),

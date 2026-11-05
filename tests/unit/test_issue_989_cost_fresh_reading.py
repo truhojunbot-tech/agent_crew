@@ -1,5 +1,6 @@
 """#989: a stale after-reading at settle_end keeps the cost pending, not UNKNOWN."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -120,3 +121,25 @@ def test_overlap_still_finalizes_at_settle_end(tmp_path, monkeypatch):
 def test_fresh_wait_env(monkeypatch, raw, expected):
     monkeypatch.setenv("AGENT_CREW_CLOUD_COST_FRESH_WAIT_SECONDS", raw)
     assert cloud.cloud_cost_fresh_wait_seconds() == expected
+
+
+@pytest.mark.parametrize("shadow", [False, True], ids=["implement", "shadow"])
+def test_session_launched_during_fresh_wait_is_overlap(tmp_path, monkeypatch, shadow):
+    """Review of PR #995: the delayed after-reading covers sessions that ran
+    after settle_end, so overlap must be checked up to that reading."""
+    queue, attr_id, now, snapshot, tick, _ = _setup(tmp_path, monkeypatch, shadow)
+    snapshot[0] = SimpleNamespace(used_dollars=11.0, fetched_at=SETTLE_END - 300)
+    now[0] = SETTLE_END + 1
+    tick()
+    assert queue.get_attribution(attr_id)["cloud_cost_status"] == "PENDING_SETTLE"
+    queue.enqueue(TaskRequest(task_id="later", task_type="implement",
+                              description="Later", branch="agent/later",
+                              context={"cloud_attempt_started_at": 2000.0,
+                                       "cloud_ended_at": 2100.0}))
+    now[0] = 3000.0
+    snapshot[0] = SimpleNamespace(used_dollars=15.0, fetched_at=2990.0)
+    tick()
+    attr = queue.get_attribution(attr_id)
+    assert attr["cloud_cost_status"] == "UNKNOWN_OVERLAP"
+    assert attr["cloud_usd"] is None
+    assert json.loads(attr["cloud_cost_overlaps"]) == ["later"]
