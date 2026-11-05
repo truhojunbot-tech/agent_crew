@@ -29,6 +29,8 @@ def test_terminal_cloud_cost_status_and_overlaps(
                               description="Cloud task", branch="agent/target"))
     started = time.time() - 10
     monkeypatch.setenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "0")
+    # #989: no fresh-reading retry here; this pins the final label.
+    monkeypatch.setenv("AGENT_CREW_CLOUD_COST_FRESH_WAIT_SECONDS", "0")
     prefix = "cloud_shadow_" if shadow else "cloud_"
     queue.patch_context("target", {
         prefix + "attempt_started_at": started,

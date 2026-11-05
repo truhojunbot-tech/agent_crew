@@ -146,7 +146,8 @@ def test_no_fresh_snapshot_after_settle_is_unknown(tmp_path, monkeypatch, shadow
         cloud._record_shadow_review_cost(queue, "target")
     else:
         cloud.record_terminal_cloud_cost(queue, "target")
-    now[0] = 1910.0
+    # #989: a stale reading is retried until settle_end + the fresh-wait bound.
+    now[0] = 1910.0 + cloud.DEFAULT_COST_FRESH_WAIT_SECONDS
     if shadow:
         cloud.reconcile_shadow_reviews(queue, pr_comments_fn=lambda *a, **k: [])
     else:
