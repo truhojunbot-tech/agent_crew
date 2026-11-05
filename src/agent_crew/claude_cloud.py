@@ -91,8 +91,13 @@ _ENV_UNKNOWN_SESSION_USD = "AGENT_CREW_CLOUD_UNKNOWN_SESSION_USD"
 DEFAULT_UNKNOWN_SESSION_USD = 2.0
 _ENV_COST_SETTLE_SECONDS = "AGENT_CREW_CLOUD_COST_SETTLE_SECONDS"
 _ENV_SUBMIT_TIMEOUT_SECONDS = "AGENT_CREW_CLOUD_SUBMIT_TIMEOUT_SECONDS"
+_ENV_COST_FRESH_WAIT_SECONDS = "AGENT_CREW_CLOUD_COST_FRESH_WAIT_SECONDS"
 _CREDIT_MAX_AGE_SECONDS = 600
 DEFAULT_COST_SETTLE_SECONDS = 900.0
+#: #989: the Quota credit cache refreshes about every 10 min, so the reading
+#: seen at settle_end is usually older than settle_end. Wait this long past
+#: settle_end for a fresh one before giving up as UNKNOWN_NO_FRESH_READING.
+DEFAULT_COST_FRESH_WAIT_SECONDS = 1800.0
 DEFAULT_SUBMIT_TIMEOUT_SECONDS = 90.0
 DEFAULT_SUBMIT_TOTAL_BUDGET_SECONDS = 120.0
 DEFAULT_MAX_CONCURRENCY = 3
@@ -187,6 +192,26 @@ def cloud_cost_settle_seconds() -> float:
     except ValueError:
         value = DEFAULT_COST_SETTLE_SECONDS
     return value if math.isfinite(value) and value >= 0 else DEFAULT_COST_SETTLE_SECONDS
+
+
+def cloud_cost_fresh_wait_seconds() -> float:
+    raw = (os.getenv(_ENV_COST_FRESH_WAIT_SECONDS) or "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_COST_FRESH_WAIT_SECONDS
+    except ValueError:
+        value = DEFAULT_COST_FRESH_WAIT_SECONDS
+    return value if math.isfinite(value) and value >= 0 else DEFAULT_COST_FRESH_WAIT_SECONDS
+
+
+def _await_fresh_reading(status: str, after_fetched_at: object, settle_end: float) -> bool:
+    """#989: keep the row PENDING_SETTLE while only the after reading is stale.
+
+    A later tick may see a refreshed cache; past the bound, finalize as before."""
+    if status != "UNKNOWN_NO_FRESH_READING":
+        return False
+    if isinstance(after_fetched_at, (int, float)) and after_fetched_at >= settle_end:
+        return False  # the after reading is fresh; something else is missing
+    return time.time() < settle_end + cloud_cost_fresh_wait_seconds()
 
 
 def _credit_parts(snapshot: object) -> tuple[Optional[float], Optional[float]]:
@@ -333,6 +358,8 @@ def _record_reconciled_cloud_cost(queue: TaskQueue, task: TaskRequest) -> None:
                                 before_fetched_at=context.get("cloud_credit_before_fetched_at"),
                                 after_fetched_at=after_fetched_at,
                                 started=started, settle_end=settle_end)
+    if _await_fresh_reading(status, after_fetched_at, settle_end):
+        return
     usd = round(after - before, 6) if status == "MEASURED" else None
     queue.record_cloud_cost(task.task_id, before, after, usd,
                             status=status, overlaps=overlaps)
@@ -370,6 +397,8 @@ def _record_shadow_review_cost(queue: TaskQueue, task_id: str) -> None:
                                 before_fetched_at=context.get("cloud_shadow_credit_before_fetched_at"),
                                 after_fetched_at=after_fetched_at,
                                 started=started, settle_end=settle_end)
+    if _await_fresh_reading(status, after_fetched_at, settle_end):
+        return
     usd = round(after - before, 6) if status == "MEASURED" else None
     queue.record_cloud_cost(attribution_id, before, after, usd,
                             status=status, overlaps=overlaps)
