@@ -83,6 +83,18 @@ def test_dispatcher_protocol_keeps_every_role_in_foreground(role):
         assert term in rule, term
 
 
+@pytest.mark.parametrize("role", ["reviewer", "tester"])
+def test_bounded_pytest_spliced_exactly_once(role):
+    """#881: the common foreground rule must not displace or duplicate the
+    reviewer/tester bounded-pytest section."""
+    from agent_crew.instructions import _BOUNDED_PYTEST
+
+    content = generate(role, "myproject", 8123, delivery="dispatcher")
+    assert content.count(_BOUNDED_PYTEST) == 1
+    assert content.count("### Bounded pytest runs") == 1
+    assert "<bounded_pytest>" not in content
+
+
 def test_implementer_protocol_has_no_pytest_rule():
     content = generate("implementer", "myproject", 8123, delivery="dispatcher")
     assert "Bounded pytest runs" not in content
