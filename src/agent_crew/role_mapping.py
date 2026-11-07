@@ -21,7 +21,10 @@ DEFAULT_ROLE_TO_AGENT = {
 #: A legacy gemini worktree can still be read as a tester worktree; the
 #: effective role mapping refuses that provider for general test work (#924).
 LEGACY_AGENT_TO_ROLE = {"codex": "implementer", "claude": "reviewer", "gemini": "tester"}
-KNOWN_ROLE_AGENTS = frozenset((*LEGACY_AGENT_TO_ROLE, "claude_cloud", "script", "agy"))
+KNOWN_ROLE_AGENTS = frozenset((*LEGACY_AGENT_TO_ROLE, "claude_cloud", "script", "agy", "chatgpt"))
+#: Backends that can only ever review (#1000). ``chatgpt`` answers a GitHub
+#: review request; it has no checkout to implement or test in.
+REVIEWER_ONLY_AGENTS = frozenset(("chatgpt",))
 EXPLICIT_SOURCE = "explicit project config"
 LEGACY_SOURCE = "legacy state.json.roles"
 DEFAULT_SOURCE = "hardcoded default"
@@ -129,7 +132,7 @@ def anonymous_pull_refusal(role: object, agent: object) -> str | None:
 
 #: Role-mapped backends with no checkout of their own. A task bound to one is
 #: dispatchable only while that backend still holds the task's role (#891).
-ROLE_BOUND_PROVIDERS = ("claude_cloud",)
+ROLE_BOUND_PROVIDERS = ("claude_cloud", "chatgpt")
 
 
 def provider_task_types(provider: str, role_to_agent: Mapping[str, str]) -> tuple[str, ...]:
@@ -155,6 +158,8 @@ def validate_explicit_role_agents(mapping: Mapping[str, object]) -> dict[str, st
             raise ValueError(f"unknown agent {agent!r} for {role!r}")
         if role == "tester" and role_policy_refusal(role, agent):
             raise ValueError(role_policy_refusal(role, agent))
+        if role != "reviewer" and agent.strip() in REVIEWER_ONLY_AGENTS:
+            raise ValueError(f"agent {agent.strip()!r} is reviewer-only and may not hold {role!r}")
         result[role] = agent.strip()
     return result
 
