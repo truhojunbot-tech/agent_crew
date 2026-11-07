@@ -1026,6 +1026,36 @@ class ReviewRoundCapReached:
     lineage_root: str
 
 
+#: #999: a test task run BEFORE the review of the same head. Its outcome routes
+#: back into the review cascade instead of into a merge.
+PRE_REVIEW_KEY = "pre_review"
+#: Where an implement task records how its pre-review test ended (#999). Once
+#: it is set, ``auto_enqueue_review`` creates the review instead of a test.
+PRE_REVIEW_OUTCOME_KEY = "pre_review_test"
+
+
+@dataclass(frozen=True)
+class PreReviewTestEnqueued:
+    """#999: the implement result went to a pre-review script test, not a review."""
+    test_task_id: str
+
+
+def pre_review_script_test_enabled() -> bool:
+    """``AGENT_CREW_PRE_REVIEW_SCRIPT_TEST=0`` restores review-first (#999)."""
+    return (os.getenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST") or "").strip() != "0"
+
+
+def pre_review_test_id(impl_task_id: str) -> str:
+    """One pre-review test per implement task; the id is the replay guard."""
+    return f"pretest-{impl_task_id}"
+
+
+def is_pre_review_test(task: Optional[TaskRequest]) -> bool:
+    return (task is not None and task.task_type == "test"
+            and isinstance(task.context, dict)
+            and task.context.get(PRE_REVIEW_KEY) is True)
+
+
 def _approved_test_fix_sha(queue: TaskQueue, fix: TaskRequest) -> str:
     """Return the approved base only for a fix of a failed post-approval test."""
     context = fix.context if isinstance(fix.context, dict) else {}
@@ -1936,6 +1966,13 @@ def auto_enqueue_fix(
             )
             return None
 
+        if is_pre_review_test(review_task):
+            return _auto_enqueue_pre_review_fix(
+                queue, review_task, review_result, pr_number=pr_number,
+                cascade_branch=cascade_branch, pane_map=pane_map,
+                server_project=server_project,
+                coordinator_notify_fn=coordinator_notify_fn)
+
         # The operator ceiling remains the baseline. The quota-core citation
         # below may narrow it only for the pinned canary lineage.
         contract = _review_cascade_contract(queue, review_task)
@@ -2134,125 +2171,11 @@ def auto_enqueue_fix(
                     logger.exception(f"auto_enqueue_fix: external_op_mark({_cop}) 실패")
             return None
 
-        findings = list(review_result.findings or [])
-        if failed_test:
-            script = (review_result.error_info or {}).get("script_test") if isinstance(
-                review_result.error_info, dict) else None
-            if isinstance(script, dict):
-                for node_id in script.get("new_failures") or []:
-                    finding = f"new failure: {node_id}"
-                    if finding not in findings:
-                        findings.append(finding)
-        findings_text = _findings_block(findings, review_task_id)
-        summary = (review_result.summary or "").strip()
-        if not findings_text and not summary:
-            logger.warning(
-                f"auto_enqueue_fix: review {review_task_id} requested changes with "
-                f"neither findings nor a summary — nothing to act on, skipping"
-            )
-            return None
-
-        where = (f"PR #{pr_number}" if pr_number
-                 else f"branch {cascade_branch!r}")
-        parts = [
-            f"Fix {where} per {review_task_id} "
-            f"{'test failure' if failed_test else 'request_changes'} "
-            f"(automated fix round {fix_round}/{max_rounds}).",
-        ]
-        if summary:
-            parts.append(f"\nReviewer summary: {summary}")
-        if findings_text:
-            parts.append(f"\nFindings to address:\n{findings_text}")
-        parts.append(
-            f"\nCommit to the SAME branch {cascade_branch!r} — do not open a "
-            f"new PR. Reproduce each finding before fixing it, and say so if one "
-            f"does not reproduce."
-        )
-
-        fix_context: dict = {
-            "prev_task_id": review_task_id,
-            "fix_round": fix_round,
-            "review_findings": findings,
-        }
-        if failed_test:
-            fix_context["feedback"] = findings_text
-        inherited_tier = review_ctx.get("risk_tier")
-        if type(inherited_tier) is int and 0 <= inherited_tier <= 3:
-            fix_context["risk_tier"] = inherited_tier
-        if pr_number is not None:
-            # #186: lets the dispatcher check out the PR head for this task.
-            fix_context["pr_number"] = pr_number
-        for key in ("no_tester", "issue", "issue_title", "issue_body",
-                    "issue_url", "repo"):
-            if review_ctx.get(key) is not None:
-                fix_context[key] = review_ctx[key]
-        implementer_agent = (
-            review_ctx.get("implementer_agent")
-            or (default_agent_for_role("implementer", pane_map) if pane_map else None)
-        )
-        if implementer_agent:
-            fix_context["implementer_agent"] = implementer_agent
-        _carry_lineage_intent(fix_context, review_task, "implementer")
-
-        # EGD Step 2 (#51): carry the contract's recommended round budget next
-        # to the cap actually in force, so the gap between them is measurable
-        # before anyone proposes enforcing it. Guarded separately from the
-        # outer handler because that one returns None — losing an observation
-        # must not read as "no fix task was created".
-        citation = None
-        try:
-            citation = _shadow_rounds_citation(tasks_by_id, review_task, queue)
-            fix_context["tokenomics_shadow"] = citation
-        except Exception:
-            logger.exception(
-                f"auto_enqueue_fix: shadow rounds citation failed for "
-                f"{review_task_id} — cascade continues on the stored contract")
-
-        fix_id = fix_task_id(review_task_id, fix_round)
-        # Cheap early-out with a legible log. It is NOT the guard — the
-        # `enqueue` below is, because only the PRIMARY KEY is atomic.
-        existing = queue.get_task(fix_id)
-        if existing is not None:
-            logger.info(
-                f"auto_enqueue_fix: {fix_id} already exists for {review_task_id} "
-                f"(status={existing.status!r}) — this review round already has "
-                f"its fix task, not enqueueing another"
-            )
-            return None
-        try:
-            _enqueue_with_inherited_risk(queue, TaskRequest(
-                task_id=fix_id,
-                task_type="implement",  # type: ignore[arg-type]
-                description="\n".join(parts),
-                branch=cascade_branch,
-                context=fix_context,
-                project=_successor_project(queue, review_task, server_project),
-            ), tasks_by_id, review_task, ingress="cascade.fix",
-                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
-                coordinator_notify_fn=coordinator_notify_fn)
-        except (sqlite3.IntegrityError, TaskAlreadyExistsError):
-            # A concurrent submission (or replay 재실행) won the insert. That is the
-            # mechanism working, not an error: exactly one fix task exists.
-            logger.info(
-                f"auto_enqueue_fix: {fix_id} was created concurrently for "
-                f"{review_task_id} — leaving the winner in place"
-            )
-            return None
-        if citation is not None:
-            try:
-                queue.record_shadow_rounds_vs_cap(
-                    fix_id,
-                    recommended=citation["recommended_max_review_fix_rounds"],
-                    actual_cap=max_rounds)
-            except Exception:
-                logger.exception(
-                    f"auto_enqueue_fix: shadow_rounds_vs_cap receipt failed for "
-                    f"{fix_id} — the fix task itself stands")
-        logger.info(
-            f"auto_enqueue_fix: enqueued {fix_id} for {review_task_id} "
-            f"(round {fix_round}/{max_rounds})"
-        )
-        return fix_id
+        return _enqueue_fix_task(
+            queue, review_task, review_result, failed_test=failed_test,
+            fix_round=fix_round, max_rounds=max_rounds, pr_number=pr_number,
+            cascade_branch=cascade_branch, tasks_by_id=tasks_by_id, pane_map=pane_map,
+            server_project=server_project, coordinator_notify_fn=coordinator_notify_fn)
     except PausedError:
         # #314 §4 P0-2: STOP race — 부모(review) outbox reopen + 전파.
         try:
@@ -2267,6 +2190,181 @@ def auto_enqueue_fix(
         record_cascade_enqueue_failure(queue, review_task_id, "fix", e,
                                        coordinator_notify_fn)
         return None
+
+
+def _auto_enqueue_pre_review_fix(queue: TaskQueue, test_task: TaskRequest,
+                                 test_result: TaskResult, *, pr_number, cascade_branch: str,
+                                 pane_map: Optional[dict], server_project: Optional[str],
+                                 coordinator_notify_fn) -> Optional[str]:
+    """#999: send a red pre-review suite back to the implementer.
+
+    ⛔Not a review round. ``fix_round`` is the review↔fix counter that
+      ``AGENT_CREW_REVIEW_FIX_MAX_ROUNDS`` bounds, and no review has been spent
+      here, so it is carried unchanged. These rounds have their own counter,
+      ``pre_review_fix_round``, under the same ceiling, so a suite the
+      implementer cannot turn green still stops instead of looping.
+    """
+    ctx = test_task.context if isinstance(test_task.context, dict) else {}
+    fix_round = ctx.get("fix_round", 0)
+    pre_round = ctx.get("pre_review_fix_round", 0)
+    for name, value in (("fix_round", fix_round), ("pre_review_fix_round", pre_round)):
+        if type(value) is not int or value < 0:
+            raise MalformedStoredRow(f"malformed {name} for task {test_task.task_id}")
+    pre_round += 1
+    max_rounds = _review_cascade_contract(queue, test_task).fix_round_cap(
+        review_fix_max_rounds())
+    if max_rounds <= 0 or pre_round > max_rounds:
+        logger.warning(
+            f"auto_enqueue_fix: pre-review test {test_task.task_id} failed but its "
+            f"fix budget is spent (round {pre_round} > max {max_rounds}) — stopping, "
+            f"this needs a human")
+        return None
+    extra: dict = {"pre_review_fix_round": pre_round}
+    if isinstance(ctx.get("review_task_id"), str) and ctx["review_task_id"]:
+        # The review the implementer was answering before this suite went red,
+        # so the next review still verifies its findings.
+        extra["review_task_id"] = ctx["review_task_id"]
+    return _enqueue_fix_task(
+        queue, test_task, test_result, failed_test=True, fix_round=fix_round,
+        max_rounds=max_rounds, pr_number=pr_number, cascade_branch=cascade_branch,
+        tasks_by_id=_ancestor_tasks_by_id(queue, test_task), pane_map=pane_map,
+        server_project=server_project, coordinator_notify_fn=coordinator_notify_fn,
+        fix_id=fix_task_id(test_task.task_id, pre_round),
+        round_label=f"pre-review test fix round {pre_round}/{max_rounds}; no review spent",
+        extra_context=extra, shadow_citation=False)
+
+
+def _enqueue_fix_task(queue: TaskQueue, review_task: TaskRequest, review_result: TaskResult,
+                      *, failed_test: bool, fix_round: int, max_rounds: int, pr_number,
+                      cascade_branch: str, tasks_by_id: dict, pane_map: Optional[dict],
+                      server_project: Optional[str], coordinator_notify_fn,
+                      fix_id: str = "", round_label: str = "",
+                      extra_context: Optional[dict] = None,
+                      shadow_citation: bool = True) -> Optional[str]:
+    """Build and enqueue the fix task once ``auto_enqueue_fix`` has admitted it."""
+    review_task_id = review_task.task_id
+    review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
+    findings = list(review_result.findings or [])
+    if failed_test:
+        script = (review_result.error_info or {}).get("script_test") if isinstance(
+            review_result.error_info, dict) else None
+        if isinstance(script, dict):
+            for node_id in script.get("new_failures") or []:
+                finding = f"new failure: {node_id}"
+                if finding not in findings:
+                    findings.append(finding)
+    findings_text = _findings_block(findings, review_task_id)
+    summary = (review_result.summary or "").strip()
+    if not findings_text and not summary:
+        logger.warning(
+            f"auto_enqueue_fix: review {review_task_id} requested changes with "
+            f"neither findings nor a summary — nothing to act on, skipping"
+        )
+        return None
+
+    where = (f"PR #{pr_number}" if pr_number
+             else f"branch {cascade_branch!r}")
+    parts = [
+        f"Fix {where} per {review_task_id} "
+        f"{'test failure' if failed_test else 'request_changes'} "
+        f"({round_label or f'automated fix round {fix_round}/{max_rounds}'}).",
+    ]
+    if summary:
+        parts.append(f"\nReviewer summary: {summary}")
+    if findings_text:
+        parts.append(f"\nFindings to address:\n{findings_text}")
+    parts.append(
+        f"\nCommit to the SAME branch {cascade_branch!r} — do not open a "
+        f"new PR. Reproduce each finding before fixing it, and say so if one "
+        f"does not reproduce."
+    )
+
+    fix_context: dict = {
+        "prev_task_id": review_task_id,
+        "fix_round": fix_round,
+        "review_findings": findings,
+        **(extra_context or {}),
+    }
+    if failed_test:
+        fix_context["feedback"] = findings_text
+    inherited_tier = review_ctx.get("risk_tier")
+    if type(inherited_tier) is int and 0 <= inherited_tier <= 3:
+        fix_context["risk_tier"] = inherited_tier
+    if pr_number is not None:
+        # #186: lets the dispatcher check out the PR head for this task.
+        fix_context["pr_number"] = pr_number
+    for key in ("no_tester", "issue", "issue_title", "issue_body",
+                "issue_url", "repo"):
+        if review_ctx.get(key) is not None:
+            fix_context[key] = review_ctx[key]
+    implementer_agent = (
+        review_ctx.get("implementer_agent")
+        or (default_agent_for_role("implementer", pane_map) if pane_map else None)
+    )
+    if implementer_agent:
+        fix_context["implementer_agent"] = implementer_agent
+    _carry_lineage_intent(fix_context, review_task, "implementer")
+
+    # EGD Step 2 (#51): carry the contract's recommended round budget next
+    # to the cap actually in force, so the gap between them is measurable
+    # before anyone proposes enforcing it. Guarded separately from the
+    # outer handler because that one returns None — losing an observation
+    # must not read as "no fix task was created".
+    citation = None
+    try:
+        if shadow_citation:
+            citation = _shadow_rounds_citation(tasks_by_id, review_task, queue)
+            fix_context["tokenomics_shadow"] = citation
+    except Exception:
+        logger.exception(
+            f"auto_enqueue_fix: shadow rounds citation failed for "
+            f"{review_task_id} — cascade continues on the stored contract")
+
+    fix_id = fix_id or fix_task_id(review_task_id, fix_round)
+    # Cheap early-out with a legible log. It is NOT the guard — the
+    # `enqueue` below is, because only the PRIMARY KEY is atomic.
+    existing = queue.get_task(fix_id)
+    if existing is not None:
+        logger.info(
+            f"auto_enqueue_fix: {fix_id} already exists for {review_task_id} "
+            f"(status={existing.status!r}) — this review round already has "
+            f"its fix task, not enqueueing another"
+        )
+        return None
+    try:
+        _enqueue_with_inherited_risk(queue, TaskRequest(
+            task_id=fix_id,
+            task_type="implement",  # type: ignore[arg-type]
+            description="\n".join(parts),
+            branch=cascade_branch,
+            context=fix_context,
+            project=_successor_project(queue, review_task, server_project),
+        ), tasks_by_id, review_task, ingress="cascade.fix",
+            successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+            coordinator_notify_fn=coordinator_notify_fn)
+    except (sqlite3.IntegrityError, TaskAlreadyExistsError):
+        # A concurrent submission (or replay 재실행) won the insert. That is the
+        # mechanism working, not an error: exactly one fix task exists.
+        logger.info(
+            f"auto_enqueue_fix: {fix_id} was created concurrently for "
+            f"{review_task_id} — leaving the winner in place"
+        )
+        return None
+    if citation is not None:
+        try:
+            queue.record_shadow_rounds_vs_cap(
+                fix_id,
+                recommended=citation["recommended_max_review_fix_rounds"],
+                actual_cap=max_rounds)
+        except Exception:
+            logger.exception(
+                f"auto_enqueue_fix: shadow_rounds_vs_cap receipt failed for "
+                f"{fix_id} — the fix task itself stands")
+    logger.info(
+        f"auto_enqueue_fix: enqueued {fix_id} for {review_task_id} "
+        f"(round {fix_round}/{max_rounds})"
+    )
+    return fix_id
 
 
 def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
@@ -2444,6 +2542,62 @@ def _successor_project(queue, parent_task, server_project: Optional[str] = None)
     return ""
 
 
+def _enqueue_pre_review_test(queue: TaskQueue, impl_task: TaskRequest, *, pr_number: int,
+                             head_sha: str, repo: str, server_project: Optional[str],
+                             coordinator_notify_fn) -> Optional[PreReviewTestEnqueued]:
+    """#999: run the script tester's suite on this head before a review is spent.
+
+    Returns ``None`` when the test could not be created; the reason is then
+    recorded on the implement task, so the review that follows carries it.
+    """
+    impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
+    test_id = pre_review_test_id(impl_task.task_id)
+    if queue.get_task(test_id) is not None:
+        return PreReviewTestEnqueued(test_id)  # A replayed implement result.
+    test_context: dict = {PRE_REVIEW_KEY: True, "prev_task_id": impl_task.task_id,
+                          "pr_number": pr_number}
+    if head_sha:
+        # The suite runs on, and a fix is judged against, this pushed head.
+        test_context["reviewed_sha"] = head_sha
+    for key in ("fix_round", "pre_review_fix_round", "issue", "issue_title",
+                "issue_body", "issue_url", "implementer_agent"):
+        if impl_ctx.get(key) is not None:
+            test_context[key] = impl_ctx[key]
+    prior_review = impl_ctx.get("review_task_id") or impl_ctx.get("prev_task_id")
+    if isinstance(prior_review, str) and prior_review and (
+            (prior := queue.get_task(prior_review)) is not None
+            and prior.task_type == "review"):
+        test_context["review_task_id"] = prior_review
+    if repo:
+        test_context["repo"] = repo
+    _carry_lineage_intent(test_context, impl_task, "tester")
+    test_req = TaskRequest(
+        task_id=test_id, task_type="test",  # type: ignore[arg-type]
+        description=(f"Pre-review test of PR #{pr_number} for task {impl_task.task_id} "
+                     "(full suite before review, #999)."),
+        branch=impl_task.branch, context=test_context,
+        project=_successor_project(queue, impl_task, server_project))
+    try:
+        _enqueue_with_inherited_risk(
+            queue, test_req, _ancestor_tasks_by_id(queue, impl_task), impl_task,
+            ingress="cascade.test", successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+            coordinator_notify_fn=coordinator_notify_fn)
+    except TaskAlreadyExistsError:
+        pass
+    except PausedError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — the review still runs, with the reason
+        logger.warning("auto_enqueue_review: pre-review test for %s not enqueued: %s",
+                       impl_task.task_id, exc)
+        queue.patch_context(impl_task.task_id, {PRE_REVIEW_OUTCOME_KEY: {
+            "task_id": test_id, "outcome": "not_run",
+            "reason": f"enqueue_failed: {type(exc).__name__}: {str(exc)[:200]}"}})
+        return None
+    logger.info("auto_enqueue_review: %s goes to pre-review test %s before review (#999)",
+                impl_task.task_id, test_id)
+    return PreReviewTestEnqueued(test_id)
+
+
 def auto_enqueue_review(
     queue: TaskQueue,
     impl_task_id: str,
@@ -2456,8 +2610,14 @@ def auto_enqueue_review(
     repo_cwd: str = "",
     coordinator_notify_fn=None,
     reviewer_provider: str = "",
-) -> str | ReviewRoundCapReached | None:
+    pre_review_test: bool = False,
+) -> str | ReviewRoundCapReached | PreReviewTestEnqueued | None:
     """Create the review task that follows a completed impl task.
+
+    ``pre_review_test`` (#999): the caller runs the script tester, so a PR is
+    first sent to a pre-review suite run and this returns
+    ``PreReviewTestEnqueued``. The review is created when that test's outcome
+    is recorded on the implement task (``PRE_REVIEW_OUTCOME_KEY``).
 
     ``result`` is the implementer's own report (#305). When it names a branch
     that differs from the task's, THAT is where the work is and the review is
@@ -2730,6 +2890,8 @@ def auto_enqueue_review(
             review_context["implementer_agent"] = implementer_agent
         if impl_ctx.get("no_tester"):
             review_context["no_tester"] = True
+        if isinstance(impl_ctx.get(PRE_REVIEW_OUTCOME_KEY), dict):
+            review_context[PRE_REVIEW_OUTCOME_KEY] = dict(impl_ctx[PRE_REVIEW_OUTCOME_KEY])
         # #244: carry the fix-round counter along the lineage. Without this the
         # counter resets every time a fix task produces a fresh review, and the
         # cap that makes review→fix safe to automate would never be reached.
@@ -2791,6 +2953,22 @@ def auto_enqueue_review(
                                     coordinator_notify_fn)
         if blocked is not None:
             return blocked
+        if (pre_review_test and pr_number is not None and not impl_ctx.get("no_tester")
+                and PRE_REVIEW_OUTCOME_KEY not in impl_ctx
+                and queue.get_task(review_id) is None):
+            queued = _enqueue_pre_review_test(
+                queue, impl_task, pr_number=pr_number, head_sha=_pushed_commit,
+                repo=_impl_repo, server_project=server_project,
+                coordinator_notify_fn=coordinator_notify_fn)
+            if queued is not None:
+                return queued
+            # The helper recorded why it could not run; the review carries it.
+            refreshed = queue.get_task(impl_task_id)
+            fallback = ((refreshed.context or {}).get(PRE_REVIEW_OUTCOME_KEY)
+                        if refreshed is not None else None)
+            if isinstance(fallback, dict):
+                review_req = replace(review_req, context={
+                    **review_context, PRE_REVIEW_OUTCOME_KEY: dict(fallback)})
         try:
             _enqueue_with_inherited_risk(
                 queue, review_req, _ancestor_tasks_by_id(queue, impl_task),

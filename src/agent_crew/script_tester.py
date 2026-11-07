@@ -596,7 +596,12 @@ def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: s
         record = run_script_test(repo, base_sha=base_sha, head_sha=head_sha, state=state,
                                  cache_dir=cache_dir, runner=runner)
         record["base_branch"] = base_branch
-        if record.get("outcome") == PASSED and head_has_workflows(repo, head_sha):
+        if ctx.get("pre_review") is True:
+            # #999: the pre-review run only screens the suite. CI on a head
+            # pushed seconds ago is still pending, and the post-review test
+            # keeps the CI gate.
+            record["pre_review"] = True
+        elif record.get("outcome") == PASSED and head_has_workflows(repo, head_sha):
             from agent_crew.github import get_repo, head_checks_state
             gh_repo = ctx.get("repo") or get_repo(cwd=repo)
             if not gh_repo:
