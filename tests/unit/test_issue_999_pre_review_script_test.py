@@ -317,3 +317,172 @@ def test_cli_driven_loop_keeps_review_first(tmp_path, monkeypatch):
         _complete_impl(client)
     assert [r.task_id for r in _of_type(queue, "review")] == ["review-impl-999-r0"]
     assert _of_type(queue, "test") == []
+
+
+# ── review of PR #1003: every implement-result route, not just HTTP ────────
+
+def _mcp_harness(tmp_path, monkeypatch, *, role_agents=None, flag=None):
+    """The MCP transport with no server: role map from state.json beside the DB."""
+    from agent_crew.mcp_server import build_mcp_server
+    if flag is not None:
+        monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", flag)
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.delenv("AGENT_CREW_STATE", raising=False)
+    import agent_crew.github as github
+    monkeypatch.setattr(github, "pr_state", lambda *a, **k: "open")
+    monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: HEAD)
+    monkeypatch.setattr(github, "pr_number_for_branch", lambda *a, **k: PR)
+    monkeypatch.setattr("agent_crew.pipeline._repo_default_branch", lambda repo: "main")
+    monkeypatch.setattr("agent_crew.mcp_server.verify_implement_artifact",
+                        lambda _task, _result, *, repo_cwd: (True, "verified artifact"))
+    state = {"project": "agent_crew"}
+    if role_agents:
+        state["role_agents"] = role_agents
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    queue.enqueue(TaskRequest(
+        task_id="impl-999", task_type="implement", description="Implement #999",
+        branch=BRANCH, project="agent_crew",
+        context={"issue": 999, "risk_tier": 2, "repo": "owner/repo",
+                 "base_branch": "main"}), ingress="http.tasks")
+    submit = build_mcp_server(db)._tool_manager._tools["submit_result"].fn
+    return queue, submit
+
+
+def _mcp_impl(submit, task_id="impl-999"):
+    response = submit(task_id=task_id, status="completed", summary="implemented",
+                      branch=BRANCH, commit=HEAD, pr_number=PR)
+    assert response["acknowledged"] is True, response
+
+
+def _mcp_script(submit, task_id, record):
+    result = script_tester.record_to_result(task_id, record, pr_number=PR)
+    response = submit(task_id=task_id, status=result.status, summary=result.summary,
+                      findings=result.findings, pr_number=PR, error_info=result.error_info)
+    assert response["acknowledged"] is True, response
+
+
+def test_mcp_implement_result_goes_to_pre_review_test(tmp_path, monkeypatch):
+    queue, submit = _mcp_harness(tmp_path, monkeypatch)
+    _mcp_impl(submit)
+    assert [t.task_id for t in _of_type(queue, "test")] == [pre_review_test_id("impl-999")]
+    assert _of_type(queue, "review") == []
+
+
+def test_mcp_green_pre_review_enqueues_exactly_one_review(tmp_path, monkeypatch):
+    queue, submit = _mcp_harness(tmp_path, monkeypatch)
+    pretest = pre_review_test_id("impl-999")
+    _mcp_impl(submit)
+    _mcp_script(submit, pretest, GREEN)
+    reviews = _of_type(queue, "review")
+    assert [r.task_id for r in reviews] == ["review-impl-999-r0"]
+    assert reviews[0].context[PRE_REVIEW_OUTCOME_KEY] == {"task_id": pretest,
+                                                          "outcome": "passed"}
+    assert [t.task_id for t in _of_type(queue, "test")] == [pretest]   # no post-review test yet
+
+
+def test_mcp_red_pre_review_enqueues_one_fix_and_zero_reviews(tmp_path, monkeypatch):
+    queue, submit = _mcp_harness(tmp_path, monkeypatch)
+    pretest = pre_review_test_id("impl-999")
+    _mcp_impl(submit)
+    _mcp_script(submit, pretest, RED)
+    fixes = [t for t in _of_type(queue, "implement") if t.task_id != "impl-999"]
+    assert [t.task_id for t in fixes] == [fix_task_id(pretest, 1)]
+    assert fixes[0].context["review_findings"] == [f"new failure: {FAILING}"]
+    assert fixes[0].context["fix_round"] == 0
+    assert _of_type(queue, "review") == []
+
+
+def test_mcp_pre_review_infra_error_reviews_with_reason(tmp_path, monkeypatch):
+    queue, submit = _mcp_harness(tmp_path, monkeypatch)
+    _mcp_impl(submit)
+    _mcp_script(submit, pre_review_test_id("impl-999"),
+                {"executor": "script", "outcome": script_tester.INCOMPLETE,
+                 "reason": "script_test_timeout"})
+    reviews = _of_type(queue, "review")
+    assert len(reviews) == 1
+    assert reviews[0].context[PRE_REVIEW_OUTCOME_KEY]["reason"] == "script_test_timeout"
+    assert [t for t in _of_type(queue, "implement") if t.task_id != "impl-999"] == []
+
+
+@pytest.mark.parametrize("flag, role_agents", [
+    ("0", None),
+    (None, {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}),
+])
+def test_mcp_flag_off_or_provider_tester_keeps_review_first(
+        tmp_path, monkeypatch, flag, role_agents):
+    queue, submit = _mcp_harness(tmp_path, monkeypatch, role_agents=role_agents, flag=flag)
+    _mcp_impl(submit)
+    assert [r.task_id for r in _of_type(queue, "review")] == ["review-impl-999-r0"]
+    assert _of_type(queue, "test") == []
+
+
+def _cloud_task(queue):
+    queue.enqueue(TaskRequest(
+        task_id="impl-cloud-999", task_type="implement", description="Implement #999",
+        branch=BRANCH, project="agent_crew",
+        context={"issue": 999, "risk_tier": 2, "repo": "owner/repo",
+                 "base_branch": "main"}), ingress="http.tasks")
+    return queue.get_task("impl-cloud-999")
+
+
+def _reconcile_cloud(queue, task):
+    from agent_crew import claude_cloud
+    return claude_cloud.reconcile_cloud_dispatch(
+        queue, task, repo="owner/repo",
+        pr_number_for_branch_fn=lambda *a, **k: PR,
+        pr_head_sha_fn=lambda *a, **k: HEAD,
+        commit_message_fn=lambda *a, **k: None,
+        pr_state_fn=lambda *a, **k: "open")
+
+
+@pytest.mark.parametrize("flag, expect_pretest", [(None, True), ("0", False)])
+def test_cloud_pr_discovery_follows_the_same_policy(tmp_path, monkeypatch, flag, expect_pretest):
+    queue, _ = _mcp_harness(tmp_path, monkeypatch, flag=flag)
+    task = _cloud_task(queue)
+    outcome = _reconcile_cloud(queue, task)
+    assert outcome.action == "pr_ready"
+    assert queue.get_task("impl-cloud-999").status == "completed"
+    tests = [t.task_id for t in _of_type(queue, "test")]
+    reviews = [r.task_id for r in _of_type(queue, "review")]
+    if expect_pretest:
+        assert tests == [pre_review_test_id("impl-cloud-999")] and reviews == []
+    else:
+        assert tests == [] and reviews == ["review-impl-cloud-999-r0"]
+    # A second reconcile pass creates nothing new.
+    _reconcile_cloud(queue, queue.get_task("impl-cloud-999"))
+    assert [t.task_id for t in _of_type(queue, "test")] == tests
+    assert [r.task_id for r in _of_type(queue, "review")] == reviews
+
+
+def test_every_implement_result_route_asks_the_shared_policy():
+    """Static guard: every caller of auto_enqueue_review names its #999 policy,
+    so a new implement-result route cannot silently default to review-first."""
+    import ast
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[2] / "src" / "agent_crew"
+    missing = []
+    for path in sorted(src.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (isinstance(node, ast.Call)
+                    and getattr(node.func, "id", getattr(node.func, "attr", "")) in (
+                        "auto_enqueue_review", "_pipeline_auto_enqueue_review")
+                    and not any(kw.arg == "pre_review_test" for kw in node.keywords)):
+                missing.append(f"{path.name}:{node.lineno}")
+    assert missing == []
+
+
+def test_tier3_gate_resume_is_screened_by_the_pre_review_test(tmp_path, monkeypatch):
+    from agent_crew.pipeline import (PreReviewTestEnqueued, auto_enqueue_review,
+                                     resume_tier3_gate)
+    queue, _ = _mcp_harness(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
+    queue.enqueue(TaskRequest("deploy", "implement", "deploy release", branch=BRANCH,
+                              context={"risk_tier": 3, "pr_number": PR}))
+    assert auto_enqueue_review(queue, "deploy", pr_number=PR, pr_state_fn=lambda *a: "open",
+                               pre_review_test=True) is None
+    queue.resolve_gate("risk-tier3-deploy", approved=True)
+    resumed = resume_tier3_gate(queue, "risk-tier3-deploy", pr_state_fn=lambda *a: "open")
+    assert resumed == PreReviewTestEnqueued(pre_review_test_id("deploy"))
+    assert [r for r in _of_type(queue, "review") if r.context.get("prev_task_id") == "deploy"] == []

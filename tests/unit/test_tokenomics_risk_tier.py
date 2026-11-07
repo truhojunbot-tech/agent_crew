@@ -101,6 +101,8 @@ def test_legacy_low_tier_contract_cannot_skip_independent_gates(tmp_db, monkeypa
 def test_tier_two_marks_adversarial_review_and_tier_three_requires_gate(
     tmp_db, monkeypatch,
 ):
+    # #999: this test is about the Tier 3 gate itself, not the pre-review test.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("core", "implement", "change src/agent_crew/queue.py", branch="b", context={"risk_tier": 2}))

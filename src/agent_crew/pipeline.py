@@ -1045,6 +1045,88 @@ def pre_review_script_test_enabled() -> bool:
     return (os.getenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST") or "").strip() != "0"
 
 
+def pre_review_test_applies(queue: TaskQueue, *, tester_agent: Optional[str] = None) -> bool:
+    """The one #999 policy decision every implement-result route asks.
+
+    True when the flag is on and the project's tester is the script tester.
+    ``tester_agent`` is the caller's live role map (HTTP); routes without one
+    (MCP, claude_cloud) resolve it from the project's state.json beside the
+    task DB, the same file the server reads. An unreadable role map keeps
+    today's review-first order and says so.
+    """
+    if not pre_review_script_test_enabled():
+        return False
+    if tester_agent is None:
+        from agent_crew.role_mapping import RoleResolutionError, effective_role_mapping
+        state_path = (os.path.expanduser(os.getenv("AGENT_CREW_STATE", ""))
+                      or os.path.join(os.path.dirname(os.path.abspath(queue.db_path)),
+                                      "state.json"))
+        try:
+            state = None
+            if os.path.exists(state_path):
+                with open(state_path) as f:
+                    state = json.load(f)
+            mapping, _ = effective_role_mapping(
+                state, project=(state or {}).get("project", "unknown")
+                if isinstance(state, dict) else "unknown")
+        except (OSError, ValueError, TypeError, AttributeError, RoleResolutionError) as exc:
+            logger.warning("pre-review test: role map unreadable at %s (%s); "
+                           "reviewing first", state_path, exc)
+            return False
+        tester_agent = mapping.get("tester")
+    from agent_crew.script_tester import SCRIPT_TESTER
+    return tester_agent == SCRIPT_TESTER
+
+
+def pre_review_outcome(result: TaskResult) -> tuple[str, str]:
+    """``(outcome, reason)`` of a pre-review test that did NOT find new failures."""
+    if handle_test_result(result) == "passed":
+        return "passed", ""
+    info = result.error_info if isinstance(result.error_info, dict) else {}
+    record = info.get("script_test") if isinstance(info.get("script_test"), dict) else {}
+    reason = (info.get("reason") or record.get("reason") or record.get("outcome")
+              or info.get("kind") or result.status)
+    return "not_run", str(reason)
+
+
+def review_after_pre_review_test(queue: TaskQueue, test_task_id: str, outcome: str,
+                                 reason: str = "", *, enqueue_review_fn=None,
+                                 **review_kwargs):
+    """#999: the pre-review suite lets the review go ahead; create it.
+
+    ``outcome`` is ``passed``, or ``not_run`` when the suite could not judge
+    the head (no test command, setup error, timeout, ...). A suite that could
+    not run must not hold the PR, but it must not look like a pass either, so
+    ``reason`` is recorded on the test, the implement task and the review.
+    Shared by every result transport; ``enqueue_review_fn(impl_id, pr, result)``
+    lets the HTTP server add its push. Returns what the review enqueue
+    returned, or ``None``.
+    """
+    test_task = queue.get_task(test_task_id)
+    if not is_pre_review_test(test_task):
+        return None
+    ctx = test_task.context if isinstance(test_task.context, dict) else {}
+    impl_id = ctx.get("prev_task_id")
+    impl = queue.get_task(impl_id) if isinstance(impl_id, str) else None
+    if impl is None or impl.task_type != "implement":
+        logger.warning("pre-review test %s has no implement predecessor (%r)",
+                       test_task_id, impl_id)
+        return None
+    record = {"task_id": test_task_id, "outcome": outcome}
+    if reason:
+        record["reason"] = reason
+        logger.warning("pre-review test %s did not judge the head (%s); reviewing anyway",
+                       test_task_id, reason)
+    queue.patch_context(test_task_id, {PRE_REVIEW_OUTCOME_KEY: record})
+    queue.patch_context(impl.task_id, {PRE_REVIEW_OUTCOME_KEY: record})
+    impl_result = queue.get_result(impl.task_id)
+    if enqueue_review_fn is not None:
+        return enqueue_review_fn(impl.task_id, ctx.get("pr_number"), impl_result)
+    # The outcome is recorded above, so this creates the review itself.
+    return auto_enqueue_review(queue, impl.task_id, ctx.get("pr_number"),
+                               result=impl_result, pre_review_test=False, **review_kwargs)
+
+
 def pre_review_test_id(impl_task_id: str) -> str:
     """One pre-review test per implement task; the id is the replay guard."""
     return f"pretest-{impl_task_id}"
@@ -3200,8 +3282,10 @@ def resume_tier3_gate(queue: TaskQueue, gate_id: str, *,
     if gate.kind == "review" and gate.target_task_id:
         impl_task_id = gate.target_task_id
         queue.patch_context(impl_task_id, {"tier3_gate_approved": True})
+        # #999: the approved review is still screened by the suite first.
         return auto_enqueue_review(queue, impl_task_id, server_project=server_project,
-                                   pr_state_fn=pr_state_fn)
+                                   pr_state_fn=pr_state_fn,
+                                   pre_review_test=pre_review_test_applies(queue))
     return None
 
 

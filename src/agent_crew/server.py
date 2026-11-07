@@ -80,7 +80,9 @@ from agent_crew.pipeline import (
     PRE_REVIEW_OUTCOME_KEY,
     PreReviewTestEnqueued,
     is_pre_review_test,
-    pre_review_script_test_enabled,
+    pre_review_outcome,
+    pre_review_test_applies,
+    review_after_pre_review_test as _pipeline_review_after_pre_review_test,
 )
 from agent_crew import provenance as _prov
 from agent_crew.protocol import (
@@ -6605,8 +6607,7 @@ def create_app(
             # #999: a red suite goes back to the implementer before a review
             # is spent on it. Only the script tester runs it: it is the suite
             # the post-review test would run, and it calls no provider.
-            pre_review_test=(pre_review_script_test_enabled()
-                             and _script_tester_active()),
+            pre_review_test=_pre_review_test_applies(),
         )
         if isinstance(review_id, PreReviewTestEnqueued):
             _try_push_next("tester")
@@ -6618,40 +6619,20 @@ def create_app(
             _try_push_next("implementer")
         return review_id
 
+    def _pre_review_test_applies() -> bool:
+        """#999: the shared policy, asked with this server's live role map."""
+        _refresh_role_map()
+        return pre_review_test_applies(q(), tester_agent=_DISPATCH_ROLE_TO_AGENT.get("tester"))
+
     def _review_after_pre_review_test(test_task: TaskRequest, outcome: str,
                                       reason: str = "") -> bool:
-        """#999: the pre-review suite lets the review go ahead; create it.
-
-        ``outcome`` is ``passed``, or ``not_run`` when the suite could not judge
-        the head (no test command, setup error, timeout, ...). A suite that
-        could not run must not hold the PR, but it must not look like a pass
-        either, so ``reason`` is recorded on both tasks and on the review.
-        Returns whether a review now continues the lineage.
-        """
-        ctx = test_task.context if isinstance(test_task.context, dict) else {}
-        impl_id = ctx.get("prev_task_id")
-        impl = q().get_task(impl_id) if isinstance(impl_id, str) else None
-        if impl is None or impl.task_type != "implement":
-            logger.warning("pre-review test %s has no implement predecessor (%r)",
-                           test_task.task_id, impl_id)
-            return False
-        record = {"task_id": test_task.task_id, "outcome": outcome}
-        if reason:
-            record["reason"] = reason
-            logger.warning("pre-review test %s did not judge the head (%s); "
-                           "reviewing anyway", test_task.task_id, reason)
-        q().patch_context(test_task.task_id, {PRE_REVIEW_OUTCOME_KEY: record})
-        q().patch_context(impl.task_id, {PRE_REVIEW_OUTCOME_KEY: record})
-        review_id = _auto_enqueue_review(impl.task_id, pr_number=ctx.get("pr_number"),
-                                         result=q().get_result(impl.task_id))
+        """HTTP-side wrapper of ``pipeline.review_after_pre_review_test``.
+        Returns whether a review now continues the lineage."""
+        review_id = _pipeline_review_after_pre_review_test(
+            q(), test_task.task_id, outcome, reason,
+            enqueue_review_fn=lambda impl_id, pr, impl_result: _auto_enqueue_review(
+                impl_id, pr_number=pr, result=impl_result))
         return isinstance(review_id, str) and bool(review_id)
-
-    def _pre_review_not_run_reason(result: TaskResult) -> str:
-        info = result.error_info if isinstance(result.error_info, dict) else {}
-        record = info.get("script_test") if isinstance(info.get("script_test"), dict) else {}
-        reason = (info.get("reason") or record.get("reason") or record.get("outcome")
-                  or info.get("kind") or result.status)
-        return str(reason)
 
     def _auto_enqueue_test(review_task_id: str, repo: str = "") -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
@@ -8423,10 +8404,8 @@ def create_app(
             elif _pre_review and _task is not None:
                 # #999: not a merge gate. Green, or unable to judge, goes on to
                 # the review; only new failures (above) go back to the implementer.
-                _passed = _test_verdict == "passed"
                 _lineage_continues_without_task = _review_after_pre_review_test(
-                    _task, "passed" if _passed else "not_run",
-                    "" if _passed else _pre_review_not_run_reason(result))
+                    _task, *pre_review_outcome(result))
             elif result.status == "failed" and _script_tester.is_script_test_result(result):
                 if (_test_info.get("reason") == "script_test_merge_conflict"
                         and _auto_enqueue_conflict_rebase(task_id, result)):
