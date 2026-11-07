@@ -82,6 +82,9 @@ def _post_task_http(port: int, req: TaskRequest) -> str:
 
 _TDD_CONTEXT = {
     "tdd": True,
+    # #999: this CLI loop waits for the review successor itself, so the
+    # server must not put a pre-review test between them.
+    "cli_driven_loop": True,
     "instructions": "Write tests first (RED), then implement (GREEN), then refactor.",
 }
 

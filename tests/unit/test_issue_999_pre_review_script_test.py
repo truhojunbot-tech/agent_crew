@@ -298,3 +298,22 @@ def test_completed_pre_review_test_does_not_block_post_review_test(tmp_path, mon
     assert test_id == f"test-{review_id}"
     post = queue.get_task(test_id)
     assert post is not None and not post.context.get("pre_review")
+
+
+def test_flag_is_on_by_default(monkeypatch):
+    from agent_crew.pipeline import pre_review_script_test_enabled
+    monkeypatch.delenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", raising=False)
+    assert pre_review_script_test_enabled() is True
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
+    assert pre_review_script_test_enabled() is False
+
+
+def test_cli_driven_loop_keeps_review_first(tmp_path, monkeypatch):
+    """`crew run` / `discuss --then-run` wait for the review successor themselves."""
+    from agent_crew import loop
+    assert loop._TDD_CONTEXT["cli_driven_loop"] is True
+    app, queue, _ = _harness(tmp_path, monkeypatch, impl_context={"cli_driven_loop": True})
+    with TestClient(app) as client:
+        _complete_impl(client)
+    assert [r.task_id for r in _of_type(queue, "review")] == ["review-impl-999-r0"]
+    assert _of_type(queue, "test") == []
