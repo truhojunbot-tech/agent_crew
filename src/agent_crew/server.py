@@ -98,6 +98,7 @@ from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
 from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
 from agent_crew.queue import INDEPENDENT_REVIEW_UNAVAILABLE
 from agent_crew import claude_cloud as _claude_cloud
+from agent_crew import chatgpt_review as _chatgpt_review
 from agent_crew import script_tester as _script_tester
 from agent_crew import contract_emit as _contract_emit
 from agent_crew.cea import wiring as cea_wiring
@@ -2478,6 +2479,7 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
                     if path:
                         result[role] = path
                     elif agent not in (_claude_cloud.CLOUD_PROVIDER_NAME,
+                                       _chatgpt_review.PROVIDER_NAME,
                                        _script_tester.SCRIPT_TESTER):
                         # Cloud and script roles need no local worktree.
                         logger.warning(
@@ -2501,6 +2503,7 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
                 if path:
                     result[role] = path
                 elif agent not in (_claude_cloud.CLOUD_PROVIDER_NAME,
+                                   _chatgpt_review.PROVIDER_NAME,
                                    _script_tester.SCRIPT_TESTER):
                     logger.warning(
                         "_load_worktree_map: explicit role %s uses agent %s with no worktree; omitting role",
@@ -3556,6 +3559,13 @@ def create_app(
                 # task context and the deterministic retry id from detail.
                 _coordinator_notice(outcome.task_id, "cloud_stale_requeued", outcome.detail)
 
+    def _reconcile_chatgpt_reviews() -> None:
+        """#1000: chatgpt reviews wait on a GitHub thread, not a pane. Each
+        row throttles its own reads to AGENT_CREW_CHATGPT_REVIEW_POLL_S."""
+        _chatgpt_review.reconcile_chatgpt_reviews(
+            q(), submit_review_result_fn=lambda task_id, result: submit_result(
+                task_id, result, x_agent_crew_project=_server_identity()["project"]))
+
     def _resume_codex_quota_holds() -> list[str]:
         """Release one probe, then its cohort after a dispatch was recorded."""
         rows = q().codex_quota_holds()
@@ -3971,6 +3981,10 @@ def create_app(
                 _claude_cloud.reconcile_shadow_reviews(q())
         except Exception:
             logger.exception("watchdog: claude_cloud reconciliation failed")
+        try:
+            _reconcile_chatgpt_reviews()
+        except Exception:
+            logger.exception("watchdog: chatgpt review reconciliation failed")
         try:
             for successor_id in q().readmit_parked_owner_conflicts():
                 successor = q().get_task(successor_id)
@@ -6173,7 +6187,8 @@ def create_app(
                     workers.append(agent)
             # Discuss can use an agent with no assigned task role.
             discuss_workers = list(dict.fromkeys(
-                [worker for worker in workers if worker != _script_tester.SCRIPT_TESTER]
+                [worker for worker in workers
+                 if worker not in (_script_tester.SCRIPT_TESTER, _chatgpt_review.PROVIDER_NAME)]
                 + [agent for agent in _DISPATCH_DISCUSS_WORKTREES
                    if agent in ("claude", "codex", "gemini", "agy")]))
             return by_agent, workers, discuss_workers
@@ -6268,6 +6283,17 @@ def create_app(
                                 if _cloud_type:
                                     await asyncio.to_thread(
                                         _notice_cloud_disabled_role, _cloud_role, _cloud_type)
+                            continue
+                        if worker == _chatgpt_review.PROVIDER_NAME:
+                            # #1000: reviewer-only, no pane and no checkout. The
+                            # adapter owns dequeue and admission; it never falls
+                            # through to a local dispatch.
+                            if "reviewer" in _worker_roles:
+                                await asyncio.to_thread(
+                                    _chatgpt_review.dispatch_chatgpt_review, q(),
+                                    role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT),
+                                    review_guard_fn=_refuse_self_review,
+                                    state_path=state_path)
                             continue
                         if (worker == _claude_cloud.CLOUD_PROVIDER_NAME and
                                 "implementer" in _worker_roles):
