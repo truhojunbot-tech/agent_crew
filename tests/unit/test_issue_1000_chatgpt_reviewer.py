@@ -2,6 +2,8 @@
 fail-closed ends. GitHub is a fake with the four calls the backend makes."""
 
 import re
+import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +27,10 @@ ROLES = {"implementer": "claude", "reviewer": "chatgpt", "tester": "script"}
 FINDING = "src/agent_crew/queue.py:42 must keep the review cascade intact"
 
 
+def _iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class FakeGh:
     def __init__(self):
         self.threads: dict[tuple[str, int], list[dict]] = {}
@@ -45,14 +51,16 @@ class FakeGh:
     def post_comment(self, repo, number, body):
         self.next_id += 1
         self.posted.append((repo, number, body))
-        row = {"id": self.next_id, "body": body,
+        row = {"id": self.next_id, "body": body, "created_at": _iso(time.time()),
                "html_url": f"https://github.com/{repo}/issues/{number}#c{self.next_id}"}
         self.threads.setdefault((repo, number), []).append(row)
         return row
 
-    def reply(self, repo, number, body):
+    def reply(self, repo, number, body, created_at=None):
         self.next_id += 1
-        self.threads.setdefault((repo, number), []).append({"id": self.next_id, "body": body})
+        self.threads.setdefault((repo, number), []).append({
+            "id": self.next_id, "body": body,
+            "created_at": _iso(time.time() if created_at is None else created_at)})
 
 
 @pytest.fixture
@@ -248,6 +256,43 @@ def test_no_reply_within_timeout_ends_timed_out_never_approve(queue, gh, notices
     assert [o.action for o in outcomes] == ["timed_out"]
     task = queue.get_task(task_id)
     assert task.status == "timed_out"
+    result = queue.get_result(task_id)
+    assert result is None or result.verdict is None
+    assert [kind for _, kind, _ in notices] == ["chatgpt_review_timed_out"]
+
+
+@pytest.mark.parametrize("verdict", ["approve", "request_changes"])
+def test_reply_posted_before_deadline_but_read_after_it_is_accepted(
+        queue, gh, notices, monkeypatch, verdict):
+    monkeypatch.setenv(chatgpt._ENV_CARRIER, "pr")
+    monkeypatch.setenv(chatgpt._ENV_TIMEOUT_S, "600")
+    task_id = _enqueue(queue)
+    _dispatch(queue, gh, now=1000.0)
+    gh.reply(REPO, PR, _reply(verdict=f"VERDICT: {verdict}"), created_at=1599.0)
+    submitted = []
+    outcomes = chatgpt.reconcile_chatgpt_reviews(  # first read after an outage
+        queue, gh=gh, now=5000.0,
+        submit_review_result_fn=lambda tid, result: submitted.append(result) or {"status": "ok"})
+    assert [o.action for o in outcomes] == ["review_completed"]
+    (result,) = submitted
+    assert result.verdict == verdict
+    assert notices == []
+
+
+@pytest.mark.parametrize("created_at", [1601.0, None])
+def test_reply_posted_after_deadline_is_ignored_and_times_out(
+        queue, gh, notices, monkeypatch, created_at):
+    monkeypatch.setenv(chatgpt._ENV_CARRIER, "pr")
+    monkeypatch.setenv(chatgpt._ENV_TIMEOUT_S, "600")
+    task_id = _enqueue(queue)
+    _dispatch(queue, gh, now=1000.0)
+    gh.reply(REPO, PR, _reply(verdict="VERDICT: approve", text=""), created_at=created_at or 1601.0)
+    if created_at is None:  # no readable post time: never accepted either
+        gh.threads[(REPO, PR)][-1].pop("created_at")
+    outcomes = chatgpt.reconcile_chatgpt_reviews(
+        queue, gh=gh, now=5000.0, submit_review_result_fn=lambda *_: pytest.fail("late approve"))
+    assert [o.action for o in outcomes] == ["timed_out"]
+    assert queue.get_task(task_id).status == "timed_out"
     result = queue.get_result(task_id)
     assert result is None or result.verdict is None
     assert [kind for _, kind, _ in notices] == ["chatgpt_review_timed_out"]

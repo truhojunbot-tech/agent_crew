@@ -29,6 +29,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, List, Optional
 
 from agent_crew import github as _github
@@ -133,7 +134,8 @@ class GhClient:
 
     def comments(self, repo: str, number: int) -> Optional[list[dict]]:
         out = self._api(["--paginate", f"repos/{_github._repo_slug(repo)}/issues/{number}/comments",
-                         "--jq", ".[] | {id: .id, body: .body, html_url: .html_url}"])
+                         "--jq", ".[] | {id: .id, body: .body, html_url: .html_url, "
+                         "created_at: .created_at}"])
         if out is None:
             return None
         try:
@@ -444,6 +446,17 @@ def dispatch_chatgpt_review(
     return ChatGPTOutcome(task.task_id, "dispatched", posted.get("html_url") or "")
 
 
+def _created_epoch(row: dict) -> Optional[float]:
+    """GitHub's ``created_at`` (``2026-11-07T11:44:30Z``) as epoch seconds."""
+    raw = row.get("created_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return datetime.fromisoformat(raw.strip().replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def reconcile_chatgpt_review(
     queue: TaskQueue, task: TaskRequest, *, submit_review_result_fn=None,
     gh: Optional[GhClient] = None, now: Optional[float] = None,
@@ -478,8 +491,14 @@ def reconcile_chatgpt_review(
     else:
         # GitHub comment ids increase monotonically: only comments after the
         # request, on the request's own thread, can answer it.
+        # The deadline is judged by when GitHub says a reply was posted, not
+        # by when this poll ran: a reply posted in time but read after an
+        # outage still counts, and one posted after the deadline never does.
+        # A comment whose post time cannot be read is not accepted.
+        deadline = requested_at + timeout_seconds()
         later = [row for row in comments if isinstance(row, dict)
-                 and isinstance(row.get("id"), int) and row["id"] > request_id]
+                 and isinstance(row.get("id"), int) and row["id"] > request_id
+                 and (created := _created_epoch(row)) is not None and created <= deadline]
         for row in later:
             parsed = parse_reply(str(row.get("body") or ""), task_id=task.task_id, sha=sha)
             if parsed.kind == "foreign":
