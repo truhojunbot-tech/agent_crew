@@ -388,10 +388,8 @@ def dispatch_chatgpt_review(
         return _end(queue, task, "needs_human", "chatgpt_review_repo_unresolved",
                     "review repo could not be resolved")
     thread, refusal = request_thread(task_repo, pr_number)
-    if thread is None:  # pragma: no cover - env changed between probe and claim
-        queue.requeue(task.task_id)
-        _notice(queue, task.task_id, "chatgpt_review_carrier_refused", refusal)
-        return ChatGPTOutcome(task.task_id, "carrier_refused", refusal)
+    if thread is None:  # only if the env changed between the probe and the claim
+        return _end(queue, task, "needs_human", "chatgpt_review_carrier_refused", refusal)
 
     pull = gh.pull(task_repo, pr_number)
     files = gh.pull_files(task_repo, pr_number) if pull else None

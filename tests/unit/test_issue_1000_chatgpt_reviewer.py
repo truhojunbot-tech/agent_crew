@@ -358,3 +358,11 @@ def test_headless_dispatcher_posts_request_and_watchdog_reconciles(tmp_path, mon
         app.state.watchdog_tick(time.time())
     assert queue.get_task(task_id).status == "needs_human"
     assert [kind for _, kind, _ in notices] == ["chatgpt_review_reply_rejected"]
+
+
+def test_unreadable_pr_leaves_review_pending_and_posts_nothing(queue, gh, notices, monkeypatch):
+    monkeypatch.setenv(chatgpt._ENV_CARRIER, "pr")
+    gh.pull = lambda *a: None
+    task_id = _enqueue(queue)
+    assert _dispatch(queue, gh).action == "github_unavailable"
+    assert queue.get_task(task_id).status == "pending" and gh.posted == []
