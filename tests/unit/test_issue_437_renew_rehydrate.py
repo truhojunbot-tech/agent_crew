@@ -122,7 +122,8 @@ def test_dispatch_renewal(tmp_path, monkeypatch, unused_tcp_port,
                         shadow_memory_enabled=False)
     with TestClient(app):
         queue = TaskQueue(db)
-        for tid, ctx in (("first", {}), ("second", context)):
+        # #1004: codex resumes only inside a lineage, so "second" follows "first".
+        for tid, ctx in (("first", {}), ("second", {"lineage_root_task_id": "first", **context})):
             queue.enqueue(TaskRequest(task_id=tid, task_type=task_type,
                                       description="Do work", branch="feat/test",
                                       project="p", context=ctx))

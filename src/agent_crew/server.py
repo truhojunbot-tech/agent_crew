@@ -4802,6 +4802,27 @@ def create_app(
                     and not _force_context_reset and _codex_planned):
                 _renew_previous_session = _codex_planned
                 _force_context_reset = True
+            # #1004: the context is keyed on the worktree, so without this every
+            # review in a reviewer pane resumed ONE codex session for days
+            # (~205K context re-sent per turn). Resume only inside a lineage —
+            # a fix round of the same task — and start fresh when the previous
+            # task in this context belongs to another one.
+            if not _force_context_reset:
+                try:
+                    _codex_prev_task = q().peek_context_last_task_id(_project, agent, wt)
+                    if (_codex_prev_task
+                            and q().task_lineage_root_id(_codex_prev_task)
+                            != q().task_lineage_root_id(task.task_id)):
+                        _force_context_reset = True
+                        _lineage_reset = True
+                        logger.info(
+                            "dispatcher: codex task=%s follows %s of another lineage "
+                            "in %s — forcing a fresh provider conversation (#1004): "
+                            "lineage changed", task.task_id, _codex_prev_task, wt)
+                except Exception:
+                    logger.exception(
+                        "dispatcher: codex lineage lookup failed for task=%s; "
+                        "keeping worktree context policy", task.task_id)
             _ctx_over, _ctx_cap_info = codex_context_exceeds_cap(
                 wt, max_mb=_codex_cap_mb, session_id=_codex_planned)
         elif agent == "claude":
