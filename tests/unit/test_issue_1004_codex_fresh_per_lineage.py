@@ -18,7 +18,8 @@ from agent_crew.queue import TaskQueue
 SESSION = "11111111-2222-3333-4444-555555555555"
 
 
-def _dispatch(tmp_path, monkeypatch, port, *, agent, second, first=None):
+def _dispatch(tmp_path, monkeypatch, port, *, agent, second, first=None,
+              lineage_error=False):
     """Dispatch ``first`` (if given) then ``second`` into one ``agent`` worktree.
 
     Returns (last argv, context identity, context events for ``second``)."""
@@ -70,6 +71,10 @@ def _dispatch(tmp_path, monkeypatch, port, *, agent, second, first=None):
         queue = TaskQueue(db_path)
         for task, role in ([first] if first else []) + [second]:
             queue.enqueue(task)
+            if lineage_error and task is second[0]:
+                def _fail(*_a, **_kw):
+                    raise RuntimeError("lineage lookup failed")
+                monkeypatch.setattr(TaskQueue, "task_lineage_root_id", _fail)
             asyncio.run(app.state.dispatch_task(queue.dequeue(role=role), role))
         identity = queue.peek_context_identity("p", agent, str(worktree))
 
@@ -117,6 +122,21 @@ def test_fix_round_of_the_same_lineage_resumes(tmp_path, monkeypatch, unused_tcp
     assert cmd[:4] == ["codex", "exec", "resume", SESSION]
     assert identity["context_generation"] == 1
     assert not any(e["event_type"] == "context_reset" for e in events)
+
+
+def test_lineage_lookup_failure_fails_closed_to_fresh(tmp_path, monkeypatch,
+                                                      unused_tcp_port, caplog):
+    """An unverifiable lineage must not authorize reusing another task's session
+    (review-impl-1004a-r0): even a same-lineage fix round starts fresh."""
+    cmd, identity, events = _dispatch(
+        tmp_path, monkeypatch, unused_tcp_port, agent="codex",
+        first=_review("review-a", "impl-a"),
+        second=_fix("fix-review-a-r1", "review-a", "impl-a"), lineage_error=True)
+    assert cmd[:2] == ["codex", "exec"]
+    assert "resume" not in cmd and SESSION not in cmd
+    assert identity["context_generation"] == 2
+    assert any(e["event_type"] == "context_reset" for e in events)
+    assert "lineage lookup failed" in caplog.text
 
 
 def test_first_task_in_a_worktree_is_fresh(tmp_path, monkeypatch, unused_tcp_port):

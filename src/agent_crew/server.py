@@ -4820,9 +4820,14 @@ def create_app(
                             "in %s — forcing a fresh provider conversation (#1004): "
                             "lineage changed", task.task_id, _codex_prev_task, wt)
                 except Exception:
+                    # Fail closed: an unverifiable lineage must not authorize
+                    # resuming another task's session (review-impl-1004a-r0).
+                    # A wrongly fresh fix round costs one re-read; a wrong
+                    # resume re-sends a foreign context on every turn.
+                    _force_context_reset = True
                     logger.exception(
-                        "dispatcher: codex lineage lookup failed for task=%s; "
-                        "keeping worktree context policy", task.task_id)
+                        "dispatcher: codex lineage lookup failed for task=%s — "
+                        "forcing a fresh provider conversation (#1004)", task.task_id)
             _ctx_over, _ctx_cap_info = codex_context_exceeds_cap(
                 wt, max_mb=_codex_cap_mb, session_id=_codex_planned)
         elif agent == "claude":
