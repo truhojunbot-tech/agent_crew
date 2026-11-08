@@ -136,7 +136,10 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, unused_tcp_port,
             identity = q.get_or_create_context("p", "codex", str(wt), task_id="seed")
             q.update_context_provider_session_id(identity["context_key"], codex_session_id)
         q.enqueue(TaskRequest(task_id="t-1", task_type="implement",
-                              description="do it", branch="main", context=context or {},
+                              description="do it", branch="main",
+                              # #1004: codex resumes only inside the seed's lineage.
+                              context={**({"lineage_root_task_id": "seed"}
+                                          if agent == "codex" else {}), **(context or {})},
                               project="p" if codex_rollout_size is not None else ""))
         task = q.dequeue(role="implementer")
         assert task is not None

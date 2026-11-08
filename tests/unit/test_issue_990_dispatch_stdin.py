@@ -45,8 +45,10 @@ print("fake CLI completed", flush=True)
     queue = TaskQueue(db)
     if resume:
         queue.get_or_create_context("demo", agent, str(wt), task_id="seed")
+    # #1004: codex resumes only inside the seed's lineage.
     queue.enqueue(TaskRequest(task_id="large", task_type="implement", description="large prompt",
-                              branch="main", project="demo"))
+                              branch="main", project="demo",
+                              context={"lineage_root_task_id": "seed"} if resume else {}))
     task = queue.dequeue(role="implementer")
     with TestClient(app):
         asyncio.run(app.state.dispatch_task(task, "implementer"))

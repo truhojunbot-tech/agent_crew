@@ -9261,6 +9261,13 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def task_lineage_root_id(self, task_id: str) -> str:
+        """The lineage a task belongs to (#1004): its recorded
+        ``lineage_root_task_id``, else the task itself. A task row that no
+        longer exists is its own lineage, so it never matches another one."""
+        root = self.get_task_context(task_id).get("lineage_root_task_id")
+        return root if isinstance(root, str) and root else task_id
+
     def update_context_provider_session_id(self, context_key: str, provider_session_id: str) -> None:
         """Record a provider-native session id observed for this context
         (#202) — e.g. parsed from claude's stream-json output. Best-effort;

@@ -177,7 +177,10 @@ def _dispatch(tmp_path, monkeypatch, *, policy="resume", bound_session="", unuse
         tag = uuid.uuid4().hex[:6]
         # The first dispatch into a triple is always fresh (#202), so seed one.
         _one(f"seed-{tag}", {})
-        _one(f"t-{tag}", {"context_reset": True} if policy == "fresh" else {})
+        # #1004: codex resumes only inside a lineage, so the graded task is the
+        # seed's follow-up rather than an unrelated review.
+        _lineage = {"lineage_root_task_id": f"seed-{tag}"}
+        _one(f"t-{tag}", {"context_reset": True, **_lineage} if policy == "fresh" else _lineage)
         attribution = q.get_attribution(f"t-{tag}") or {}
     return spawned.get("cmd", []), attribution
 
@@ -284,7 +287,7 @@ def test_the_binding_is_recorded_at_dispatch_not_only_afterwards(tmp_path, monke
 
         tid = f"t-{uuid.uuid4().hex[:6]}"
         q.enqueue(TaskRequest(task_id=tid, task_type="review", description="r",
-                              branch="main", context={}))
+                              branch="main", context={"lineage_root_task_id": seed}))
         asyncio.run(app.state.dispatch_task(q.dequeue(role="reviewer"), "reviewer"))
         attribution = q.get_attribution(tid) or {}
 
@@ -524,9 +527,11 @@ def _codex_dispatch(tmp_path, monkeypatch, *, over, bound="sess-a", unused_tcp_p
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
-        for tid in (f"seed-{uuid.uuid4().hex[:6]}", f"t-{uuid.uuid4().hex[:6]}"):
+        seed = f"seed-{uuid.uuid4().hex[:6]}"
+        # #1004: the graded task follows the seed's lineage, so a resume is possible.
+        for tid in (seed, f"t-{uuid.uuid4().hex[:6]}"):
             q.enqueue(TaskRequest(task_id=tid, task_type="review", description="r",
-                                  branch="main", context={}))
+                                  branch="main", context={"lineage_root_task_id": seed}))
             asyncio.run(app.state.dispatch_task(q.dequeue(role="reviewer"), "reviewer"))
 
     events = [json.loads(l) for l in open(tmp_path / "context_events.jsonl")]
