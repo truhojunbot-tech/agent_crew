@@ -153,6 +153,10 @@ def test_ac3_flag_off_restores_review_first(tmp_path, monkeypatch):
 
 
 def test_ac4_provider_tester_keeps_review_first(tmp_path, monkeypatch):
+    # #889 now bars every family but the script tester from the role; lift
+    # that here, so a non-script tester can be configured at all.
+    import agent_crew.role_mapping as role_mapping
+    monkeypatch.setitem(role_mapping.ROLE_PROVIDER_POLICY, "tester", None)
     app, queue, _ = _harness(tmp_path, monkeypatch, role_agents={
         "implementer": "codex", "reviewer": "claude", "tester": "gemini"})
     with TestClient(app) as client:
@@ -308,15 +312,122 @@ def test_flag_is_on_by_default(monkeypatch):
     assert pre_review_script_test_enabled() is False
 
 
-def test_cli_driven_loop_keeps_review_first(tmp_path, monkeypatch):
-    """`crew run` / `discuss --then-run` wait for the review successor themselves."""
+def test_cli_driven_implement_result_goes_to_pre_review_test(tmp_path, monkeypatch):
+    """`crew run` / `discuss --then-run` follow the pretest; no exemption (r2)."""
     from agent_crew import loop
-    assert loop._TDD_CONTEXT["cli_driven_loop"] is True
-    app, queue, _ = _harness(tmp_path, monkeypatch, impl_context={"cli_driven_loop": True})
+    assert "cli_driven_loop" not in loop._TDD_CONTEXT
+    app, queue, _ = _harness(tmp_path, monkeypatch, impl_context=dict(loop._TDD_CONTEXT))
     with TestClient(app) as client:
         _complete_impl(client)
-    assert [r.task_id for r in _of_type(queue, "review")] == ["review-impl-999-r0"]
+    assert [t.task_id for t in _of_type(queue, "test")] == [pre_review_test_id("impl-999")]
+    assert _of_type(queue, "review") == []
+
+
+# ── review r2 of PR #1003: the CLI loops follow the pretest ─────────────────
+
+APPROVE = ("approve: the change is correct and fully covered by tests")
+
+
+def _approve_review_and_pass_post_test(queue, review_id):
+    """The review and post-review test results the CLI then only reads."""
+    from agent_crew.pipeline import auto_enqueue_test
+    from agent_crew.protocol import TaskResult
+    queue.submit_result(review_id, TaskResult(
+        task_id=review_id, status="completed", verdict="approve", findings=[],
+        summary=APPROVE, pr_number=PR))
+    test_id = auto_enqueue_test(queue, review_id, pr_state_fn=lambda *a, **k: "open",
+                                repo="owner/repo")
+    queue.submit_result(test_id, script_tester.record_to_result(
+        test_id, GREEN, pr_number=PR))
+    return test_id
+
+
+def _cli(tmp_path, monkeypatch, command):
+    """Run a CLI loop over the server-made rows; the CLI may write none itself."""
+    from click.testing import CliRunner
+    import agent_crew.discussion as discussion
+    import agent_crew.loop as loop
+    from agent_crew.cli import crew
+    monkeypatch.setenv("AGENT_CREW_DEFAULT_RISK_TIER", "2")
+    monkeypatch.setattr(loop, "enqueue_implement", lambda *a, **k: "impl-999")
+    for name in ("enqueue_review", "enqueue_test"):
+        monkeypatch.setattr(loop, name, lambda *a, _n=name, **k: (_ for _ in ()).throw(
+            AssertionError(f"CLI called {_n}")))
+    monkeypatch.setattr("agent_crew.pipeline.auto_enqueue_fix", lambda *a, **k: (
+        _ for _ in ()).throw(AssertionError("CLI enqueued a fix")))
+    monkeypatch.setattr(discussion, "enqueue_panel_tasks", lambda *a, **k: [])
+    db = str(tmp_path / "tasks.db")
+    if command == "run":
+        args = ["run", "work", "--db", db, "--max-iter", "2", "--timeout", "1"]
+    else:
+        args = ["discuss", "topic", "--then-run", "--db", db, "--agents", "claude",
+                "--output", str(tmp_path / "synthesis.md"), "--timeout", "1"]
+    return CliRunner().invoke(crew, args)
+
+
+def _rows(queue):
+    return sorted((t.task_type, t.task_id) for t in queue.list_tasks())
+
+
+@pytest.mark.parametrize("command", ["run", "discuss"])
+def test_cli_loop_green_pretest_follows_exactly_one_review(tmp_path, monkeypatch, command):
+    app, queue, _ = _harness(tmp_path, monkeypatch)
+    pretest = pre_review_test_id("impl-999")
+    with TestClient(app) as client:
+        _complete_impl(client)
+        _post_script(client, pretest, GREEN)
+    post_test = _approve_review_and_pass_post_test(queue, "review-impl-999-r0")
+    before = _rows(queue)
+    out = _cli(tmp_path, monkeypatch, command)
+    assert out.exception is None, out.output
+    assert _rows(queue) == before                  # the CLI wrote no row
+    assert before == [("implement", "impl-999"), ("review", "review-impl-999-r0"),
+                      ("test", pretest), ("test", post_test)]
+    if command == "run":
+        assert "Reviewing... (review-impl-999-r0)" in out.output
+        assert "Tests passed" in out.output
+    else:
+        assert "Loop complete: approved." in out.output
+
+
+@pytest.mark.parametrize("command", ["run", "discuss"])
+def test_cli_loop_red_pretest_follows_the_fix_and_spends_no_review(tmp_path, monkeypatch,
+                                                                   command):
+    app, queue, _ = _harness(tmp_path, monkeypatch)
+    pretest = pre_review_test_id("impl-999")
+    fix_id = fix_task_id(pretest, 1)
+    with TestClient(app) as client:
+        _complete_impl(client)
+        _post_script(client, pretest, RED)
+    before = _rows(queue)
+    assert before == [("implement", fix_id), ("implement", "impl-999"), ("test", pretest)]
+    assert queue.get_task(fix_id).context["review_findings"] == [f"new failure: {FAILING}"]
+    out = _cli(tmp_path, monkeypatch, command)
+    assert _rows(queue) == before
+    assert _of_type(queue, "review") == []
+    # The loop moved on to the fix and is now waiting for its result.
+    assert "Pre-review tests failed" in out.output and fix_id in out.output
+    if command == "run":
+        assert out.exception is None, out.output
+        assert f"Task queued (ID={fix_id!r})" in out.output
+    else:
+        assert f"task {fix_id!r} timed out" in out.output
+
+
+@pytest.mark.parametrize("command", ["run", "discuss"])
+def test_cli_loop_flag_off_follows_the_review_as_before(tmp_path, monkeypatch, command):
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
+    app, queue, _ = _harness(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        _complete_impl(client)
     assert _of_type(queue, "test") == []
+    post_test = _approve_review_and_pass_post_test(queue, "review-impl-999-r0")
+    before = _rows(queue)
+    out = _cli(tmp_path, monkeypatch, command)
+    assert out.exception is None, out.output
+    assert _rows(queue) == before == [("implement", "impl-999"),
+                                      ("review", "review-impl-999-r0"), ("test", post_test)]
+    assert "Pre-review" not in out.output
 
 
 # ── review of PR #1003: every implement-result route, not just HTTP ────────

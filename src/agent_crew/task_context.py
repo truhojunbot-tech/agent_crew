@@ -96,7 +96,6 @@ TASK_CONTEXT_KEYS = frozenset({
     'coordinator_id',
     'coordinator_managed',
     'crew_run_branch',
-    'cli_driven_loop',
     'dependencies',
     'delta_review',
     'directive',

@@ -3036,7 +3036,6 @@ def auto_enqueue_review(
         if blocked is not None:
             return blocked
         if (pre_review_test and pr_number is not None and not impl_ctx.get("no_tester")
-                and impl_ctx.get("cli_driven_loop") is not True
                 and PRE_REVIEW_OUTCOME_KEY not in impl_ctx
                 and queue.get_task(review_id) is None):
             queued = _enqueue_pre_review_test(
