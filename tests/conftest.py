@@ -173,6 +173,18 @@ def _isolate_shadow_memory_environment(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _admit_crew_run(monkeypatch, request):
+    """Admit every pre-#1006 `crew run` fixture without touching ~/alfred.
+
+    The admission guard's own tests (test_issue_1006_*) exercise the real check.
+    """
+    if "issue_1006" in request.node.path.name:
+        return
+    from agent_crew import cli
+    monkeypatch.setattr(cli, "_require_run_admission", lambda repo, issue: {})
+
+
+@pytest.fixture(autouse=True)
 def _no_live_coordinator_notice_sink(monkeypatch):
     """Keep the server's real notice delivery routes out of every test (#874).
 
