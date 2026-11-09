@@ -283,6 +283,7 @@ def test_server_retry_keeps_both_role_choices(tmp_db, monkeypatch):
     assert_lineage_contract(tmp_db, "impl-773", INTENT)
 
 
+@pytest.mark.usefixtures("admit_crew_run")
 def test_cli_test_failure_retry_preserves_full_lineage(tmp_db, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)

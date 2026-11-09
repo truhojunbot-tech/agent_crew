@@ -2492,6 +2492,80 @@ def _await_review_fix(queue, review_id: str, *, repo: str = "", repo_cwd: str = 
     return fixes
 
 
+def _load_admission_trigger():
+    """Load alfred's #44 priority trigger from a file; never import alfred (#1006).
+
+    The path is installation config (``AGENT_CREW_ADMISSION_TRIGGER``), not a
+    portable-core default (#310). Returns the module, or None when the variable
+    is unset or the file is missing or fails to import.
+    """
+    import importlib.util
+
+    raw = os.environ.get("AGENT_CREW_ADMISSION_TRIGGER", "").strip()
+    if not raw:
+        return None
+    path = os.path.expanduser(raw)
+    if not os.path.isfile(path):
+        return None
+    tools_dir = os.path.dirname(os.path.abspath(path))
+    added = tools_dir not in sys.path
+    if added:
+        sys.path.insert(0, tools_dir)  # the trigger imports its sibling modules
+    try:
+        spec = importlib.util.spec_from_file_location("_crew_admission_trigger", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:  # noqa: BLE001 — any import failure fails closed
+        return None
+    finally:
+        if added:
+            try:
+                sys.path.remove(tools_dir)
+            except ValueError:
+                pass
+
+
+def _require_run_admission(repo: str, issue) -> dict:
+    """Re-read #44 authority before crew run's first implement POST (#1006).
+
+    Mirrors alfred ``crew_enqueue._require_current_priority``; fail-closed.
+    """
+    def refuse(decision: str, reason: str):
+        raise click.ClickException(f"ADMIT_{decision}: {reason}")
+
+    if issue is None:
+        refuse("REFRESH_REQUIRED", "crew run needs --issue for the priority admission check")
+    if not repo:
+        refuse("REFRESH_REQUIRED", "crew run needs --repo for the priority admission check")
+    trigger = _load_admission_trigger()
+    check = getattr(trigger, "priority_check", None)
+    if not callable(check):
+        refuse("REFRESH_REQUIRED", "priority trigger unavailable (AGENT_CREW_ADMISSION_TRIGGER)")
+    candidate = {"repo": repo, "issue": int(issue), "scoped_target": True,
+                 "new_implementation": True, "task_type": "implement"}
+    try:
+        verdict = check(candidate)
+    except Exception as exc:  # noqa: BLE001
+        refuse("REFRESH_REQUIRED", f"priority guard raised: {exc}")
+    if not isinstance(verdict, dict):
+        refuse("REFRESH_REQUIRED", "priority guard returned no verdict")
+    decision = verdict.get("decision")
+    evidence = verdict.get("evidence")
+    if not isinstance(evidence, dict):
+        refuse("REFRESH_REQUIRED", "priority guard evidence missing or malformed")
+    if decision in {"DENY", "PARK", "REFRESH_REQUIRED"}:
+        refuse(decision, str(evidence.get("reason") or "current issue authority gate refused"))
+    if (decision != "ALLOW" or not evidence.get("ssot_revision")
+            or not evidence.get("authority_revision")
+            or evidence.get("ssot_age_s") is None):
+        refuse("REFRESH_REQUIRED",
+               "explicit current implementation authority not verified before task POST")
+    return verdict
+
+
 @crew.command("run")
 @click.argument("task")
 @click.option("--db", default="", help="SQLite DB path (standalone)")
@@ -2883,6 +2957,10 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             _adopted_impl_id = _matches[0].task_id
             _adopted_impl_status = _matches[0].status
             click.echo(f"(task already in flight, adopted {_adopted_impl_id})")
+
+    # #1006: a new lineage needs current #44 authority; adopted ones already had it.
+    if _adopted_impl_id is None:
+        _require_run_admission(repo, issue_context.get("issue"))
 
     # Sync all worktrees to the task's actual base before starting (#175, #176).
     # Agents may be on stale branches from the previous run; reset them so the

@@ -136,6 +136,7 @@ def test_cli_sync_falls_back_to_master_without_origin_head(tmp_path, monkeypatch
                      id="explicit-main-is-a-run-branch"),
     ],
 )
+@pytest.mark.usefixtures("admit_crew_run")
 def test_crew_run_records_resolved_or_configured_base(
         tmp_path, monkeypatch, configured_main, branch_args,
         expected_base, expected_run_branch):

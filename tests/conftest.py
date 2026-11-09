@@ -172,6 +172,17 @@ def _isolate_shadow_memory_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
 
 
+@pytest.fixture
+def admit_crew_run(monkeypatch):
+    """Opt-in: admit `crew run` without the #44 trigger (#1006).
+
+    Not autouse — tests that do not request it exercise the real fail-closed
+    admission check, so a reintroduced bypass is caught by default.
+    """
+    from agent_crew import cli
+    monkeypatch.setattr(cli, "_require_run_admission", lambda repo, issue: {})
+
+
 @pytest.fixture(autouse=True)
 def _no_live_coordinator_notice_sink(monkeypatch):
     """Keep the server's real notice delivery routes out of every test (#874).
