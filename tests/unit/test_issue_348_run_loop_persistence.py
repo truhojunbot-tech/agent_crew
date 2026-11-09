@@ -12,6 +12,8 @@ from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
+pytestmark = pytest.mark.usefixtures("admit_crew_run")  # #1006: subject is not admission
+
 
 COMMIT = "a" * 40
 

@@ -19,6 +19,8 @@ from agent_crew.queue import TaskQueue
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 from agent_crew.server import create_app
 
+pytestmark = pytest.mark.usefixtures("admit_crew_run")  # #1006: subject is not admission
+
 PYTEST = f"{sys.executable} -m pytest -q -p no:cacheprovider"
 PR = 7
 

@@ -18,6 +18,8 @@ from agent_crew.cli import _conformance_gate_allows_merge, crew
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 
+pytestmark = pytest.mark.usefixtures("admit_crew_run")  # #1006: subject is not admission
+
 # Fake gate: records its argv, writes a receipt with the requested verdict and
 # mimics the real CLI's --enforce exit codes (10 for BLOCK, else 0).
 _FAKE_GATE = r'''

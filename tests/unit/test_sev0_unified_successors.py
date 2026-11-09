@@ -1,6 +1,7 @@
 """The CLI and HTTP cascade share one fix; server merge needs review status."""
 
 import json
+import pytest
 from unittest.mock import Mock
 
 from click.testing import CliRunner
@@ -10,6 +11,7 @@ from agent_crew.protocol import TaskResult
 from agent_crew.queue import TaskQueue
 
 
+@pytest.mark.usefixtures("admit_crew_run")
 def test_crew_run_adopts_server_fix_after_request_changes(tmp_db, monkeypatch):
     """One review verdict produces exactly one implement successor."""
     from agent_crew import pipeline

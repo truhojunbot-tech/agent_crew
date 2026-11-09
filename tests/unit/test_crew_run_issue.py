@@ -1,10 +1,13 @@
 """crew run passes an explicitly supplied issue number to implement tasks."""
 
+import pytest
 from click.testing import CliRunner
 
 from agent_crew.cli import crew
 from agent_crew.protocol import TaskResult
 from agent_crew.queue import TaskQueue
+
+pytestmark = pytest.mark.usefixtures("admit_crew_run")  # #1006: subject is not admission
 
 
 def _run(monkeypatch, tmp_path, *extra):

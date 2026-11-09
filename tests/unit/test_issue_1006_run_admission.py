@@ -124,3 +124,20 @@ def test_loader_resolves_sibling_imports(monkeypatch, tmp_path):
     module = cli._load_admission_trigger()
 
     assert module.priority_check({}) == "ok"
+
+
+def test_unset_trigger_config_fails_closed(monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_ADMISSION_TRIGGER", raising=False)
+    assert cli._load_admission_trigger() is None
+
+
+def test_unstubbed_crew_run_without_config_enqueues_nothing(monkeypatch, tmp_path):
+    """Default tests see the real guard: no config, no task (#1006)."""
+    monkeypatch.delenv("AGENT_CREW_ADMISSION_TRIGGER", raising=False)
+    db = tmp_path / "tasks.db"
+    result = CliRunner().invoke(
+        crew, ["run", "work", "--db", str(db), "--risk-tier", "1", "--no-tester", *ISSUE])
+
+    assert result.exit_code != 0
+    assert "ADMIT_REFRESH_REQUIRED" in result.output
+    assert (TaskQueue(str(db)).list_tasks() if db.exists() else []) == []

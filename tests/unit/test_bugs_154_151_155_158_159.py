@@ -236,6 +236,7 @@ class TestCrewRunTimeoutPendingTask:
         q.dequeue(role="implementer")
         assert q.get_task_status("gs2") == "in_progress"
 
+    @pytest.mark.usefixtures("admit_crew_run")
     def test_wait_exits_gracefully_when_task_still_pending(self, tmp_db, tmp_path, unused_tcp_port):
         """
         When crew run --timeout N expires and the task is still pending

@@ -172,14 +172,13 @@ def _isolate_shadow_memory_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
 
 
-@pytest.fixture(autouse=True)
-def _admit_crew_run(monkeypatch, request):
-    """Admit every pre-#1006 `crew run` fixture without touching ~/alfred.
+@pytest.fixture
+def admit_crew_run(monkeypatch):
+    """Opt-in: admit `crew run` without the #44 trigger (#1006).
 
-    The admission guard's own tests (test_issue_1006_*) exercise the real check.
+    Not autouse — tests that do not request it exercise the real fail-closed
+    admission check, so a reintroduced bypass is caught by default.
     """
-    if "issue_1006" in request.node.path.name:
-        return
     from agent_crew import cli
     monkeypatch.setattr(cli, "_require_run_admission", lambda repo, issue: {})
 

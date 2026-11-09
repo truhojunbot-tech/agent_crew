@@ -80,6 +80,7 @@ def test_implement_never_falls_back_to_server_cwd(tmp_path, monkeypatch):
     assert queue.get_task("impl-762").status == "failed"
 
 
+@pytest.mark.usefixtures("admit_crew_run")
 def test_crew_run_repo_sets_implement_context(monkeypatch, tmp_path):
     db = tmp_path / "tasks.db"
     monkeypatch.setattr(TaskQueue, "get_result", lambda _queue, task_id: TaskResult(

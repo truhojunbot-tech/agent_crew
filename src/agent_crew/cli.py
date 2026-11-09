@@ -2492,18 +2492,19 @@ def _await_review_fix(queue, review_id: str, *, repo: str = "", repo_cwd: str = 
     return fixes
 
 
-_ADMISSION_TRIGGER_DEFAULT = "~/alfred/tools/chatgpt_directive_trigger.py"
-
-
 def _load_admission_trigger():
     """Load alfred's #44 priority trigger from a file; never import alfred (#1006).
 
-    Returns the module, or None when the file is missing or fails to import.
+    The path is installation config (``AGENT_CREW_ADMISSION_TRIGGER``), not a
+    portable-core default (#310). Returns the module, or None when the variable
+    is unset or the file is missing or fails to import.
     """
     import importlib.util
 
-    path = os.path.expanduser(os.environ.get("AGENT_CREW_ADMISSION_TRIGGER")
-                              or _ADMISSION_TRIGGER_DEFAULT)
+    raw = os.environ.get("AGENT_CREW_ADMISSION_TRIGGER", "").strip()
+    if not raw:
+        return None
+    path = os.path.expanduser(raw)
     if not os.path.isfile(path):
         return None
     tools_dir = os.path.dirname(os.path.abspath(path))
