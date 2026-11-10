@@ -39,7 +39,7 @@ class FakeGh:
         self.pull_body = "## Tests\nfull suite: 5120 passed, 3 failed (main: 5118 passed, 3 failed)\n"
 
     def pull(self, repo, number):
-        return {"base": {"sha": BASE}, "body": self.pull_body,
+        return {"base": {"sha": BASE}, "body": self.pull_body, "state": "open",
                 "html_url": f"https://github.com/{repo}/pull/{number}"}
 
     def pull_files(self, repo, number):
