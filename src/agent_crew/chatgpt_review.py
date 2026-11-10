@@ -48,9 +48,11 @@ _ENV_CARRIER = "AGENT_CREW_CHATGPT_REVIEW_CARRIER"
 _ENV_INTAKE = "AGENT_CREW_CHATGPT_REVIEW_INTAKE"
 _ENV_POLL_S = "AGENT_CREW_CHATGPT_REVIEW_POLL_S"
 _ENV_TIMEOUT_S = "AGENT_CREW_CHATGPT_REVIEW_TIMEOUT_S"
+_ENV_REPOST_S = "AGENT_CREW_CHATGPT_REVIEW_REPOST_S"
 DEFAULT_CARRIER = "intake"
 DEFAULT_POLL_SECONDS = 300.0
 DEFAULT_TIMEOUT_SECONDS = 43200.0
+DEFAULT_REPOST_SECONDS = 10800.0
 
 _SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 _INTAKE_RE = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9]\d*)")
@@ -78,6 +80,11 @@ def poll_seconds() -> float:
 
 def timeout_seconds() -> float:
     return _positive_env(_ENV_TIMEOUT_S, DEFAULT_TIMEOUT_SECONDS)
+
+
+def repost_seconds() -> float:
+    """How long an unanswered request waits before its one re-post (#1011)."""
+    return _positive_env(_ENV_REPOST_S, DEFAULT_REPOST_SECONDS)
 
 
 def request_thread(repo: str, pr_number: int) -> tuple[Optional[tuple[str, int]], str]:
@@ -350,6 +357,18 @@ def _issue_link(task: TaskRequest, repo: str) -> str:
     return ""
 
 
+def _request_body(queue: TaskQueue, task: TaskRequest, task_repo: str, pr_number: int,
+                  sha: str, pull: dict, files: list[str]) -> str:
+    """The request comment for ``task``; dispatch and the #1011 re-post share it."""
+    pr_url = (pull.get("html_url")
+              or f"https://github.com/{_github._repo_slug(task_repo)}/pull/{pr_number}")
+    return build_request_comment(
+        project=task.project or "", task_id=task.task_id, pr_number=pr_number, pr_url=pr_url,
+        head_sha=sha, base_sha=((pull.get("base") or {}).get("sha") or ""),
+        issue_link=_issue_link(task, task_repo), acceptance=_acceptance_text(queue, task),
+        files=files, suite_counts=suite_count_lines(pull.get("body") or ""))
+
+
 def dispatch_chatgpt_review(
     queue: TaskQueue, *, role_to_agent: Optional[dict[str, str]] = None,
     review_guard_fn: Optional[Callable[[TaskRequest, str], bool]] = None,
@@ -401,13 +420,7 @@ def dispatch_chatgpt_review(
         queue.patch_context(task.task_id, {"push_not_before": now + 60})
         queue.requeue(task.task_id)
         return ChatGPTOutcome(task.task_id, "github_unavailable", "PR read failed; retry in 60s")
-    pr_url = (pull.get("html_url")
-              or f"https://github.com/{_github._repo_slug(task_repo)}/pull/{pr_number}")
-    body = build_request_comment(
-        project=task.project or "", task_id=task.task_id, pr_number=pr_number, pr_url=pr_url,
-        head_sha=sha, base_sha=base_sha, issue_link=_issue_link(task, task_repo),
-        acceptance=_acceptance_text(queue, task), files=files,
-        suite_counts=suite_count_lines(pull.get("body") or ""))
+    body = _request_body(queue, task, task_repo, pr_number, sha, pull, files)
 
     thread_repo, thread_number = thread
     try:
@@ -527,11 +540,67 @@ def reconcile_chatgpt_review(
                 "chatgpt_reply_comment_id": row["id"], "chatgpt_reply_url": row.get("html_url") or "",
                 "chatgpt_review_verdict": result.verdict, "chatgpt_ended_at": now})
             return ChatGPTOutcome(task.task_id, "review_completed", result.verdict or "")
+    if (not timed_out and comments is not None and not hold
+            and now - requested_at >= repost_seconds()
+            and "chatgpt_reposted_at" not in context):
+        _repost_request(queue, task, context, thread, pr_number, sha, gh, now)
     if timed_out:
         return _end(queue, task, "timed_out", "chatgpt_review_timed_out",
                     f"no accepted reply within {int(timeout_seconds())}s"
                     + (f" ({hold})" if hold else ""))
     return ChatGPTOutcome(task.task_id, "still_waiting", hold)
+
+
+def _repost_request(queue: TaskQueue, task: TaskRequest, context: dict, thread: dict,
+                    pr_number: int, sha: str, gh: GhClient, now: float) -> None:
+    """Post the request once more on its own thread (#1011).
+
+    A request nobody answers otherwise waits out the whole timeout. Exactly one
+    re-post per task: ``chatgpt_reposted_at`` is recorded whether or not the
+    post lands, so a failing post never loops. The deadline and the accepted
+    reply window stay anchored on the FIRST request. An unreadable or
+    non-open PR, or an unreadable head sha, re-posts nothing and records
+    nothing; the next poll retries. A head that moved off the pinned sha is
+    never re-posted (recorded as ``chatgpt_repost_skipped``)."""
+    from agent_crew.claude_cloud import _resolve_task_repo
+    task_repo = str(context.get("repo") or _resolve_task_repo(task, None, None) or "")
+    if not task_repo:
+        return
+    pull = gh.pull(task_repo, pr_number)
+    if not isinstance(pull, dict) or str(pull.get("state") or "").lower() != "open":
+        return
+    head_sha = str((pull.get("head") or {}).get("sha") or "")
+    if not _SHA_RE.fullmatch(head_sha):
+        return  # head unreadable: no decision, the next poll retries
+    if head_sha.lower() != sha.lower():
+        # The pinned sha is no longer the PR head. A request for it could not
+        # get an exact-head review, so none is posted. Decided once and said
+        # once; the first request and its deadline stand as they are.
+        detail = f"PR head moved {sha} -> {head_sha}; not re-posting a stale request"
+        queue.patch_context(task.task_id, {"chatgpt_reposted_at": now,
+                                           "chatgpt_repost_skipped": detail})
+        _notice(queue, task.task_id, "chatgpt_review_repost_skipped", detail)
+        return
+    files = gh.pull_files(task_repo, pr_number)
+    if files is None:
+        return
+    body = _request_body(queue, task, task_repo, pr_number, sha, pull, files)
+    posted = gh.post_comment(thread["repo"], int(thread["number"]), body)
+    first_url = str(context.get("chatgpt_request_url") or
+                    f"comment {context.get('chatgpt_request_comment_id')}")
+    if posted is None:
+        queue.patch_context(task.task_id, {"chatgpt_reposted_at": now,
+                                           "chatgpt_repost_failed": True})
+        _notice(queue, task.task_id, "chatgpt_review_reposted",
+                f"{first_url} -> re-post FAILED on {thread['repo']}#{thread['number']}; "
+                "not retried")
+        return
+    new_url = posted.get("html_url") or f"comment {posted['id']}"
+    queue.patch_context(task.task_id, {"chatgpt_reposted_at": now,
+                                       "chatgpt_repost_comment_id": int(posted["id"]),
+                                       "chatgpt_repost_url": posted.get("html_url") or ""})
+    logger.info("chatgpt_review: re-posted %s request comment=%s", task.task_id, posted["id"])
+    _notice(queue, task.task_id, "chatgpt_review_reposted", f"{first_url} -> {new_url}")
 
 
 def reconcile_chatgpt_reviews(queue: TaskQueue, *, submit_review_result_fn=None,
