@@ -171,3 +171,38 @@ def test_failed_repost_is_recorded_and_never_retried(queue, gh, notices):
     for now in (2400.0, 3000.0):
         _reconcile(queue, gh, now)
     assert len(attempts) == 1 and len(_reposts(notices)) == 1
+
+
+# review-impl-1011a-r0: a moved PR head is never re-posted ----------------
+
+def test_moved_head_is_not_reposted(queue, gh, notices):
+    task_id = _enqueue(queue)
+    _dispatch(queue, gh, now=1000.0)
+    original_pull = gh.pull
+    gh.pull = lambda *a: {**original_pull(*a), "head": {"sha": "d" * 40}}
+    assert _reconcile(queue, gh, 2000.0) == ["still_waiting"]
+    assert len(gh.posted) == 1 and _reposts(notices) == []
+    context = queue.get_task(task_id).context
+    assert "chatgpt_repost_comment_id" not in context
+    assert "d" * 40 in context["chatgpt_repost_skipped"]
+    (detail,) = [d for _, kind, d in notices if kind == "chatgpt_review_repost_skipped"]
+    assert SHA in detail and "d" * 40 in detail
+    # Decided once: later polls neither post nor notify again.
+    for now in (2400.0, 3000.0):
+        _reconcile(queue, gh, now)
+    assert len(gh.posted) == 1 and len(notices) == 1
+    # The deadline still runs from the first request.
+    assert _reconcile(queue, gh, 6001.0) == ["timed_out"]
+
+
+def test_unreadable_head_sha_is_retried_not_reposted(queue, gh, notices):
+    task_id = _enqueue(queue)
+    _dispatch(queue, gh, now=1000.0)
+    original_pull = gh.pull
+    gh.pull = lambda *a: {k: v for k, v in original_pull(*a).items() if k != "head"}
+    _reconcile(queue, gh, 2000.0)
+    assert len(gh.posted) == 1 and notices == []
+    assert "chatgpt_reposted_at" not in queue.get_task(task_id).context
+    gh.pull = original_pull
+    _reconcile(queue, gh, 2400.0)
+    assert len(gh.posted) == 2 and len(_reposts(notices)) == 1

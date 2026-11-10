@@ -559,13 +559,27 @@ def _repost_request(queue: TaskQueue, task: TaskRequest, context: dict, thread: 
     re-post per task: ``chatgpt_reposted_at`` is recorded whether or not the
     post lands, so a failing post never loops. The deadline and the accepted
     reply window stay anchored on the FIRST request. An unreadable or
-    non-open PR re-posts nothing and records nothing; the next poll retries."""
+    non-open PR, or an unreadable head sha, re-posts nothing and records
+    nothing; the next poll retries. A head that moved off the pinned sha is
+    never re-posted (recorded as ``chatgpt_repost_skipped``)."""
     from agent_crew.claude_cloud import _resolve_task_repo
     task_repo = str(context.get("repo") or _resolve_task_repo(task, None, None) or "")
     if not task_repo:
         return
     pull = gh.pull(task_repo, pr_number)
     if not isinstance(pull, dict) or str(pull.get("state") or "").lower() != "open":
+        return
+    head_sha = str((pull.get("head") or {}).get("sha") or "")
+    if not _SHA_RE.fullmatch(head_sha):
+        return  # head unreadable: no decision, the next poll retries
+    if head_sha.lower() != sha.lower():
+        # The pinned sha is no longer the PR head. A request for it could not
+        # get an exact-head review, so none is posted. Decided once and said
+        # once; the first request and its deadline stand as they are.
+        detail = f"PR head moved {sha} -> {head_sha}; not re-posting a stale request"
+        queue.patch_context(task.task_id, {"chatgpt_reposted_at": now,
+                                           "chatgpt_repost_skipped": detail})
+        _notice(queue, task.task_id, "chatgpt_review_repost_skipped", detail)
         return
     files = gh.pull_files(task_repo, pr_number)
     if files is None:
