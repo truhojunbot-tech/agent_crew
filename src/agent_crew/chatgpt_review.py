@@ -49,10 +49,12 @@ _ENV_INTAKE = "AGENT_CREW_CHATGPT_REVIEW_INTAKE"
 _ENV_POLL_S = "AGENT_CREW_CHATGPT_REVIEW_POLL_S"
 _ENV_TIMEOUT_S = "AGENT_CREW_CHATGPT_REVIEW_TIMEOUT_S"
 _ENV_REPOST_S = "AGENT_CREW_CHATGPT_REVIEW_REPOST_S"
+_ENV_DISPATCH_GRACE_S = "AGENT_CREW_CHATGPT_REVIEW_DISPATCH_GRACE_S"
 DEFAULT_CARRIER = "intake"
 DEFAULT_POLL_SECONDS = 300.0
 DEFAULT_TIMEOUT_SECONDS = 43200.0
 DEFAULT_REPOST_SECONDS = 10800.0
+DEFAULT_DISPATCH_GRACE_SECONDS = 120.0
 
 _SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 _INTAKE_RE = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9]\d*)")
@@ -85,6 +87,11 @@ def timeout_seconds() -> float:
 def repost_seconds() -> float:
     """How long an unanswered request waits before its one re-post (#1011)."""
     return _positive_env(_ENV_REPOST_S, DEFAULT_REPOST_SECONDS)
+
+
+def dispatch_grace_seconds() -> float:
+    """How long a just-dispatched row may lack its request state (#1010)."""
+    return _positive_env(_ENV_DISPATCH_GRACE_S, DEFAULT_DISPATCH_GRACE_SECONDS)
 
 
 def request_thread(repo: str, pr_number: int) -> tuple[Optional[tuple[str, int]], str]:
@@ -445,6 +452,17 @@ def dispatch_chatgpt_review(
         # so a blind re-post could leave two requests. A human decides.
         return _end(queue, task, "needs_human", "chatgpt_review_request_failed",
                     f"could not post the review request on {thread_repo}#{thread_number}")
+    # #1010: the row was visible to the reconciler while the post was in
+    # flight. If something ended it meanwhile, patching would write request
+    # state onto an ended row; the posted request is reported, not adopted.
+    current = queue.get_task(task.task_id)
+    if current is None or current.status != "in_progress":
+        url = posted.get("html_url") or f"comment {posted['id']}"
+        logger.warning("chatgpt_review: %s ended (%s) while its request was posted; "
+                       "orphaned comment=%s %s", task.task_id,
+                       current.status if current else "missing", posted["id"], url)
+        _notice(queue, task.task_id, "chatgpt_review_request_orphaned", url)
+        return ChatGPTOutcome(task.task_id, "request_orphaned", url)
     queue.patch_context(task.task_id, {
         "chatgpt_thread": {"repo": _github._repo_slug(thread_repo), "number": thread_number},
         "chatgpt_request_comment_id": int(posted["id"]),
@@ -482,6 +500,13 @@ def reconcile_chatgpt_review(
     thread = context.get("chatgpt_thread") or {}
     request_id = context.get("chatgpt_request_comment_id")
     pr_number, sha = _pinned(task)
+    if (pr_number is not None and (not isinstance(thread, dict) or not thread.get("repo")
+                                   or not thread.get("number") or not isinstance(request_id, int))
+            and now - queue.get_dispatched_at(task.task_id) < dispatch_grace_seconds()):
+        # #1010: record_dispatch runs before the request is posted, so a
+        # fresh row has no thread/comment yet. The dispatcher records them
+        # once the post returns; only a row past the grace is really missing.
+        return ChatGPTOutcome(task.task_id, "still_waiting", "dispatch in progress")
     if (not isinstance(thread, dict) or not thread.get("repo") or not thread.get("number")
             or not isinstance(request_id, int) or pr_number is None):
         return _end(queue, task, "needs_human", "chatgpt_review_state_missing",
