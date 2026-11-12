@@ -23,3 +23,23 @@ def test_review_and_test_sections_unchanged_by_1015():
     for role in ("reviewer", "tester"):
         section = instructions._ROLE_SECTIONS[role]
         assert "required for every completed implement result" not in section
+
+
+def test_pr_creation_names_the_pushed_head_for_detached_dispatch():
+    """Review of PR #1017: a detached HEAD pushed via ``git push origin
+    HEAD:<branch>`` leaves gh no current branch to infer, so the generated
+    command must pass ``--head`` with the branch that was pushed."""
+    content = instructions.generate(
+        "implementer", "proj", 8100, delivery="dispatcher")
+    assert "git push origin HEAD:<pushed-branch>" in content
+    assert ("gh pr create --head <pushed-branch> --base <base_branch>"
+            in content)
+    # Every gh pr create command line must name its head explicitly.
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("gh pr create"):
+            assert "--head " in stripped, stripped
+    # The detached-HEAD safety rule is still there; no force-move advice added.
+    assert "Never \"fix\" a detached HEAD with `git branch -f`" in content
+    assert "git branch -f <" not in content
+    assert "checkout -B <" not in content

@@ -490,10 +490,20 @@ You write production code following TDD where practical:
 1. Write failing tests that capture the requirements.
 2. Implement until tests pass.
 3. Refactor, commit (with tests + impl together), and push. If the task
-   context has no `pr_number`, open a PR yourself with
-   `gh pr create --base <base_branch>` (the context's `base_branch`, else
-   `main`) and report its number in `pr_number`. If `context.pr_number` is
-   set, push to that PR's branch and report that number.
+   context has no `pr_number`, open a PR yourself and report its number in
+   `pr_number`. If `context.pr_number` is set, push to that PR's branch and
+   report that number. Always name the branch you pushed with `--head`: on a
+   detached HEAD (see below) `gh pr create` cannot infer it and fails with
+   "could not determine the current branch".
+
+   ```bash
+   git push origin HEAD:<pushed-branch>   # the dispatched branch, or your own agent/ branch
+   gh pr create --head <pushed-branch> --base <base_branch> --title "..." --body "..."
+   ```
+
+   `<base_branch>` is the context's `base_branch`, else `main`. Report
+   `pr_number` only from the PR `gh pr create` actually printed (or
+   `gh pr view <pushed-branch> --json number`) — never a guessed number.
 
 <implementer_test_scope>
 
