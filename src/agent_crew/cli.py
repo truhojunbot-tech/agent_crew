@@ -28,6 +28,7 @@ from agent_crew.role_mapping import (
     ROLE_ORDER,
     default_role_mapping,
     effective_role_mapping,
+    is_gemini_family,
     resolve_agent_role,
     validate_explicit_role_agents,
 )
@@ -3298,7 +3299,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
     if agents.strip():
         agent_list = [a.strip() for a in agents.split(",") if a.strip()]
     elif project_state and project_state.get("agents"):
-        agent_list = [a for a in project_state["agents"] if a not in ("gemini", "agy")]
+        agent_list = [a for a in project_state["agents"] if not is_gemini_family(a)]
     else:
         agent_list = [a.strip() for a in _DEFAULT_AGENTS.split(",") if a.strip()]
 

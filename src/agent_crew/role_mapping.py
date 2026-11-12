@@ -75,6 +75,16 @@ def provider_family(agent: object) -> str:
     return name
 
 
+#: Providers that own a tmux pane / worktree key (#930). ``agy`` is the gemini
+#: binary, not a pane key of its own.
+PANE_PROVIDERS = ("claude", "codex", "gemini")
+
+
+def is_gemini_family(agent: object) -> bool:
+    """True for gemini and its ``agy`` binary aliases (#930)."""
+    return provider_family(agent) == "gemini"
+
+
 #: Which provider families may hold each role (#889). The one policy every
 #: route reads: explicit override, ``implementer_agent``, role assignment, fix
 #: rounds, retries. ``None`` means no family restriction — review independence

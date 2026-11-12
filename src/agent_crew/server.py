@@ -105,7 +105,8 @@ from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import (
     EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, ROLE_BOUND_PROVIDERS,
     TASK_TYPE_TO_ROLE, RoleResolutionError, anonymous_pull_refusal,
-    default_role_mapping, effective_role_mapping, provider_family, resolve_agent_role,
+    PANE_PROVIDERS, default_role_mapping, effective_role_mapping, is_gemini_family,
+    provider_family, resolve_agent_role,
     provider_task_types, role_policy, role_policy_refusal,
 )
 from agent_crew.risk_tier import risk_declaration as _risk_declaration
@@ -4750,7 +4751,7 @@ def create_app(
         # #202: resolve the explicit provider model once so attribution and
         # argv cannot drift. An unpinned Claude/Codex model remains unknown.
         _known_model = (
-            _resolve_gemini_model() if agent in ("gemini", "agy") else
+            _resolve_gemini_model() if is_gemini_family(agent) else
             _resolve_claude_model(wt) if agent == "claude" else ""
         )
 
@@ -4765,7 +4766,7 @@ def create_app(
         # starts fresh (#982).
         # #982: agy starts a new conversation on every dispatch, including
         # retries in the same worktree. Keep logical context identity aligned.
-        _force_context_reset = (agent in ("gemini", "agy") or
+        _force_context_reset = (is_gemini_family(agent) or
                                 (isinstance(_ctx, dict) and bool(_ctx.get("context_reset"))))
         # ⛔Initialised before the provider branches so the event gate below can
         #   read it for ANY agent, and named for the CONTEXT rather than for agy:
@@ -5698,7 +5699,7 @@ def create_app(
                     "--verbose", "--output-format", "stream-json"]
             if _known_model:
                 cmd += ["--model", _known_model]
-        elif agent in ("gemini", "agy"):
+        elif is_gemini_family(agent):
             # Compare agy's cwd mapping before and after this invocation so a
             # zero-turn failure cannot attribute its predecessor's session.
             try:
@@ -5787,7 +5788,7 @@ def create_app(
                 #   child keeps its own dup, so closing ours on exit is safe.
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        *cmd, stdin=asyncio.subprocess.PIPE if agent not in ("gemini", "agy") else None,
+                        *cmd, stdin=asyncio.subprocess.PIPE if not is_gemini_family(agent) else None,
                         stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
                         start_new_session=True,
                     )
@@ -5811,7 +5812,7 @@ def create_app(
             _timeout_reason, _last_output_age = await _wait_for_dispatch_activity(
                 proc, log_path, _task_log_start_offset,
                 hard_timeout_s=timeout_secs, idle_timeout_s=_idle_timeout_secs,
-                input_data=message.encode() if agent not in ("gemini", "agy") else None,
+                input_data=message.encode() if not is_gemini_family(agent) else None,
                 on_progress=lambda: q().record_heartbeat(
                     task.task_id, source="output_progress"),
             )
@@ -5850,7 +5851,7 @@ def create_app(
                     _discovered_session_id = extract_claude_session_id(_task_log_tail)
                     if _discovered_session_id and _discovered_session_id != _ctx_info.get("provider_session_id"):
                         q().update_context_provider_session_id(_context_key, _discovered_session_id)
-                elif agent in ("gemini", "agy"):
+                elif is_gemini_family(agent):
                     # agy's cwd mapping now points to the conversation this
                     # dispatch created. Bind it to the existing identity rows.
                     _, _discovered_session_id = agy_conversation_size(wt)
@@ -6216,7 +6217,7 @@ def create_app(
                 [worker for worker in workers
                  if worker not in (_script_tester.SCRIPT_TESTER, _chatgpt_review.PROVIDER_NAME)]
                 + [agent for agent in _DISPATCH_DISCUSS_WORKTREES
-                   if agent in ("claude", "codex", "gemini", "agy")]))
+                   if agent in PANE_PROVIDERS or is_gemini_family(agent)]))
             return by_agent, workers, discuss_workers
 
         # ⭐dispatcher 가 **실제로 들고 있는 lease**. orphan 판정의 권위다 —
@@ -8519,7 +8520,7 @@ def create_app(
                             _do_post = False
                         if _do_post:
                             _reviewer_agent = next(
-                                (k for k in (pane_map or {}) if k in ("claude", "codex", "gemini")),
+                                (k for k in (pane_map or {}) if k in PANE_PROVIDERS),
                                 "agent",
                             )
                             _ok = post_review_comment(
