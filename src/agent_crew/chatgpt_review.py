@@ -60,6 +60,9 @@ _SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 _INTAKE_RE = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9]\d*)")
 _HEADER_RE = re.compile(r"\[CHATGPT\]\[CREW-REVIEW\] task=(\S+) sha=(\S+)")
 _VERDICT_RE = re.compile(r"VERDICT: (approve|request_changes)")
+#: A line is a verdict line only when the word is followed by a colon, so prose
+#: such as "Verdict covers this exact SHA" is review text, not a 2nd verdict (#1016).
+_VERDICT_LINE_RE = re.compile(r"(?i)^\s*verdict\s*:")
 
 
 def _positive_env(name: str, default: float) -> float:
@@ -247,7 +250,7 @@ def parse_reply(body: str, *, task_id: str, sha: str) -> ReplyParse:
         return ReplyParse("rejected", reason=f"sha mismatch: reply names {header.group(2)[:40]}, "
                                              f"request named {sha}")
     rest = lines[1:]
-    verdict_lines = [i for i, line in enumerate(rest) if line.strip().upper().startswith("VERDICT")]
+    verdict_lines = [i for i, line in enumerate(rest) if _VERDICT_LINE_RE.match(line)]
     if len(verdict_lines) != 1:
         return ReplyParse("rejected", reason=("missing VERDICT line" if not verdict_lines
                                               else f"{len(verdict_lines)} VERDICT lines"))
