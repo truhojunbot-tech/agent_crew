@@ -7,6 +7,8 @@ import json
 import os
 from typing import Any, Optional
 
+from agent_crew.role_mapping import PANE_PROVIDERS
+
 DEFAULT_CHAINS: dict[str, list[str]] = {
     "implement": ["claude", "codex"],
     "review":    ["codex", "claude"],
@@ -90,6 +92,6 @@ def default_agent_for_role(role: str, pane_map: dict[str, Any]) -> Optional[str]
     if not role_pane:
         return None
     for k, v in pane_map.items():
-        if v == role_pane and k in ("claude", "codex", "gemini"):
+        if v == role_pane and k in PANE_PROVIDERS:
             return k
     return None
