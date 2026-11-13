@@ -497,6 +497,8 @@ def test_mcp_result_omitting_the_pr_does_not_review_a_merged_pr(tmp_db, monkeypa
 
 def test_http_result_omitting_the_pr_still_reviews_an_open_pr(tmp_db, monkeypatch):
     """⛔And the resolution must not brake the normal path."""
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     from fastapi.testclient import TestClient
 
     monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")

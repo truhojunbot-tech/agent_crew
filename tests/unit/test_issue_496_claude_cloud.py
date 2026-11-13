@@ -194,7 +194,9 @@ def test_at4_already_fixed_without_pr(q):
 
 # ── AT5: PR_READY enters the existing review pipeline ───────────────────
 
-def test_at5_pr_ready_enqueues_existing_review_task(q):
+def test_at5_pr_ready_enqueues_existing_review_task(q, monkeypatch):
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     task_id, branch = _enqueue_implement(q)
     q.dequeue(role="implementer")
     q.record_dispatch(task_id, channel=cc.DISPATCH_CHANNEL, agent=cc.CLOUD_PROVIDER_NAME,

@@ -2665,6 +2665,7 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
         _adapter_project,
         build_feedback,
         enqueue_implement,
+        follow_implement_successor,
         wait_for_pipeline_successor,
         handle_review_result,
         INVALID_REVIEW_RESULT,
@@ -3049,8 +3050,16 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             return
         click.echo(f"[{iteration}/{max_iter}] ✅ Implementation done ({impl_elapsed}s)")
 
-        review_id = wait_for_pipeline_successor(
-            queue, "review", impl_id, min(wait_timeout, 60))
+        next_kind, next_id = follow_implement_successor(
+            queue, impl_id, min(wait_timeout, 60), _wait, no_tester=no_tester)
+        if next_kind == "fix":
+            # #999: the pre-review script suite found new failures. The server
+            # queued the fix without spending a review; follow it.
+            click.echo(f"[{iteration}/{max_iter}] ❌ Pre-review tests failed. "
+                       f"Re-implementing... ({next_id})")
+            impl_id = next_id
+            continue
+        review_id = next_id
         click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
         review_start = time.time()
         review_result = _wait(review_id)
@@ -3519,10 +3528,20 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
         from agent_crew.loop import (
             DEFAULT_MAX_ITER,
             build_feedback,
-            wait_for_pipeline_successor,
+            follow_implement_successor,
             handle_review_result,
             INVALID_REVIEW_RESULT,
         )
+
+        def _wait_then_run(task_id: str):
+            result = None
+            deadline = time.time() + wait_timeout
+            while time.time() < deadline:
+                result = queue.get_result(task_id)
+                if result is not None:
+                    return result
+                time.sleep(0.1)
+            raise click.ClickException(f"task {task_id!r} timed out after {wait_timeout}s")
 
         max_iter = DEFAULT_MAX_ITER
         impl_id = enqueue_implement(queue, topic, branch,
@@ -3530,32 +3549,22 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
         click.echo(f"Code-review loop started: {impl_id}")
 
         for iteration in range(1, max_iter + 1):
-            _wait_result = None
-            deadline = time.time() + wait_timeout
-            while time.time() < deadline:
-                _wait_result = queue.get_result(impl_id)
-                if _wait_result is not None:
-                    break
-                time.sleep(0.1)
-            if _wait_result is None:
-                raise click.ClickException(f"task {impl_id!r} timed out after {wait_timeout}s")
+            _wait_result = _wait_then_run(impl_id)
             if _wait_result.status != "completed":
                 click.echo(
                     f"Implement task {impl_id} ended {_wait_result.status}; "
                     "server owns retry/fallback/cascade. Stopping loop.")
                 return
 
-            review_id = wait_for_pipeline_successor(
-                queue, "review", impl_id, min(wait_timeout, 60))
-            review_result = None
-            deadline = time.time() + wait_timeout
-            while time.time() < deadline:
-                review_result = queue.get_result(review_id)
-                if review_result is not None:
-                    break
-                time.sleep(0.1)
-            if review_result is None:
-                raise click.ClickException(f"task {review_id!r} timed out after {wait_timeout}s")
+            next_kind, next_id = follow_implement_successor(
+                queue, impl_id, min(wait_timeout, 60), _wait_then_run)
+            if next_kind == "fix":
+                # #999: new failures in the pre-review script suite.
+                click.echo(f"Pre-review tests failed; following fix {next_id}.")
+                impl_id = next_id
+                continue
+            review_id = next_id
+            review_result = _wait_then_run(review_id)
             outcome = handle_review_result(
                 review_result, iteration=iteration, max_iter=max_iter,
                 no_tester=True, queue=queue,

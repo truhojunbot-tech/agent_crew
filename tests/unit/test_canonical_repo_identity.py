@@ -147,6 +147,8 @@ def test_B_missing_repo_marks_merge_failed_without_github_calls(tmp_db, tmp_path
 
 def test_C_repo_survives_implement_review_test_lineage(tmp_db, tmp_path, monkeypatch):
     """C — an implement-context repo is persisted into both successors."""
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     from fastapi.testclient import TestClient
 
     _patch_open_pr(monkeypatch)

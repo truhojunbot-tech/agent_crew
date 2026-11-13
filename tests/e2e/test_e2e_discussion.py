@@ -201,8 +201,10 @@ def test_e_di03_then_run(live_server, tmp_path, monkeypatch):
 
     # Discussion phase: one panel agent responds
     assert _stub(port, "panel").returncode == 0
-    # Code-review loop chain: coder implements, reviewer approves
+    # Code-review loop chain: coder implements, the pre-review script suite
+    # passes (#999), reviewer approves
     assert _stub(port, "coder", pr_number=965).returncode == 0
+    assert _stub(port, "tester").returncode == 0
     assert _stub(port, "reviewer", verdict="approve").returncode == 0
 
     cli_t.join(timeout=60.0)
@@ -222,3 +224,9 @@ def test_e_di03_then_run(live_server, tmp_path, monkeypatch):
     assert any(t.task_type == "discuss" for t in all_tasks)
     assert any(t.task_type == "implement" for t in all_tasks)
     assert any(t.task_type == "review" for t in all_tasks)
+    # #999: the suite ran before the one review, which follows the implement.
+    impl = next(t for t in all_tasks if t.task_type == "implement")
+    pretests = [t for t in all_tasks if t.task_type == "test" and t.context.get("pre_review")]
+    reviews = [t for t in all_tasks if t.task_type == "review"]
+    assert [t.context["prev_task_id"] for t in pretests] == [impl.task_id]
+    assert [t.context["prev_task_id"] for t in reviews] == [impl.task_id]

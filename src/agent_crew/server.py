@@ -77,6 +77,12 @@ from agent_crew.pipeline import (
     stale_review_task_id,
     verify_implement_artifact,
     git_fetch_origin,
+    PRE_REVIEW_OUTCOME_KEY,
+    PreReviewTestEnqueued,
+    is_pre_review_test,
+    pre_review_outcome,
+    pre_review_test_applies,
+    review_after_pre_review_test as _pipeline_review_after_pre_review_test,
 )
 from agent_crew import provenance as _prov
 from agent_crew.protocol import (
@@ -4417,6 +4423,9 @@ def create_app(
                 except Exception:
                     logger.exception("script test: task %s raised", task.task_id)
                     _fail_if_active(task.task_id, "script_test_exception")
+                    if is_pre_review_test(task):
+                        _review_after_pre_review_test(task, "not_run",
+                                                      "script_test_exception")
         finally:
             _script_test_lock.release()
 
@@ -4659,7 +4668,15 @@ def create_app(
             def _locked_script_test() -> None:
                 with _script_test_lock:
                     _run_script_test_task(task)
-            await asyncio.to_thread(_locked_script_test)
+            try:
+                await asyncio.to_thread(_locked_script_test)
+            except Exception:
+                if not is_pre_review_test(task):
+                    raise
+                # #999: a pre-review run that broke must not strand the PR.
+                logger.exception("script test: pre-review task %s raised", task.task_id)
+                _fail_if_active(task.task_id, "script_test_exception")
+                _review_after_pre_review_test(task, "not_run", "script_test_exception")
             return
         if _honor_provider_cooldown(task, agent):
             return
@@ -6614,13 +6631,35 @@ def create_app(
             repo_cwd=_any_worktree_path(),
             coordinator_notify_fn=coordinator_notify_fn,
             reviewer_provider=_DISPATCH_ROLE_TO_AGENT.get("reviewer", ""),
+            # #999: a red suite goes back to the implementer before a review
+            # is spent on it. Only the script tester runs it: it is the suite
+            # the post-review test would run, and it calls no provider.
+            pre_review_test=_pre_review_test_applies(),
         )
-        if isinstance(review_id, str) and review_id:
+        if isinstance(review_id, PreReviewTestEnqueued):
+            _try_push_next("tester")
+        elif isinstance(review_id, str) and review_id:
             _try_push_next("reviewer")
         elif ((parent := q().get_task(impl_task_id)) is not None
               and isinstance(parent.context, dict)
               and parent.context.get("review_retry_task_id")):
             _try_push_next("implementer")
+        return review_id
+
+    def _pre_review_test_applies() -> bool:
+        """#999: the shared policy, asked with this server's live role map."""
+        _refresh_role_map()
+        return pre_review_test_applies(q(), tester_agent=_DISPATCH_ROLE_TO_AGENT.get("tester"))
+
+    def _review_after_pre_review_test(test_task: TaskRequest, outcome: str,
+                                      reason: str = "") -> bool:
+        """HTTP-side wrapper of ``pipeline.review_after_pre_review_test``.
+        Returns whether a review now continues the lineage."""
+        review_id = _pipeline_review_after_pre_review_test(
+            q(), test_task.task_id, outcome, reason,
+            enqueue_review_fn=lambda impl_id, pr, impl_result: _auto_enqueue_review(
+                impl_id, pr_number=pr, result=impl_result))
+        return isinstance(review_id, str) and bool(review_id)
 
     def _auto_enqueue_test(review_task_id: str, repo: str = "") -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
@@ -8376,6 +8415,7 @@ def create_app(
             # #772: re-running a deterministic script repeats the same verdict.
             _test_verdict = handle_test_result(result) if task_type == "test" else None
             _test_info = result.error_info if isinstance(result.error_info, dict) else {}
+            _pre_review = is_pre_review_test(_task)
             if task_type == "test" and _test_verdict == "failed":
                 logger.info(f"POST /tasks/{task_id}/result: actionable test failure; enqueueing fix")
                 _fix_id = _auto_enqueue_fix(task_id, repo=str((ctx or {}).get("repo") or ""))
@@ -8388,6 +8428,11 @@ def create_app(
                         _existing_fix = None
                     if _existing_fix is None:
                         logger.info("test failure %s has no fix successor", task_id)
+            elif _pre_review and _task is not None:
+                # #999: not a merge gate. Green, or unable to judge, goes on to
+                # the review; only new failures (above) go back to the implementer.
+                _lineage_continues_without_task = _review_after_pre_review_test(
+                    _task, *pre_review_outcome(result))
             elif result.status == "failed" and _script_tester.is_script_test_result(result):
                 if (_test_info.get("reason") == "script_test_merge_conflict"
                         and _auto_enqueue_conflict_rebase(task_id, result)):
@@ -8581,7 +8626,7 @@ def create_app(
                 logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
                 _auto_enqueue_fix(task_id, repo=_review_repo)
             # #171: test passed → merge the PR. pr_number carried via test context.
-            if task_type == "test" and result.status == "completed":
+            if task_type == "test" and result.status == "completed" and not _pre_review:
                 test_pr = result.pr_number or _task_ctx.get("pr_number")
                 if test_pr:
                     _test_wt = _any_worktree_path()

@@ -215,6 +215,72 @@ def wait_for_pipeline_successor(queue, task_type: str, prev_task_id: str,
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 
+def _single_successor(queue, task_type: str, prev_task_id: str,
+                      pre_review: bool | None = None) -> str | None:
+    """The one server-created successor of ``prev_task_id``, or None if absent."""
+    matches = [
+        task for task in queue.list_tasks()
+        if task.task_type == task_type
+        and isinstance(task.context, dict)
+        and task.context.get("prev_task_id") == prev_task_id
+        and (pre_review is None
+             or bool(task.context.get("pre_review")) is pre_review)
+    ]
+    live = [task for task in matches if task.status not in _DEAD_REVIEW_STATUSES]
+    if len(live) > 1 or (not live and len(matches) > 1):
+        raise click.ClickException(
+            f"Multiple {task_type} successors for {prev_task_id!r}; "
+            "refusing to choose one")
+    chosen = live or matches
+    return chosen[0].task_id if chosen else None
+
+
+def follow_implement_successor(queue, impl_id: str, timeout: float,
+                               wait_result, *, no_tester: bool = False) -> tuple[str, str]:
+    """Follow the server's next step after a completed implement (#999).
+
+    Returns ``("review", review_id)`` or ``("fix", fix_id)``. With the
+    pre-review script test on, the server queues ``pretest-<impl>`` instead of
+    the review. This waits for its result through ``wait_result`` and then
+    follows what the server made of it: the review of ``impl_id`` (green or
+    not run) or an implement fix whose parent is the pretest (new failures).
+    No task row is written here. When no pretest can apply (flag off, another
+    tester, ``--no-tester``, a queue without lineage) it is today's review wait.
+    """
+    from agent_crew.pipeline import pre_review_test_applies
+    if (no_tester or not hasattr(queue, "list_tasks")
+            or not hasattr(queue, "db_path") or not pre_review_test_applies(queue)):
+        return "review", wait_for_pipeline_successor(queue, "review", impl_id, timeout)
+    deadline = time.monotonic() + timeout
+    while True:
+        review_id = _single_successor(queue, "review", impl_id)
+        if review_id:
+            return "review", review_id
+        pretest_id = _single_successor(queue, "test", impl_id, pre_review=True)
+        if pretest_id:
+            break
+        if time.monotonic() >= deadline:
+            raise click.ClickException(
+                f"Server did not create a review successor for "
+                f"{impl_id!r} within {timeout:g}s")
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+
+    wait_result(pretest_id)
+    deadline = time.monotonic() + timeout
+    while True:
+        review_id = _single_successor(queue, "review", impl_id)
+        if review_id:
+            return "review", review_id
+        fix_id = _single_successor(queue, "implement", pretest_id)
+        if fix_id:
+            return "fix", fix_id
+        if time.monotonic() >= deadline:
+            raise click.ClickException(
+                f"Server created neither a review nor a fix after pre-review "
+                f"test {pretest_id!r} within {timeout:g}s")
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+
+
 def _patch_adopted_review_context(queue, task_id: str,
                                   context: dict | None) -> None:
     if context:
