@@ -2544,6 +2544,15 @@ def auto_enqueue_review(
             )
             return None
 
+        # #1022: a declared report has no PR by contract, so there is nothing
+        # to review and no PR to ask a retry for.
+        if declared_artifact_kind(impl_task) == "report":
+            logger.info(
+                f"auto_enqueue_review: {impl_task_id} declared artifact_kind=report "
+                f"— no review, no PR-opening retry (#1022)"
+            )
+            return None
+
         # A crew-run branch's CLI may open the PR after this result (#666).
         # All other pushed branches need a PR before a reviewer is enqueued.
         if (pr_number is None and impl_task.branch
