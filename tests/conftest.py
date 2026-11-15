@@ -165,11 +165,18 @@ def _isolate_shadow_memory_environment(monkeypatch, tmp_path):
     """Keep inherited server memory flags and HOME paths out of every test.
 
     Capture tests can opt in within their own body with an explicit tmp DB.
+    Forge/context-pack flags too: an inherited one hit the live forge (#1020).
+    The scrub uses its own MonkeyPatch so a test's ``monkeypatch.undo()``
+    cannot bring an inherited key back mid-test.
     """
+    scrub = pytest.MonkeyPatch()
     for key in tuple(os.environ):
-        if key.startswith(("AGENT_CREW_SHADOW_MEMORY_", "AGENT_CREW_ADR001_")):
-            monkeypatch.delenv(key)
+        if key.startswith(("AGENT_CREW_SHADOW_MEMORY_", "AGENT_CREW_ADR001_",
+                           "AGENT_CREW_FORGE_", "AGENT_CREW_CONTEXT_PACK")):
+            scrub.delenv(key)
     monkeypatch.setenv("HOME", str(tmp_path))
+    yield
+    scrub.undo()
 
 
 @pytest.fixture
