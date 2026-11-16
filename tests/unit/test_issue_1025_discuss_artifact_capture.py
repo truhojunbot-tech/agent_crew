@@ -2,11 +2,14 @@
 
 import hashlib
 import subprocess
+import tracemalloc
 
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_crew.discuss_artifacts import DISCUSS_ARTIFACT_CAP_BYTES, parse_artifact
+from agent_crew import discuss_artifacts
+from agent_crew.discuss_artifacts import (
+    DISCUSS_ARTIFACT_CAP_BYTES, capture_worktree_artifacts, parse_artifact)
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
@@ -195,3 +198,64 @@ def test_discuss_task_block_tells_worker_to_use_findings():
     assert "full answer in findings" in _format_task_message(task, 8105)
     impl = TaskRequest(task_id="impl-1025h", task_type="implement", description="x")
     assert "full answer in findings" not in _format_task_message(impl, 8105)
+
+
+def _peak_capture_bytes(wt):
+    tracemalloc.start()
+    try:
+        entries, warnings = capture_worktree_artifacts(str(wt))
+        return entries, warnings, tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+_LARGE = 32 * 1024 * 1024
+_PEAK_LIMIT = 4 * 1024 * 1024
+
+
+def test_large_text_file_capture_memory_is_bounded(worktree):
+    """Review of PR #1027: the cap must bound peak memory, not just the stored text."""
+    big = worktree / "huge.log"
+    chunk = ("한글 line of log text\n" * 4096).encode("utf-8")
+    hasher = hashlib.sha256()
+    with open(big, "wb") as file:
+        written = 0
+        while written < _LARGE:
+            file.write(chunk)
+            hasher.update(chunk)
+            written += len(chunk)
+    entries, warnings, peak = _peak_capture_bytes(worktree)
+    assert warnings == []
+    (entry,) = [e for e in entries if e["path"] == "huge.log"]
+    assert entry["sha256"] == hasher.hexdigest()
+    assert entry["truncated"] is True
+    assert 0 < len(entry["content"].encode("utf-8")) <= DISCUSS_ARTIFACT_CAP_BYTES
+    assert peak < _PEAK_LIMIT
+
+
+def test_large_sparse_file_capture_memory_is_bounded(worktree):
+    sparse = worktree / "sparse.bin"
+    with open(sparse, "wb") as file:
+        file.truncate(_LARGE)
+    entries, warnings, peak = _peak_capture_bytes(worktree)
+    (entry,) = [e for e in entries if e["path"] == "sparse.bin"]
+    assert entry == {"kind": "discuss_artifact", "path": "sparse.bin", "binary": True,
+                     "sha256": hashlib.sha256(b"\0" * _LARGE).hexdigest()}
+    assert peak < _PEAK_LIMIT
+
+
+def test_invalid_utf8_after_the_cap_still_marks_binary(worktree):
+    """Classification covers the whole file, not just the stored prefix."""
+    (worktree / "late.txt").write_bytes(b"a" * (DISCUSS_ARTIFACT_CAP_BYTES * 2) + b"\xff")
+    entries, _ = capture_worktree_artifacts(str(worktree))
+    (entry,) = [e for e in entries if e["path"] == "late.txt"]
+    assert entry.get("binary") is True and "content" not in entry
+
+
+def test_multibyte_char_split_across_read_chunks_is_text(worktree, monkeypatch):
+    monkeypatch.setattr(discuss_artifacts, "_READ_CHUNK_BYTES", 5)
+    text = "가나다라마바사" * 10
+    (worktree / "ko.md").write_text(text, encoding="utf-8")
+    entries, _ = capture_worktree_artifacts(str(worktree))
+    (entry,) = [e for e in entries if e["path"] == "ko.md"]
+    assert entry["content"] == text and "binary" not in entry

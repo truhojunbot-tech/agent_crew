@@ -14,6 +14,7 @@ or hold it.
 """
 from __future__ import annotations
 
+import codecs
 import dataclasses
 import hashlib
 import json
@@ -27,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 #: Total bytes of file content copied into one result's findings.
 DISCUSS_ARTIFACT_CAP_BYTES = 256 * 1024
+#: Bytes read per step while hashing and classifying a file.
+_READ_CHUNK_BYTES = 64 * 1024
 ARTIFACT_KIND = "discuss_artifact"
 MISSING_WARNING = "discuss_artifact_missing"
 
@@ -57,6 +60,56 @@ def _dirty_paths(worktree: str) -> list[str]:
     return paths
 
 
+def _read_artifact(full: str, rel: str, budget: int) -> tuple[dict, int]:
+    """Return ``(entry, stored bytes)``, keeping at most ``budget`` bytes of text.
+
+    The file is hashed and classified in chunks over its full length.
+
+    Peak memory is one read chunk plus the stored prefix, whatever the file
+    size (review of PR #1027: a multi-GB file must not be loaded whole).
+    """
+    hasher = hashlib.sha256()
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    binary = False
+    prefix = bytearray()
+    size = 0
+    with open(full, "rb") as file:
+        while True:
+            chunk = file.read(_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            size += len(chunk)
+            if binary:
+                continue
+            if b"\0" in chunk:
+                binary = True
+                continue
+            try:
+                decoder.decode(chunk)
+            except UnicodeDecodeError:
+                binary = True
+                continue
+            if len(prefix) < budget:
+                prefix += chunk[:budget - len(prefix)]
+    if not binary:
+        try:
+            decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            binary = True
+    entry: dict = {"kind": ARTIFACT_KIND, "path": rel, "sha256": hasher.hexdigest()}
+    if binary:
+        entry["binary"] = True
+        return entry, 0
+    if size > len(prefix):
+        # Cut on a character boundary so the stored text stays valid UTF-8.
+        entry["content"] = bytes(prefix).decode("utf-8", "ignore")
+        entry["truncated"] = True
+    else:
+        entry["content"] = bytes(prefix).decode("utf-8")
+    return entry, len(prefix)
+
+
 def capture_worktree_artifacts(worktree: str,
                                cap: int = DISCUSS_ARTIFACT_CAP_BYTES
                                ) -> tuple[list[dict], list[dict]]:
@@ -69,30 +122,12 @@ def capture_worktree_artifacts(worktree: str,
         if not os.path.isfile(full) or os.path.islink(full):
             continue
         try:
-            with open(full, "rb") as file:
-                data = file.read()
+            entry, stored = _read_artifact(full, rel, budget)
         except OSError as exc:
             warnings.append({"kind": "discuss_artifact_capture_error",
                              "path": rel, "detail": str(exc)[:200]})
             continue
-        entry: dict = {"kind": ARTIFACT_KIND, "path": rel,
-                 "sha256": hashlib.sha256(data).hexdigest()}
-        try:
-            if b"\0" in data:
-                raise UnicodeDecodeError("utf-8", data, 0, 1, "NUL byte")
-            data.decode("utf-8")
-        except UnicodeDecodeError:
-            entry["binary"] = True
-            entries.append(entry)
-            continue
-        if len(data) > budget:
-            # Cut on a character boundary so the stored text stays valid UTF-8.
-            entry["content"] = data[:budget].decode("utf-8", "ignore")
-            entry["truncated"] = True
-            budget = 0
-        else:
-            entry["content"] = data.decode("utf-8")
-            budget -= len(data)
+        budget -= stored
         entries.append(entry)
     return entries, warnings
 
