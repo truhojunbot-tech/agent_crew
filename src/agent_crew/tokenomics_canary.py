@@ -204,6 +204,7 @@ def evaluate_review_dispatch(
     project: Optional[str] = None,
     reviewed_artifact_kind: Optional[str] = None,
     lineage_root_lookup: Optional[Callable[[str], str]] = None,
+    override_lookup: Optional[Callable[[str], bool]] = None,
 ) -> CanaryDecision:
     """Decide whether THIS review dispatch is the one to suppress.
 
@@ -289,6 +290,21 @@ def evaluate_review_dispatch(
     extra = {"standing_verdict": verdict,
              "standing_findings_count": standing.get("findings_count"),
              "condition_holds": True}
+    if context.get("allow_duplicate_review") is True and override_lookup is not None:
+        # #1029: the coordinator asked for this same-SHA re-review and the
+        # queue audited it. An evidence-only request_changes can only be
+        # cleared by a re-review; suppressing it would stall the lineage.
+        try:
+            overridden = override_lookup(getattr(task, "task_id", "") or "") is True
+        except Exception:
+            logger.exception("tokenomics canary: override lookup failed for %s",
+                             getattr(task, "task_id", "?"))
+            overridden = False
+        if overridden:
+            return CanaryDecision(
+                applied=False, reason="coordinator_duplicate_review_override",
+                standing_review_task_id=standing_id, counterfactual=counterfactual,
+                extra={**extra}, **base)
     if not pin:
         return CanaryDecision(
             applied=False, reason="condition_holds_canary_unarmed",

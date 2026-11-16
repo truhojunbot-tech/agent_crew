@@ -3877,12 +3877,18 @@ def create_app(
                 first = tasks_by_id.get(task_id)
                 return _lineage_root_task_id(tasks_by_id, first) if first else ""
 
+            def _duplicate_review_overridden(task_id: str) -> bool:
+                state = q().get_exec_state(task_id) or {}
+                return any(e.get("event") == "duplicate_review_override"
+                           for e in state.get("events") or [])
+
             decision = _canary.evaluate_review_dispatch(
                 task, reviewed_sha=reviewed_sha or "",
                 standing_lookup=q().standing_request_changes_review,
                 project=_server_identity()["project"],
                 reviewed_artifact_kind=_reviewed_artifact_kind(),
                 lineage_root_lookup=_lineage_root_for,
+                override_lookup=_duplicate_review_overridden,
             )
         except Exception:
             logger.exception(
