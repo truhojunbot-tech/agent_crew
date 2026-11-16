@@ -6034,7 +6034,8 @@ class TaskQueue:
             # `needs_human` also needs its stop reason for a coordinator to act.
             error_info_json = None
             if (result.status in ("failed", "timed_out", "blocked", "needs_human")
-                    or (task_type == "test" and result.status == "completed")) and result.error_info:
+                    or (task_type in ("test", "discuss") and result.status == "completed")) and result.error_info:
+                # #1025: a completed discuss keeps its capture warnings.
                 error_info_json = json.dumps(result.error_info)
             # ⛔`status_changed_at` moves only when the status actually moves.
             #   Stamping it on every submission made a duplicate same-status

@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover — surfaced loud at import time
     FastMCP = None  # type: ignore
 
 from agent_crew.loop import _resolve_verdict, handle_test_result
+from agent_crew.discuss_artifacts import MISSING_WARNING as DISCUSS_ARTIFACT_MISSING, capture_discuss_result
 from agent_crew.failure_kind import FailureKind
 from agent_crew.pipeline import (
     auto_enqueue_fix,
@@ -276,6 +277,15 @@ def build_mcp_server(
         result, mismatch = hold_mismatched_pr_result(task_id, result, _task_ctx)
         _artifact_held = None
         _task = queue.get_task(task_id)
+        # #1025: same discuss worktree capture as the HTTP transport.
+        _discuss_missing: list = []
+        if (_task is not None and _task.task_type == "discuss"
+                and result.status == "completed" and _task.status == "in_progress"):
+            try:
+                _wt = str((queue.get_attribution(task_id) or {}).get("worktree_path") or "")
+                result, _discuss_missing = capture_discuss_result(result, _wt or None)
+            except Exception:
+                logger.exception("MCP submit_result: discuss artifact capture failed for %s", task_id)
         try:
             _runtime_paused = queue.get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
@@ -345,6 +355,11 @@ def build_mcp_server(
                 queue.merge_task_context(task_id, _result_ref)
             except Exception:
                 logger.exception("MCP submit_result: could not persist result ref metadata for %s", task_id)
+        if _discuss_missing:
+            from agent_crew.server import coordinator_notice_once
+            coordinator_notice_once(queue, task_id, DISCUSS_ARTIFACT_MISSING,
+                                    "summary names a file that is missing or empty "
+                                    f"and findings is empty: {', '.join(_discuss_missing)[:200]}")
         if mismatch:
             requested, reported = mismatch
             return {"acknowledged": True, "task_id": task_id, "task_type": task_type,

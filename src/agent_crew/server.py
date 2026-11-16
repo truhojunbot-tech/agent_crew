@@ -51,6 +51,7 @@ from agent_crew.context_identity import (
     extract_claude_session_id,
     record_context_event,
 )
+from agent_crew.discuss_artifacts import MISSING_WARNING as DISCUSS_ARTIFACT_MISSING, capture_discuss_result
 from agent_crew.failure_kind import FailureKind, failure_kind, provider_failure_from_log
 from agent_crew import tokenomics_canary as _canary
 from agent_crew.github import get_repo, _repo_slug
@@ -2814,6 +2815,11 @@ def _format_task_message(task: TaskRequest, port: int,
         if commit_contract else
         "Do the work described above, then POST result: "
     )
+    if task.task_type == "discuss":
+        # #1025: worktree files are wiped before the next dispatch.
+        result_instruction = (
+            "Put the full answer in findings; worktree files are not kept.\n"
+            + result_instruction)
     return (
         f"=== AGENT_CREW TASK ===\n"
         f"task_id: {task.task_id}\n"
@@ -8166,6 +8172,18 @@ def create_app(
         # target. Both numbers survive: `requested` in the context, `reported`
         # on the row.
         result, _pr_mismatch = hold_mismatched_pr_result(task_id, result, ctx)
+        # #1025: copy the discuss worktree's uncommitted files into findings
+        # before the row is written; the next dispatch prep wipes them.
+        _discuss_missing: list = []
+        if (not _REPLAYING.get() and _task is not None
+                and _task.task_type == "discuss" and result.status == "completed"
+                and _task.status == "in_progress"):
+            try:
+                _discuss_wt = str((q().get_attribution(task_id) or {}).get("worktree_path") or "")
+                result, _discuss_missing = capture_discuss_result(result, _discuss_wt or None)
+            except Exception:
+                logger.exception("POST /tasks/%s/result: discuss artifact capture failed",
+                                 task_id)
         # #265: worker-reported failures can still be revised by that worker.
         # Queue admission now refuses a timeout, cancel or dispatcher failure
         # under the write lock, so those statuses never reach revision logging.
@@ -8415,6 +8433,10 @@ def create_app(
         if task_type == "discuss":
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
+            if _discuss_missing:
+                _coordinator_notice(task_id, DISCUSS_ARTIFACT_MISSING,
+                                    "summary names a file that is missing or empty "
+                                    f"and findings is empty: {', '.join(_discuss_missing)[:200]}")
             _try_push_discuss(agent)
             _lineage_end_notice(task_id)
         else:
