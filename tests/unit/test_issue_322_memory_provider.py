@@ -94,7 +94,7 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled
 
     async def fake_exec(*cmd, **kwargs):
         from tests.dispatch_stdin import CapturedStdin
-        stdin = spawned["stdin"] = CapturedStdin()
+        stdin = spawned["stdin"] = CapturedStdin(kwargs.get("stdin"))
 
         class Process:
             returncode = 0

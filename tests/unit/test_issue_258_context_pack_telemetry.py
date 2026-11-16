@@ -348,7 +348,7 @@ def _shadow_dispatch(tmp_path, monkeypatch, port, *, live=False, shadow=False, b
 
     async def fake_exec(*cmd, **kwargs):
         from tests.dispatch_stdin import CapturedStdin
-        stdin = CapturedStdin()
+        stdin = CapturedStdin(kwargs.get("stdin"))
         inputs.append(stdin)
         commands.append(cmd)
 

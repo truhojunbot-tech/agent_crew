@@ -34,7 +34,7 @@ def _harness(tmp_path, monkeypatch, unused_tcp_port):
 
     async def fake_exec(*cmd, **kwargs):
         from tests.dispatch_stdin import CapturedStdin
-        stdin = CapturedStdin()
+        stdin = CapturedStdin(kwargs.get("stdin"))
         seen.append((list(cmd), kwargs["env"], stdin))
 
         class Process:

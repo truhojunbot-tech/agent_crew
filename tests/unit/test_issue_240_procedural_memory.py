@@ -754,7 +754,7 @@ def test_enabled_dispatcher_puts_a_persisted_procedure_into_the_prompt(
 
     async def _fake_exec(*cmd, **kwargs):
         from tests.dispatch_stdin import CapturedStdin
-        stdin = spawned["stdin"] = CapturedStdin()
+        stdin = spawned["stdin"] = CapturedStdin(kwargs.get("stdin"))
 
         class _P:
             returncode = 0
@@ -1063,7 +1063,7 @@ def test_enabled_dispatcher_respects_module_scope(tmp_path, monkeypatch, *, unus
 
     async def _fake_exec(*cmd, **kwargs):
         from tests.dispatch_stdin import CapturedStdin
-        stdin = CapturedStdin()
+        stdin = CapturedStdin(kwargs.get("stdin"))
         spawned.setdefault("inputs", []).append(stdin)
 
         class _P:
