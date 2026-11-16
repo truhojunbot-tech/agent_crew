@@ -717,6 +717,11 @@ Before you POST the result, verify:
 You analyze the topic from your assigned perspective (see `context.perspective`)
 and submit your opinion in the result `summary`.
 
+⛔Put the full answer in the result body: a short `summary` plus the complete
+text in `findings`. Worktree files are not kept — nothing commits them and the
+worktree is reset and cleaned before the next dispatch. A summary that only says
+"written to <file>" loses the answer (#1025).
+
 ### Post GitHub Discussion comment (if provided)
 
 If `context.github_discussion` contains a URL, post your opinion directly to GitHub
@@ -739,7 +744,8 @@ fi
 - [ ] GitHub Discussion comment posted if `context.github_discussion` is set
 - [ ] `status: completed`
 - [ ] `summary` contains your perspective-grounded opinion (not a rehash of the topic)
-- [ ] `verdict: null`, `findings: []`, `pr_number: null`
+- [ ] `findings` carries the full answer text, not a pointer to a file
+- [ ] `verdict: null`, `pr_number: null`
 """,
 }
 
