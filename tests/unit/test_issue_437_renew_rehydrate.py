@@ -82,7 +82,7 @@ def test_dispatch_renewal(tmp_path, monkeypatch, unused_tcp_port,
 
     async def fake_exec(*cmd, **kwargs):
         from tests.dispatch_stdin import CapturedStdin
-        stdin = CapturedStdin()
+        stdin = CapturedStdin(kwargs.get("stdin"))
         inputs.append(stdin)
         commands.append(list(cmd))
         if len(commands) == 2 and not expected_resume:

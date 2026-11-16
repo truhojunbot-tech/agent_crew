@@ -102,7 +102,7 @@ def _run(tmp_db, tmp_path, port, *, env: dict, succeed_on: int, task_id: str,
             completed.set()
             proc.returncode = 0
         from tests.dispatch_stdin import CapturedStdin
-        proc.stdin = CapturedStdin()
+        proc.stdin = CapturedStdin(kwargs.get("stdin"))
         proc.wait = AsyncMock(return_value=proc.returncode)
         return proc
 
@@ -171,7 +171,7 @@ def test_u_581_transient_budget_still_applies_to_other_tags(tmp_db, tmp_path, *,
         kwargs["stdout"].flush()
         proc = MagicMock(returncode=1, kill=MagicMock())
         from tests.dispatch_stdin import CapturedStdin
-        proc.stdin = CapturedStdin()
+        proc.stdin = CapturedStdin(kwargs.get("stdin"))
         proc.wait = AsyncMock(return_value=1)
         return proc
 
@@ -407,7 +407,7 @@ def test_u_581_capacity_redispatches_under_cea_enforcement(tmp_path, enforcing_c
                             nonce=nonce, presenter="codex")
             proc.returncode = 0
         from tests.dispatch_stdin import CapturedStdin
-        proc.stdin = CapturedStdin()
+        proc.stdin = CapturedStdin(kwargs.get("stdin"))
         proc.wait = AsyncMock(return_value=proc.returncode)
         return proc
 

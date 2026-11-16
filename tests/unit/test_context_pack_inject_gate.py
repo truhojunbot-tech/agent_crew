@@ -134,7 +134,7 @@ def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=Fals
 
     async def fake_exec(*cmd, **kwargs):
         from tests.dispatch_stdin import CapturedStdin
-        stdin = CapturedStdin()
+        stdin = CapturedStdin(kwargs.get("stdin"))
         inputs.append(stdin)
         commands.append(cmd)
 

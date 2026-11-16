@@ -679,7 +679,7 @@ def test_enabled_dispatcher_puts_the_ac_into_the_real_dispatched_prompt(
 
     async def _fake_exec(*cmd, **kwargs):
         from tests.dispatch_stdin import CapturedStdin
-        stdin = spawned["stdin"] = CapturedStdin()
+        stdin = spawned["stdin"] = CapturedStdin(kwargs.get("stdin"))
 
         class _P:
             returncode = 0
@@ -947,7 +947,7 @@ def test_enabled_dispatcher_ships_the_ac_of_a_capped_issue(tmp_path, monkeypatch
 
     async def _fake_exec(*cmd, **kwargs):
         from tests.dispatch_stdin import CapturedStdin
-        stdin = spawned["stdin"] = CapturedStdin()
+        stdin = spawned["stdin"] = CapturedStdin(kwargs.get("stdin"))
 
         class _P:
             returncode = 0

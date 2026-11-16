@@ -14,6 +14,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import hashlib
 import time
@@ -1789,6 +1790,27 @@ def _dispatch_idle_timeout() -> float:
     return value if math.isfinite(value) and value > 0 else 600.0
 
 
+def _write_dispatch_prompt_file(state_dir: str, task_id: str, data: bytes) -> str:
+    """Write a dispatch prompt to a 0600 file under the state dir (#1026).
+
+    The file becomes the child's stdin, so delivery no longer depends on the
+    event loop writing a pipe before the CLI gives up waiting. The caller
+    removes it once the child has exited.
+    """
+    prompt_dir = os.path.join(state_dir, "dispatch_prompts")
+    os.makedirs(prompt_dir, mode=0o700, exist_ok=True)
+    safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", task_id)[:64]
+    fd, path = tempfile.mkstemp(prefix=f"{safe_id}.", suffix=".prompt", dir=prompt_dir)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+    return path
+
+
 async def _wait_for_dispatch_activity(
     proc, log_path: str, initial_offset: int, *, hard_timeout_s: float,
     idle_timeout_s: float, on_progress, input_data: Optional[bytes] = None,
@@ -1801,8 +1823,10 @@ async def _wait_for_dispatch_activity(
     """
     started = last_output = time.monotonic()
     offset = initial_offset
+    stdin_closed = False
 
     async def feed_stdin():
+        nonlocal stdin_closed
         try:
             proc.stdin.write(input_data)
             await proc.stdin.drain()
@@ -1810,6 +1834,10 @@ async def _wait_for_dispatch_activity(
             # A CLI may exit before consuming input; its exit/log handling below
             # remains authoritative, just as with asyncio.Process.communicate.
             pass
+        except RuntimeError:
+            # #1026: the loop stalled past the child's stdin wait, so the
+            # transport closed before the write — the prompt never arrived.
+            stdin_closed = True
         except asyncio.CancelledError:
             # Discard buffered input on timeout; closing alone would wait for
             # a child that is not reading before the caller can kill it.
@@ -1817,7 +1845,7 @@ async def _wait_for_dispatch_activity(
             raise
         finally:
             proc.stdin.close()
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError, RuntimeError):
                 await proc.stdin.wait_closed()
 
     # Feed concurrently so backpressure cannot bypass the existing kill limits.
@@ -1838,7 +1866,11 @@ async def _wait_for_dispatch_activity(
                 on_progress()
             if wait_task.done():
                 await wait_task
-                return None, now - last_output
+                if input_task is not None:
+                    # Bounded: a grandchild may still hold the pipe open.
+                    await asyncio.wait({input_task}, timeout=1.0)
+                return ("stdin_closed_before_write" if stdin_closed else None,
+                        now - last_output)
             if now - started >= hard_timeout_s:
                 return "dispatcher_timeout", now - last_output
             if now - last_output >= idle_timeout_s:
@@ -2835,6 +2867,7 @@ _LINEAGE_REASON_CODES = frozenset({
     "wip_restore_conflict", "missing_role_protocol", "no_worktree",
     "pane_target_unresolvable", "pane_not_owned", "dispatch_exception",
     "dispatcher_exception", "script_test_exception", "transient_max_retries",
+    "stdin_closed_before_write",
     "provider_capacity_requeue_failed", "codex_quota_park_failed",
     "provider_error", "provider_test_not_run", "no_result_submitted",
     "cloud_submit_timeout", "cloud_launch_interactive_prompt",
@@ -5753,6 +5786,7 @@ def create_app(
         # capped anything (#201).
         _terminal = True
         _task_log_tail = ""
+        _prompt_path = None
         try:
             import datetime as _dt
             with open(log_path, "a") as log_f:
@@ -5786,12 +5820,20 @@ def create_app(
                 #   handle is closed and every dispatch dies with
                 #   "I/O operation on closed file" (review of 720ac76). The
                 #   child keeps its own dup, so closing ours on exit is safe.
+                # #1026: the prompt reaches stdin from a private file opened
+                #   before the spawn. A pipe written after the spawn depended
+                #   on the loop running within `claude -p`'s 3 s stdin wait.
+                if not is_gemini_family(agent):
+                    _prompt_path = _write_dispatch_prompt_file(
+                        os.path.dirname(db_path), task.task_id, message.encode())
                 try:
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd, stdin=asyncio.subprocess.PIPE if not is_gemini_family(agent) else None,
-                        stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
-                        start_new_session=True,
-                    )
+                    with (open(_prompt_path, "rb") if _prompt_path
+                          else contextlib.nullcontext()) as _prompt_f:
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd, stdin=_prompt_f,
+                            stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
+                            start_new_session=True,
+                        )
                 except OSError as exc:
                     if task.task_type != "test":
                         raise
@@ -5812,7 +5854,6 @@ def create_app(
             _timeout_reason, _last_output_age = await _wait_for_dispatch_activity(
                 proc, log_path, _task_log_start_offset,
                 hard_timeout_s=timeout_secs, idle_timeout_s=_idle_timeout_secs,
-                input_data=message.encode() if not is_gemini_family(agent) else None,
                 on_progress=lambda: q().record_heartbeat(
                     task.task_id, source="output_progress"),
             )
@@ -5913,7 +5954,10 @@ def create_app(
                     "codex_rollout_bytes": _rollout_bytes or None,
                     "codex_context_cap_mb": _codex_cap_mb,
                 }
-            if _timeout_reason:
+            if _timeout_reason == "stdin_closed_before_write":
+                _fail_if_active(task.task_id, _timeout_reason,
+                                details={"failure_class": "infra"})
+            elif _timeout_reason:
                 # The task receipt, error_info, and event all carry the fired
                 # limit and output age for post-mortem inspection.
                 _fail_if_active(task.task_id, _timeout_reason, status="timed_out",
@@ -6034,6 +6078,9 @@ def create_app(
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
+            if _prompt_path:
+                with contextlib.suppress(OSError):
+                    os.unlink(_prompt_path)
             with _active_dispatch_lock:
                 _active_dispatch_processes.pop(task.task_id, None)
             # The process is reaped; a cancel's pending SIGKILL now has no
