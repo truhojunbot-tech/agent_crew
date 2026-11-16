@@ -77,6 +77,7 @@ from agent_crew.pipeline import (
     stale_review_task_id,
     verify_implement_artifact,
     git_fetch_origin,
+    resolve_rebase_floor_sha,
 )
 from agent_crew import provenance as _prov
 from agent_crew.protocol import (
@@ -3690,6 +3691,13 @@ def create_app(
             }
             base_context["prep_error"] = prep_error or None
             base_context["prep_error_base_source"] = source if prep_error else None
+            rebase_target = str((task.context or {}).get("rebase_onto") or "").strip()
+            if role == "implementer" and rebase_target:
+                # #908: pin the target as dispatched, so a fix round's rebase
+                # survives the target moving before its result is verified.
+                wt = worktree_path or (worktree_map.get(role) if worktree_map else "") or ""
+                base_context["rebase_onto_floor_sha"] = resolve_rebase_floor_sha(
+                    wt, rebase_target)
             landed = (task.context or {}).get("sync_landed_bases", {})
             if isinstance(landed, dict):
                 record = landed.get(role)

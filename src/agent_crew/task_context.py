@@ -170,6 +170,7 @@ TASK_CONTEXT_KEYS = frozenset({
     'push_refusals',
     'reason',
     'rebase_onto',
+    'rebase_onto_floor_sha',
     'rebase_onto_sha',
     'rebase_source_sha',
     'repo',
