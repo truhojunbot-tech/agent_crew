@@ -87,6 +87,28 @@ def git_fetch_origin(repo_cwd: str, *branches: str) -> subprocess.CompletedProce
         return subprocess.CompletedProcess(command, 124, "", "fetch timed out")
 
 
+def resolve_rebase_floor_sha(repo_cwd: str, target: str) -> str | None:
+    """Full SHA of ``origin/<target>`` right now, or None when unresolvable (#908).
+
+    Recorded at dispatch so the result-time rebase gate can floor descent at
+    the target the worker was actually asked to rebase onto. Never raises.
+    """
+    try:
+        if not repo_cwd or not target:
+            return None
+        if git_fetch_origin(repo_cwd, target).returncode != 0:
+            return None
+        resolved = subprocess.run(
+            ["git", "-C", repo_cwd, "rev-parse", "--verify",
+             f"origin/{target}^{{commit}}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        sha = resolved.stdout.strip()
+        return sha if resolved.returncode == 0 and sha else None
+    except Exception:
+        return None
+
+
 def successor_context(parent_context: object) -> dict:
     """Copy task metadata without the parent's per-receipt CEA decisions.
 
@@ -232,11 +254,20 @@ def verify_implement_artifact(
             # is still valid after another PR merges. A recorded base that is
             # not on the target's history (e.g. the pre-rebase branch head) is
             # no floor, so fall back to the current tip.
+            # A fix round's base is the PR branch head, which is not on the
+            # target, so the dispatch-time target SHA recorded at dispatch is
+            # the floor when it is still on the target's history.
+            def _on_target(sha: str) -> bool:
+                return bool(sha) and sha != rebase_tip and subprocess.run(
+                    ["git", "-C", repo_cwd, "merge-base", "--is-ancestor", sha, rebase_tip],
+                    capture_output=True, text=True, timeout=30,
+                ).returncode == 0
+
+            recorded_floor = str(context.get("rebase_onto_floor_sha") or "").strip()
             ancestor = rebase_tip
-            if base and base != rebase_tip and subprocess.run(
-                ["git", "-C", repo_cwd, "merge-base", "--is-ancestor", base, rebase_tip],
-                capture_output=True, text=True, timeout=30,
-            ).returncode == 0:
+            if _on_target(recorded_floor):
+                ancestor = recorded_floor
+            elif _on_target(base):
                 ancestor = base
 
         # Workers should report their full SHA, but a missing typed field must
