@@ -134,6 +134,8 @@ def hermetic_cea(monkeypatch):
 @pytest.mark.parametrize("advanced_base", [False, True])
 def test_held_missing_ref_can_be_corrected_by_same_worker(
         tmp_path, monkeypatch, hermetic_cea, mode, advanced_base):
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     from agent_crew.server import create_app
 
     def git_head(argv, **kwargs):

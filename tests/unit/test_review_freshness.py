@@ -82,7 +82,9 @@ def _make_app(tmp_db, push_calls):
     )
 
 
-def test_review_task_carries_pr_number_when_impl_posts_one(tmp_db):
+def test_review_task_carries_pr_number_when_impl_posts_one(tmp_db, monkeypatch):
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     push_calls: list = []
     app = _make_app(tmp_db, push_calls)
     with TestClient(app) as client:
@@ -97,7 +99,9 @@ def test_review_task_carries_pr_number_when_impl_posts_one(tmp_db):
     assert review.context["pr_number"] == 83
 
 
-def test_review_instructions_mention_pr_diff_when_pr_known(tmp_db):
+def test_review_instructions_mention_pr_diff_when_pr_known(tmp_db, monkeypatch):
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     push_calls: list = []
     app = _make_app(tmp_db, push_calls)
     with TestClient(app) as client:

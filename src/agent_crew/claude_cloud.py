@@ -1979,9 +1979,12 @@ def reconcile_cloud_dispatch(
                 pr_number=pr_number, branch=branch, commit=head_sha,
             )
             try:
-                from agent_crew.pipeline import auto_enqueue_review
+                from agent_crew.pipeline import auto_enqueue_review, pre_review_test_applies
+                # #999: a script tester screens the suite before the review.
+                # The pre-review test counts as the confirmed successor.
                 review_id = auto_enqueue_review(queue, task.task_id, pr_number,
-                                                pr_state_fn=pr_state_fn, result=result)
+                                                pr_state_fn=pr_state_fn, result=result,
+                                                pre_review_test=pre_review_test_applies(queue))
             except Exception:
                 logger.exception("claude_cloud: auto_enqueue_review raised for %s", task.task_id)
                 review_id = None

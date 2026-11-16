@@ -53,11 +53,11 @@ def test_then_run_follows_server_review_by_parent(tmp_path, monkeypatch):
         status="completed", pr_number=938, branch="fix/935", commit="a" * 40))
     lookups = []
 
-    def capture(queue, task_type, prev_task_id, timeout):
-        lookups.append((task_type, prev_task_id))
+    def capture(queue, prev_task_id, timeout, wait_result, **kwargs):
+        lookups.append(("review", prev_task_id))
         raise RuntimeError("captured before server successor lookup")
 
-    monkeypatch.setattr(loop, "wait_for_pipeline_successor", capture)
+    monkeypatch.setattr(loop, "follow_implement_successor", capture)
     monkeypatch.setattr(loop, "enqueue_review", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("discuss must not enqueue a review")))
     result = CliRunner().invoke(crew, ["discuss", "topic", "--then-run",

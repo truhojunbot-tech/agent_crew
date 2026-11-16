@@ -94,6 +94,8 @@ def test_finding1_end_to_end_pr_appears_and_review_gets_enqueued(q, monkeypatch)
 
     #762 r1: a real cloud dispatch records context.repo; the default
     pr_state lookup is bound to it (no repo -> no cwd guess -> unknown)."""
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     task_id, branch = _enqueue_implement(q, context={"repo": "owner/agent_crew"})
     q.dequeue(role="implementer")
     q.record_dispatch(task_id, channel=cc.DISPATCH_CHANNEL, agent=cc.CLOUD_PROVIDER_NAME,
@@ -312,11 +314,13 @@ def test_finding4_enqueue_failure_keeps_task_dispatched_for_retry(q, monkeypatch
     assert not [t for t in q.list_tasks(status="completed") if t.task_id == task_id]
 
 
-def test_finding4_retry_succeeds_once_enqueue_works(q):
+def test_finding4_retry_succeeds_once_enqueue_works(q, monkeypatch):
     """The retry itself must actually work once the transient failure clears:
     a second reconciliation pass with a healthy auto_enqueue_review completes
     the task AND creates the review, and the deterministic review task id
     keeps a retry idempotent even if it had partially succeeded before."""
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     task_id, branch = _enqueue_implement(q)
     q.dequeue(role="implementer")
     q.record_dispatch(task_id, channel=cc.DISPATCH_CHANNEL, agent=cc.CLOUD_PROVIDER_NAME,

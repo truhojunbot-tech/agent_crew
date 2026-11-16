@@ -243,6 +243,8 @@ def test_http_an_implement_result_may_still_name_the_pr_it_just_opened(tmp_db, m
     """★★The path this gate could most easily have broken: the implement task
     was dispatched with no PR at all, and its result reports the PR it created.
     One-sided is not a mismatch."""
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
     with TestClient(_server(tmp_db, _Push())) as c:
         # canonical-repo-identity remediation: see test_http_an_agreeing_review_still_cascades.

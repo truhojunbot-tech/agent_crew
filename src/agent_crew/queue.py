@@ -3823,6 +3823,10 @@ class TaskQueue:
                     and row["status"] == "in_progress"):
                 continue
             old = _stored_context(row["context"], row["task_id"])
+            # #999: a pre-review test and the post-review test of one head are
+            # different stages; neither stands in for the other.
+            if (old.get("pre_review") is True) != (context.get("pre_review") is True):
+                continue
             old_pr = _normalize_pr_number(old.get("pr_number"))
             if old_pr is None:
                 old_pr = _normalize_pr_number(row["pr_number"])
@@ -4672,9 +4676,10 @@ class TaskQueue:
                 validate_http_root_risk(context)
                 validate_local_inputs(context)
             if _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
+                # #999: a pre-review fix counts its own round, not a review's.
                 if (ingress == "cascade.fix" and context.get("artifact_kind") != "rebase"
-                        and (type(context.get("fix_round")) is not int
-                             or context["fix_round"] < 1)):
+                        and not any(type(context.get(key)) is int and context[key] >= 1
+                                    for key in ("fix_round", "pre_review_fix_round"))):
                     raise ValueError("fix successor requires fix_round")
                 if ingress == "retry.failed_task" and not (
                         isinstance(context.get("retry_of"), str)

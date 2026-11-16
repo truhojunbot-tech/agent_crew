@@ -169,6 +169,8 @@ def test_existing_daily_launch_cap_applies_to_cloud_implement(tmp_path, monkeypa
 
 
 def test_cloud_fix_waits_for_new_pr_head_before_re_review(tmp_path, monkeypatch):
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     old_head = "a" * 40
     new_head = "b" * 40

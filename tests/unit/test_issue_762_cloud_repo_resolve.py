@@ -95,6 +95,8 @@ def test_crew_run_repo_sets_implement_context(monkeypatch, tmp_path):
 
 def test_cloud_implement_without_context_repo_reconciles_and_enqueues_review(
         tmp_path, monkeypatch):
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     checkout = _git_repo(tmp_path / "claude", "https://github.com/owner/agent_crew.git")
     server_cwd = _git_repo(tmp_path / "server", "https://github.com/owner/alfred.git")
     monkeypatch.chdir(server_cwd)
@@ -129,6 +131,8 @@ def test_cloud_implement_without_context_repo_reconciles_and_enqueues_review(
 
 def test_default_pr_state_lookup_is_bound_to_context_repo(tmp_path, monkeypatch):
     """#762 r1 HIGH: no injected pr_state_fn — the DEFAULT lookup must get the repo."""
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     from agent_crew import github
 
     server_cwd = _git_repo(tmp_path / "server", "https://github.com/owner/wrong.git")

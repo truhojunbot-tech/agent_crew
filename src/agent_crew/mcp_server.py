@@ -45,6 +45,8 @@ from agent_crew.pipeline import (
     artifact_gate_applies, declared_artifact_kind, dispatch_base_absent_hold, no_artifact_result,
     verify_implement_artifact, verify_task_artifact, review_publication_decision,
     requeue_review_at_head, _successor_project,
+    is_pre_review_test, pre_review_outcome, pre_review_test_applies,
+    review_after_pre_review_test,
 )
 from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
@@ -401,8 +403,11 @@ def build_mcp_server(
             # transport routes from the implement TASK's branch — `main` for
             # every watch-ingested issue — and the review is pointed at a commit
             # that never contained the work.
+            # #999: the same policy as HTTP — a script tester screens the
+            # suite before a review is spent.
             auto_enqueue_review(queue, task_id, pr_number=result.pr_number,
-                                result=result)
+                                result=result,
+                                pre_review_test=pre_review_test_applies(queue))
         elif task_type == "review" and _resolve_verdict(result) == "approve":
             # #887: the #304 head gate HTTP applies before acting on an
             # approval. A verdict about a head that has moved neither spends a
@@ -443,6 +448,13 @@ def build_mcp_server(
                              require_repo_default=True)
         actionable_test_failure = (task_type == "test"
                                    and handle_test_result(result) == "failed")
+        if (task_type == "test" and not actionable_test_failure
+                and is_pre_review_test(queue.get_task(task_id))):
+            # #999: green, or unable to judge, goes on to exactly one review.
+            # Never a fallback/retry: the review is the continuation.
+            review_id = review_after_pre_review_test(
+                queue, task_id, *pre_review_outcome(result))
+            return isinstance(review_id, str) and bool(review_id)
         if actionable_test_failure:
             fix_id = auto_enqueue_fix(queue, task_id, repo=(_task_ctx or {}).get("repo") or "",
                                       require_repo_default=True)

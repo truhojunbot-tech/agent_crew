@@ -54,6 +54,8 @@ def _worktree(tmp_path, head_state):
 ])
 def test_missing_refs_use_only_descendant_dispatched_worktree_head(
         tmp_path, monkeypatch, caplog, head_state):
+    # #999: this test is about the implement -> review hop itself.
+    monkeypatch.setenv("AGENT_CREW_PRE_REVIEW_SCRIPT_TEST", "0")
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__DEMO", "off")
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     worker, base, head = _worktree(tmp_path, head_state)

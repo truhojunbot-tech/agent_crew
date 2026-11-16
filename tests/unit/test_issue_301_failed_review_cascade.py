@@ -220,7 +220,8 @@ def test_both_cli_loops_stop_instead_of_re_implementing():
     #   before one could run (review of PR #303).
     stop_guards = source.count('outcome == "review_failed"')
     invalid_guards = source.count('outcome == INVALID_REVIEW_RESULT')
-    successor_follows = source.count("wait_for_pipeline_successor(")
+    # #999: the review is reached through the pre-review test follower.
+    successor_follows = source.count("follow_implement_successor(")
 
     assert stop_guards == 2, (
         f"each review loop must stop on a review that did not run; "
