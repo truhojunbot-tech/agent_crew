@@ -9351,7 +9351,7 @@ class TaskQueue:
             if pr_number is not None:
                 rows = conn.execute(
                     "SELECT task_id, verdict, findings, pr_number, branch, context, summary, "
-                    "       status, last_activity_at, created_at, status_changed_at "
+                    "       status, last_activity_at, created_at, status_changed_at, result_posted_at "
                     "FROM tasks WHERE task_type='review' AND status='completed' "
                     "  AND pr_number=? AND task_id<>? "
                     f"ORDER BY {self._VERDICT_AT_SQL} DESC, created_at DESC",
@@ -9360,7 +9360,7 @@ class TaskQueue:
             else:
                 rows = conn.execute(
                     "SELECT task_id, verdict, findings, pr_number, branch, context, summary, "
-                    "       status, last_activity_at, created_at, status_changed_at "
+                    "       status, last_activity_at, created_at, status_changed_at, result_posted_at "
                     "FROM tasks WHERE task_type='review' AND status='completed' "
                     "  AND branch=? AND pr_number IS NULL AND task_id<>? "
                     f"ORDER BY {self._VERDICT_AT_SQL} DESC, created_at DESC",
@@ -9390,7 +9390,9 @@ class TaskQueue:
                     # suppression has to reproduce this verdict in full, and a
                     # count cannot be handed to a fix agent.
                     "findings": findings,
-                    "findings_count": len(findings)}
+                    "findings_count": len(findings),
+                    # When the verdict was posted; #1029 evidence must be newer.
+                    "result_posted_at": row["result_posted_at"]}
         return None
 
     def settle_unused_task_receipt(self, task_id: str, *, note: str) -> Optional[str]:

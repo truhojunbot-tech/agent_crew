@@ -3883,6 +3883,7 @@ def create_app(
                 project=_server_identity()["project"],
                 reviewed_artifact_kind=_reviewed_artifact_kind(),
                 lineage_root_lookup=_lineage_root_for,
+                evidence_lookup=_canary.github_comment_evidence,
             )
         except Exception:
             logger.exception(

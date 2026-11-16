@@ -23,10 +23,12 @@ decision is reversible by unsetting that switch and restarting the server.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
@@ -67,6 +69,17 @@ REUSED_FROM_KEY = "canary_reused_from"
 #: condition here.
 _OBJECT_ID_RE = re.compile(r"\A[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z")
 _PROJECT_PIN_RE = re.compile(r"project:([A-Za-z][A-Za-z0-9_-]*)\Z")
+
+#: Task-context key naming the coordinator's evidence for a deliberate re-review
+#: of an unchanged commit (#1029).
+EVIDENCE_URL_KEY = "evidence_rereview_comment_url"
+#: Decision reason when that evidence is confirmed and the review is dispatched.
+EVIDENCE_REREVIEW_REASON = "coordinator_evidence_rereview"
+_COMMENT_URL_RE = re.compile(
+    r"\Ahttps://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:pull|issues)/(\d+)"
+    r"#issuecomment-(\d+)\Z")
+_ISSUE_API_URL_RE = re.compile(
+    r"\Ahttps://api\.github\.com/repos/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)\Z")
 
 
 def reuse_findings(findings, standing_review_task_id: str) -> list:
@@ -180,6 +193,90 @@ def _target_of(task) -> tuple[str, Optional[int], str]:
     return ("", None, "")
 
 
+def parse_comment_url(url) -> Optional[tuple[str, int, int]]:
+    """``(repo, pr_number, comment_id)`` of a GitHub PR comment URL, else ``None``."""
+    match = _COMMENT_URL_RE.match(url.strip()) if isinstance(url, str) else None
+    if not match:
+        return None
+    return match.group(1), int(match.group(2)), int(match.group(3))
+
+
+def github_comment_evidence(url: str, *, gh=None, timeout: float = 10.0) -> Optional[dict]:
+    """Read one PR comment from GitHub for :func:`evaluate_review_dispatch`.
+
+    Returns ``{"repo", "pr_number", "created_at" (epoch), "body"}`` or ``None``.
+    The repo and PR number come from GitHub's own ``issue_url`` and must agree
+    with the URL, so a URL cannot claim a comment that lives elsewhere. Any
+    failure is ``None``, which the canary treats as "no evidence".
+    """
+    try:
+        parsed = parse_comment_url(url)
+        if parsed is None:
+            return None
+        repo, pr_number, comment_id = parsed
+        if gh is None:
+            # Lazy: chatgpt_review imports queue, which imports this module.
+            from agent_crew.chatgpt_review import GhClient
+            gh = GhClient(timeout=timeout)
+        out = gh._api([f"repos/{repo}/issues/comments/{comment_id}"])
+        record = json.loads(out) if out else None
+        if not isinstance(record, dict):
+            return None
+        issue = _ISSUE_API_URL_RE.match(record.get("issue_url") or "")
+        if not issue or issue.group(1).lower() != repo.lower() or int(issue.group(2)) != pr_number:
+            return None
+        created = datetime.fromisoformat(
+            str(record["created_at"]).replace("Z", "+00:00")).timestamp()
+        body = record.get("body")
+        if not isinstance(body, str):
+            return None
+        return {"repo": issue.group(1), "pr_number": int(issue.group(2)),
+                "created_at": created, "body": body}
+    except Exception:
+        logger.exception("tokenomics canary: evidence comment lookup failed for %r", url)
+        return None
+
+
+def _evidence_confirms_rereview(context: dict, *, pr_number: Optional[int],
+                                reviewed_sha: str, standing: dict,
+                                evidence_lookup) -> bool:
+    """Does the coordinator's comment justify re-reviewing this unchanged commit?
+
+    All three must hold: the comment is on the same repo and PR, it was written
+    after the standing review's result was posted, and it names the commit
+    under review in full. Anything unknown is ``False`` — the suppression stays.
+    """
+    url = context.get(EVIDENCE_URL_KEY)
+    target = parse_comment_url(url)
+    repo = _repo_slug_or_empty(context.get("repo"))
+    if evidence_lookup is None or target is None or pr_number is None or not repo:
+        return False
+    if target[0].lower() != repo.lower() or target[1] != pr_number:
+        return False
+    posted_at = standing.get("result_posted_at")
+    try:
+        evidence = evidence_lookup(url)
+        if not isinstance(evidence, dict):
+            return False
+        posted_at = float(posted_at)
+        created_at = float(evidence["created_at"])
+        if (str(evidence.get("repo") or "").lower() != repo.lower()
+                or int(evidence.get("pr_number")) != pr_number):
+            return False
+        body = evidence.get("body")
+        sha = re.escape(reviewed_sha)
+        return (created_at > posted_at and isinstance(body, str)
+                and re.search(rf"(?<![0-9a-fA-F]){sha}(?![0-9a-fA-F])", body, re.I) is not None)
+    except Exception:
+        logger.exception("tokenomics canary: evidence check failed for %r — suppression stands", url)
+        return False
+
+
+def _repo_slug_or_empty(repo) -> str:
+    from agent_crew.github import _repo_slug
+    return _repo_slug(repo) if isinstance(repo, str) else ""
+
+
 def _is_pinned(task, pin: str, project: Optional[str] = None,
                *, lineage_root: Optional[str] = None) -> bool:
     """Does the pin name this review's lineage?
@@ -204,6 +301,7 @@ def evaluate_review_dispatch(
     project: Optional[str] = None,
     reviewed_artifact_kind: Optional[str] = None,
     lineage_root_lookup: Optional[Callable[[str], str]] = None,
+    evidence_lookup: Optional[Callable[[str], Optional[dict]]] = None,
 ) -> CanaryDecision:
     """Decide whether THIS review dispatch is the one to suppress.
 
@@ -221,6 +319,11 @@ def evaluate_review_dispatch(
     ⛔Every ``return`` below that is not the last one is ``applied=False`` —
       the default is always "dispatch". A bug, a missing field or an unreadable
       row can only produce a shadow receipt, never a silent suppression.
+
+    ``evidence_lookup(url)`` reads the comment named by the task context's
+    ``evidence_rereview_comment_url`` (#1029). Only a confirmed comment on the
+    same PR, posted after the standing result and naming ``reviewed_sha``,
+    lets a held condition dispatch; ``allow_duplicate_review`` alone does not.
     """
     pin = canary_pin() if pin is None else (pin or "").strip()
     label, pr_number, branch = _target_of(task)
@@ -289,6 +392,12 @@ def evaluate_review_dispatch(
     extra = {"standing_verdict": verdict,
              "standing_findings_count": standing.get("findings_count"),
              "condition_holds": True}
+    if _evidence_confirms_rereview(context, pr_number=pr_number, reviewed_sha=reviewed_sha,
+                                   standing=standing, evidence_lookup=evidence_lookup):
+        return CanaryDecision(
+            applied=False, reason=EVIDENCE_REREVIEW_REASON,
+            standing_review_task_id=standing_id, counterfactual=counterfactual,
+            extra={**extra, EVIDENCE_URL_KEY: context.get(EVIDENCE_URL_KEY)}, **base)
     if not pin:
         return CanaryDecision(
             applied=False, reason="condition_holds_canary_unarmed",
