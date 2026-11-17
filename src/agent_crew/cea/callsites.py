@@ -303,6 +303,7 @@ REQUEUE_CALL_SITES: dict[str, tuple[str, ...]] = {
     "queue.defer_provider_capacity": ("server dispatcher provider capacity cooldown (#581)",),
     "queue.defer_prep_retry": ("server transient worktree prep retry (#896)",),
     "queue.resume_codex_quota": ("server dispatcher codex quota hold release (#653)",),
+    "queue.park_pool_hold": ("server dispatcher Quota pool hold on a claimed Claude round (#1033)",),
     "queue.reset_stale_to_pending": ("cli.recover --reset-stale (#155)",),
 }
 """ADR §8 re-admission paths, registered so I2 can enumerate them.

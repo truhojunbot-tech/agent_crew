@@ -179,6 +179,18 @@ def _isolate_shadow_memory_environment(monkeypatch, tmp_path):
     scrub.undo()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_pool_signal(monkeypatch, tmp_path):
+    """Never read the live Quota pool signal (#1033): point it at a missing
+    tmp file (fail-open) and drop the reader cache between tests."""
+    from agent_crew import pool_signal
+    monkeypatch.setenv("AGENT_CREW_POOL_SIGNAL_PATH",
+                       str(tmp_path / "no-pool-signal" / "pace_signal.json"))
+    pool_signal.clear_cache()
+    yield
+    pool_signal.clear_cache()
+
+
 @pytest.fixture
 def admit_crew_run(monkeypatch):
     """Opt-in: admit `crew run` without the #44 trigger (#1006).

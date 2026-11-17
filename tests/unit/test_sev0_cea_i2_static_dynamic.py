@@ -366,9 +366,11 @@ def test_static_every_literal_pending_write_is_inventoried():
     ``defer_push_delivery`` is the bound-parameter writer. #581 added
     ``defer_provider_capacity`` (same gate before its UPDATE). #653 adds
     ``resume_codex_quota`` (same gate before its UPDATE). #896 adds
-    ``defer_prep_retry`` (same gate before its UPDATE)."""
+    ``defer_prep_retry`` (same gate before its UPDATE). #1033 adds
+    ``resume_pool_hold`` (waiting_pool → pending; a claimed row already went
+    through the gate in ``park_pool_hold``, an unclaimed one never left QUEUED)."""
     writes = _pending_writes()
-    assert set(writes) == {"queue.py"} and len(writes["queue.py"]) == 6, writes
+    assert set(writes) == {"queue.py"} and len(writes["queue.py"]) == 7, writes
 
 
 def test_dispatcher_claim_requeue_moves_receipt_before_pending(tmp_path):
