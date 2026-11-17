@@ -162,6 +162,34 @@ def test_fallback_chain_config_and_next_agent(tmp_path, project, refused):
         assert fallback.next_agent("review", "claude", [], chains=chains, project=project) == "gemini"
 
 
+@pytest.mark.parametrize("chain", [["gemini"], ["gemini", "script"], ["agy", "script"]])
+def test_test_fallback_chain_naming_gemini_refused_not_trimmed(tmp_path, chain):
+    """review-impl-924d-r0 #1: the script-only trim must not hide a gemini chain."""
+    base = tmp_path / "agent_crew"
+    base.mkdir()
+    state = base / "state.json"
+    state.write_text(json.dumps({"project": "agent_crew"}))
+    (base / "fallback_chains.json").write_text(json.dumps({"test": chain}))
+    with pytest.raises(RoleResolutionError) as exc:
+        fallback.load_fallback_chains(str(state))
+    _refused(exc)
+    with pytest.raises(RoleResolutionError) as exc:
+        fallback.next_agent("test", None, [], chains={"test": chain}, project="agent_crew")
+    _refused(exc)
+
+
+@pytest.mark.parametrize("state", [
+    {"roles": [{"role": "tester", "agent": "agy"}]},
+    {"roles": [{"role": "tester", "agent": "gemini"}, {"role": "reviewer", "agent": "claude"}]},
+    {"role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}},
+])
+def test_tester_role_config_naming_gemini_refused_as_athena_only(state):
+    """review-impl-924d-r0 #2: no silent skip, no generic invalid_role_agents."""
+    with pytest.raises(RoleResolutionError) as exc:
+        effective_role_mapping(state, project="agent_crew")
+    _refused(exc)
+
+
 @pytest.mark.parametrize("state", [
     {"role_agents": {"implementer": "codex", "reviewer": "gemini", "tester": "script"}},
     {"roles": [{"role": "reviewer", "agent": "agy"}]},
