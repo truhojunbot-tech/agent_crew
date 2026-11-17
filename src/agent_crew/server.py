@@ -109,7 +109,8 @@ from agent_crew import contract_emit as _contract_emit
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import (
     EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, ROLE_BOUND_PROVIDERS,
-    TASK_TYPE_TO_ROLE, RoleResolutionError, anonymous_pull_refusal,
+    GEMINI_ATHENA_ONLY, TASK_TYPE_TO_ROLE, RoleResolutionError, anonymous_pull_refusal,
+    gemini_agents_in_context, gemini_athena_only_refusal,
     PANE_PROVIDERS, default_role_mapping, effective_role_mapping, is_gemini_family,
     provider_family, resolve_agent_role,
     provider_task_types, role_policy, role_policy_refusal,
@@ -3634,6 +3635,18 @@ def create_app(
                         details={"role": role, "agent": agent})
         return True
 
+    def _refuse_gemini_outside_athena(task: TaskRequest, *agents: Optional[str]) -> bool:
+        """#924b backstop: fail a task bound for gemini outside Athena, unrun."""
+        named = [a for a in agents if a] + gemini_agents_in_context(task.context)
+        detail = gemini_athena_only_refusal(_server_identity()["project"], named)
+        if detail is None:
+            return False
+        logger.error("dispatcher: refusing task=%s — %s: %s",
+                     task.task_id, GEMINI_ATHENA_ONLY, detail)
+        _fail_if_active(task.task_id, GEMINI_ATHENA_ONLY, details={"detail": detail},
+                        kind=FailureKind.CONFIG_ERROR.value)
+        return True
+
     def _lineage_end_notice(task_id: str, *, continuation: bool = False) -> None:
         notify_lineage_end(q(), task_id, continuation=continuation,
                            notify_fn=coordinator_notify_fn)
@@ -4884,6 +4897,8 @@ def create_app(
         """
         _ctx = task.context if isinstance(task.context, dict) else {}
         _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
+        if _refuse_gemini_outside_athena(task, _override, dispatch_agent):
+            return
         if _override and _refuse_role_policy(task, _override):
             return
         agent, wt = _resolve_dispatch_target(task, role)
@@ -4891,6 +4906,8 @@ def create_app(
             agent = dispatch_agent
         if dispatch_worktree:
             wt = dispatch_worktree
+        if _refuse_gemini_outside_athena(task, agent):
+            return
         if _refuse_role_policy(task, agent):
             return
         if _refuse_self_review(task, agent):

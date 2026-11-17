@@ -43,7 +43,9 @@ from agent_crew.protocol import (
     validate_review_result,
 )
 from agent_crew.role_mapping import (
-    ROLE_BOUND_PROVIDERS, effective_role_mapping, provider_family, provider_task_types,
+    GEMINI_ATHENA_ONLY, ROLE_BOUND_PROVIDERS, effective_role_mapping, gemini_agents_in_context,
+    gemini_athena_only_refusal, provider_family, provider_task_types,
+    refuse_gemini_outside_athena,
 )
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
@@ -2907,7 +2909,7 @@ class TaskQueue:
         try:
             with open(state_path, "r", encoding="utf-8") as fh:
                 state = json.load(fh)
-            current = effective_role_mapping(state)[0]
+            current = effective_role_mapping(state, project=self.queue_project)[0]
         except Exception:
             logger.warning("#891: unreadable %s; refusing %s claim", state_path, provider)
             return False
@@ -4677,6 +4679,10 @@ class TaskQueue:
         # rather than admitted under a project it chose for itself.
         with self._implement_admission_lock(task):
             task, refusal = self._project_from_queue_identity(task)
+            # #924b: Gemini is Athena-only. Judged against the queue's own
+            # identity, never the request's project, and refused whole.
+            refuse_gemini_outside_athena(self.queue_project,
+                                         gemini_agents_in_context(task.context))
             if ingress is not None and isinstance(task.context, dict) and "risk_tier" in task.context:
                 validate_http_root_risk(task.context)
             context = self._trusted_enqueue_context(
@@ -5692,6 +5698,10 @@ class TaskQueue:
         that does not hold the reviewer role claim exactly the reviews bound to
         it for independence (``independent_review_binding``), and nothing else.
         """
+        if agent and gemini_athena_only_refusal(self.queue_project, agent):
+            # #924b: a gemini-family claimant outside Athena claims nothing.
+            logger.warning("dequeue: %s refused — %s", agent, GEMINI_ATHENA_ONLY)
+            return None
         _now = time.time()
         if skip_deferred:
             _defer_sql = (" AND COALESCE(json_extract(context, '$.push_not_before'), 0) <= "

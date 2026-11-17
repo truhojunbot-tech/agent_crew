@@ -8,7 +8,7 @@ from agent_crew.cea.engine import DEFAULT_ROLE_AGENTS
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.role_mapping import (
-    effective_role_mapping, role_policy_refusal, validate_explicit_role_agents,
+    RoleResolutionError, effective_role_mapping, role_policy_refusal, validate_explicit_role_agents,
 )
 
 
@@ -104,15 +104,13 @@ def test_refused_explicit_tester_refuses_entire_mapping(tester):
 
 
 def test_unmapped_gemini_override_claims_review_only(tmp_path):
+    """#924b: outside Athena a gemini override is refused, not claimed."""
     queue = TaskQueue(str(tmp_path / "tasks.db"))
-    queue.enqueue(TaskRequest(task_id="old-implement", task_type="implement",
-                              description="old", branch="main",
-                              context={"agent_override": "gemini", "risk_tier": 1}))
-    queue.enqueue(TaskRequest(task_id="review", task_type="review",
-                              description="review", branch="main",
-                              context={"agent_override": "gemini", "risk_tier": 1}))
+    for task_id, task_type in (("old-implement", "implement"), ("review", "review")):
+        with pytest.raises(RoleResolutionError, match="gemini_athena_only"):
+            queue.enqueue(TaskRequest(task_id=task_id, task_type=task_type,
+                                      description=task_id, branch="main",
+                                      context={"agent_override": "gemini", "risk_tier": 1}))
 
-    claimed = queue.dequeue(agent="gemini", override_task_type="review")
-
-    assert claimed is not None and claimed.task_id == "review"
-    assert queue.get_task("old-implement").status == "pending"
+    assert queue.dequeue(agent="gemini", override_task_type="review") is None
+    assert queue.get_task("review") is None
