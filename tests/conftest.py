@@ -89,6 +89,21 @@ def legacy_gemini_tester_policy(monkeypatch):
     monkeypatch.setitem(role_mapping.ROLE_PROVIDER_POLICY, "tester", ("gemini", "script"))
 
 
+@pytest.fixture(autouse=True)
+def _gemini_allowed_everywhere_unless_policy_test(monkeypatch, request):
+    """#924c: let generic dispatch tests run gemini on tmp non-athena projects.
+
+    Production keeps Gemini Athena-only through
+    ``role_mapping.gemini_allowed_for_project``. Tests that exercise dispatch
+    mechanics with a gemini agent are not about that policy, so this widens it
+    for them only. Tests marked ``gemini_policy`` keep the real allowlist.
+    """
+    if request.node.get_closest_marker("gemini_policy"):
+        return
+    from agent_crew import role_mapping
+    monkeypatch.setattr(role_mapping, "gemini_allowed_for_project", lambda project: True)
+
+
 def pytest_configure(config):
     """Prove to the CEA engine that this interpreter is a test harness.
 
