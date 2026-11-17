@@ -103,6 +103,7 @@ TASK_CONTEXT_KEYS = frozenset({
     'duplicate_review_lineage_from',
     'duplicate_review_survivor',
     'evidence',
+    'evidence_rereview_comment_url',
     'execution_policy',
     'expected_head_sha',
     'external_impact',
