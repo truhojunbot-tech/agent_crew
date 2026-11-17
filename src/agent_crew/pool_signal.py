@@ -1,7 +1,7 @@
 """Quota pool admission signal for Claude implement/fix rounds (#1033).
 
-Quota owns ``~/alfred/quota/pace_signal.json``; enforcing it is the crew
-runtime's job. Before this, the pipeline auto-spawned review→fix rounds on
+Quota owns the pace signal file (``DEFAULT_POOL_SIGNAL_PATH``); enforcing it
+is the crew runtime's job. Before this, the pipeline auto-spawned review→fix rounds on
 ``claude_p`` during a non-Athena Claude hold and coordinators could only cancel
 after Claude was already spent (8105 ``fix-review-impl-924d-r0-r1``, 11-17).
 
@@ -20,7 +20,7 @@ from typing import Optional
 from agent_crew.role_mapping import provider_family
 
 POOL_SIGNAL_ENV = "AGENT_CREW_POOL_SIGNAL_PATH"
-DEFAULT_POOL_SIGNAL_PATH = os.path.join("~", "alfred", "quota", "pace_signal.json")
+DEFAULT_POOL_SIGNAL_PATH = "~/alfred/quota/pace_signal.json"
 #: Parked rows wait in this status: not needs_human, not failed.
 WAITING_POOL_STATUS = "waiting_pool"
 CACHE_SECONDS = 60.0
