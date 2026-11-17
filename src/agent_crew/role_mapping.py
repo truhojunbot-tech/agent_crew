@@ -89,7 +89,9 @@ def is_gemini_family(agent: object) -> bool:
 #: guard is mechanical (owner 15765): every route that could hand work to a
 #: gemini-family agent asks :func:`gemini_athena_only_refusal` first.
 GEMINI_ATHENA_ONLY = "gemini_athena_only"
-GEMINI_ALLOWED_PROJECT = "athena"
+#: The whole allowlist. A module constant on purpose: no env var or config
+#: file may widen it (#924c). Read only through :func:`gemini_allowed_for_project`.
+GEMINI_ALLOWED_PROJECTS = frozenset({"athena"})
 #: Context keys that name who runs a task (#924b). ``agent`` is the discuss
 #: panel member; the list keys are explicit panels and fallback chains.
 _AGENT_CONTEXT_KEYS = ("agent_override", "agent", "agents", "panel",
@@ -102,7 +104,7 @@ def gemini_allowed_for_project(project: object) -> bool:
     ``project`` must be the server's / queue's own identity, never a value
     read from task context: a caller does not get to name itself Athena.
     """
-    return str(project or "").strip().lower() == GEMINI_ALLOWED_PROJECT
+    return str(project or "").strip().lower() in GEMINI_ALLOWED_PROJECTS
 
 
 def _agent_names(value: object) -> list[str]:
@@ -132,8 +134,8 @@ def gemini_athena_only_refusal(project: object, agents: object) -> str | None:
     gemini = sorted({name.strip() for name in _agent_names(agents) if is_gemini_family(name)})
     if not gemini:
         return None
-    return (f"gemini-family agent(s) {gemini} may only serve project "
-            f"{GEMINI_ALLOWED_PROJECT!r}; this server is {str(project or '')!r}")
+    return (f"gemini-family agent(s) {gemini} may only serve projects "
+            f"{sorted(GEMINI_ALLOWED_PROJECTS)}; this server is {str(project or '')!r}")
 
 
 def refuse_gemini_outside_athena(project: object, agents: object) -> None:

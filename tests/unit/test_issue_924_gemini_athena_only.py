@@ -11,6 +11,8 @@ from agent_crew.role_mapping import (
     RoleResolutionError, effective_role_mapping, role_policy_refusal, validate_explicit_role_agents,
 )
 
+pytestmark = pytest.mark.gemini_policy
+
 
 def test_general_defaults_assign_no_gemini_test_work():
     assert cli._DEFAULT_AGENTS == "codex,claude"
