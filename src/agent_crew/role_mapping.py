@@ -248,6 +248,9 @@ def effective_role_mapping(
 
     explicit = state.get("role_agents")
     if explicit is not None:
+        # Before validation, so a gemini tester is refused as gemini_athena_only
+        # rather than as a generic invalid_role_agents.
+        refuse_gemini_outside_athena(project, explicit)
         try:
             if not isinstance(explicit, Mapping):
                 raise ValueError("role_agents must be an object")
@@ -260,6 +263,8 @@ def effective_role_mapping(
     result = default_role_mapping()
     legacy = state.get("roles")
     if isinstance(legacy, list):
+        refuse_gemini_outside_athena(
+            project, [e.get("agent") for e in legacy if isinstance(e, Mapping)])
         found = False
         for entry in legacy:
             if not isinstance(entry, Mapping):
@@ -267,7 +272,6 @@ def effective_role_mapping(
             role, agent = entry.get("role"), entry.get("agent")
             if (role in ROLE_ORDER and isinstance(agent, str) and agent.strip()
                     and role_policy_refusal(role, agent) is None):
-                refuse_gemini_outside_athena(project, agent)
                 result[role] = agent.strip()
                 found = True
         if found:

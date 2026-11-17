@@ -53,10 +53,11 @@ def load_fallback_chains(state_path: Optional[str]) -> dict[str, list[str]]:
         if not isinstance(agents, list):
             continue
         cleaned = [a for a in agents if isinstance(a, str) and a]
+        # Judged on the declared chain, before the script-only tester trim:
+        # a gemini-naming chain is refused whole for every task type.
+        refuse_gemini_outside_athena(_state_project(state_path), cleaned)
         if task_type == "test":
             cleaned = [a for a in cleaned if a == "script"]
-        else:
-            refuse_gemini_outside_athena(_state_project(state_path), cleaned)
         if cleaned:
             chains[task_type] = cleaned
     return chains
@@ -80,12 +81,11 @@ def next_agent(
     3. Skip anything in ``excluded``. Returns ``None`` when the chain is
        exhausted.
 
-    ``project`` is the server's own identity. A non-test chain naming a
-    gemini-family agent outside Athena is refused whole (#924b).
+    ``project`` is the server's own identity. A chain naming a gemini-family
+    agent outside Athena is refused whole, test chains included (#924b).
     """
     chain = (chains or DEFAULT_CHAINS).get(task_type, [])
-    if task_type != "test":
-        refuse_gemini_outside_athena(project, chain)
+    refuse_gemini_outside_athena(project, chain)
     excluded_set = set(excluded or [])
     if current_agent and current_agent in excluded_set:
         pass  # current agent already excluded; just walk from start
