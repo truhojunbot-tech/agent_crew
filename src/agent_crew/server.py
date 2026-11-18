@@ -3645,7 +3645,9 @@ def create_app(
         project? Reviews, script tests, ChatGPT and Codex are never gated."""
         if task.task_type not in _pool_signal.GATED_TASK_TYPES:
             return False
-        if _pool_signal.is_exempt_project(_server_identity()["project"], task.project):
+        # The exemption is the trusted server identity only: task.project is
+        # task payload and must not lift a non-Athena hold (review-impl-1033b-r0).
+        if _pool_signal.is_exempt_project(_server_identity()["project"]):
             return False
         agent, _wt = _resolve_dispatch_target(
             task, _TYPE_TO_ROLE.get(task.task_type, "implementer"))

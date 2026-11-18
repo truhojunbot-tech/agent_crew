@@ -435,6 +435,24 @@ def test_athena_under_unknown_dispatches(tmp_path, monkeypatch, notices):
     assert notices == []
 
 
+@pytest.mark.parametrize("signal", ["hold", "unknown"])
+def test_task_project_athena_on_non_athena_server_is_gated(tmp_path, monkeypatch, notices,
+                                                           signal):
+    """review-impl-1033b-r0 P1: ``task.project`` is task payload, not proof
+    the server is Athena. Only the server identity grants the exemption."""
+    _signal(tmp_path, monkeypatch, "hold", missing=signal == "unknown")
+    app, queue, dispatched = _app(tmp_path, monkeypatch, CLAUDE_IMPL, project="agent_crew")
+    task_id = _impl(queue, project="athena")
+    with TestClient(app):
+        assert _wait(lambda: queue.get_task_status(task_id) == "waiting_pool")
+        time.sleep(0.3)
+    assert dispatched == []
+    parked = _events(queue, task_id, "pool_hold_parked")
+    assert len(parked) == 1 and parked[0]["rule"] == signal
+    assert parked[0]["code"] == ("POOL_SIGNAL_UNKNOWN" if signal == "unknown" else "POOL_HOLD")
+    assert [n[:2] for n in notices] == [(task_id, "pool_hold_parked")]
+
+
 def test_codex_implement_and_claude_review_under_unknown_dispatch(tmp_path, monkeypatch,
                                                                   notices):
     _signal(tmp_path, monkeypatch, raw="{not json")
