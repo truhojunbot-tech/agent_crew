@@ -103,6 +103,7 @@ from agent_crew.queue import INDEPENDENT_REVIEW_UNAVAILABLE
 from agent_crew import claude_cloud as _claude_cloud
 from agent_crew import chatgpt_review as _chatgpt_review
 from agent_crew import script_tester as _script_tester
+from agent_crew import pool_signal as _pool_signal
 from agent_crew import contract_emit as _contract_emit
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import (
@@ -3639,6 +3640,74 @@ def create_app(
 
     app.state.resume_codex_quota_holds = _resume_codex_quota_holds
 
+    def _pool_gate_applies(task: TaskRequest) -> bool:
+        """#1033: is this row a Claude implement/fix round on a non-Athena
+        project? Reviews, script tests, ChatGPT and Codex are never gated."""
+        if task.task_type not in _pool_signal.GATED_TASK_TYPES:
+            return False
+        # The exemption is the trusted server identity only: task.project is
+        # task payload and must not lift a non-Athena hold (review-impl-1033b-r0).
+        if _pool_signal.is_exempt_project(_server_identity()["project"]):
+            return False
+        agent, _wt = _resolve_dispatch_target(
+            task, _TYPE_TO_ROLE.get(task.task_type, "implementer"))
+        return _pool_signal.is_claude_round(task.task_type, agent)
+
+    def _park_for_pool(task: TaskRequest, signal: dict) -> bool:
+        code = (_pool_signal.UNKNOWN_REASON if signal["rule"] == _pool_signal.UNKNOWN
+                else "POOL_HOLD")
+        if not q().park_pool_hold(task.task_id, reason=signal["reason"],
+                                  rule=signal["rule"], code=code):
+            return False
+        logger.info("pool signal %s: parked %s as %s — %s", signal["rule"], task.task_id,
+                    _pool_signal.WAITING_POOL_STATUS, signal["reason"])
+        _coordinator_notice(task.task_id, "pool_hold_parked",
+                            f"reason={signal['reason']}")
+        return True
+
+    _pool_state_dir = os.path.dirname(db_path)
+
+    def _read_pool_signal() -> dict:
+        """Fresh read per gate decision; the last valid state is per project."""
+        return _pool_signal.read_pool_signal(state_dir=_pool_state_dir)
+
+    def _pool_gate_dispatch(task: TaskRequest) -> bool:
+        """Last check on a claimed row before a Claude spawn. True = parked.
+        Only a fresh valid ``open`` dispatches; hold and UNKNOWN both park."""
+        if not _pool_gate_applies(task):
+            return False
+        signal = _read_pool_signal()
+        if signal["rule"] == _pool_signal.OPEN:
+            return False
+        if not _park_for_pool(task, signal) and q().get_task_status(
+                task.task_id) == "in_progress":
+            # §8 refused the requeue: never spawn Claude without a fresh
+            # open; the claim is left to orphan recovery.
+            logger.warning("pool signal %s: %s could not be parked; not dispatching",
+                           signal["rule"], task.task_id)
+        return True
+
+    def _apply_pool_signal() -> dict:
+        """#1033: on hold or UNKNOWN park pending Claude implement/fix rows;
+        on a fresh valid open resume parked rows exactly once (the status
+        predicate is the claim). The resumed row then meets the normal
+        admission and STOP checks at dispatch."""
+        signal = _read_pool_signal()
+        out: dict = {"rule": signal["rule"], "parked": [], "resumed": []}
+        if signal["rule"] != _pool_signal.OPEN:
+            for task in q().list_tasks(status="pending"):
+                if _pool_gate_applies(task) and _park_for_pool(task, signal):
+                    out["parked"].append(task.task_id)
+            return out
+        for task in q().list_tasks(status=_pool_signal.WAITING_POOL_STATUS):
+            if q().resume_pool_hold(task.task_id, rule=signal["rule"],
+                                    reason=signal["reason"]):
+                logger.info("pool signal %s: resumed %s", signal["rule"], task.task_id)
+                out["resumed"].append(task.task_id)
+        return out
+
+    app.state.apply_pool_signal = _apply_pool_signal
+
     def _hold_or_skip_provider_limit(task: TaskRequest, agent: str,
                                      until: Optional[float]) -> None:
         recorded_until = until if until is None or math.isfinite(until) else "unknown"
@@ -6305,6 +6374,10 @@ def create_app(
                     except Exception:
                         logger.exception("codex quota hold scan failed — continuing dispatch")
                     try:
+                        _apply_pool_signal()
+                    except Exception:
+                        logger.exception("pool signal scan failed — continuing dispatch")
+                    try:
                         for op in q().pending_ci_merge_ops():
                             number = op.get("pr_number")
                             detail = op.get("last_error") or ""
@@ -6389,12 +6462,20 @@ def create_app(
                             # The adapter owns dequeue and admission.  A cap or
                             # capacity skip must leave the task pending for this
                             # mapped worker, never launch a local subprocess.
-                            _cloud_implement_outcome = await asyncio.to_thread(
-                                _claude_cloud.dispatch_cloud_for_role, q(),
-                                role="implementer", task_type="implement",
-                                state_path=state_path, review_guard_fn=_refuse_self_review,
-                                role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
-                            if _cloud_implement_outcome.dispatched or _worker_roles == ["implementer"]:
+                            # #1033: the tick sweep parked every pending
+                            # row unless the signal is a fresh open; the
+                            # adapter dequeues itself, so skip it rather
+                            # than race an enqueue.
+                            _cloud_implement_dispatched = False
+                            if (_pool_signal.is_exempt_project(_server_identity()["project"])
+                                    or _read_pool_signal()["rule"] == _pool_signal.OPEN):
+                                _cloud_implement_outcome = await asyncio.to_thread(
+                                    _claude_cloud.dispatch_cloud_for_role, q(),
+                                    role="implementer", task_type="implement",
+                                    state_path=state_path, review_guard_fn=_refuse_self_review,
+                                    role_to_agent=dict(_DISPATCH_ROLE_TO_AGENT))
+                                _cloud_implement_dispatched = _cloud_implement_outcome.dispatched
+                            if _cloud_implement_dispatched or _worker_roles == ["implementer"]:
                                 continue
                             if "reviewer" in _worker_roles and _claude_cloud.cloud_dispatch_enabled():
                                 await asyncio.to_thread(
@@ -6482,6 +6563,8 @@ def create_app(
                                 if _k_key not in active_workers and _k_wt not in active_worktrees:
                                     _slot, _target_wt, _slot_wt = _k_key, _k_wt, _k_wt
                                     break
+                        if _dispatch_agent is None and _pool_gate_dispatch(task):
+                            continue   # #1033: parked waiting_pool (hold or unknown signal)
                         if _slot in active_workers:
                             # override 가 이미 바쁜 worker 를 가리켰다.
                             logger.info(
@@ -6778,6 +6861,14 @@ def create_app(
                 coordinator_notify_fn=coordinator_notify_fn,
             )
             if fix_id:
+                # #1033: park at the start site unless the signal is a
+                # fresh open; the dispatcher re-checks before any spawn.
+                try:
+                    _fix = q().get_task(fix_id)
+                    if _fix is not None and _fix.status == "pending":
+                        _pool_gate_dispatch(_fix)
+                except Exception:
+                    logger.exception("pool hold check failed for %s", fix_id)
                 _try_push_next("implementer")
             return fix_id
         except _PausedError:

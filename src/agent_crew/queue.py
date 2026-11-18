@@ -7803,6 +7803,70 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def park_pool_hold(self, task_id: str, *, reason: str, rule: str = "hold",
+                       code: str = "POOL_HOLD", now: Optional[float] = None) -> bool:
+        """Park a Claude implement/fix row as ``waiting_pool`` under a Quota
+        pool hold or an UNKNOWN signal (#1033). Not needs_human, not failed:
+        the row resumes on its own on a fresh valid open. A claimed row is returned through the
+        §8 re-admission gate first, like :meth:`requeue`.
+        """
+        now = time.time() if now is None else now
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status FROM tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] not in ("pending", "in_progress"):
+                conn.rollback()
+                return False
+            if row["status"] == "in_progress":
+                requeued, gate = self.requeue_through_gate(
+                    conn, task_id, path="queue.park_pool_hold", reason="pool_hold")
+                if not requeued or (gate is not None and gate.enforced
+                                    and gate.outcome is _CeaOutcome.RE_ADMIT):
+                    conn.commit()   # keep the refusal's runtime event
+                    return False
+                self._record_end_on(conn, task_id, now, "requeued", posted=False)
+            conn.execute(
+                "UPDATE tasks SET status='waiting_pool', claim_source='' "
+                "WHERE task_id=? AND status IN ('pending', 'in_progress')", (task_id,))
+            self._append_exec_event_on(conn, task_id, "pool_hold_parked", now,
+                                       rule=rule, code=code, reason=reason)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def resume_pool_hold(self, task_id: str, *, rule: str, reason: str = "",
+                         now: Optional[float] = None) -> bool:
+        """Return one ``waiting_pool`` row to pending, exactly once (#1033).
+        The status predicate is the claim; STOP keeps the row parked."""
+        now = time.time() if now is None else now
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if self._stop_active_in_txn(conn):
+                conn.rollback()
+                return False
+            cur = conn.execute(
+                "UPDATE tasks SET status='pending', claim_source='' "
+                "WHERE task_id=? AND status='waiting_pool'", (task_id,))
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False
+            self._append_exec_event_on(conn, task_id, "pool_hold_resumed", now,
+                                       rule=rule, reason=reason)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def requeue_dispatcher_claim(self, task_id: str, *,
                                  unstarted_before: Optional[float] = None) -> bool:
         """Recover a dispatcher claim; optionally require an old, unstarted attempt.
