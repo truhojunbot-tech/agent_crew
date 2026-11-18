@@ -453,6 +453,20 @@ def test_task_project_athena_on_non_athena_server_is_gated(tmp_path, monkeypatch
     assert [n[:2] for n in notices] == [(task_id, "pool_hold_parked")]
 
 
+@pytest.mark.parametrize("signal", ["hold", "unknown"])
+def test_athena_server_exempts_any_task_project(tmp_path, monkeypatch, notices, signal):
+    """The Athena exemption follows the server identity (the trust anchor):
+    every row an Athena server dispatches is Athena work, whatever its
+    task-supplied ``project`` says."""
+    _signal(tmp_path, monkeypatch, "hold", missing=signal == "unknown")
+    app, queue, dispatched = _app(tmp_path, monkeypatch, CLAUDE_IMPL, project="athena")
+    task_id = _impl(queue, project="agent_crew")
+    with TestClient(app):
+        assert _wait(lambda: dispatched == [task_id])
+    assert _events(queue, task_id, "pool_hold_parked") == []
+    assert notices == []
+
+
 def test_codex_implement_and_claude_review_under_unknown_dispatch(tmp_path, monkeypatch,
                                                                   notices):
     _signal(tmp_path, monkeypatch, raw="{not json")
