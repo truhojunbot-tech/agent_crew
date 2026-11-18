@@ -3652,39 +3652,47 @@ def create_app(
         return _pool_signal.is_claude_round(task.task_type, agent)
 
     def _park_for_pool(task: TaskRequest, signal: dict) -> bool:
+        code = (_pool_signal.UNKNOWN_REASON if signal["rule"] == _pool_signal.UNKNOWN
+                else "POOL_HOLD")
         if not q().park_pool_hold(task.task_id, reason=signal["reason"],
-                                  rule=signal["rule"]):
+                                  rule=signal["rule"], code=code):
             return False
-        logger.info("pool hold: parked %s as %s — %s", task.task_id,
+        logger.info("pool signal %s: parked %s as %s — %s", signal["rule"], task.task_id,
                     _pool_signal.WAITING_POOL_STATUS, signal["reason"])
         _coordinator_notice(task.task_id, "pool_hold_parked",
                             f"reason={signal['reason']}")
         return True
 
-    def _pool_gate_dispatch(task: TaskRequest, *, warn: bool = True) -> bool:
-        """Last check on a claimed row before a Claude spawn. True = parked."""
+    _pool_state_dir = os.path.dirname(db_path)
+
+    def _read_pool_signal() -> dict:
+        """Fresh read per gate decision; the last valid state is per project."""
+        return _pool_signal.read_pool_signal(state_dir=_pool_state_dir)
+
+    def _pool_gate_dispatch(task: TaskRequest) -> bool:
+        """Last check on a claimed row before a Claude spawn. True = parked.
+        Only a fresh valid ``open`` dispatches; hold and UNKNOWN both park."""
         if not _pool_gate_applies(task):
             return False
-        signal = _pool_signal.read_pool_signal()
-        if signal["rule"] == "hold":
-            if not _park_for_pool(task, signal) and q().get_task_status(
-                    task.task_id) == "in_progress":
-                # §8 refused the requeue: never spawn Claude under a hold;
-                # the claim is left to orphan recovery.
-                logger.warning("pool hold: %s could not be parked; not dispatching",
-                               task.task_id)
-            return True
-        if warn and signal["rule"] == "unreadable":
-            q().record_pool_signal_unreadable(task.task_id, reason=signal["reason"])
-        return False
+        signal = _read_pool_signal()
+        if signal["rule"] == _pool_signal.OPEN:
+            return False
+        if not _park_for_pool(task, signal) and q().get_task_status(
+                task.task_id) == "in_progress":
+            # §8 refused the requeue: never spawn Claude without a fresh
+            # open; the claim is left to orphan recovery.
+            logger.warning("pool signal %s: %s could not be parked; not dispatching",
+                           signal["rule"], task.task_id)
+        return True
 
     def _apply_pool_signal() -> dict:
-        """#1033: on hold park pending Claude implement/fix rows; otherwise
-        resume parked rows exactly once (the status predicate is the claim).
-        An unreadable signal fails open."""
-        signal = _pool_signal.read_pool_signal()
+        """#1033: on hold or UNKNOWN park pending Claude implement/fix rows;
+        on a fresh valid open resume parked rows exactly once (the status
+        predicate is the claim). The resumed row then meets the normal
+        admission and STOP checks at dispatch."""
+        signal = _read_pool_signal()
         out: dict = {"rule": signal["rule"], "parked": [], "resumed": []}
-        if signal["rule"] == "hold":
+        if signal["rule"] != _pool_signal.OPEN:
             for task in q().list_tasks(status="pending"):
                 if _pool_gate_applies(task) and _park_for_pool(task, signal):
                     out["parked"].append(task.task_id)
@@ -6453,11 +6461,12 @@ def create_app(
                             # capacity skip must leave the task pending for this
                             # mapped worker, never launch a local subprocess.
                             # #1033: the tick sweep parked every pending
-                            # row under a pool hold; the adapter dequeues
-                            # itself, so skip it rather than race an enqueue.
+                            # row unless the signal is a fresh open; the
+                            # adapter dequeues itself, so skip it rather
+                            # than race an enqueue.
                             _cloud_implement_dispatched = False
                             if (_pool_signal.is_exempt_project(_server_identity()["project"])
-                                    or _pool_signal.read_pool_signal()["rule"] != "hold"):
+                                    or _read_pool_signal()["rule"] == _pool_signal.OPEN):
                                 _cloud_implement_outcome = await asyncio.to_thread(
                                     _claude_cloud.dispatch_cloud_for_role, q(),
                                     role="implementer", task_type="implement",
@@ -6553,7 +6562,7 @@ def create_app(
                                     _slot, _target_wt, _slot_wt = _k_key, _k_wt, _k_wt
                                     break
                         if _dispatch_agent is None and _pool_gate_dispatch(task):
-                            continue   # #1033: parked waiting_pool under a pool hold
+                            continue   # #1033: parked waiting_pool (hold or unknown signal)
                         if _slot in active_workers:
                             # override 가 이미 바쁜 worker 를 가리켰다.
                             logger.info(
@@ -6850,12 +6859,12 @@ def create_app(
                 coordinator_notify_fn=coordinator_notify_fn,
             )
             if fix_id:
-                # #1033: park at the start site under a pool hold; the
-                # dispatcher re-checks before any spawn.
+                # #1033: park at the start site unless the signal is a
+                # fresh open; the dispatcher re-checks before any spawn.
                 try:
                     _fix = q().get_task(fix_id)
                     if _fix is not None and _fix.status == "pending":
-                        _pool_gate_dispatch(_fix, warn=False)
+                        _pool_gate_dispatch(_fix)
                 except Exception:
                     logger.exception("pool hold check failed for %s", fix_id)
                 _try_push_next("implementer")

@@ -181,14 +181,21 @@ def _isolate_shadow_memory_environment(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _isolate_pool_signal(monkeypatch, tmp_path):
-    """Never read the live Quota pool signal (#1033): point it at a missing
-    tmp file (fail-open) and drop the reader cache between tests."""
+    """Never read the live Quota pool signal (#1033): point it at a tmp file
+    reading a fresh ``open``. A missing file is UNKNOWN and parks every
+    Claude implement/fix round, so tests that want that remove it."""
+    import json as _json
+    from datetime import datetime, timezone
     from agent_crew import pool_signal
-    monkeypatch.setenv("AGENT_CREW_POOL_SIGNAL_PATH",
-                       str(tmp_path / "no-pool-signal" / "pace_signal.json"))
-    pool_signal.clear_cache()
+    path = tmp_path / "pool-signal" / "pace_signal.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps({
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "balance": {"action": "none", "reason": "",
+                    "numbers": {"admissions_rule": "open",
+                                "admissions_rule_reason": "test default"}}}))
+    monkeypatch.setenv(pool_signal.POOL_SIGNAL_ENV, str(path))
     yield
-    pool_signal.clear_cache()
 
 
 @pytest.fixture

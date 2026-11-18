@@ -7804,10 +7804,10 @@ class TaskQueue:
             conn.close()
 
     def park_pool_hold(self, task_id: str, *, reason: str, rule: str = "hold",
-                       now: Optional[float] = None) -> bool:
+                       code: str = "POOL_HOLD", now: Optional[float] = None) -> bool:
         """Park a Claude implement/fix row as ``waiting_pool`` under a Quota
-        pool hold (#1033). Not needs_human, not failed: the row resumes on its
-        own when the signal reads open. A claimed row is returned through the
+        pool hold or an UNKNOWN signal (#1033). Not needs_human, not failed:
+        the row resumes on its own on a fresh valid open. A claimed row is returned through the
         §8 re-admission gate first, like :meth:`requeue`.
         """
         now = time.time() if now is None else now
@@ -7831,7 +7831,7 @@ class TaskQueue:
                 "UPDATE tasks SET status='waiting_pool', claim_source='' "
                 "WHERE task_id=? AND status IN ('pending', 'in_progress')", (task_id,))
             self._append_exec_event_on(conn, task_id, "pool_hold_parked", now,
-                                       rule=rule, reason=reason)
+                                       rule=rule, code=code, reason=reason)
             conn.commit()
             return True
         except Exception:
@@ -7859,29 +7859,6 @@ class TaskQueue:
                 return False
             self._append_exec_event_on(conn, task_id, "pool_hold_resumed", now,
                                        rule=rule, reason=reason)
-            conn.commit()
-            return True
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def record_pool_signal_unreadable(self, task_id: str, *, reason: str,
-                                      now: Optional[float] = None) -> bool:
-        """One ``pool_signal_unreadable`` warning per task (#1033 fail-open)."""
-        now = time.time() if now is None else now
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            seen = conn.execute(
-                "SELECT 1 FROM task_exec_events WHERE task_id=? "
-                "AND event='pool_signal_unreadable' LIMIT 1", (task_id,)).fetchone()
-            if seen:
-                conn.rollback()
-                return False
-            self._append_exec_event_on(conn, task_id, "pool_signal_unreadable", now,
-                                       reason=reason, outcome="fail_open")
             conn.commit()
             return True
         except Exception:
