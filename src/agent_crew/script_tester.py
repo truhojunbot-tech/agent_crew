@@ -84,6 +84,28 @@ def _rerun_limit(state: Mapping, key: str, env_key: str, default: int | float,
         return default
 
 
+CI_GATE_ENV = "AGENT_CREW_SCRIPT_TEST_CI_GATE"
+# #1038: CI states that establish no job ran a step: no check at all, or every
+# failure is an Actions job with no runner and no steps (billing block). Only
+# these yield to a local pass. ``pending`` covers a runner still executing
+# steps and ``error`` means CI could not be read, so neither proves the absence
+# of a failing job; they stay INCOMPLETE. ``head_checks_state`` reports any
+# genuinely failed run as red.
+_CI_NOT_GATING_STATES = frozenset({"none", "infra_unavailable"})
+
+
+def ci_gate_enabled() -> bool:
+    """``AGENT_CREW_SCRIPT_TEST_CI_GATE``: unset/``1`` gates on red CI, ``0`` does not."""
+    raw = os.environ.get(CI_GATE_ENV)
+    if raw is None:
+        return True
+    value = raw.strip()
+    if value in ("0", "1"):
+        return value == "1"
+    logger.warning("invalid %s=%r; using default 1", CI_GATE_ENV, raw)
+    return True
+
+
 @dataclass
 class RunOutcome:
     exit_code: Optional[int]
@@ -524,6 +546,8 @@ def record_to_result(task_id: str, record: Mapping, pr_number=None) -> TaskResul
         pre = record.get("pre_existing") or []
         flaky = record.get("flaky") or []
         summary = (f"script test {PASSED}: {_counts_text(record.get('counts') or {})}"
+                   + (f"; ci_state={record.get('ci_state')} (not gated: "
+                      f"{record.get('ci_not_gated')})" if record.get("ci_not_gated") else "")
                    + (f"; pre_existing failures not blamed on PR: {len(pre)}" if pre else "")
                    + (f"; flaky: {', '.join(flaky[:20])}" if flaky else ""))
         return TaskResult(task_id, "completed", summary, pr_number=pr_number, error_info=info)
@@ -603,9 +627,17 @@ def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: s
                 raise RuntimeError("missing context.repo for CI checks lookup")
             ci_state, ci_detail = head_checks_state(gh_repo, head_sha)
             record.update(ci_state=ci_state, ci_detail=ci_detail)
-            if ci_state == "red":
+            # #1038: the local suite verdict stays authoritative unless a CI
+            # job really ran and failed; CI is then recorded as evidence only.
+            if ci_state == "green":
+                pass
+            elif not ci_gate_enabled():
+                record["ci_not_gated"] = "gate off"
+            elif ci_state in _CI_NOT_GATING_STATES:
+                record["ci_not_gated"] = "infra"
+            elif ci_state == "red":
                 record.update(outcome=FAILED, reason="ci_red")
-            elif ci_state != "green":
+            else:
                 record.update(outcome=INCOMPLETE, reason=f"ci_{ci_state}")
     except Exception as exc:  # noqa: BLE001 — the stage reports, never crashes
         logger.exception("script test setup failed for %s", task.task_id)

@@ -433,7 +433,9 @@ def test_unjudged_rerun_is_incomplete_and_notifies_once(project, server, monkeyp
     assert (pushes, spawns, merges) == ([], [], [])
 
 
-def test_ci_never_started_is_incomplete_with_no_successor(project, server, monkeypatch):
+def test_ci_never_started_keeps_local_pass(project, server, monkeypatch):
+    # #1038: an Actions job that never got a runner is infra, not a test result;
+    # the local pass stands and CI is recorded as evidence only.
     from agent_crew import github
 
     repo, head = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert True\n"})
@@ -444,13 +446,15 @@ def test_ci_never_started_is_incomplete_with_no_successor(project, server, monke
     monkeypatch.setattr(github, "head_checks_state", lambda *a: (
         "infra_unavailable", "enforce https://github.com/o/r/actions/runs/71"))
 
+    monkeypatch.delenv(script_tester.CI_GATE_ENV, raising=False)
     done = _run_through_push_path(app, queue, _task(head))
-    assert done.status == "needs_human"
-    assert done.error_info["script_test"]["outcome"] == "INCOMPLETE"
-    assert done.error_info["script_test"]["reason"] == "ci_infra_unavailable"
-    assert [task.task_id for task in queue.list_tasks()] == [done.task_id]
-    assert (pushes, spawns, merges) == ([], [], [])
-    assert len(notices) == 1 and "reason_code=ci_infra_unavailable" in notices[0]
+    assert done.status == "completed"
+    record = queue.get_task_context(done.task_id)["script_test"]
+    assert record["outcome"] == "PASSED"
+    assert record["ci_state"] == "infra_unavailable"
+    assert "ci_state=infra_unavailable (not gated: infra)" in done.summary
+    assert (pushes, spawns) == ([], [])
+    assert merges == [f"merge:pr:{PR}"]
 
 
 def test_collection_abort_shared_with_base_is_not_a_pass(project, tmp_path):
