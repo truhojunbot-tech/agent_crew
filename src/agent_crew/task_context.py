@@ -8,6 +8,7 @@ validated as top-level task context here.
 
 TASK_CONTEXT_KEYS = frozenset({
     'suppressed_merge',
+    'acceptance_verbatim',
     'admitted_ref',
     'agent',
     'agent_override',
@@ -140,6 +141,7 @@ TASK_CONTEXT_KEYS = frozenset({
     'modules',
     'no_tester',
     'op',
+    'ops_deps',
     'original_task_id',
     'owner_conflict',
     'parent_receipt_id',
@@ -183,6 +185,7 @@ TASK_CONTEXT_KEYS = frozenset({
     'retry',
     'retry_attempt',
     'transient_retry_attempt',
+    'verification_contract',
     'watchdog_redispatch_attempt',
     'retry_of',
     'retry_reason',
@@ -224,6 +227,7 @@ TASK_CONTEXT_KEYS = frozenset({
     'target_repo',
     'target_issue',
     'tdd',
+    'test_gate',
     'test_lock_defer_count',
     'test_lock_first_deferred_at',
     'test_scope',

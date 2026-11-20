@@ -1826,6 +1826,126 @@ def _findings_block(findings: list, review_task_id: str) -> str:
     return "\n".join(lines)
 
 
+#: Root-context keys that state how the work is accepted. A fix round is judged
+#: by the same contract as its root, so they are copied unchanged (#1040).
+ROOT_ACCEPTANCE_CONTEXT_KEYS = ("acceptance_verbatim", "verification_contract",
+                                "test_gate", "ops_deps")
+_ACCEPTANCE_MARKER = re.compile(
+    r"^(acceptance|done when|test gate|full suite)\b", re.IGNORECASE)
+_FULL_SUITE_COMMAND = re.compile(r"\bpytest\b.*\stests\b")
+_MD_HEADING = re.compile(r"^(#{1,6})\s")
+_LIST_OR_CONTINUATION = re.compile(r"^(\s+\S|\s*([-*+]|\d+[.)]|[A-Za-z][.)])\s)")
+
+
+def _is_fix_round(task) -> bool:
+    ctx = task.context if isinstance(task.context, dict) else {}
+    return "fix_round" in ctx or task.task_id.startswith("fix-")
+
+
+def _lineage_root_implement(queue: TaskQueue, review_task, tasks_by_id: dict):
+    """Return the implement task a fix lineage started from, or ``None``.
+
+    ``context.lineage_root_task_id`` wins when it names a stored, non-fix
+    implement task. Otherwise ``prev_task_id`` is walked back and the EARLIEST
+    non-fix implement task is the root — the nearest one is usually the
+    previous fix round, whose description is not the contract (#1040).
+    ``tasks_by_id`` comes from ``_ancestor_tasks_by_id``, which already stops
+    on a missing row or a cycle.
+    """
+    ctx = review_task.context if isinstance(review_task.context, dict) else {}
+    root_id = ctx.get("lineage_root_task_id")
+    if isinstance(root_id, str) and root_id:
+        root = tasks_by_id.get(root_id) or queue.get_task(root_id)
+        if root is not None and root.task_type == "implement" and not _is_fix_round(root):
+            return root
+    found = None
+    current, seen = review_task, set()
+    while current is not None and current.task_id not in seen:
+        seen.add(current.task_id)
+        if current.task_type == "implement" and not _is_fix_round(current):
+            found = current
+        cur_ctx = current.context if isinstance(current.context, dict) else {}
+        prev = cur_ctx.get("prev_task_id")
+        current = tasks_by_id.get(prev) if isinstance(prev, str) else None
+    return found
+
+
+def extract_acceptance_sections(description: str) -> str:
+    """Copy the acceptance and test-gate sections of ``description`` verbatim.
+
+    A section starts at a marker line: a line whose text, after any leading
+    ``#``/``*``/``-``/``>`` and whitespace, starts with ``Acceptance``,
+    ``Done when``, ``Test gate`` or ``Full suite`` (case-insensitive).
+
+      * A markdown heading marker runs until the next heading of the same or a
+        higher level.
+      * Any other marker runs until the next heading, or until a blank line
+        followed by a line that is neither a list item (``-``, ``*``, ``+``,
+        ``1.``, ``A.``, ``a)``) nor indented.
+
+    A paragraph (blank-line delimited) holding a full-suite pytest command
+    (``pytest ... tests``) is a section too. Overlapping sections are merged,
+    output keeps source order, and lines are never altered. With no marker the
+    whole description is returned — copying too much is recoverable, a fix
+    round without its gate is not.
+    """
+    lines = description.split("\n")
+    n = len(lines)
+    keep = [False] * n
+
+    def _heading_level(line: str) -> int:
+        m = _MD_HEADING.match(line)
+        return len(m.group(1)) if m else 0
+
+    for i, line in enumerate(lines):
+        text = re.sub(r"^[\s#*>\-]+", "", line)
+        if _ACCEPTANCE_MARKER.match(text):
+            level = _heading_level(line)
+            end = i + 1
+            while end < n:
+                nxt = lines[end]
+                nxt_level = _heading_level(nxt)
+                if nxt_level and (not level or nxt_level <= level):
+                    break
+                if not level and not nxt.strip():
+                    after = end
+                    while after < n and not lines[after].strip():
+                        after += 1
+                    if after >= n or not _LIST_OR_CONTINUATION.match(lines[after]):
+                        break
+                end += 1
+            for j in range(i, end):
+                keep[j] = True
+        if _FULL_SUITE_COMMAND.search(line):
+            start = i
+            while start > 0 and lines[start - 1].strip():
+                start -= 1
+            end = i
+            while end < n and lines[end].strip():
+                end += 1
+            for j in range(start, end):
+                keep[j] = True
+
+    if not any(keep):
+        return description.strip("\n")
+    sections, current = [], []
+    for line, kept in zip(lines, keep):
+        if kept:
+            current.append(line)
+        elif current:
+            sections.append(current)
+            current = []
+    if current:
+        sections.append(current)
+    blocks = []
+    for section in sections:
+        while section and not section[-1].strip():
+            section.pop()
+        if section:
+            blocks.append("\n".join(section))
+    return "\n\n".join(blocks)
+
+
 def auto_enqueue_fix(
     queue: TaskQueue,
     review_task_id: str,
@@ -2199,12 +2319,29 @@ def auto_enqueue_fix(
             f"new PR. Reproduce each finding before fixing it, and say so if one "
             f"does not reproduce."
         )
+        # #1040: the root's acceptance and test gate ride along verbatim and
+        # untruncated. Every round reads the ROOT, so r2+ do not duplicate it.
+        root_task = _lineage_root_implement(queue, review_task, tasks_by_id)
+        if root_task is None:
+            logger.warning(
+                f"auto_enqueue_fix: no root implement task found for "
+                f"{review_task_id} — fix description carries findings only (#1040)")
+        elif (root_task.description or "").strip():
+            parts.append(
+                f"\nParent acceptance and test gate (verbatim from "
+                f"{root_task.task_id}):\n"
+                f"{extract_acceptance_sections(root_task.description)}")
 
         fix_context: dict = {
             "prev_task_id": review_task_id,
             "fix_round": fix_round,
             "review_findings": findings,
         }
+        root_ctx = (root_task.context if root_task is not None
+                    and isinstance(root_task.context, dict) else {})
+        for key in ROOT_ACCEPTANCE_CONTEXT_KEYS:
+            if key in root_ctx:
+                fix_context[key] = root_ctx[key]
         if failed_test:
             fix_context["feedback"] = findings_text
         inherited_tier = review_ctx.get("risk_tier")
