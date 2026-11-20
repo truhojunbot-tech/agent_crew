@@ -54,8 +54,9 @@ GATED_TASK_TYPES = frozenset({"implement", "fix"})
 #: wins over ``balance.action`` / ``admissions_rule``: exactly ``open`` or
 #: ``hold`` is valid, anything else (unknown string, null, wrong type, missing
 #: pool key, a non-object map) is HOLD, never open. Without it the legacy
-#: single rule applies to the Claude pool only; the Codex pool is gated only by
-#: a fresh ``admissions_effective`` and otherwise dispatches as before.
+#: single rule applies to the Claude pool only; on a fresh, valid legacy file
+#: the Codex pool dispatches as before. A missing, malformed, stale or
+#: future-dated file is UNKNOWN for every pool, Codex included.
 CLAUDE_POOL, CODEX_POOL = "claude", "codex"
 POOLS = (CLAUDE_POOL, CODEX_POOL)
 #: Typed reason for a park on a present but invalid ``admissions_effective``.
@@ -227,9 +228,9 @@ def read_pool_signal(*, state_dir: Optional[str] = None,
     """
     path = pool_signal_path()
     now = time.time() if now is None else now
+    # UNKNOWN stays UNKNOWN for every pool: only a fresh, valid legacy file
+    # without ``admissions_effective`` leaves Codex ungated (review-impl-1033d-r0).
     signal = _read_file(path, now, pool)
-    if pool != CLAUDE_POOL and signal["rule"] == UNKNOWN:
-        return _ungated(pool, signal["reason"], path, None)
     with _state_lock:
         if signal["rule"] in (HOLD, OPEN):
             if not (signal.get("invalid") or signal.get("ungated")):

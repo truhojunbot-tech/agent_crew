@@ -88,9 +88,26 @@ def test_codex_without_effective_is_not_gated(tmp_path, monkeypatch):
     path = _signal(tmp_path, monkeypatch, raw=_eff_body(rule="hold"))
     codex = _read(tmp_path, "codex")
     assert codex["rule"] == "open" and codex.get("ungated")
-    path.write_text("{not json")
-    assert _read(tmp_path, "codex")["rule"] == "open"
     assert pool_signal.load_last_valid(str(tmp_path / "crew"), "codex") is None
+
+
+@pytest.mark.parametrize("break_file", ["stale", "corrupt", "missing", "future"])
+def test_codex_unreadable_signal_is_unknown_not_ungated(tmp_path, monkeypatch, break_file):
+    """review-impl-1033d-r0 P1: a fresh codex hold that goes stale, corrupt,
+    missing or future-dated is UNKNOWN, never the ungated OPEN."""
+    path = _signal(tmp_path, monkeypatch, raw=_eff_body({"claude": "open", "codex": "hold"}))
+    assert _read(tmp_path, "codex")["rule"] == "hold"
+    if break_file == "stale":
+        path.write_text(_eff_body({"claude": "open", "codex": "open"}, age=61 * 60))
+    elif break_file == "corrupt":
+        path.write_text("{not json")
+    elif break_file == "missing":
+        path.unlink()
+    else:
+        path.write_text(_eff_body({"claude": "open", "codex": "open"}, age=-10 * 60))
+    codex = _read(tmp_path, "codex")
+    assert codex["rule"] == "unknown" and not codex.get("ungated")
+    assert codex["reason"].startswith(pool_signal.UNKNOWN_REASON)
 
 
 def test_stale_effective_file_is_unknown(tmp_path, monkeypatch):
@@ -223,6 +240,34 @@ def test_stale_effective_file_parks_unknown(tmp_path, monkeypatch, notices):
     assert dispatched == []
     parked = _events(queue, task_id, "pool_hold_parked")
     assert len(parked) == 1 and parked[0]["code"] == pool_signal.UNKNOWN_REASON
+
+
+@pytest.mark.parametrize("break_file", ["stale", "corrupt"])
+def test_codex_hold_turned_unreadable_neither_dispatches_nor_resumes(
+        tmp_path, monkeypatch, notices, break_file):
+    """review-impl-1033d-r0 P1 at the dispatcher: a parked Codex row is not
+    resumed and a new Codex implement is not dispatched once the fresh
+    ``codex=hold`` signal goes stale or corrupt; only a fresh open resumes."""
+    path = _signal(tmp_path, monkeypatch, raw=_eff_body({"claude": "open", "codex": "hold"}))
+    app, queue, dispatched = _app(tmp_path, monkeypatch, CODEX_IMPL)
+    parked_id = _impl(queue, "impl-codex-parked")
+    with TestClient(app):
+        assert _wait(lambda: queue.get_task_status(parked_id) == "waiting_pool")
+        if break_file == "stale":
+            path.write_text(_eff_body({"claude": "open", "codex": "open"}, age=61 * 60))
+        else:
+            path.write_text("{not json")
+        new_id = _impl(queue, "impl-codex-new")
+        app.state.apply_pool_signal()
+        assert _wait(lambda: queue.get_task_status(new_id) == "waiting_pool")
+        app.state.apply_pool_signal()
+        time.sleep(0.3)
+        assert dispatched == []
+        assert queue.get_task_status(parked_id) == "waiting_pool"
+        path.write_text(_eff_body({"claude": "open", "codex": "open"}))
+        out = app.state.apply_pool_signal()
+        assert set(out["resumed"]) == {parked_id, new_id}
+        assert _wait(lambda: sorted(dispatched) == sorted([parked_id, new_id]))
 
 
 def test_fresh_claude_open_resumes_claude_row_only(tmp_path, monkeypatch, notices):

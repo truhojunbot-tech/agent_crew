@@ -467,8 +467,10 @@ def test_athena_server_exempts_any_task_project(tmp_path, monkeypatch, notices, 
     assert notices == []
 
 
-def test_codex_implement_and_claude_review_under_unknown_dispatch(tmp_path, monkeypatch,
-                                                                  notices):
+def test_claude_review_dispatches_and_codex_implement_parks_under_unknown(
+        tmp_path, monkeypatch, notices):
+    """Reviews are never gated; an UNKNOWN signal parks Codex implement/fix
+    too (review-impl-1033d-r0: UNKNOWN is not the ungated OPEN)."""
     _signal(tmp_path, monkeypatch, raw="{not json")
     app, queue, dispatched = _app(
         tmp_path, monkeypatch, {"implementer": "codex", "reviewer": "claude", "tester": "script"})
@@ -478,8 +480,12 @@ def test_codex_implement_and_claude_review_under_unknown_dispatch(tmp_path, monk
                               context={"risk_tier": 1, "pr_number": 1033,
                                        "reviewed_sha": "a" * 40}))
     with TestClient(app):
-        assert _wait(lambda: task_id in dispatched and "review-1033" in dispatched)
-    assert notices == []
+        assert _wait(lambda: "review-1033" in dispatched
+                     and queue.get_task_status(task_id) == "waiting_pool")
+        time.sleep(0.2)
+    assert task_id not in dispatched
+    parked = _events(queue, task_id, "pool_hold_parked")
+    assert len(parked) == 1 and parked[0]["code"] == pool_signal.UNKNOWN_REASON
 
 
 def test_chatgpt_review_under_unknown_dispatches(tmp_path, monkeypatch, notices):
