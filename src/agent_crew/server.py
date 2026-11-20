@@ -3640,24 +3640,26 @@ def create_app(
 
     app.state.resume_codex_quota_holds = _resume_codex_quota_holds
 
-    def _pool_gate_applies(task: TaskRequest) -> bool:
-        """#1033: is this row a Claude implement/fix round on a non-Athena
-        project? Reviews, script tests, ChatGPT and Codex are never gated."""
+    def _pool_of(task: TaskRequest) -> Optional[str]:
+        """#1033: the provider pool this row's implement/fix round spends
+        (``claude`` or ``codex``) on a non-Athena project, else ``None``.
+        Reviews, script tests, ChatGPT and gemini are never gated."""
         if task.task_type not in _pool_signal.GATED_TASK_TYPES:
-            return False
+            return None
         # The exemption is the trusted server identity only: task.project is
         # task payload and must not lift a non-Athena hold (review-impl-1033b-r0).
         if _pool_signal.is_exempt_project(_server_identity()["project"]):
-            return False
+            return None
         agent, _wt = _resolve_dispatch_target(
             task, _TYPE_TO_ROLE.get(task.task_type, "implementer"))
-        return _pool_signal.is_claude_round(task.task_type, agent)
+        return _pool_signal.round_pool(task.task_type, agent)
 
     def _park_for_pool(task: TaskRequest, signal: dict) -> bool:
         code = (_pool_signal.UNKNOWN_REASON if signal["rule"] == _pool_signal.UNKNOWN
                 else "POOL_HOLD")
         if not q().park_pool_hold(task.task_id, reason=signal["reason"],
-                                  rule=signal["rule"], code=code):
+                                  rule=signal["rule"], code=code,
+                                  pool=signal.get("pool") or _pool_signal.CLAUDE_POOL):
             return False
         logger.info("pool signal %s: parked %s as %s — %s", signal["rule"], task.task_id,
                     _pool_signal.WAITING_POOL_STATUS, signal["reason"])
@@ -3667,39 +3669,51 @@ def create_app(
 
     _pool_state_dir = os.path.dirname(db_path)
 
-    def _read_pool_signal() -> dict:
-        """Fresh read per gate decision; the last valid state is per project."""
-        return _pool_signal.read_pool_signal(state_dir=_pool_state_dir)
+    def _read_pool_signal(pool: str = _pool_signal.CLAUDE_POOL) -> dict:
+        """Fresh read per gate decision; the last valid state is per project
+        and per pool."""
+        signal = _pool_signal.read_pool_signal(state_dir=_pool_state_dir, pool=pool)
+        signal.setdefault("pool", pool)
+        return signal
 
     def _pool_gate_dispatch(task: TaskRequest) -> bool:
-        """Last check on a claimed row before a Claude spawn. True = parked.
-        Only a fresh valid ``open`` dispatches; hold and UNKNOWN both park."""
-        if not _pool_gate_applies(task):
+        """Last check on a claimed row before a gated spawn. True = parked.
+        Only a fresh valid ``open`` for the round's pool dispatches; hold
+        and UNKNOWN both park."""
+        pool = _pool_of(task)
+        if pool is None:
             return False
-        signal = _read_pool_signal()
+        signal = _read_pool_signal(pool)
         if signal["rule"] == _pool_signal.OPEN:
             return False
         if not _park_for_pool(task, signal) and q().get_task_status(
                 task.task_id) == "in_progress":
-            # §8 refused the requeue: never spawn Claude without a fresh
-            # open; the claim is left to orphan recovery.
+            # §8 refused the requeue: never spawn without a fresh open;
+            # the claim is left to orphan recovery.
             logger.warning("pool signal %s: %s could not be parked; not dispatching",
                            signal["rule"], task.task_id)
         return True
 
     def _apply_pool_signal() -> dict:
-        """#1033: on hold or UNKNOWN park pending Claude implement/fix rows;
-        on a fresh valid open resume parked rows exactly once (the status
-        predicate is the claim). The resumed row then meets the normal
-        admission and STOP checks at dispatch."""
-        signal = _read_pool_signal()
-        out: dict = {"rule": signal["rule"], "parked": [], "resumed": []}
-        if signal["rule"] != _pool_signal.OPEN:
-            for task in q().list_tasks(status="pending"):
-                if _pool_gate_applies(task) and _park_for_pool(task, signal):
-                    out["parked"].append(task.task_id)
-            return out
+        """#1033: per pool, on hold or UNKNOWN park pending implement/fix rows
+        of that pool; on a fresh valid open resume that pool's parked rows
+        exactly once (the status predicate is the claim). A parked row that
+        no longer maps to a gated pool follows the Claude pool, as before
+        the per-pool round. The resumed row then meets the normal admission
+        and STOP checks at dispatch."""
+        signals = {pool: _read_pool_signal(pool) for pool in _pool_signal.POOLS}
+        out: dict = {"rule": signals[_pool_signal.CLAUDE_POOL]["rule"],
+                     "pools": {pool: sig["rule"] for pool, sig in signals.items()},
+                     "parked": [], "resumed": []}
+        for task in q().list_tasks(status="pending"):
+            pool = _pool_of(task)
+            if (pool is not None and signals[pool]["rule"] != _pool_signal.OPEN
+                    and _park_for_pool(task, signals[pool])):
+                out["parked"].append(task.task_id)
         for task in q().list_tasks(status=_pool_signal.WAITING_POOL_STATUS):
+            signal = signals[_pool_of(task) or _pool_signal.CLAUDE_POOL]
+            if signal["rule"] != _pool_signal.OPEN:
+                continue
             if q().resume_pool_hold(task.task_id, rule=signal["rule"],
                                     reason=signal["reason"]):
                 logger.info("pool signal %s: resumed %s", signal["rule"], task.task_id)
