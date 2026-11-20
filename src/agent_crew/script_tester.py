@@ -85,10 +85,13 @@ def _rerun_limit(state: Mapping, key: str, env_key: str, default: int | float,
 
 
 CI_GATE_ENV = "AGENT_CREW_SCRIPT_TEST_CI_GATE"
-# #1038: CI states that carry no evidence a job ran a step and failed. With
-# Actions billing-blocked these never turn green, so they cannot veto a local
-# pass; ``head_checks_state`` already reports any genuinely failed run as red.
-_CI_NOT_GATING_STATES = frozenset({"none", "pending", "infra_unavailable", "error"})
+# #1038: CI states that establish no job ran a step: no check at all, or every
+# failure is an Actions job with no runner and no steps (billing block). Only
+# these yield to a local pass. ``pending`` covers a runner still executing
+# steps and ``error`` means CI could not be read, so neither proves the absence
+# of a failing job; they stay INCOMPLETE. ``head_checks_state`` reports any
+# genuinely failed run as red.
+_CI_NOT_GATING_STATES = frozenset({"none", "infra_unavailable"})
 
 
 def ci_gate_enabled() -> bool:

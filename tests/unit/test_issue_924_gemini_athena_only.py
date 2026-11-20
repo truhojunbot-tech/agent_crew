@@ -35,8 +35,9 @@ def test_all_test_role_config_paths_refuse_gemini_family(agent, tmp_path):
 
 @pytest.mark.parametrize("ci_state,expected_status", [
     ("green", "completed"), ("red", "failed"),
-    # #1038: CI that never ran a failing job no longer vetoes a local pass.
-    ("pending", "completed"), ("none", "completed"), ("error", "completed"),
+    # #1038: CI that never ran a job no longer vetoes a local pass; running or
+    # unreadable CI still does not prove the absence of a failing job.
+    ("pending", "needs_human"), ("none", "completed"), ("error", "needs_human"),
 ])
 def test_script_tester_folds_ci_when_workflows_exist(monkeypatch, ci_state, expected_status):
     monkeypatch.setattr(script_tester, "resolve_refs", lambda *a, **k: ("base", "a" * 40))
