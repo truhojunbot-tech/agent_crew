@@ -7804,7 +7804,8 @@ class TaskQueue:
             conn.close()
 
     def park_pool_hold(self, task_id: str, *, reason: str, rule: str = "hold",
-                       code: str = "POOL_HOLD", now: Optional[float] = None) -> bool:
+                       code: str = "POOL_HOLD", pool: str = "claude",
+                       now: Optional[float] = None) -> bool:
         """Park a Claude implement/fix row as ``waiting_pool`` under a Quota
         pool hold or an UNKNOWN signal (#1033). Not needs_human, not failed:
         the row resumes on its own on a fresh valid open. A claimed row is returned through the
@@ -7831,7 +7832,7 @@ class TaskQueue:
                 "UPDATE tasks SET status='waiting_pool', claim_source='' "
                 "WHERE task_id=? AND status IN ('pending', 'in_progress')", (task_id,))
             self._append_exec_event_on(conn, task_id, "pool_hold_parked", now,
-                                       rule=rule, code=code, reason=reason)
+                                       rule=rule, code=code, reason=reason, pool=pool)
             conn.commit()
             return True
         except Exception:
