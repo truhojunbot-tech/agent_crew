@@ -3719,12 +3719,15 @@ def create_app(
             task, _TYPE_TO_ROLE.get(task.task_type, "implementer"))
         return _pool_signal.round_pool(task.task_type, agent)
 
-    def _pool_grant_for(task: TaskRequest, pool: str) -> Optional[dict]:
-        """#1047: the Quota grant that lets this gated round through a hold,
-        else ``None``. Matched on the server identity (never ``task.project``),
+    def _pool_grant_for(task: TaskRequest, pool: str, signal: dict) -> Optional[dict]:
+        """#1047: the Quota grant that lets this gated round through a
+        verified explicit hold, else ``None`` (never on UNKNOWN or an invalid
+        ``admissions_effective``). Matched on the server identity (never ``task.project``),
         the round's pool, the row id or (``include_lineage``) its lineage
         root, expiry and the ``pool_grant_used`` count. Any failure is no
         grant: the hold stays in force."""
+        if not _pool_signal.grant_may_apply(signal):
+            return None
         try:
             grants = _pool_signal.load_pool_grants()
             if not grants:
@@ -3775,7 +3778,7 @@ def create_app(
         signal = _read_pool_signal(pool)
         if signal["rule"] == _pool_signal.OPEN:
             return False
-        grant = _pool_grant_for(task, pool)
+        grant = _pool_grant_for(task, pool, signal)
         if grant is not None:
             if not spawn:
                 return False
@@ -3807,7 +3810,7 @@ def create_app(
         for task in q().list_tasks(status="pending"):
             pool = _pool_of(task)
             if (pool is not None and signals[pool]["rule"] != _pool_signal.OPEN
-                    and _pool_grant_for(task, pool) is None
+                    and _pool_grant_for(task, pool, signals[pool]) is None
                     and _park_for_pool(task, signals[pool])):
                 out["parked"].append(task.task_id)
         for task in q().list_tasks(status=_pool_signal.WAITING_POOL_STATUS):
@@ -3816,7 +3819,7 @@ def create_app(
             if signal["rule"] != _pool_signal.OPEN:
                 # #1047: a grant resumes the row under the hold; the
                 # dispatcher spends the use at the spawn.
-                grant = _pool_grant_for(task, pool)
+                grant = _pool_grant_for(task, pool, signal)
                 if grant is None:
                     continue
                 reason = (f"pool grant {grant['grant_id']} "

@@ -241,3 +241,59 @@ def test_tick_sweep_spends_no_use(tmp_path, monkeypatch, notices):
     assert out["parked"] == [] and queue.get_task_status(FIX) == "pending"
     assert dispatched == []
     assert queue.count_pool_grant_uses("g-1") == 0
+
+
+# ── review-impl-1047-r0 P1: a grant is an exception to a verified HOLD ─────
+
+def _break_signal(tmp_path, monkeypatch, case):
+    if case == "missing":
+        _signal(tmp_path, monkeypatch, missing=True)
+    elif case == "stale":
+        _signal(tmp_path, monkeypatch, raw=_eff_body({"claude": "hold", "codex": "open"},
+                                                     age=61 * 60))
+    elif case == "malformed":
+        _signal(tmp_path, monkeypatch, raw="{not json")
+    elif case == "future":
+        _signal(tmp_path, monkeypatch, raw=_eff_body({"claude": "hold", "codex": "open"},
+                                                     age=-10 * 60))
+    else:   # invalid admissions_effective: a synthesized HOLD, not Quota's verdict
+        _signal(tmp_path, monkeypatch, raw=_eff_body({"claude": "weird", "codex": "open"}))
+
+
+SIGNAL_BREAKS = ["missing", "stale", "malformed", "future", "invalid-effective"]
+
+
+@pytest.mark.parametrize("case", SIGNAL_BREAKS)
+def test_grant_never_bypasses_unknown_or_invalid_signal(tmp_path, monkeypatch, notices,
+                                                        case):
+    _break_signal(tmp_path, monkeypatch, case)
+    _grants(tmp_path, monkeypatch, _grant(max_dispatches=5))
+    app, queue, dispatched = _app(tmp_path, monkeypatch, CLAUDE_IMPL)
+    _impl(queue, ROOT)
+    with TestClient(app):
+        assert _wait(lambda: queue.get_task_status(ROOT) == "waiting_pool")
+        time.sleep(0.3)
+    assert dispatched == []
+    assert _used(queue, ROOT) == []
+    assert _events(queue, ROOT, "pool_hold_resumed") == []
+
+
+@pytest.mark.parametrize("case", SIGNAL_BREAKS)
+def test_sweep_does_not_resume_on_unknown_or_invalid_signal(tmp_path, monkeypatch, notices,
+                                                            case):
+    _break_signal(tmp_path, monkeypatch, case)
+    _grants(tmp_path, monkeypatch, _grant(max_dispatches=5))
+    app, queue, dispatched = _app(tmp_path, monkeypatch, CLAUDE_IMPL)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    _impl(queue, ROOT)
+    assert queue.park_pool_hold(ROOT, reason="hold")
+    with TestClient(app):
+        out = app.state.apply_pool_signal()
+    assert out["resumed"] == [] and queue.get_task_status(ROOT) == "waiting_pool"
+    # A granted pending row is parked too, as with no grant.
+    pending = _impl(queue, "impl-1047-pending")
+    _grants(tmp_path, monkeypatch, _grant(task_id=pending, max_dispatches=5))
+    with TestClient(app):
+        out = app.state.apply_pool_signal()
+    assert pending in out["parked"]
+    assert dispatched == [] and queue.count_pool_grant_uses("g-1") == 0

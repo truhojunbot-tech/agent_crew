@@ -332,6 +332,14 @@ def load_pool_grants(path: Optional[str] = None) -> list:
     return [g for g in map(_valid_grant, data["grants"]) if g is not None]
 
 
+def grant_may_apply(signal: dict) -> bool:
+    """A grant is an exception to a verified explicit HOLD only (review-impl-1047-r0).
+    UNKNOWN (missing, stale, malformed, future-dated file) and the HOLD
+    synthesized from an invalid ``admissions_effective`` are not Quota
+    verdicts, so no grant lifts them."""
+    return signal.get("rule") == HOLD and not signal.get("invalid")
+
+
 def match_pool_grant(grants: list, *, project: object, pool: str, task_id: str,
                      lineage_root: Optional[str], uses, now: Optional[float] = None
                      ) -> Optional[dict]:
