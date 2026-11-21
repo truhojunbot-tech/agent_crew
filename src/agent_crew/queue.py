@@ -8816,6 +8816,17 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def get_dispatch_target(self, task_id: str) -> str:
+        """Return the recorded dispatch target (``%N`` / ``pid:N``), or ''."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT dispatch_target FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            return (row["dispatch_target"] or "") if row else ""
+        finally:
+            conn.close()
+
     def pane_has_other_active_task(self, pane_id: str, task_id: str) -> bool:
         """Refuse an interrupt when a pane is also bound to another active task."""
         conn = self._connect()

@@ -1822,6 +1822,55 @@ def task_group():
     """Manage individual tasks in the queue."""
 
 
+def _cancel_via_server(port: int, project: str, task_id: str, reason: str):
+    """DELETE /tasks/<id> on the project server.  None means the server is down
+    (connection failed) and the caller may fall back to DB-direct; any answer
+    from the server — including a refusal — is returned as ``(code, body)``."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/tasks/{urllib.parse.quote(task_id, safe='')}"
+        f"?reason={urllib.parse.quote(reason, safe='')}",
+        headers={"X-Agent-Crew-Project": project}, method="DELETE")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read() or b"{}")
+        except ValueError:
+            body = {}
+        return exc.code, body
+    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
+        return None
+
+
+def _report_server_cancel(task_id: str, served) -> None:
+    code, body = served
+    if code == 409:
+        click.echo(f"Not cancelled: {task_id} is already {body.get('status')} (NOT_ACTIVE)")
+        return
+    if code != 200:
+        raise click.ClickException(
+            f"server cancel of {task_id} failed ({code}): {body.get('detail', body)}")
+    if body.get("reason") == "NO_SUCH_TASK":
+        raise click.ClickException(f"Task not found: {task_id!r}")
+    signal_outcome = body.get("cancel_signal_outcome")
+    termination = body.get("worker_termination")
+    if (signal_outcome in ("not_running", "pane_exited")
+            or termination in ("sigterm_sent", "already_exited")):
+        click.echo(f"Cancelled via server: {task_id} "
+                   f"(signal={signal_outcome}, worker_termination={termination})")
+        return
+    click.echo(
+        f"Cancelled via server: {task_id}; worker stop unconfirmed "
+        f"(signal={signal_outcome}, worker_termination={termination})", err=True,
+    )
+    raise SystemExit(1)
+
+
 @task_group.command("cancel")
 @click.argument("task_id")
 @click.option("--project", default="", help="Project name (reads DB from state)")
@@ -1832,14 +1881,29 @@ def task_group():
               help="Reason recorded in the cancellation audit")
 def task_cancel(task_id: str, project: str, allow_cross_project: bool, base: str,
                 db: str, reason: str):
-    """Cancel TASK_ID and attempt to interrupt its bound worker pane."""
+    """Cancel TASK_ID and attempt to interrupt its bound worker pane.
+
+    #1044: with a project whose server answers, the cancel goes through the
+    server's DELETE — the server owns ``pid:`` dispatch workers and is the only
+    process that can signal them.  DB-direct is the fallback when it is down.
+    """
     from agent_crew.server import cancel_task_with_signal
+    port = None
     if not db:
         project = _select_project(base, project, allow_cross_project)
         state = _read_state(base, project)
         if state is None:
             raise click.ClickException(f"project {project!r} not found")
         db = state["db"]
+        port = state.get("port")
+    if port:
+        served = _cancel_via_server(int(port), project, task_id, reason)
+        if served is not None:
+            _report_server_cancel(task_id, served)
+            return
+        click.echo(f"Server for {project!r} unreachable on port {port}; "
+                   "cancelling DB-direct (server-owned workers are not signalled)",
+                   err=True)
     state_path = os.path.join(os.path.dirname(os.path.abspath(db)), "state.json")
     try:
         result = cancel_task_with_signal(
@@ -1847,7 +1911,7 @@ def task_cancel(task_id: str, project: str, allow_cross_project: bool, base: str
             state_path=state_path, pane_map=None,
             events_path=os.path.join(os.path.dirname(os.path.abspath(db)),
                                      "context_events.jsonl"),
-            reason=reason,
+            reason=reason, out_of_process=True,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
