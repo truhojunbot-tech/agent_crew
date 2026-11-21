@@ -3719,6 +3719,27 @@ def create_app(
             task, _TYPE_TO_ROLE.get(task.task_type, "implementer"))
         return _pool_signal.round_pool(task.task_type, agent)
 
+    def _pool_grant_for(task: TaskRequest, pool: str) -> Optional[dict]:
+        """#1047: the Quota grant that lets this gated round through a hold,
+        else ``None``. Matched on the server identity (never ``task.project``),
+        the round's pool, the row id or (``include_lineage``) its lineage
+        root, expiry and the ``pool_grant_used`` count. Any failure is no
+        grant: the hold stays in force."""
+        try:
+            grants = _pool_signal.load_pool_grants()
+            if not grants:
+                return None
+            ctx = task.context if isinstance(task.context, dict) else {}
+            root = ctx.get("lineage_root_task_id")
+            return _pool_signal.match_pool_grant(
+                grants, project=_server_identity()["project"], pool=pool,
+                task_id=task.task_id,
+                lineage_root=root if isinstance(root, str) and root else None,
+                uses=q().count_pool_grant_uses)
+        except Exception:
+            logger.exception("pool grant lookup failed for %s; no grant", task.task_id)
+            return None
+
     def _park_for_pool(task: TaskRequest, signal: dict) -> bool:
         code = (_pool_signal.UNKNOWN_REASON if signal["rule"] == _pool_signal.UNKNOWN
                 else "POOL_HOLD")
@@ -3741,16 +3762,29 @@ def create_app(
         signal.setdefault("pool", pool)
         return signal
 
-    def _pool_gate_dispatch(task: TaskRequest) -> bool:
+    def _pool_gate_dispatch(task: TaskRequest, *, spawn: bool = True) -> bool:
         """Last check on a claimed row before a gated spawn. True = parked.
         Only a fresh valid ``open`` for the round's pool dispatches; hold
-        and UNKNOWN both park."""
+        and UNKNOWN both park, unless a Quota grant matches (#1047). With
+        ``spawn`` a granted dispatch spends one use (``pool_grant_used``)
+        before the spawn; the start-site check (``spawn=False``) only leaves
+        a granted row pending."""
         pool = _pool_of(task)
         if pool is None:
             return False
         signal = _read_pool_signal(pool)
         if signal["rule"] == _pool_signal.OPEN:
             return False
+        grant = _pool_grant_for(task, pool)
+        if grant is not None:
+            if not spawn:
+                return False
+            used = q().record_pool_grant_use(task.task_id, grant)
+            if used is not None:
+                logger.info("pool signal %s: %s dispatched under grant %s (%s) use %d/%d",
+                            signal["rule"], task.task_id, grant["grant_id"],
+                            grant["authority_ref"], used, grant["max_dispatches"])
+                return False
         if not _park_for_pool(task, signal) and q().get_task_status(
                 task.task_id) == "in_progress":
             # §8 refused the requeue: never spawn without a fresh open;
@@ -3773,14 +3807,21 @@ def create_app(
         for task in q().list_tasks(status="pending"):
             pool = _pool_of(task)
             if (pool is not None and signals[pool]["rule"] != _pool_signal.OPEN
+                    and _pool_grant_for(task, pool) is None
                     and _park_for_pool(task, signals[pool])):
                 out["parked"].append(task.task_id)
         for task in q().list_tasks(status=_pool_signal.WAITING_POOL_STATUS):
-            signal = signals[_pool_of(task) or _pool_signal.CLAUDE_POOL]
+            pool = _pool_of(task) or _pool_signal.CLAUDE_POOL
+            signal, reason = signals[pool], signals[pool]["reason"]
             if signal["rule"] != _pool_signal.OPEN:
-                continue
-            if q().resume_pool_hold(task.task_id, rule=signal["rule"],
-                                    reason=signal["reason"]):
+                # #1047: a grant resumes the row under the hold; the
+                # dispatcher spends the use at the spawn.
+                grant = _pool_grant_for(task, pool)
+                if grant is None:
+                    continue
+                reason = (f"pool grant {grant['grant_id']} "
+                          f"authority={grant['authority_ref']}")[:300]
+            if q().resume_pool_hold(task.task_id, rule=signal["rule"], reason=reason):
                 logger.info("pool signal %s: resumed %s", signal["rule"], task.task_id)
                 out["resumed"].append(task.task_id)
         return out
@@ -6646,8 +6687,6 @@ def create_app(
                                 if _k_key not in active_workers and _k_wt not in active_worktrees:
                                     _slot, _target_wt, _slot_wt = _k_key, _k_wt, _k_wt
                                     break
-                        if _dispatch_agent is None and _pool_gate_dispatch(task):
-                            continue   # #1033: parked waiting_pool (hold or unknown signal)
                         if _slot in active_workers:
                             # override 가 이미 바쁜 worker 를 가리켰다.
                             logger.info(
@@ -6663,6 +6702,11 @@ def create_app(
                                 f"agent={_target_agent} — worktree lease {_target_wt} is held"
                             )
                             q().requeue(task.task_id)
+                            continue
+                        # #1033: parked waiting_pool (hold or unknown signal). After
+                        # the slot/lease deferrals so a #1047 grant use is spent only
+                        # on a row that is about to spawn.
+                        if _dispatch_agent is None and _pool_gate_dispatch(task):
                             continue
                         active_workers.add(_slot)
                         if _target_wt:
@@ -6950,7 +6994,7 @@ def create_app(
                 try:
                     _fix = q().get_task(fix_id)
                     if _fix is not None and _fix.status == "pending":
-                        _pool_gate_dispatch(_fix)
+                        _pool_gate_dispatch(_fix, spawn=False)
                 except Exception:
                     logger.exception("pool hold check failed for %s", fix_id)
                 _try_push_next("implementer")

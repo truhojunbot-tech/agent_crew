@@ -31,8 +31,10 @@ PRIVATE_LITERAL_ALLOWLIST = {
         "Optional CEA policy snapshot default; environment configurable.",
     ("cea/wiring.py", 71, "/home/truhojun"):
         "Optional CEA memory command default; environment configurable.",
-    ("pool_signal.py", 36, "~/alfred"):
+    ("pool_signal.py", 37, "~/alfred"):
         "Quota pool signal default (#1033); AGENT_CREW_POOL_SIGNAL_PATH replaces it.",
+    ("pool_signal.py", 281, "~/alfred"):
+        "Quota pool grants default (#1047); AGENT_CREW_POOL_GRANTS_PATH replaces it.",
 }
 
 

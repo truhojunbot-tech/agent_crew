@@ -195,6 +195,9 @@ def _isolate_pool_signal(monkeypatch, tmp_path):
                     "numbers": {"admissions_rule": "open",
                                 "admissions_rule_reason": "test default"}}}))
     monkeypatch.setenv(pool_signal.POOL_SIGNAL_ENV, str(path))
+    # #1047: never read the live Quota grants file; absent means no grants.
+    monkeypatch.setenv(pool_signal.POOL_GRANTS_ENV,
+                       str(tmp_path / "pool-signal" / "pool_grants.json"))
     yield
 
 
