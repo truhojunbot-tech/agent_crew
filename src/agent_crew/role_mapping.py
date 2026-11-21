@@ -85,6 +85,66 @@ def is_gemini_family(agent: object) -> bool:
     return provider_family(agent) == "gemini"
 
 
+#: Owner rule (#924, owner 10766/10769): Gemini works for Athena only. The
+#: guard is mechanical (owner 15765): every route that could hand work to a
+#: gemini-family agent asks :func:`gemini_athena_only_refusal` first.
+GEMINI_ATHENA_ONLY = "gemini_athena_only"
+#: The whole allowlist. A module constant on purpose: no env var or config
+#: file may widen it (#924c). Read only through :func:`gemini_allowed_for_project`.
+GEMINI_ALLOWED_PROJECTS = frozenset({"athena"})
+#: Context keys that name who runs a task (#924b). ``agent`` is the discuss
+#: panel member; the list keys are explicit panels and fallback chains.
+_AGENT_CONTEXT_KEYS = ("agent_override", "agent", "agents", "panel",
+                       "panel_agents", "fallback_chain", "fallback_agents")
+
+
+def gemini_allowed_for_project(project: object) -> bool:
+    """Gemini may serve ``project`` only when it is Athena (#924b).
+
+    ``project`` must be the server's / queue's own identity, never a value
+    read from task context: a caller does not get to name itself Athena.
+    """
+    return str(project or "").strip().lower() in GEMINI_ALLOWED_PROJECTS
+
+
+def _agent_names(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [name for item in value.values() for name in _agent_names(item)]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [name for item in value for name in _agent_names(item)]
+    return []
+
+
+def gemini_agents_in_context(context: object) -> list[str]:
+    """Gemini-family agents a task context names as its runner (#924b)."""
+    if not isinstance(context, Mapping):
+        return []
+    names = []
+    for key in (*_AGENT_CONTEXT_KEYS, "role_agents"):
+        names.extend(_agent_names(context.get(key)))
+    return [name.strip() for name in names if is_gemini_family(name)]
+
+
+def gemini_athena_only_refusal(project: object, agents: object) -> str | None:
+    """Detail of a gemini_athena_only refusal, or ``None`` when allowed."""
+    if gemini_allowed_for_project(project):
+        return None
+    gemini = sorted({name.strip() for name in _agent_names(agents) if is_gemini_family(name)})
+    if not gemini:
+        return None
+    return (f"gemini-family agent(s) {gemini} may only serve projects "
+            f"{sorted(GEMINI_ALLOWED_PROJECTS)}; this server is {str(project or '')!r}")
+
+
+def refuse_gemini_outside_athena(project: object, agents: object) -> None:
+    """Raise the typed ``gemini_athena_only`` refusal when it applies."""
+    detail = gemini_athena_only_refusal(project, agents)
+    if detail is not None:
+        raise RoleResolutionError(GEMINI_ATHENA_ONLY, detail)
+
+
 #: Which provider families may hold each role (#889). The one policy every
 #: route reads: explicit override, ``implementer_agent``, role assignment, fix
 #: rounds, retries. ``None`` means no family restriction — review independence
@@ -177,7 +237,12 @@ def validate_explicit_role_agents(mapping: Mapping[str, object]) -> dict[str, st
 def effective_role_mapping(
     state: Mapping[str, object] | None, *, project: str = "unknown",
 ) -> tuple[dict[str, str], str]:
-    """Resolve a project role map, refusing malformed declared assignments."""
+    """Resolve a project role map, refusing malformed declared assignments.
+
+    ``project`` is the server's own identity (its ``state.json``). A role
+    config that would select a gemini-family agent outside Athena is refused
+    whole with ``gemini_athena_only`` (#924b), never trimmed to a substitute.
+    """
     if not isinstance(state, Mapping):
         return default_role_mapping(), DEFAULT_SOURCE
 
@@ -187,9 +252,10 @@ def effective_role_mapping(
             if not isinstance(explicit, Mapping):
                 raise ValueError("role_agents must be an object")
             mapping = validate_explicit_role_agents(explicit)
-            return mapping, EXPLICIT_SOURCE
         except ValueError as exc:
             raise RoleResolutionError("invalid_role_agents", str(exc)) from exc
+        refuse_gemini_outside_athena(project, mapping)
+        return mapping, EXPLICIT_SOURCE
 
     result = default_role_mapping()
     legacy = state.get("roles")
@@ -201,6 +267,7 @@ def effective_role_mapping(
             role, agent = entry.get("role"), entry.get("agent")
             if (role in ROLE_ORDER and isinstance(agent, str) and agent.strip()
                     and role_policy_refusal(role, agent) is None):
+                refuse_gemini_outside_athena(project, agent)
                 result[role] = agent.strip()
                 found = True
         if found:
