@@ -343,8 +343,13 @@ def cancel_task_with_signal(
     pane_map: Optional[dict], events_path: str,
     reason: str = _CANCEL_REASON_ATTEMPT,
     expected_status: Optional[str] = None,
+    out_of_process: bool = False,
 ) -> dict:
     """Cancel in the DB and signal only its server-recorded, project-owned pane.
+
+    ``out_of_process`` is the CLI's DB-direct fallback (#1044): the crew server
+    is down, so a ``pid:`` worker — which only the server can signal — is
+    reported ``server_owned_worker_not_signalled`` rather than ``unreachable``.
 
     G12 I-A then #336's pane interrupt: the authoritative cancel (status,
     receipt REVOKED, nonces spent, end event) commits in
@@ -370,6 +375,13 @@ def cancel_task_with_signal(
     pane_exit_observed = False
     if prior_status == "in_progress":
         outcome = "unreachable"
+        if out_of_process and not bound_pane:
+            try:
+                target = queue.get_dispatch_target(task_id)
+            except Exception:
+                target = ""
+            if target.startswith("pid:"):
+                outcome = "server_owned_worker_not_signalled"
         if bound_pane:
             owned_panes, _, _ = _recorded_pane_ids(state_path, pane_map)
             can_signal = (re.fullmatch(r"%\d+", bound_pane)
@@ -3265,6 +3277,8 @@ def create_app(
         """
         with _active_dispatch_lock:
             entry = _active_dispatch_processes.get(task_id)
+            if entry is not None:
+                _stopped_entries[task_id] = entry
             if isinstance(entry, _DispatchSlot):
                 entry.cancel_requested = True
                 entry.cancel_reason = reason
@@ -3277,6 +3291,57 @@ def create_app(
         if proc is not None and outcome not in ("sigterm_sent", "already_exited"):
             _record_orphaned_worker(task_id, proc, reason=reason, outcome=outcome)
         return outcome
+
+    #: #1044: registry entry each task's worker was last stopped for, so the
+    #: dispatcher sweep signals an externally-ended worker once, not every tick.
+    #: Keyed by entry identity: a later dispatch of the same id is a new entry.
+    _stopped_entries: dict[str, object] = {}
+    #: First tick a non-cancelled terminal row was seen with a live slot.
+    _external_terminal_seen: dict[str, float] = {}
+    #: A worker that just POSTed its own result is exiting by itself; only a
+    #: cancel is acted on at once, other terminal states after this grace.
+    _external_terminal_grace = float(
+        os.getenv("AGENT_CREW_EXTERNAL_TERMINAL_GRACE", "30"))
+
+    def _stop_externally_terminated_workers() -> dict[str, str]:
+        """#1044: stop workers whose row another process moved to terminal.
+
+        ``crew task cancel`` and other out-of-process writers commit the end in
+        the DB without reaching this server, which is the only process that can
+        signal a ``pid:`` worker.  Each tick checks the active slots' rows and
+        hands a terminal one to ``_stop_worker_for_ended_task`` exactly once.
+        """
+        from agent_crew.queue import TERMINAL_TASK_STATUSES
+        with _active_dispatch_lock:
+            entries = dict(_active_dispatch_processes)
+        for tid in [t for t in _stopped_entries if entries.get(t) is not _stopped_entries[t]]:
+            _stopped_entries.pop(tid, None)
+        for tid in [t for t in _external_terminal_seen if t not in entries]:
+            _external_terminal_seen.pop(tid, None)
+        stopped: dict[str, str] = {}
+        for tid, entry in entries.items():
+            if _stopped_entries.get(tid) is entry:
+                continue
+            proc = entry.proc if isinstance(entry, _DispatchSlot) else entry
+            if proc is not None and getattr(proc, "returncode", None) is not None:
+                continue
+            status = q().get_task_status(tid)
+            if status not in TERMINAL_TASK_STATUSES:
+                _external_terminal_seen.pop(tid, None)
+                continue
+            if status != "cancelled":
+                first = _external_terminal_seen.setdefault(tid, time.monotonic())
+                if time.monotonic() - first < _external_terminal_grace:
+                    continue
+            with _active_dispatch_lock:
+                if _active_dispatch_processes.get(tid) is not entry:
+                    continue
+            _external_terminal_seen.pop(tid, None)
+            outcome = _stop_worker_for_ended_task(tid, reason="external_terminal")
+            stopped[tid] = outcome
+            logger.warning("dispatcher: task=%s is %s outside this server — worker %s pid=%s",
+                           tid, status, outcome, getattr(proc, "pid", None))
+        return stopped
 
     def _terminate_worker(task_id: str, proc) -> str:
         """Stop the worker for an already-cancelled task.  Returns the state
@@ -6428,6 +6493,10 @@ def create_app(
                         f"active_workers={sorted(active_workers)} "
                         f"active_worktrees={len(active_worktrees)}"
                     )
+                    try:
+                        _stop_externally_terminated_workers()
+                    except Exception:
+                        logger.exception("external terminal scan failed — continuing dispatch")
                     # Reap completed dispatches, freeing their slots.
                     done = [tid for tid, t in list(active_tasks.items()) if t.done()]
                     for tid in done:
@@ -6742,6 +6811,7 @@ def create_app(
     app.state.reserve_dispatch_slot = _reserve_dispatch_slot
     app.state.claim_spawned_child = _claim_spawned_child
     app.state.stop_worker_for_ended_task = _stop_worker_for_ended_task
+    app.state.stop_externally_terminated_workers = _stop_externally_terminated_workers
     # Same rationale (#248, #265): expose the terminal-marking helper so a test
     # can drive the real timeout path instead of asserting against a
     # reimplementation of it.
