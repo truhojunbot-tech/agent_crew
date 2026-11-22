@@ -7868,6 +7868,49 @@ class TaskQueue:
         finally:
             conn.close()
 
+    _POOL_GRANT_USES_SQL = (
+        "SELECT COUNT(*) FROM task_exec_events WHERE event='pool_grant_used' "
+        "AND json_extract(fields, '$.grant_id')=?")
+
+    def count_pool_grant_uses(self, grant_id: str) -> int:
+        """``pool_grant_used`` events recorded for one Quota grant (#1047)."""
+        conn = self._connect()
+        try:
+            return int(conn.execute(self._POOL_GRANT_USES_SQL, (grant_id,)).fetchone()[0])
+        finally:
+            conn.close()
+
+    def record_pool_grant_use(self, task_id: str, grant: dict, *,
+                              now: Optional[float] = None) -> Optional[int]:
+        """Spend one dispatch of ``grant`` on ``task_id`` (#1047): append one
+        ``pool_grant_used`` event and return the use number, or ``None`` when
+        the cap is already reached. Count and insert share one write lock, so
+        two dispatchers cannot both take the last use."""
+        now = time.time() if now is None else now
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            used = int(conn.execute(self._POOL_GRANT_USES_SQL,
+                                    (grant["grant_id"],)).fetchone()[0])
+            if used >= grant["max_dispatches"]:
+                conn.rollback()
+                return None
+            # Direct insert: ``task_id`` is also a field of this event.
+            conn.execute(
+                "INSERT INTO task_exec_events (task_id, event, at, fields) "
+                "VALUES (?, 'pool_grant_used', ?, ?)",
+                (task_id, now, json.dumps({
+                    "grant_id": grant["grant_id"], "authority_ref": grant["authority_ref"],
+                    "pool": grant["pool"], "task_id": task_id, "used": used + 1,
+                    "max": grant["max_dispatches"]}, sort_keys=True)))
+            conn.commit()
+            return used + 1
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def requeue_dispatcher_claim(self, task_id: str, *,
                                  unstarted_before: Optional[float] = None) -> bool:
         """Recover a dispatcher claim; optionally require an old, unstarted attempt.

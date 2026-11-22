@@ -23,6 +23,7 @@ can never authorise a dispatch. Per-pool ``admissions_effective``: see ``POOLS``
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import threading
@@ -267,3 +268,100 @@ def round_pool(task_type: object, agent: object) -> Optional[str]:
         return None
     family = provider_family(agent)
     return family if family in POOLS else None
+
+
+# ── #1047: Quota per-task pool grants ─────────────────────────────────────
+#
+# Under a hold Quota can let one named task (and optionally its auto fix
+# rounds) run anyway. Quota owns and atomically writes the grants file; the
+# crew only reads it. Fail closed: anything but a valid, matching, unexpired,
+# under-cap entry leaves the hold in force.
+
+POOL_GRANTS_ENV = "AGENT_CREW_POOL_GRANTS_PATH"
+DEFAULT_POOL_GRANTS_PATH = "~/alfred/quota/pool_grants.json"
+POOL_GRANTS_SCHEMA = 1
+#: One exec event per gated dispatch a grant lets through: audit trail and cap counter.
+GRANT_USED_EVENT = "pool_grant_used"
+
+
+def pool_grants_path() -> str:
+    return os.path.expanduser(os.getenv(POOL_GRANTS_ENV) or DEFAULT_POOL_GRANTS_PATH)
+
+
+def _nonempty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _valid_grant(entry: object) -> Optional[dict]:
+    if not isinstance(entry, dict):
+        return None
+    for key in ("grant_id", "authority_ref", "project", "task_id"):
+        if not _nonempty_str(entry.get(key)):
+            return None
+    if entry.get("pool") not in POOLS:
+        return None
+    expires = entry.get("expires_at")
+    if (isinstance(expires, bool) or not isinstance(expires, (int, float))
+            or not math.isfinite(expires)):
+        return None
+    cap = entry.get("max_dispatches")
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+        return None
+    if not isinstance(entry.get("include_lineage"), bool):
+        return None
+    return {"grant_id": entry["grant_id"].strip(),
+            "authority_ref": entry["authority_ref"].strip(),
+            "project": entry["project"].strip().lower(), "task_id": entry["task_id"].strip(),
+            "pool": entry["pool"], "expires_at": float(expires), "max_dispatches": cap,
+            "include_lineage": entry["include_lineage"]}
+
+
+def load_pool_grants(path: Optional[str] = None) -> list:
+    """Valid grant entries only. A missing, unreadable, corrupt or
+    unknown-schema file is no grants; a malformed entry is skipped."""
+    path = pool_grants_path() if path is None else path
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if (not isinstance(data, dict) or isinstance(data.get("schema"), bool)
+            or data.get("schema") != POOL_GRANTS_SCHEMA
+            or not isinstance(data.get("grants"), list)):
+        return []
+    return [g for g in map(_valid_grant, data["grants"]) if g is not None]
+
+
+def grant_may_apply(signal: dict) -> bool:
+    """A grant is an exception to a verified explicit HOLD only (review-impl-1047-r0).
+    UNKNOWN (missing, stale, malformed, future-dated file) and the HOLD
+    synthesized from an invalid ``admissions_effective`` are not Quota
+    verdicts, so no grant lifts them."""
+    return signal.get("rule") == HOLD and not signal.get("invalid")
+
+
+def match_pool_grant(grants: list, *, project: object, pool: str, task_id: str,
+                     lineage_root: Optional[str], uses, now: Optional[float] = None
+                     ) -> Optional[dict]:
+    """The first grant that lets this round through, else ``None``.
+
+    ``project`` must be the trusted server identity, never ``task.project``.
+    ``uses(grant_id)`` returns the ``pool_grant_used`` count so far.
+    """
+    if not _nonempty_str(project):
+        return None
+    project = str(project).strip().lower()
+    now = time.time() if now is None else now
+    for grant in grants:
+        if grant["project"] != project or grant["pool"] != pool:
+            continue
+        if not (grant["task_id"] == task_id
+                or (grant["include_lineage"] and lineage_root
+                    and grant["task_id"] == lineage_root)):
+            continue
+        if grant["expires_at"] <= now:
+            continue
+        if uses(grant["grant_id"]) >= grant["max_dispatches"]:
+            continue
+        return grant
+    return None
