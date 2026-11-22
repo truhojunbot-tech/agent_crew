@@ -90,6 +90,7 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               DuplicateReviewResult, InvalidReviewResult, InvalidRiskTierError,
                               PausedError,
                               LateResultRejected,
+                              ParkedResultRejected,
                               TaskAlreadyExistsError,
                               TaskQueue, WorkIntentTargetConflict, QUEUE_SCHEMA_VERSION,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
@@ -8482,6 +8483,16 @@ def create_app(
                         "fallback_task_id": exc.fallback_task_id}
             return JSONResponse(status_code=409, content={
                 "late_result": True, "accepted": False,
+                "task_id": task_id, "prior_status": exc.status,
+                "reason": str(exc),
+            })
+        except ParkedResultRejected as exc:
+            # #1050: refused under the result write lock with nothing written —
+            # no state change, no exec event, no fallback or retry.
+            from fastapi.responses import JSONResponse
+            logger.warning("POST /tasks/%s/result: %s", task_id, exc)
+            return JSONResponse(status_code=409, content={
+                "parked": True, "accepted": False,
                 "task_id": task_id, "prior_status": exc.status,
                 "reason": str(exc),
             })

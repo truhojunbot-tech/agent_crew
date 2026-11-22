@@ -162,6 +162,21 @@ class LateResultRejected(RuntimeError):
         super().__init__(f"LATE_RESULT_REJECTED: task already {status}")
 
 
+class ParkedResultRejected(RuntimeError):
+    """A result for a row that never ran is refused with no write (#1050).
+
+    A ``waiting_pool`` row has not been dispatched, so nothing can have
+    finished or timed out; nor can a wrapper deadline on a pending row that
+    was never handed to a worker.
+    """
+    code = "PARKED_RESULT_REJECTED"
+
+    def __init__(self, status: str):
+        self.status = status
+        super().__init__(f"PARKED_RESULT_REJECTED: task is {status} and was never "
+                         "dispatched; result refused")
+
+
 class CompletedReviewRejected(RuntimeError):
     """A published review verdict cannot be replaced after its cascade ran."""
 
@@ -5844,6 +5859,33 @@ class TaskQueue:
         finally:
             conn.close()
 
+    @staticmethod
+    def _refuse_undispatched_result_on(conn, task_id: str, prior_status: str,
+                                       result: TaskResult) -> bool:
+        """#1050: True when this result reports on work that never started.
+
+        Every result for a ``waiting_pool`` row is refused. On a pending row
+        only a wrapper timeout is, and only when the row was never dispatched:
+        other results on undispatched pending rows keep their existing path.
+        """
+        if prior_status == "waiting_pool":
+            return True
+        info = result.error_info if isinstance(result.error_info, dict) else {}
+        if (prior_status != "pending" or result.status == "completed"
+                or info.get("reason") != "wrapper_timeout"):
+            return False
+        row = conn.execute("SELECT dispatched_at FROM tasks WHERE task_id=?",
+                           (task_id,)).fetchone()
+        if row is not None and row["dispatched_at"]:
+            return False
+        try:
+            dispatched = conn.execute(
+                "SELECT 1 FROM task_exec_events WHERE task_id=? AND event='dispatched' "
+                "LIMIT 1", (task_id,)).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return dispatched is None
+
     def submit_result(self, task_id: str, result: TaskResult, *,
                       nonce: Optional[str] = None,
                       presenter: Optional[str] = None,
@@ -5901,6 +5943,9 @@ class TaskQueue:
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
             prior_status = row["status"]
+            if self._refuse_undispatched_result_on(conn, task_id, prior_status, result):
+                conn.execute("ROLLBACK")
+                raise ParkedResultRejected(prior_status)
             task_context = _stored_context(row["context"], task_id)
             op_id = (task_context.get("external_operation_id")
                      if isinstance(task_context, dict) else None)
