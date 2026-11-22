@@ -5623,6 +5623,7 @@ def create_app(
                 task_id=task.task_id, task_type=task.task_type, role=role,
                 **_pack_kwargs,
                 repo_path=wt, branch=task.branch,
+                description=task.description or "",
                 episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
                 # #240: persisted procedures reach the dispatch from here.
                 # Passed explicitly rather than derived inside the builder so
@@ -5713,6 +5714,7 @@ def create_app(
                     task_id=task.task_id, task_type=task.task_type, role=role,
                     **_pack_kwargs,
                     repo_path=wt, branch=task.branch,
+                    description=task.description or "",
                     episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
                     procedures_path=os.path.join(_state_dir, "procedures.jsonl"),
                     shadow_path=os.path.join(_state_dir, "procedure_shadow.jsonl"),
@@ -5748,6 +5750,7 @@ def create_app(
                     task_id=task.task_id, task_type=task.task_type, role=role,
                     **_pack_kwargs,
                     repo_path=wt, branch=task.branch,
+                    description=task.description or "",
                     episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
                     procedures_path=os.path.join(_state_dir, "procedures.jsonl"),
                     shadow_path=os.path.join(_state_dir, "procedure_shadow.jsonl"),
@@ -5782,6 +5785,13 @@ def create_app(
                         "has_issue": _cpack.TYPE_ISSUE in _item_types,
                         "has_acceptance_criteria": _cpack.TYPE_AC in _item_types,
                         "has_linked_review": _cpack.TYPE_REVIEW in _item_types,
+                        # #1048: recorded, not inferred from the `fix-` prefix.
+                        "fix_round": _cpack._ctx_int(
+                            _ctx.get("fix_round") if isinstance(_ctx, dict) else 0),
+                        "no_ac": any(
+                            item.artifact_type == _cpack.TYPE_ISSUE
+                            and "no_ac=true" in (item.provenance or "")
+                            for item in _shadow_pack.items),
                     },
                 )
             except Exception:
