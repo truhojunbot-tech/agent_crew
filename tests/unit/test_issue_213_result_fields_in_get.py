@@ -79,6 +79,7 @@ def test_u213_get_task_http_endpoint_returns_result_fields(tmp_db, github_writes
             "description": "review PR", "branch": "main",
             "priority": 3, "context": {"pr_number": 99}, "project": "",
         })
+        record_dispatch_provenance(tmp_db, "review-213d")
         client.post("/tasks/review-213d/result", json={
             "task_id": "review-213d", "status": "completed",
             "summary": "Approved after reviewing the change; no blocking issues remain.",
@@ -93,6 +94,7 @@ def test_u213_get_task_http_endpoint_returns_result_fields(tmp_db, github_writes
         assert body["pr_number"] == 99
         assert body["status"] == "completed"
 
+from tests.dispatch_provenance import record_dispatch_provenance
 import pytest
 
 pytestmark = pytest.mark.usefixtures("pinned_task_transport")

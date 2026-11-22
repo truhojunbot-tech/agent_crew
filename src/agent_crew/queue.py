@@ -166,8 +166,8 @@ class ParkedResultRejected(RuntimeError):
     """A result for a row that never ran is refused with no write (#1050).
 
     A ``waiting_pool`` row has not been dispatched, so nothing can have
-    finished or timed out; nor can a wrapper deadline on a pending row that
-    was never handed to a worker.
+    finished or timed out. At the worker-facing entry points neither can any
+    row without dispatch provenance (see ``_refuse_undispatched_result_on``).
     """
     code = "PARKED_RESULT_REJECTED"
 
@@ -5861,20 +5861,32 @@ class TaskQueue:
 
     @staticmethod
     def _refuse_undispatched_result_on(conn, task_id: str, prior_status: str,
-                                       result: TaskResult) -> bool:
+                                       result: TaskResult, *,
+                                       worker_entry: bool = False) -> bool:
         """#1050: True when this result reports on work that never started.
 
-        Every result for a ``waiting_pool`` row is refused. On a pending row
-        only a wrapper timeout is, and only when the row was never dispatched:
-        other results on undispatched pending rows keep their existing path.
-        Scope: #1050 comment "Scope decision (agent-crew coordinator, 11-22 01:1xZ)".
+        Plan: Alfred option (a) 023138z (#1050 c7072954527 blocker). The broad
+        rule applies at the worker-facing entry points only — HTTP
+        ``POST /tasks/{id}/result`` and the MCP ``submit_result`` tool pass
+        ``worker_entry=True``. There any result is refused on a ``waiting_pool``
+        row or on a row with no dispatch provenance (``dispatched_at`` NULL and
+        no ``dispatched`` exec event), whatever its status or reason.
+
+        Server-internal terminal writes never pass it: ``_fail_if_active``
+        ends claimed rows before ``record_dispatch`` (no_worktree, prep
+        failures, dispatch_exception) and the canary completes a review
+        *instead of* dispatching it. For them only the original rule holds —
+        every ``waiting_pool`` row, and a wrapper timeout on a never-dispatched
+        pending row. ``worker_entry`` is a code-level caller boundary, not a
+        request field, header or env.
         """
         if prior_status == "waiting_pool":
             return True
-        info = result.error_info if isinstance(result.error_info, dict) else {}
-        if (prior_status != "pending" or result.status == "completed"
-                or info.get("reason") != "wrapper_timeout"):
-            return False
+        if not worker_entry:
+            info = result.error_info if isinstance(result.error_info, dict) else {}
+            if (prior_status != "pending" or result.status == "completed"
+                    or info.get("reason") != "wrapper_timeout"):
+                return False
         row = conn.execute("SELECT dispatched_at FROM tasks WHERE task_id=?",
                            (task_id,)).fetchone()
         if row is not None and row["dispatched_at"]:
@@ -5884,7 +5896,9 @@ class TaskQueue:
                 "SELECT 1 FROM task_exec_events WHERE task_id=? AND event='dispatched' "
                 "LIMIT 1", (task_id,)).fetchone()
         except sqlite3.OperationalError:
-            return False
+            # No event table to consult: a worker result with no dispatched_at
+            # is still unproven; the narrow internal rule stays permissive.
+            return worker_entry
         return dispatched is None
 
     def submit_result(self, task_id: str, result: TaskResult, *,
@@ -5896,7 +5910,8 @@ class TaskQueue:
                       dispatcher_failed: bool = False,
                       allow_review_replay: bool = False,
                       validate_review: bool = False,
-                      adopted_fallback_task_id: Optional[str] = None) -> str:
+                      adopted_fallback_task_id: Optional[str] = None,
+                      worker_entry: bool = False) -> str:
         """Submit a task result. Returns the task_type of the completed task
         (so push-model callers can decide what to push next).
 
@@ -5924,6 +5939,9 @@ class TaskQueue:
         ``late_result`` events are unverified evidence only. Their asserted
         verdict and commit must never become verdict, commit provenance, or a
         cascade, even when a presented nonce passes the read-only check.
+
+        ``worker_entry=True`` is passed only by the worker-facing HTTP and MCP
+        result entry points (#1050): see :meth:`_refuse_undispatched_result_on`.
         """
         result.__post_init__()  # The dataclass can be mutated before queue admission.
         conn = self._connect()
@@ -5944,7 +5962,8 @@ class TaskQueue:
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
             prior_status = row["status"]
-            if self._refuse_undispatched_result_on(conn, task_id, prior_status, result):
+            if self._refuse_undispatched_result_on(conn, task_id, prior_status, result,
+                                                  worker_entry=worker_entry):
                 conn.execute("ROLLBACK")
                 raise ParkedResultRejected(prior_status)
             task_context = _stored_context(row["context"], task_id)

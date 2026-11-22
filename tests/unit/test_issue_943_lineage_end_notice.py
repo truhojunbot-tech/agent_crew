@@ -10,6 +10,7 @@ from agent_crew.pipeline import fix_task_id
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 @pytest.fixture
@@ -41,6 +42,7 @@ def test_A_standalone_completion_has_one_structured_end_notice(harness):
     app, queue, notices = harness
     _task(queue, "research-943")
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "research-943")
         response = _result(client, "research-943")
     assert response.status_code == 200, response.text
     assert len(notices) == 1
@@ -60,8 +62,11 @@ def test_B_successor_suppresses_parent_and_merged_leaf_carries_pr(harness, monke
     monkeypatch.setattr("agent_crew.github.pr_head_sha", lambda *a, **k: "a" * 40)
     monkeypatch.setattr("agent_crew.github.pr_state", lambda *a, **k: "merged")
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "impl-943")
         assert _result(client, "impl-943", pr_number=943).status_code == 200
+        record_dispatch_provenance(queue, "review-943")
         assert _result(client, "review-943", verdict="approve", pr_number=943).status_code == 200
+        record_dispatch_provenance(queue, "test-943")
         assert _result(client, "test-943", pr_number=943).status_code == 200
     assert len(notices) == 1
     assert queue.external_op_get("merge:pr:943")["state"] == "done"
@@ -76,6 +81,7 @@ def test_C_terminal_without_retry_notifies(harness, monkeypatch, status):
     _task(queue, f"leaf-{status}")
     monkeypatch.setenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", "0")
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, f"leaf-{status}")
         assert _result(client, f"leaf-{status}", status).status_code == 200
     assert len(notices) == 1
     assert f"status={status}" in notices[0]
@@ -94,12 +100,14 @@ def test_D_retry_suppresses_end_until_exhaustion(harness):
     app, queue, notices = harness
     _task(queue, "impl-retry-943", "implement")
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "impl-retry-943")
         assert _result(client, "impl-retry-943", "failed",
                        error_info={"kind": "transient"}).status_code == 200
     assert queue.get_task("retry-impl-retry-943-a1") is not None
     assert notices == []
     _task(queue, "exhausted-943", "implement", retry_attempt=2)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "exhausted-943")
         assert _result(client, "exhausted-943", "failed").status_code == 200
     assert queue.get_task("retry-exhausted-943-a3") is None
     assert len(notices) == 1 and "task_id=exhausted-943" in notices[0]
@@ -109,7 +117,9 @@ def test_E_duplicate_result_does_not_duplicate_notice(harness):
     app, queue, notices = harness
     _task(queue, "once-943")
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "once-943")
         assert _result(client, "once-943").status_code == 200
+        record_dispatch_provenance(queue, "once-943")
         assert _result(client, "once-943").status_code in (200, 409)
     assert len(notices) == 1
 
@@ -118,6 +128,7 @@ def test_F_exhausted_provider_failure_uses_lineage_end_once(harness):
     app, queue, notices = harness
     _task(queue, "test-failed-943", "test", retry_attempt=2)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-failed-943")
         assert _result(client, "test-failed-943", "failed",
                        error_info={"reason": "exit_1", "final": True}).status_code == 200
     assert len(notices) == 1
@@ -131,6 +142,7 @@ def test_C3_unknown_reason_and_summary_do_not_reach_notice_sink(harness, monkeyp
     _task(queue, "leaf-secret-943")
     monkeypatch.setenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", "0")
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "leaf-secret-943")
         response = _result(client, "leaf-secret-943", "failed",
                            summary=f"provider wrote {secret}",
                            error_info={"reason": f"unexpected {secret}", "final": True})
@@ -151,6 +163,7 @@ def test_C3_known_reason_code_passes_through(harness):
     app, queue, notices = harness
     _task(queue, "known-reason-943")
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "known-reason-943")
         response = _result(client, "known-reason-943", "failed",
                            error_info={"reason": "no_artifact", "final": True})
     assert response.status_code == 200, response.text
@@ -184,6 +197,7 @@ def test_refused_review_fix_has_only_the_existing_successor_refused_notice(
         context={"risk_tier": 2, "issue": 943, "pr_number": 943,
                  "repo": "owner/repo"}), ingress="http.tasks")
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "review-refused-943")
         response = _result(client, "review-refused-943", verdict="request_changes",
                            findings=["HIGH src/x.py:1 - fix required"], pr_number=943)
     assert response.status_code == 200, response.text
@@ -200,6 +214,7 @@ def test_review_fix_created_by_server_suppresses_end_notice(harness, monkeypatch
     _task(queue, "review-fix-943", "review", pr_number=943,
           repo="owner/repo", base_branch="main")
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "review-fix-943")
         response = _result(client, "review-fix-943", verdict="request_changes",
                            findings=["HIGH src/x.py:1 - fix required"], pr_number=943)
     assert response.status_code == 200, response.text
@@ -214,6 +229,7 @@ def test_test_pass_without_merge_successor_notifies(harness, monkeypatch, pr_num
     ctx = {"pr_number": pr_number} if pr_number else {}
     _task(queue, "test-pass-943", "test", **ctx)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-pass-943")
         response = _result(client, "test-pass-943", pr_number=pr_number)
     assert response.status_code == 200, response.text
     assert len(notices) == 1
@@ -245,12 +261,14 @@ def test_mcp_completed_leaf_notifies_and_fallback_continuation_does_not(
                         lambda message: sent.append(message) or True)
     mcp = build_mcp_server(queue.db_path)
     submit = mcp._tool_manager._tools["submit_result"].fn
+    record_dispatch_provenance(queue, "mcp-leaf-943")
     assert submit(task_id="mcp-leaf-943", status="completed",
                   summary="research complete")["acknowledged"]
     assert len(sent) == 1 and "kind=lineage_end" in sent[0]
 
     monkeypatch.setattr("agent_crew.mcp_server.auto_fallback_failed_task",
                         lambda *a, **k: True)
+    record_dispatch_provenance(queue, "mcp-continuing-943")
     assert submit(task_id="mcp-continuing-943", status="failed",
                   summary="provider limited")["acknowledged"]
     assert len(sent) == 1

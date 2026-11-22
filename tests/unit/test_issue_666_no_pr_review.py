@@ -5,6 +5,7 @@ from unittest.mock import patch
 from agent_crew.pipeline import auto_enqueue_review
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _completed_impl(tmp_path, *, crew_run_branch=False, branch="agent/work"):
@@ -176,6 +177,7 @@ def test_http_result_pushes_pr_opening_retry_to_implementer(tmp_path, monkeypatc
                         "crew_run_branch": False},
         })
         assert response.status_code == 201
+        record_dispatch_provenance(str(tmp_path / "http.db"), "impl-http-666")
         result = client.post("/tasks/impl-http-666/result", json={
             "task_id": "impl-http-666", "status": "completed", "summary": "pushed",
             "branch": "agent/work", "commit": "a" * 40,

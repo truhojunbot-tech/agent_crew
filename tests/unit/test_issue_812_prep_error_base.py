@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from agent_crew import server as sv
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _git(path, *args):
@@ -100,6 +101,7 @@ def test_fetch_timeout_uses_head_and_descendant_completion_passes(
         _git(worker, "commit", "-m", "change")
         commit = _git(worker, "rev-parse", "HEAD")
         _git(worker, "push", "origin", "feature")
+        record_dispatch_provenance(queue, "impl-812-head")
         result = client.post("/tasks/impl-812-head/result", json={
             "task_id": "impl-812-head", "status": "completed", "summary": "pushed",
             "branch": "feature", "commit": commit,

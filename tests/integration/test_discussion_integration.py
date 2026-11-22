@@ -8,6 +8,7 @@ from agent_crew.discussion import (
     multi_round,
 )
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 pytestmark = pytest.mark.integration
@@ -143,6 +144,7 @@ def test_i_di04_agent_failure(tmp_db):
         success_summaries = {}
         for task_id, agent in zip(task_ids[:2], agents[:2]):
             summary = f"{agent} opinion on {topic}"
+            record_dispatch_provenance(tmp_db, task_id)
             client.post(f"/tasks/{task_id}/result", json={
                 "task_id": task_id,
                 "status": "completed",
@@ -153,6 +155,7 @@ def test_i_di04_agent_failure(tmp_db):
 
         # gemini: 실패 결과 제출 (실제 HTTP POST)
         failed_task_id = task_ids[2]
+        record_dispatch_provenance(tmp_db, failed_task_id)
         client.post(f"/tasks/{failed_task_id}/result", json={
             "task_id": failed_task_id,
             "status": "failed",

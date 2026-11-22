@@ -11,6 +11,7 @@ from agent_crew.failure_kind import FailureKind, classify_provider_record, provi
 from agent_crew.loop import handle_test_result
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import RuntimeTransitionRefused, TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def test_failure_routing_does_not_search_summary_findings_or_pane_text():
@@ -49,6 +50,7 @@ def test_exhaustion_gate_uses_kind_even_when_prose_is_identical(
                             anomaly_disabled=True, identity_required=False,
                             fallback_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "quota-task")
         response = client.post("/tasks/quota-task/result", json={
             "task_id": "quota-task", "status": "failed",
             "summary": "quota exhausted", "findings": ["rate limit exceeded"],

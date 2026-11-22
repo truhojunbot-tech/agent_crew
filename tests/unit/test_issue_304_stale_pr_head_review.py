@@ -36,6 +36,7 @@ from agent_crew.pipeline import (
     review_publication_decision,
     stale_review_task_id,
 )
+from tests.dispatch_provenance import record_dispatch_provenance
 
 PINNED = "5b496a9f8143f4a9484aeb353152cf52e7a90bcd"
 MOVED_TO = "28419e9626f06713552225be3abe38d3ee2835a1"
@@ -259,6 +260,7 @@ def _submit_review(tmp_db, monkeypatch, head, *, unused_tcp_port):
                                 "reviewed_sha": PINNED, "coordinator_managed": True,
                                 "risk_tier": 2}))
     with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
+        record_dispatch_provenance(q, "review-stale")
         response = client.post("/tasks/review-stale/result", json={
             "task_id": "review-stale", "status": "completed",
             "summary": "Review found a blocker in the current PR changes", "verdict": "request_changes",
@@ -355,6 +357,7 @@ def _submit_approve(tmp_db, monkeypatch, head, *, no_tester=False, unused_tcp_po
     app = create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True, push_fn=lambda *a, **k: None)
     with TestClient(app) as client:
+        record_dispatch_provenance(q, "review-approve")
         response = client.post("/tasks/review-approve/result", json={
             "task_id": "review-approve", "status": "completed",
             "summary": "Reviewed the current PR head and approved the changes", "verdict": "approve", "pr_number": 5652})
@@ -493,6 +496,7 @@ def test_a_non_review_result_still_submits(tmp_db, *, unused_tcp_port):
     app = create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True, push_fn=lambda *a, **k: None)
     with TestClient(app) as client:
+        record_dispatch_provenance(q, "impl-plain")
         response = client.post("/tasks/impl-plain/result", json={
             "task_id": "impl-plain", "status": "completed", "summary": "done"})
     assert response.status_code == 200, response.text

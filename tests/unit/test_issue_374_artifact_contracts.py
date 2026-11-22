@@ -22,6 +22,7 @@ from agent_crew.pipeline import (
 )
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _run(cwd, *args):
@@ -293,6 +294,7 @@ def test_http_report_task_is_accepted_and_the_artifact_is_pinned(tmp_db):
                               context={"worktree_base_sha": "a" * 40, "artifact_kind": "report",
                                        "report_format": "markdown"}))
     with _app(tmp_db) as client:
+        record_dispatch_provenance(queue, "w2")
         response = client.post("/tasks/w2/result", json={
             "task_id": "w2", "status": "completed", "summary": "inventory done",
             "artifact": {"body": REPORT, "sha256": REPORT_SHA}})
@@ -310,6 +312,7 @@ def test_http_report_task_with_a_wrong_hash_is_held(tmp_db):
     queue.enqueue(TaskRequest("w2b", "implement", "inventory", branch="main",
                               context={"artifact_kind": "report"}))
     with _app(tmp_db) as client:
+        record_dispatch_provenance(queue, "w2b")
         response = client.post("/tasks/w2b/result", json={
             "task_id": "w2b", "status": "completed", "summary": "x",
             "artifact": {"body": REPORT, "sha256": "0" * 64}})
@@ -449,6 +452,7 @@ def test_http_unrelated_force_push_is_held_no_artifact(tmp_db, dispatched):
     app = create_app(tmp_db, pane_map={"reviewer": "%crew-test-reviewer"},
                      watchdog_disabled=True, worktree_map={"implementer": dispatched["verifier"]})
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "rb")
         response = client.post("/tasks/rb/result", json={
             "task_id": "rb", "status": "completed", "summary": "rebased and pushed",
             "branch": "feat", "commit": commit})
@@ -468,6 +472,7 @@ def _mcp_submit(tmp_db, **kwargs):
     import asyncio
     from agent_crew.mcp_server import build_mcp_server
     tool = build_mcp_server(tmp_db)._tool_manager._tools["submit_result"].fn
+    record_dispatch_provenance(tmp_db, kwargs["task_id"])
     out = tool(**kwargs)
     return asyncio.run(out) if asyncio.iscoroutine(out) else out
 

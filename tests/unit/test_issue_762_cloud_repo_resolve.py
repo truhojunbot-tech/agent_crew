@@ -16,6 +16,7 @@ from agent_crew.cli import crew
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _git_repo(path, origin):
@@ -225,6 +226,7 @@ def test_cloud_cost_recorded_on_result_cancel_and_fail(tmp_path, monkeypatch):
     app = create_app(queue._db_path, pane_map={}, watchdog_disabled=True,
                      anomaly_disabled=True, identity_required=False)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "posted")
         assert client.post("/tasks/posted/result", json={
             "task_id": "posted", "status": "completed", "summary": "done"}).status_code == 200
         assert client.delete("/tasks/cancelled").status_code == 200

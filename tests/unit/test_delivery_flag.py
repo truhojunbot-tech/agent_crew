@@ -81,6 +81,7 @@ class TestMcpStillCascadesAfterSubmit:
         )
         with TestClient(app) as client:
             client.post("/tasks", json=_task_payload("imp-1"))
+            record_dispatch_provenance(tmp_db, "imp-1")
             client.post(
                 "/tasks/imp-1/result",
                 json={
@@ -165,11 +166,13 @@ class TestNoTesterFlag:
              patch("agent_crew.github.pr_state", return_value="open"):
             with TestClient(app) as client:
                 client.post("/tasks", json=_review_task_payload("r-test", no_tester=False))
+                record_dispatch_provenance(tmp_db, "r-test")
                 client.post(f"/tasks/r-test/result", json=_approved_result("r-test"))
                 tasks = client.get("/tasks").json()
         test_tasks = [t for t in tasks if t["task_type"] == "test"]
         assert len(test_tasks) == 1, "test task must be enqueued when no_tester is absent"
 
+from tests.dispatch_provenance import record_dispatch_provenance
 import pytest
 
 pytestmark = pytest.mark.usefixtures("pinned_task_transport")

@@ -9,6 +9,7 @@ from agent_crew import github
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _pending_merge(tmp_path, monkeypatch, *, timeout=False):
@@ -79,6 +80,7 @@ def _post_result(client, task_id):
 def test_tick_rechecks_pending_then_merges_with_worktree_repo(tmp_path, monkeypatch):
     app, queue, repo_cwds, ci_calls, merged, worktree = _pending_merge(tmp_path, monkeypatch)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-641")
         _post_result(client, "test-641")
         assert queue.external_op_get("merge:pr:641")["state"] == "reserved"
         time.sleep(0.1)
@@ -96,6 +98,7 @@ def test_tick_rechecks_pending_then_merges_with_worktree_repo(tmp_path, monkeypa
 def test_pending_timeout_preserves_since_and_stays_skipped(tmp_path, monkeypatch):
     app, queue, _, ci_calls, merged, _ = _pending_merge(tmp_path, monkeypatch, timeout=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-641")
         _post_result(client, "test-641")
         op = queue.external_op_get("merge:pr:641")
         since = op["last_error"].split("since=")[1].split()[0]
@@ -118,6 +121,7 @@ def test_pending_timeout_preserves_since_and_stays_skipped(tmp_path, monkeypatch
                                   context={"prev_task_id": "review-641", "pr_number": 641,
                                            "reviewed_sha": "a" * 40,
                                            "allow_duplicate_review": True}))
+        record_dispatch_provenance(queue, "test-641-again")
         _post_result(client, "test-641-again")
     assert not merged.is_set()
     assert len(ci_calls) == 3

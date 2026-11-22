@@ -10,6 +10,7 @@ from agent_crew.pipeline import fix_task_id
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _harness(tmp_path, monkeypatch):
@@ -65,6 +66,7 @@ def _failed_script_result(client):
 def test_script_new_failures_create_one_fix_with_lineage(tmp_path, monkeypatch):
     app, queue, notices = _harness(tmp_path, monkeypatch)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-795")
         response = _failed_script_result(client)
     assert response.status_code == 200, response.text
     fix_id = fix_task_id("test-795", 1)
@@ -86,6 +88,7 @@ def test_script_new_failures_create_one_fix_with_lineage(tmp_path, monkeypatch):
 def test_llm_test_failure_with_findings_creates_fix(tmp_path, monkeypatch):
     app, queue, notices = _harness(tmp_path, monkeypatch)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-795")
         response = _post(client, findings=["tests/test_y.py::test_y failed"])
     assert response.status_code == 200, response.text
     fix = queue.get_task(fix_task_id("test-795", 1))
@@ -101,10 +104,12 @@ def test_failed_tester_result_creates_one_fix_on_both_transports(
     finding = "tests/test_y.py::test_y failed"
     if transport == "http":
         with TestClient(app) as client:
+            record_dispatch_provenance(queue, "test-795")
             response = _post(client, findings=[finding])
         assert response.status_code == 200, response.text
     else:
         mcp = build_mcp_server(queue.db_path)
+        record_dispatch_provenance(queue, "test-795")
         response = mcp._tool_manager._tools["submit_result"].fn(
             task_id="test-795", status="failed", summary="test outcome",
             findings=[finding], pr_number=794,
@@ -120,6 +125,7 @@ def test_failed_tester_result_creates_one_fix_on_both_transports(
 def test_mcp_script_new_failures_without_findings_create_fix(tmp_path, monkeypatch):
     _, queue, _ = _harness(tmp_path, monkeypatch)
     mcp = build_mcp_server(queue.db_path)
+    record_dispatch_provenance(queue, "test-795")
     response = mcp._tool_manager._tools["submit_result"].fn(
         task_id="test-795", status="failed", summary="script test FAILED",
         pr_number=794, error_info={
@@ -139,12 +145,14 @@ def test_fix_cap_sends_one_notice_without_successor(tmp_path, monkeypatch, trans
     app, queue, notices = _harness(tmp_path, monkeypatch)
     if transport == "http":
         with TestClient(app) as client:
+            record_dispatch_provenance(queue, "test-795")
             response = _failed_script_result(client)
         assert response.status_code == 200, response.text
     else:
         monkeypatch.setattr("agent_crew.notify.notify_telegram",
                             lambda message: notices.append(message) or True)
         mcp = build_mcp_server(queue.db_path)
+        record_dispatch_provenance(queue, "test-795")
         response = mcp._tool_manager._tools["submit_result"].fn(
             task_id="test-795", status="failed", summary="test outcome",
             findings=["tests/test_y.py::test_y failed"], pr_number=794,
@@ -158,6 +166,7 @@ def test_fix_cap_sends_one_notice_without_successor(tmp_path, monkeypatch, trans
 def test_not_run_does_not_create_fix_or_notice(tmp_path, monkeypatch):
     app, queue, notices = _harness(tmp_path, monkeypatch)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-795")
         response = _post(client, error_info={"final": True})
     assert response.status_code == 200, response.text
     assert queue.get_task(fix_task_id("test-795", 1)) is None

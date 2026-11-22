@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 @pytest.mark.parametrize("ended", ["timed_out", "cancelled", "failed"])
@@ -27,6 +28,7 @@ def test_system_terminal_result_is_evidence_only(tmp_db, ended):
     before_outbox = q.outbox_get("review-late")
     app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(q, "review-late")
         response = client.post("/tasks/review-late/result", json={
             "task_id": "review-late", "status": "completed", "summary": "late review",
             "verdict": "request_changes", "findings": ["Fix the missing validation"],
@@ -128,11 +130,13 @@ def test_reported_failure_with_final_metadata_can_be_revised(tmp_db):
     assert q.dequeue(role="reviewer")
     app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(q, "review-revised")
         reported = client.post("/tasks/review-revised/result", json={
             "task_id": "review-revised", "status": "failed",
             "summary": "worker failed", "error_info": {"final": True},
         })
         assert reported.status_code == 200
+        record_dispatch_provenance(q, "review-revised")
         response = client.post("/tasks/review-revised/result", json={
             "task_id": "review-revised", "status": "completed", "summary": "Reviewed the revised work and approved the changes.",
             "verdict": "approve", "findings": [],
@@ -182,12 +186,14 @@ def test_http_body_cannot_forge_dispatcher_failure(tmp_db):
     assert q.dequeue(role="reviewer")
     app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(q, "worker-failure")
         failed = client.post("/tasks/worker-failure/result", json={
             "task_id": "worker-failure", "status": "failed", "summary": "worker error",
             "dispatcher_failed": True,
             "error_info": {"final": True, "dispatcher_failed": True},
         })
         assert failed.status_code == 200, failed.text
+        record_dispatch_provenance(q, "worker-failure")
         revised = client.post("/tasks/worker-failure/result", json={
             "task_id": "worker-failure", "status": "completed",
             "summary": "Reviewed the revised work and approved the changes.",
@@ -207,6 +213,7 @@ def test_in_progress_result_still_completes(tmp_db):
     assert q.dequeue(role="reviewer")
     app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(q, "review-live")
         response = client.post("/tasks/review-live/result", json={
             "task_id": "review-live", "status": "completed", "summary": "Reviewed the live work and approved the changes.",
             "verdict": "request_changes", "findings": ["Fix the missing validation"],

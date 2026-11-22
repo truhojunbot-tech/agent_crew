@@ -8,6 +8,7 @@ from agent_crew.mcp_server import build_mcp_server
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.telemetry import ClaudeSessionTelemetryAdapter
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _session(home, cwd):
@@ -42,6 +43,7 @@ def test_mcp_result_submission_captures_claude_usage(tmp_path, monkeypatch):
     mcp_db = tmp_path / "mcp.db"
     mcp = build_mcp_server(str(mcp_db))
     _seed(mcp_db, "mcp-317", cwd)
+    record_dispatch_provenance(str(mcp_db), "mcp-317")
     response = _call(mcp, "submit_result", task_id="mcp-317", status="completed", summary="done")
     assert response["acknowledged"] is True
 

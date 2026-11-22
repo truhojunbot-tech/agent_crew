@@ -14,6 +14,7 @@ import pytest
 from agent_crew import pipeline
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 TARGET_REPO = "truhojunbot-tech/quota-ops"
@@ -46,12 +47,13 @@ def _app(tmp_db, state_path):
                       watchdog_disabled=True, anomaly_disabled=True)
 
 
-def _post_task(client, task_id, task_type, context, pr_number=91001):
+def _post_task(client, task_id, task_type, context, pr_number=91001, *, db):
     response = client.post("/tasks", json={
         "task_id": task_id, "task_type": task_type, "description": task_type,
         "branch": "fix/canonical", "priority": 3, "context": context, "project": "",
     })
     assert response.status_code == 201, response.text
+    record_dispatch_provenance(db, task_id)
     return _submit_result(client, task_id, task_type, pr_number)
 
 
@@ -116,7 +118,7 @@ def test_A_merge_uses_worktree_repo_not_dispatcher_cwd(tmp_db, tmp_path, monkeyp
                               branch="fix/canonical"))
     app = _app(tmp_db, state_path)
     with TestClient(app) as client:
-        assert _post_task(client, "review-A", "review", {"pr_number": 91002, "no_tester": True, "prev_task_id": "impl-A"}, 91002).status_code == 200
+        assert _post_task(client, "review-A", "review", {"pr_number": 91002, "no_tester": True, "prev_task_id": "impl-A"}, 91002, db=tmp_db).status_code == 200
         queue.merge_task_context("review-A", {"reviewed_sha": "a" * 40})
         created = client.post("/tasks", json={
             "task_id": "test-A", "task_type": "test", "description": "test",
@@ -125,6 +127,7 @@ def test_A_merge_uses_worktree_repo_not_dispatcher_cwd(tmp_db, tmp_path, monkeyp
         })
         assert created.status_code == 201, created.text
         queue.merge_task_context("test-A", {"reviewed_sha": "a" * 40})
+        record_dispatch_provenance(queue, "test-A")
         assert _submit_result(client, "test-A", "test", 91002).status_code == 200
     assert state_calls == calls == [TARGET_REPO]
 
@@ -140,7 +143,7 @@ def test_B_missing_repo_marks_merge_failed_without_github_calls(tmp_db, tmp_path
     monkeypatch.setattr("agent_crew.github.pr_state", lambda *a, **k: pytest.fail("no state read"))
     monkeypatch.setattr("agent_crew.github.merge_pr", lambda *a, **k: pytest.fail("no merge"))
     with TestClient(_app(tmp_db, state_path)) as client:
-        response = _post_task(client, "review-B", "review", {"pr_number": 91004, "no_tester": True}, 91004)
+        response = _post_task(client, "review-B", "review", {"pr_number": 91004, "no_tester": True}, 91004, db=tmp_db)
     assert response.status_code == 200
     assert TaskQueue(tmp_db).external_op_get("merge:pr:91004") is None
 
@@ -152,10 +155,11 @@ def test_C_repo_survives_implement_review_test_lineage(tmp_db, tmp_path, monkeyp
     _patch_open_pr(monkeypatch)
     app = _app(tmp_db, _state_path(tmp_path, []))
     with TestClient(app) as client:
-        assert _post_task(client, "impl-C", "implement", {"pr_number": 91005, "repo": TARGET_REPO}, 91005).status_code == 200
+        assert _post_task(client, "impl-C", "implement", {"pr_number": 91005, "repo": TARGET_REPO}, 91005, db=tmp_db).status_code == 200
         review = next(t for t in TaskQueue(tmp_db).list_tasks()
                       if t.task_id == "review-impl-C-r0")
         assert review.context["repo"] == TARGET_REPO
+        record_dispatch_provenance(tmp_db, review.task_id)
         assert _submit_result(client, review.task_id, "review", 91005).status_code == 200
     test = next(t for t in TaskQueue(tmp_db).list_tasks()
                 if t.task_id == "test-review-impl-C-r0")
@@ -174,7 +178,7 @@ def test_D_no_tester_review_does_not_merge(tmp_db, tmp_path, monkeypatch):
     TaskQueue(tmp_db).enqueue(TaskRequest(task_id="impl-D", task_type="implement",
                                           description="work", branch="fix/canonical"))
     with TestClient(_app(tmp_db, _state_path(tmp_path, []))) as client:
-        assert _post_task(client, "review-D", "review", {"pr_number": 91006, "repo": TARGET_REPO, "no_tester": True, "prev_task_id": "impl-D"}, 91006).status_code == 200
+        assert _post_task(client, "review-D", "review", {"pr_number": 91006, "repo": TARGET_REPO, "no_tester": True, "prev_task_id": "impl-D"}, 91006, db=tmp_db).status_code == 200
     assert calls == []
     assert TaskQueue(tmp_db).external_op_get("merge:pr:91006") is None
     assert not [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "test"]
@@ -226,6 +230,7 @@ def test_H_stop_admission_remains_before_merge_even_with_repo_params(tmp_db, tmp
         })
         assert created.status_code == 201
         TaskQueue(tmp_db).set_stop_epoch(True, incident="canonical-test")
+        record_dispatch_provenance(tmp_db, "review-H")
         assert _submit_result(client, "review-H", "review", 91009).status_code == 200
     assert TaskQueue(tmp_db).external_op_get("merge:pr:91009") is None
 
@@ -242,7 +247,7 @@ def test_I_coordinator_managed_no_tester_requires_independent_status(tmp_db, tmp
     TaskQueue(tmp_db).enqueue(TaskRequest(task_id="impl-I", task_type="implement",
                                           description="work", branch="fix/canonical"))
     with TestClient(_app(tmp_db, _state_path(tmp_path, []))) as client:
-        assert _post_task(client, "review-I", "review", {"pr_number": 91010, "repo": TARGET_REPO, "no_tester": True, "coordinator_managed": True, "prev_task_id": "impl-I"}, 91010).status_code == 200
+        assert _post_task(client, "review-I", "review", {"pr_number": 91010, "repo": TARGET_REPO, "no_tester": True, "coordinator_managed": True, "prev_task_id": "impl-I"}, 91010, db=tmp_db).status_code == 200
     assert merged == []
     assert TaskQueue(tmp_db).external_op_get("merge:pr:91010") is None
 

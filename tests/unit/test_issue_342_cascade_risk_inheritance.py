@@ -8,6 +8,7 @@ from agent_crew.pipeline import (auto_enqueue_fix, auto_enqueue_review,
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 ROUTINE = {
@@ -140,6 +141,7 @@ def test_server_same_role_retry_marks_root_declaration_inherited(tmp_db, monkeyp
     app = create_app(tmp_db, pane_map={}, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "risk-root")
         response = client.post("/tasks/risk-root/result", json={
             "task_id": "risk-root", "status": "failed", "summary": "usage limit hit",
             "findings": [], "error_info": {"kind": "transient"},

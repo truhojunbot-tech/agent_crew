@@ -7,6 +7,7 @@ pytestmark = pytest.mark.usefixtures("pinned_task_transport")
 from agent_crew.server import create_app
 from agent_crew.queue import TaskQueue
 from agent_crew.protocol import TaskRequest
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _task_payload(task_id="t1", task_type="implement", description="do work", priority=3, project=""):
@@ -55,6 +56,7 @@ def test_u_sp14_impl_completed_auto_enqueue_review(tmp_db):
         impl = _task_payload("impl-001", "implement", "Add feature X")
         impl["context"]["crew_run_branch"] = True
         assert client.post("/tasks", json=impl).status_code == 201
+        record_dispatch_provenance(tmp_db, "impl-001")
         assert client.post("/tasks/impl-001/result", json=_result_payload("impl-001")).status_code == 200
     reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
     assert len(reviews) == 1
@@ -67,6 +69,7 @@ def test_u_sp15_impl_failed_no_auto_review(tmp_db):
     app = create_app(db_path=tmp_db, pane_map={})
     with TestClient(app) as client:
         assert client.post("/tasks", json=_task_payload("impl-002")).status_code == 201
+        record_dispatch_provenance(tmp_db, "impl-002")
         assert client.post("/tasks/impl-002/result", json=_result_payload("impl-002", status="failed")).status_code == 200
     assert [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"] == []
 
@@ -77,6 +80,7 @@ def test_u_sp16_impl_needs_human_no_auto_review(tmp_db):
     app = create_app(db_path=tmp_db, pane_map={})
     with TestClient(app) as client:
         assert client.post("/tasks", json=_task_payload("impl-003")).status_code == 201
+        record_dispatch_provenance(tmp_db, "impl-003")
         assert client.post("/tasks/impl-003/result", json=_result_payload("impl-003", status="needs_human")).status_code == 200
     assert [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"] == []
 
@@ -89,6 +93,7 @@ def test_u_sp17_auto_review_task_queryable(tmp_db):
         impl = _task_payload("impl-004", "implement", "Fix bug Y")
         impl["context"]["crew_run_branch"] = True
         assert client.post("/tasks", json=impl).status_code == 201
+        record_dispatch_provenance(tmp_db, "impl-004")
         assert client.post("/tasks/impl-004/result", json=_result_payload("impl-004")).status_code == 200
         reviews = [t for t in client.get("/tasks").json() if t["task_type"] == "review"]
     assert len(reviews) == 1
@@ -121,6 +126,7 @@ def test_u_sp20_auto_enqueue_review_inherits_project(tmp_db):
         client.post("/tasks", json=impl)
 
         # Submit completed result → triggers _auto_enqueue_review
+        record_dispatch_provenance(tmp_db, "impl-sp20")
         r = client.post("/tasks/impl-sp20/result", json=_result_payload("impl-sp20"))
         assert r.status_code == 200
 
@@ -161,6 +167,7 @@ def test_u_sp21_auto_enqueue_review_rejects_cross_project(tmp_db):
         client.post("/tasks", json=impl)
 
         # Submit result — should NOT auto-enqueue a review task
+        record_dispatch_provenance(tmp_db, "impl-sp21")
         r = client.post("/tasks/impl-sp21/result", json=_result_payload("impl-sp21"))
         assert r.status_code == 200
 

@@ -9,6 +9,7 @@ from agent_crew import github, pause
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 @pytest.fixture
@@ -67,6 +68,7 @@ def _submit_with_stop_race(client, queue, monkeypatch):
         return original(self, key, pr_number)
 
     monkeypatch.setattr(TaskQueue, "external_op_reserve", stop_before_merge)
+    record_dispatch_provenance(queue, "test-959")
     response = client.post("/tasks/test-959/result", json={
         "task_id": "test-959", "status": "completed", "summary": "PASS",
         "pr_number": 959, "error_info": {"script_test": {
@@ -210,6 +212,7 @@ def test_unknown_pr_state_is_owed_then_replays_merge_and_publishes_status(
                         lambda *a, **k: publications.append(1) or True)
     head["state"] = "unknown"
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-959")
         _submit_unknown_merge(client)
         assert merges == [] and publications == []
         assert queue.outbox_get("test-959")["state"] == "pending"
@@ -228,6 +231,7 @@ def test_unknown_pr_state_replay_stops_at_attempt_cap_and_notices_once(
     queue, app, head, merges, notices = merge_case
     head["state"] = "unknown"
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-959")
         _submit_unknown_merge(client)
         for _ in range(5):
             client.post("/admin/replay-suppressed")
@@ -244,6 +248,7 @@ def test_unknown_pr_state_then_terminal_state_ends_owed_merge(
     queue, app, head, merges, notices = merge_case
     head["state"] = "unknown"
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-959")
         _submit_unknown_merge(client)
         head["state"] = state
         client.post("/admin/replay-suppressed")

@@ -13,6 +13,7 @@ from agent_crew.pipeline import ARTIFACT_KINDS
 from agent_crew.protocol import TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 pytestmark = pytest.mark.usefixtures("admit_crew_run")  # #1006: subject is not admission
 
@@ -113,10 +114,12 @@ def test_enqueue_report_contract_is_verified_by_server(tmp_path):
     app = create_app(str(db), pane_map={}, worktree_map={}, watchdog_disabled=True,
                      anomaly_disabled=True, identity_required=False)
     with TestClient(app) as client:
+        record_dispatch_provenance(db, "impl-valid")
         valid = client.post("/tasks/impl-valid/result", json={
             "task_id": "impl-valid", "status": "completed", "summary": "measurement done",
             "artifact": {"body": report, "sha256": sha},
         })
+        record_dispatch_provenance(db, "impl-missing")
         missing = client.post("/tasks/impl-missing/result", json={
             "task_id": "impl-missing", "status": "completed", "summary": "measurement done",
         })

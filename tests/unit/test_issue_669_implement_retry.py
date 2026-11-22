@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from agent_crew.instructions import generate
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 SHA = "a" * 40
@@ -49,6 +50,7 @@ def test_failed_implement_with_pushed_commit_is_not_retried(
             "context": {"repo": "owner/repo", "pr_number": 999669, "risk_tier": 2},
         })
         assert created.status_code in (200, 201), created.text
+        record_dispatch_provenance(tmp_db, task_id)
         result = client.post(f"/tasks/{task_id}/result", json={
             "task_id": task_id, "status": "failed", "summary": summary,
             "branch": BRANCH, "commit": SHA, "pr_number": 999669,
@@ -75,6 +77,7 @@ def test_failed_implement_without_transient_kind_is_not_retried(tmp_db, monkeypa
             "project": "example", "context": {"repo": "owner/repo", "risk_tier": 2},
         })
         assert created.status_code in (200, 201), created.text
+        record_dispatch_provenance(tmp_db, "impl-no-commit")
         result = client.post("/tasks/impl-no-commit/result", json={
             "task_id": "impl-no-commit", "status": "failed",
             "summary": "provider failed before push",
@@ -102,6 +105,7 @@ def test_branch_head_requires_the_reported_commit(tmp_db, monkeypatch,
             "project": "example", "context": {"repo": "owner/repo", "risk_tier": 2},
         })
         assert created.status_code in (200, 201), created.text
+        record_dispatch_provenance(tmp_db, "impl-branch")
         result = client.post("/tasks/impl-branch/result", json={
             "task_id": "impl-branch", "status": "failed", "summary": "failed after push",
             "branch": BRANCH, "commit": SHA,

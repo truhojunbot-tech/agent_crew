@@ -60,6 +60,7 @@ from agent_crew.server import create_app
 from tests.unit import test_sev0_e8_adversarial as e8
 from tests.unit.test_sev0_e8_adversarial import (
     CAPABILITY, RecordingPush, request, seed_history, write_registry)
+from tests.dispatch_provenance import record_dispatch_provenance
 
 PANES = {"implementer": "%900201", "reviewer": "%900202", "tester": "%900203"}
 ADAPTER_HEADER = {"X-Agent-Crew-Adapter": "manual:fixture-operator"}   # provisional (§6.5)
@@ -202,6 +203,7 @@ def test_cx_4b_coordinator_managed_completion_still_yields_review(crew):
                                  context={"coordinator_managed": True,
                                           "crew_run_branch": True}))
         assert r.status_code == 201
+        record_dispatch_provenance(db, "adm-impl-cm")
         assert complete(client, "adm-impl-cm").status_code == 200
         assert successors_of(client, "adm-impl-cm", "review"), (
             f"no review for coordinator_managed completion: {tasks_of_type(client, 'review')}")
@@ -478,6 +480,7 @@ def test_cxc_6a_g11_gap_missing_dispatch_base_is_a_failure_not_a_skip(crew):
     make, push, db = crew
     with make() as client:
         assert post(client, request("cxc6a", "Implement something")).status_code == 201
+        record_dispatch_provenance(db, "cxc6a")
         r = complete(client, "cxc6a")                       # no worktree_base_sha anywhere
         body = r.json()
         assert body.get("held") or rows(db)["cxc6a"] != "completed", (
@@ -595,6 +598,7 @@ def test_control_honest_executor_result_is_accepted(crew):
         block = next((m for _, m in push.calls if "ctl-honest" in m), "")
         nonce = (re.search(r"nonce:\s*(\S+)", block) or [None, None])[1]
         extra = {"dispatch_nonce": nonce} if nonce else {}
+        record_dispatch_provenance(db, "ctl-honest")
         assert complete(client, "ctl-honest", **extra).status_code == 200
     assert rows(db)["ctl-honest"] not in ("pending", "in_progress")
 

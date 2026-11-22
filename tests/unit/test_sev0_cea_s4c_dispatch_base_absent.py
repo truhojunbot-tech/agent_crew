@@ -27,6 +27,7 @@ from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 
 from tests.unit.test_sev0_cea_s2c_writer_callsites import WIRED, admitted
+from tests.dispatch_provenance import record_dispatch_provenance
 
 UNREACHABLE_PANE = "no-such-session:0.0"
 MODE = "AGENT_CREW_CEA_MODE"
@@ -165,6 +166,7 @@ def test_under_shadow_the_result_still_stands(tmp_db, monkeypatch):
     monkeypatch.setenv(MODE, "shadow")
     queue = _baseless_implement(tmp_db)
     with _app(tmp_db) as client:
+        record_dispatch_provenance(tmp_db, "impl-nobase")
         response = client.post("/tasks/impl-nobase/result", json={
             "task_id": "impl-nobase", "status": "completed", "summary": "tests green"})
 
@@ -204,6 +206,7 @@ def test_a_task_that_does_have_a_base_is_unaffected(tmp_db, monkeypatch):
     monkeypatch.setattr("agent_crew.server.verify_implement_artifact",
                         lambda *_a, **_k: (True, "test evidence"))
     with _app(tmp_db) as client:
+        record_dispatch_provenance(queue, "impl-based")
         response = client.post("/tasks/impl-based/result", json={
             "task_id": "impl-based", "status": "completed", "summary": "green",
             "commit": "b" * 40})

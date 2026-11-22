@@ -7,6 +7,7 @@ from agent_crew.mcp_server import build_mcp_server
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 SUMMARY = "PR #586 review: verdict request_changes, one HIGH finding below."
@@ -30,11 +31,13 @@ def test_missing_verdict_is_422_and_repost_with_verdict_completes(tmp_db, monkey
     payload = {"task_id": "review-586", "status": "completed", "summary": SUMMARY,
                "findings": [FINDING], "pr_number": 586}
     with TestClient(create_app(tmp_db)) as client:
+        record_dispatch_provenance(queue, "review-586")
         response = client.post("/tasks/review-586/result", json=payload)
         assert response.status_code == 422
         assert "verdict" in response.json()["detail"]
         assert _task(queue, "review-586").status == "in_progress"
 
+        record_dispatch_provenance(queue, "review-586")
         response = client.post("/tasks/review-586/result",
                                json={**payload, "verdict": "request_changes"})
     assert response.status_code == 200
@@ -96,6 +99,7 @@ def test_mcp_review_without_verdict_is_rejected_and_stays_live(tmp_db, claimed):
         assert queue.dequeue(role="reviewer").task_id == "review-586"
     mcp = build_mcp_server(tmp_db)
     submit = mcp._tool_manager._tools["submit_result"].fn
+    record_dispatch_provenance(queue, "review-586")
     response = submit(task_id="review-586", status="completed", summary=SUMMARY,
                       findings=[FINDING], pr_number=586)
     assert response["acknowledged"] is False

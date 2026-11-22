@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 #: A pane id tmux can never hand out — real ids are "%" + digits. Hardcoding
@@ -41,6 +42,7 @@ def test_completed_implement_without_commit_becomes_no_artifact_and_never_dispat
     queue = TaskQueue(tmp_db)
     _implement(queue)
     with _app(tmp_db, monkeypatch, artifact_ok=False) as client:
+        record_dispatch_provenance(queue, "impl-353")
         response = client.post("/tasks/impl-353/result", json={
             "task_id": "impl-353", "status": "completed", "summary": "tests green",
         })
@@ -57,6 +59,7 @@ def test_commit_not_present_on_origin_is_no_artifact(tmp_db, monkeypatch):
     queue = TaskQueue(tmp_db)
     _implement(queue, "impl-unpushed")
     with _app(tmp_db, monkeypatch, artifact_ok=False) as client:
+        record_dispatch_provenance(queue, "impl-unpushed")
         response = client.post("/tasks/impl-unpushed/result", json={
             "task_id": "impl-unpushed", "status": "completed", "summary": "done",
             "branch": "feat/work", "commit": SHA_NEW,
@@ -198,6 +201,7 @@ def test_rebase_target_without_dispatch_base_still_runs_http_artifact_gate(tmp_d
                               branch="feat/work", context={"rebase_onto": "main"}))
 
     with _app(tmp_db, monkeypatch, artifact_ok=False) as client:
+        record_dispatch_provenance(queue, "impl-rebase-only")
         response = client.post("/tasks/impl-rebase-only/result", json={
             "task_id": "impl-rebase-only", "status": "completed", "summary": "done",
             "branch": "feat/work", "commit": SHA_NEW,
@@ -355,6 +359,7 @@ def test_http_result_persists_the_server_derived_commit_for_audit(tmp_db, monkey
     monkeypatch.setattr("agent_crew.server.verify_implement_artifact", derives)
     with TestClient(create_app(tmp_db, pane_map={"reviewer": UNREACHABLE_PANE},
                                watchdog_disabled=True, worktree_map={})) as client:
+        record_dispatch_provenance(queue, "impl-derived-http")
         response = client.post("/tasks/impl-derived-http/result", json={
             "task_id": "impl-derived-http", "status": "completed", "summary": "done",
             "branch": "feat/work",
@@ -487,6 +492,7 @@ def test_mcp_accepts_a_verified_artifact_from_its_worker_checkout(tmp_db, monkey
     monkeypatch.setattr("agent_crew.mcp_server.verify_implement_artifact", verified)
     monkeypatch.setattr("agent_crew.mcp_server.os.getcwd", lambda: "/worker-checkout")
     tool = build_mcp_server(tmp_db)._tool_manager._tools["submit_result"].fn
+    record_dispatch_provenance(queue, "impl-mcp-artifact")
     result = tool(task_id="impl-mcp-artifact", status="completed", summary="done",
                   branch="feat/work", commit=SHA_NEW)
     if asyncio.iscoroutine(result):
@@ -513,6 +519,7 @@ def test_mcp_rebase_target_without_dispatch_base_runs_artifact_gate(tmp_db, monk
     monkeypatch.setattr("agent_crew.mcp_server.verify_implement_artifact", rejected)
     monkeypatch.setattr("agent_crew.mcp_server.os.getcwd", lambda: "/worker-checkout")
     tool = build_mcp_server(tmp_db)._tool_manager._tools["submit_result"].fn
+    record_dispatch_provenance(queue, "impl-mcp-rebase-only")
     result = tool(task_id="impl-mcp-rebase-only", status="completed", summary="done",
                   branch="feat/work", commit=SHA_NEW)
     if asyncio.iscoroutine(result):

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 REVIEWER_WORKTREE = "/fake/quota-ops-worktree"
@@ -69,10 +70,11 @@ def _reviewer_repo(cwd=None):
     return None
 
 
-def _submit(app, task_id, pr_number, context=None, verdict="approve", findings=None):
+def _submit(app, task_id, pr_number, context=None, verdict="approve", findings=None, *, db):
     with TestClient(app) as client:
         created = client.post("/tasks", json=_review_payload(task_id, pr_number, context))
         assert created.status_code == 201, created.text
+        record_dispatch_provenance(db, task_id)
         response = client.post(
             f"/tasks/{task_id}/result",
             json=_result_payload(task_id, pr_number, verdict, findings),
@@ -88,7 +90,7 @@ def test_wrong_cwd_never_used_all_three_calls_use_reviewer_repo(tmp_db, tmp_path
     monkeypatch.setattr("agent_crew.github.post_review_comment",
                         lambda **kwargs: calls.append(kwargs) or True)
 
-    _submit(_app(tmp_db, state_path), "review-330-wrong-cwd", 330)
+    _submit(_app(tmp_db, state_path), "review-330-wrong-cwd", 330, db=tmp_db)
 
     assert calls[0]["repo"] == REVIEWER_REPO
     assert calls[0]["repo"] != "truhojunbot-tech/alfred"
@@ -108,6 +110,7 @@ def test_posting_and_reconciliation_use_byte_for_byte_identical_repo(tmp_db, tmp
     with TestClient(app) as client:
         assert client.post("/tasks", json=_review_payload(task_id, pr_number)).status_code == 201
         TaskQueue(tmp_db).external_op_reserve(f"comment:review:{task_id}", pr_number=pr_number)
+        record_dispatch_provenance(tmp_db, task_id)
         response = client.post(f"/tasks/{task_id}/result", json=_result_payload(task_id, pr_number))
         assert response.status_code == 200, response.text
 
@@ -122,7 +125,7 @@ def test_missing_repo_identity_is_fail_closed_zero_mutation(tmp_db, tmp_path, mo
     monkeypatch.setattr("agent_crew.github.pr_has_comment_containing",
                         lambda *args, **kwargs: pytest.fail("reconciliation must not be attempted"))
 
-    response = _submit(_app(tmp_db, state_path), "review-330-no-repo", 332)
+    response = _submit(_app(tmp_db, state_path), "review-330-no-repo", 332, db=tmp_db)
 
     assert response.json()["status"] == "ok"
 
@@ -140,6 +143,7 @@ def test_remote_success_local_crash_no_duplicate_comment(tmp_db, tmp_path, monke
     with TestClient(app) as client:
         assert client.post("/tasks", json=_review_payload(task_id, pr_number)).status_code == 201
         TaskQueue(tmp_db).external_op_reserve(f"comment:review:{task_id}", pr_number=pr_number)
+        record_dispatch_provenance(tmp_db, task_id)
         response = client.post(f"/tasks/{task_id}/result", json=_result_payload(task_id, pr_number))
         assert response.status_code == 200, response.text
 
@@ -159,6 +163,7 @@ def test_stop_race_admission_gate_unchanged(tmp_db, tmp_path, monkeypatch):
         assert client.post("/tasks", json=_review_payload(task_id, pr_number)).status_code == 201
         queue = TaskQueue(tmp_db)
         queue.set_stop_epoch(True, incident="issue-330-test")
+        record_dispatch_provenance(queue, task_id)
         response = client.post(f"/tasks/{task_id}/result", json=_result_payload(task_id, pr_number))
         assert response.status_code == 200, response.text
 
@@ -175,6 +180,7 @@ def test_coordinator_managed_cascade_suppression_unchanged(tmp_db, tmp_path, mon
     _submit(
         _app(tmp_db, state_path), "review-330-coordinator", 335,
         context={"coordinator_managed": True}, verdict="request_changes", findings=["Fix the reported code path"],
+        db=tmp_db,
     )
 
     assert not [task for task in TaskQueue(tmp_db).list_tasks() if task.task_type == "implement"]

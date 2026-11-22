@@ -8,6 +8,7 @@ from agent_crew.cea.cascade_contract import CascadeContract
 from agent_crew.pipeline import auto_enqueue_fix, auto_enqueue_test
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 HEAD = "a" * 40
@@ -227,8 +228,10 @@ def test_survivor_http_result_runs_one_existing_cascade(
                "pr_number": 706}
     headers = {"X-Agent-Crew-Project": "agent_crew"}
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "review-survivor")
         first = client.post("/tasks/review-survivor/result", json=payload, headers=headers)
         assert first.status_code == 200, first.text
+        record_dispatch_provenance(queue, "review-survivor")
         second = client.post("/tasks/review-survivor/result", json=payload, headers=headers)
         assert second.status_code == 200, second.text
 

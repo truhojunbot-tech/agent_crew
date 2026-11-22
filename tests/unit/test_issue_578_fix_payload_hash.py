@@ -16,6 +16,7 @@ from agent_crew.pipeline import auto_enqueue_fix, auto_enqueue_review, auto_enqu
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _broker_payload(task, context):
@@ -191,6 +192,7 @@ def test_failed_task_retry_matches_signed_broker_payload(tmp_db, monkeypatch):
                                         as_record=lambda: {"proceed": True}))
     app = create_app(tmp_db, pane_map={}, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "risk-root")
         response = client.post("/tasks/risk-root/result", json={
             "task_id": "risk-root", "status": "failed", "summary": "usage limit hit",
             "findings": [], "error_info": {"kind": "transient"},

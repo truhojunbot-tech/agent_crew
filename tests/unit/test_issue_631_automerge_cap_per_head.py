@@ -9,6 +9,7 @@ from agent_crew import github
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 @pytest.mark.parametrize("opt_out", [True, False])
@@ -66,6 +67,7 @@ def test_new_head_runs_after_three_failures_while_same_head_stays_capped(
             context={"prev_task_id": review_id, "repo": "owner/repo",
                      "pr_number": 631, "reviewed_sha": sha,
                      "allow_duplicate_review": True}))
+        record_dispatch_provenance(queue, task_id)
         response = client.post(f"/tasks/{task_id}/result", json={
             "task_id": task_id, "status": "completed", "summary": "passed",
             "pr_number": 631,

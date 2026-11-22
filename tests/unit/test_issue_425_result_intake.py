@@ -7,6 +7,7 @@ from agent_crew.mcp_server import build_mcp_server
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import CompletedReviewRejected, TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 SUMMARY = "PR #425 review found an actionable result intake defect."
@@ -37,6 +38,7 @@ def test_http_accepts_structured_finding(tmp_db, monkeypatch):
     _review(queue)
     monkeypatch.setattr("agent_crew.github.pr_state", lambda *args, **kwargs: "closed")
     with TestClient(create_app(tmp_db)) as client:
+        record_dispatch_provenance(queue, "review-425")
         response = client.post("/tasks/review-425/result", json={
             "task_id": "review-425", "status": "completed", "summary": SUMMARY,
             "verdict": "request_changes", "pr_number": 425,
@@ -52,6 +54,7 @@ def test_probe_rejected_without_completing_task(tmp_db):
     queue = TaskQueue(tmp_db)
     _review(queue)
     with TestClient(create_app(tmp_db)) as client:
+        record_dispatch_provenance(queue, "review-425")
         response = client.post("/tasks/review-425/result", json={
             "task_id": "review-425", "status": "completed", "summary": "probe",
             "verdict": "request_changes", "findings": ["x"], "pr_number": 425,
@@ -65,6 +68,7 @@ def test_short_finding_rejected_with_clear_reason(tmp_db):
     queue = TaskQueue(tmp_db)
     _review(queue)
     with TestClient(create_app(tmp_db)) as client:
+        record_dispatch_provenance(queue, "review-425")
         response = client.post("/tasks/review-425/result", json={
             "task_id": "review-425", "status": "completed", "summary": SUMMARY,
             "verdict": "request_changes", "findings": ["x"], "pr_number": 425,
@@ -110,6 +114,7 @@ def test_identical_completed_review_is_acknowledged_without_new_result(tmp_db):
     queue.submit_result("review-425", TaskResult(**payload))
     before = queue.outbox_get("review-425")
     with TestClient(create_app(tmp_db)) as client:
+        record_dispatch_provenance(queue, "review-425")
         response = client.post("/tasks/review-425/result", json=payload)
     assert response.status_code == 200
     assert response.json()["duplicate"] is True
@@ -136,6 +141,7 @@ def test_http_replay_context_may_resubmit_completed_review(tmp_db):
     with TestClient(create_app(tmp_db)) as client:
         token = _REPLAYING.set(True)
         try:
+            record_dispatch_provenance(queue, "review-425")
             response = client.post("/tasks/review-425/result", json=payload)
         finally:
             _REPLAYING.reset(token)
@@ -147,6 +153,7 @@ def test_short_noncompleted_review_is_not_placeholder_rejected(tmp_db):
     queue = TaskQueue(tmp_db)
     _review(queue)
     with TestClient(create_app(tmp_db)) as client:
+        record_dispatch_provenance(queue, "review-425")
         response = client.post("/tasks/review-425/result", json={
             "task_id": "review-425", "status": "needs_human", "summary": "blocked",
             "verdict": "request_changes", "findings": ["x"], "pr_number": 425,
@@ -160,6 +167,7 @@ def test_mcp_review_validation_and_completed_conflict(tmp_db):
     _review(queue)
     mcp = build_mcp_server(tmp_db)
     submit = mcp._tool_manager._tools["submit_result"].fn
+    record_dispatch_provenance(queue, "review-425")
     rejected = submit(task_id="review-425", status="completed", summary="probe",
                       verdict="request_changes", findings=["x"], pr_number=425)
     assert rejected["acknowledged"] is False
@@ -169,6 +177,7 @@ def test_mcp_review_validation_and_completed_conflict(tmp_db):
     queue.submit_result("review-425", TaskResult(
         task_id="review-425", status="completed", summary=SUMMARY,
         verdict="request_changes", findings=[FINDING], pr_number=425))
+    record_dispatch_provenance(queue, "review-425")
     conflict = submit(task_id="review-425", status="completed", summary=SUMMARY,
                       verdict="approve", findings=[], pr_number=425)
     assert conflict["acknowledged"] is False
@@ -192,6 +201,7 @@ def test_mcp_late_short_review_records_evidence_before_validation(tmp_db):
     _review(queue)
     assert queue.cancel("review-425")
     submit = build_mcp_server(tmp_db)._tool_manager._tools["submit_result"].fn
+    record_dispatch_provenance(queue, "review-425")
     late = submit(task_id="review-425", status="completed", summary="probe",
                   verdict="request_changes", findings=["x"], pr_number=425)
     assert late["acknowledged"] is False

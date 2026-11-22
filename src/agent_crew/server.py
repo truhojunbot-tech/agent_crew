@@ -8232,8 +8232,20 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(exc))
 
     @app.post("/tasks/{task_id}/result", status_code=200)
+    def submit_worker_result(task_id: str, result: TaskResult,
+                             x_agent_crew_project: Optional[str] = Header(default=None)):
+        """The worker-facing result entry point (#1050, Alfred option (a)).
+
+        A worker cannot report on a row it was never handed, so this route —
+        and only this route — refuses results on rows with no dispatch
+        provenance. Server-internal callers use :func:`submit_result` directly.
+        """
+        return submit_result(task_id, result, x_agent_crew_project=x_agent_crew_project,
+                             _worker_entry=True)
+
     def submit_result(task_id: str, result: TaskResult,
-                      x_agent_crew_project: Optional[str] = Header(default=None)):
+                      x_agent_crew_project: Optional[str] = None, *,
+                      _worker_entry: bool = False):
         """Accept active results; keep rejected late payloads as exec events.
 
         System-ended rows return HTTP 409. A late original whose fallback
@@ -8401,6 +8413,7 @@ def create_app(
         try:
             task_type = q().submit_result(task_id, result, nonce=_nonce,
                                           presenter=_presenter,
+                                          worker_entry=_worker_entry,
                                           # This one held result is an invitation
                                           # to correct the same execution's refs.
                                           # Keep its RUNNING receipt so P2 can

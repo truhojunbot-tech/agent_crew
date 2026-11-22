@@ -7,6 +7,7 @@ its deadline and POSTed ``failed:wrapper_timeout``; the server accepted it for
 a row that was never dispatched, marked it failed and spent an auto-retry.
 """
 
+import asyncio
 import json
 from unittest.mock import patch
 
@@ -14,7 +15,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.server import create_app
 from agent_crew.queue import ParkedResultRejected, TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 from tests.unit.test_issue_1033_pool_hold import (  # noqa: F401 (notices: fixture)
     CLAUDE_IMPL, _app, _body, _events, _impl, _signal, _wait, notices)
 
@@ -38,6 +41,13 @@ def _result(task_id, status, reason):
     return body
 
 
+def _own_events(queue, task_id):
+    """Exec events minus the park's async coordinator notice, which can land
+    after any snapshot and is not written by the result path."""
+    return [e["event"] for e in queue.get_exec_state(task_id)["events"]
+            if e["event"] != "coordinator_notice"]
+
+
 def _lineage(queue, task_id):
     return [t.task_id for t in queue.list_tasks() if t.task_id != task_id]
 
@@ -52,7 +62,7 @@ def test_waiting_pool_refuses_every_result(tmp_path, monkeypatch, notices, statu
     body = _result(task_id, status, reason)
     with TestClient(app) as client:
         assert _wait(lambda: queue.get_task_status(task_id) == "waiting_pool")
-        before = [e["event"] for e in queue.get_exec_state(task_id)["events"]]
+        before = _own_events(queue, task_id)
         with pytest.raises(ParkedResultRejected):
             queue.submit_result(task_id, TaskResult(**body))
         resp = client.post(f"/tasks/{task_id}/result", json=body, headers=HDR)
@@ -60,7 +70,7 @@ def test_waiting_pool_refuses_every_result(tmp_path, monkeypatch, notices, statu
         assert resp.json()["prior_status"] == "waiting_pool"
         assert queue.get_task_status(task_id) == "waiting_pool"
         assert queue.get_result(task_id) is None
-        assert [e["event"] for e in queue.get_exec_state(task_id)["events"]] == before
+        assert _own_events(queue, task_id) == before
         assert _events(queue, task_id, "result") == []
         assert _lineage(queue, task_id) == []
         assert dispatched == []
@@ -74,7 +84,7 @@ def test_parked_row_wrapper_timeout_is_409_and_row_resumes(tmp_path, monkeypatch
     task_id = _impl(queue, task_id="impl-48142056")
     with TestClient(app) as client:
         assert _wait(lambda: queue.get_task_status(task_id) == "waiting_pool")
-        before = [e["event"] for e in queue.get_exec_state(task_id)["events"]]
+        before = _own_events(queue, task_id)
         resp = client.post(f"/tasks/{task_id}/result", json=_wrapper_timeout(task_id),
                            headers=HDR)
         assert resp.status_code == 409, resp.text
@@ -83,7 +93,7 @@ def test_parked_row_wrapper_timeout_is_409_and_row_resumes(tmp_path, monkeypatch
         # No state change, no exec event, no retry/fallback row.
         assert queue.get_task_status(task_id) == "waiting_pool"
         assert queue.get_result(task_id) is None
-        assert [e["event"] for e in queue.get_exec_state(task_id)["events"]] == before
+        assert _own_events(queue, task_id) == before
         assert _events(queue, task_id, "result") == []
         assert _lineage(queue, task_id) == []
         assert dispatched == []
@@ -103,6 +113,9 @@ def test_in_progress_wrapper_timeout_still_accepted(tmp_path, monkeypatch, notic
     with TestClient(app) as client:
         assert _wait(lambda: dispatched == [task_id])
         assert queue.get_task_status(task_id) == "in_progress"
+        # The fake dispatcher stands in for the spawn only; record the
+        # dispatch the real one commits before a worker can exist.
+        record_dispatch_provenance(queue, task_id)
         resp = client.post(f"/tasks/{task_id}/result", json=_wrapper_timeout(task_id),
                            headers=HDR)
         assert resp.status_code == 200, resp.text
@@ -168,16 +181,88 @@ def test_cli_wait_deadline_on_waiting_pool_posts_nothing(tmp_db, tmp_path, unuse
     assert q.get_result("run-parked-1") is None
 
 
-def test_undispatched_pending_completed_result_still_accepted(tmp_path):
-    """Pins the narrowed #1050 scope (issue comment "Scope decision (agent-crew
-    coordinator, 11-22 01:1xZ)"): only waiting_pool rows and wrapper timeouts on
-    never-dispatched pending rows are refused. Any other result on an
-    undispatched pending row keeps its existing path; refusing all of them broke
-    187 existing tests that submit straight onto a pending row."""
+def test_undispatched_pending_completed_result_is_409_over_http(tmp_path, monkeypatch):
+    """Alfred option (a) 023138z: the worker-facing entry points refuse any result
+    on a row with no dispatch provenance — a completed one included."""
+    monkeypatch.delenv("AGENT_CREW_DISPATCHER", raising=False)
     queue = TaskQueue(str(tmp_path / "tasks.db"))
-    queue.enqueue(TaskRequest("pending-1", "implement", "work", branch="main",
-                              context={"risk_tier": 1}))
-    assert queue.get_task_status("pending-1") == "pending"
-    queue.submit_result("pending-1", TaskResult(**_result("pending-1", "completed", None)))
-    assert queue.get_task_status("pending-1") == "completed"
-    assert queue.get_result("pending-1") is not None
+    task_id = _impl(queue, task_id="impl-never")
+    app = create_app(queue._db_path, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        resp = client.post(f"/tasks/{task_id}/result",
+                           json=_result(task_id, "completed", None), headers=HDR)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["prior_status"] == "pending"
+    assert queue.get_task_status(task_id) == "pending"
+    assert queue.get_result(task_id) is None
+    assert _events(queue, task_id, "result") == []
+    assert _lineage(queue, task_id) == []
+
+
+def test_undispatched_pending_completed_result_is_refused_over_mcp(tmp_path, monkeypatch):
+    from agent_crew.mcp_server import build_mcp_server
+
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    task_id = _impl(queue, task_id="impl-never-mcp")
+    monkeypatch.setattr("agent_crew.mcp_server.verify_implement_artifact",
+                        lambda *_a, **_kw: (True, "verified"))
+    tool = build_mcp_server(queue._db_path)._tool_manager._tools["submit_result"].fn
+    out = tool(task_id=task_id, status="completed", summary="done",
+               branch="agent/x", commit="a" * 40)
+    if asyncio.iscoroutine(out):
+        out = asyncio.run(out)
+    assert out["acknowledged"] is False and out["parked"] is True, out
+    assert out["prior_status"] == "pending"
+    assert queue.get_task_status(task_id) == "pending"
+    assert queue.get_result(task_id) is None
+    assert _events(queue, task_id, "result") == []
+
+
+def test_server_internal_terminal_write_is_not_refused(tmp_path):
+    """The queue itself keeps the narrow rule for server-internal callers: the
+    dispatcher ends claimed rows before ``record_dispatch`` (_fail_if_active)."""
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    task_id = _impl(queue, task_id="impl-internal")
+    assert queue.dequeue(role="implementer").task_id == task_id
+    queue.submit_result(task_id, TaskResult(**_result(task_id, "failed", "no_worktree")),
+                        expected_status="in_progress", dispatcher_failed=True)
+    assert queue.get_task_status(task_id) == "failed"
+    with pytest.raises(ParkedResultRejected):
+        queue.submit_result(task_id, TaskResult(**_result(task_id, "failed", "other")),
+                            worker_entry=True)
+
+
+def test_no_worktree_fail_if_active_still_terminates_the_row(tmp_path, monkeypatch):
+    """A pre-dispatch dispatcher failure is a server-internal write: the row
+    must end ``failed``, not stay ``in_progress`` with no lease (#1050 c7072954527)."""
+    from tests.unit.test_issue_712_dispatcher_cloud import (
+        _enqueue_review, _state, _wait_for, cloud)
+
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_SHADOW", "1")
+    monkeypatch.setattr(cloud, "launch_shadow_review", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cloud, "reconcile_shadow_reviews", lambda *_args: None)
+    app = create_app(queue._db_path, state_path=_state(tmp_path, reviewer_worktree=False),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        _wait_for(lambda: queue.get_task("review-cloud").status == "failed")
+    assert queue.get_result("review-cloud").error_info["reason"] == "no_worktree"
+    assert _events(queue, "review-cloud", "dispatched") == []
+
+
+def test_canary_suppression_still_completes_the_review_without_dispatch(tmp_path, monkeypatch):
+    """The canary completes a review instead of dispatching it — a
+    server-internal write the worker-entry refusal must not reach."""
+    from agent_crew import tokenomics_canary as canary
+    from tests.unit.test_sev0_tokenomics_canary import _dispatch_review
+
+    spawned, row, _receipt, result, _stacks, _wt = _dispatch_review(
+        tmp_path, monkeypatch, pin="impl-77")
+    assert spawned == []
+    assert row.status == "completed", row.status
+    assert result is not None and result.summary == canary.SUPPRESSED_REASON
+    assert _events(TaskQueue(str(tmp_path / "tasks.db")), row.task_id, "dispatched") == []

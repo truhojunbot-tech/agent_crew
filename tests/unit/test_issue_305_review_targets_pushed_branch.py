@@ -26,6 +26,7 @@ commit that never contained the work at all.
 import pytest
 
 from agent_crew.protocol import TaskResult
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _result(**over):
@@ -211,6 +212,7 @@ def test_the_server_routes_a_real_posted_result_to_the_pushed_branch(tmp_db, mon
     app = create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True, push_fn=lambda *a, **k: None)
     with TestClient(app) as client:
+        record_dispatch_provenance(q, "impl-watch-0073c3a7")
         response = client.post("/tasks/impl-watch-0073c3a7/result", json={
             "task_id": "impl-watch-0073c3a7", "status": "completed",
             "summary": "done", "branch": "fix/304-stale-pr-head-review",
@@ -270,6 +272,7 @@ def _mcp_submit(tmp_db, monkeypatch=None, *, crew_run_branch=True,
         )
     mcp = build_mcp_server(tmp_db)
     _mcp_call(mcp, "get_next_task", role="implementer")
+    record_dispatch_provenance(tmp_db, "impl-watch-mcp")
     ack = _mcp_call(mcp, "submit_result", task_id="impl-watch-mcp",
                     status="completed", summary="done", **result_fields)
     if expect_ack:

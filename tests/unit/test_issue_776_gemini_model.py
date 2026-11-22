@@ -7,6 +7,7 @@ from agent_crew import server
 from agent_crew.failure_kind import classify_provider_record
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def test_gemini_model_selection_uses_only_pin_or_default(monkeypatch):
@@ -43,6 +44,7 @@ def test_server_posted_provider_config_error_has_no_retry_and_one_notice(tmp_pat
                             anomaly_disabled=True, identity_required=False,
                             coordinator_notify_fn=lambda msg: notices.append(msg) or True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-776-config")
         response = client.post("/tasks/test-776-config/result", json={
             "task_id": "test-776-config", "status": "failed", "summary": "agy config error",
             "error_info": {"reason": "config_error", "provider_status": "ERROR",

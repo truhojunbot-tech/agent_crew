@@ -2,6 +2,7 @@
 from fastapi.testclient import TestClient
 
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _task_payload(task_id, task_type, description="do work", priority=3,
@@ -63,6 +64,7 @@ class TestAutoEnqueueReviewRecordsImplementer:
         )
         with TestClient(app) as client:
             client.post("/tasks", json=_task_payload("impl-001", "implement"))
+            record_dispatch_provenance(tmp_db, "impl-001")
             client.post(
                 "/tasks/impl-001/result", json=_result_payload("impl-001")
             )
@@ -85,6 +87,7 @@ class TestAutoEnqueueReviewRecordsImplementer:
                 "/tasks",
                 json=_task_payload("impl-002", "implement", context=ctx),
             ).status_code == 201
+            record_dispatch_provenance(tmp_db, "impl-002")
             client.post(
                 "/tasks/impl-002/result", json=_result_payload("impl-002")
             )
@@ -113,11 +116,13 @@ class TestAutoEnqueueTestRecordsBothAgents:
         )
         with TestClient(app) as client:
             client.post("/tasks", json=_task_payload("impl-003", "implement"))
+            record_dispatch_provenance(tmp_db, "impl-003")
             client.post(
                 "/tasks/impl-003/result", json=_result_payload("impl-003")
             )
             tasks = client.get("/tasks").json()
             review = [t for t in tasks if t["task_type"] == "review"][0]
+            record_dispatch_provenance(tmp_db, review['task_id'])
             review_response = client.post(
                 f"/tasks/{review['task_id']}/result",
                 json=_result_payload(

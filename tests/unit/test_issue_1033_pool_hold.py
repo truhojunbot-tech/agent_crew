@@ -22,6 +22,7 @@ from agent_crew import pool_signal
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 FINDING = "HIGH src/agent_crew/pipeline.py:1829 - the fix round ignores the pool hold"
 
@@ -557,6 +558,7 @@ def test_replay_request_changes_fix_round_under_hold(tmp_path, monkeypatch, noti
             "context": {"repo": "owner/repo", "pr_number": 1031,
                         "reviewed_sha": "a" * 40, "prev_task_id": "impl-924d"},
             "pr_number": 1031}).status_code in (200, 201)
+        record_dispatch_provenance(db, "review-impl-924d-r0")
         response = client.post("/tasks/review-impl-924d-r0/result", json={
             "task_id": "review-impl-924d-r0", "status": "completed",
             "summary": "Request changes because the fix round ignores the pool hold.",

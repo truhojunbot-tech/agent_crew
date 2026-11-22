@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 @pytest.fixture(autouse=True)
@@ -87,6 +88,7 @@ def test_review_task_carries_pr_number_when_impl_posts_one(tmp_db):
     app = _make_app(tmp_db, push_calls)
     with TestClient(app) as client:
         client.post("/tasks", json=_impl_payload("impl-86a"))
+        record_dispatch_provenance(tmp_db, "impl-86a")
         client.post(
             "/tasks/impl-86a/result",
             json=_completed_result("impl-86a", pr_number=83),
@@ -102,6 +104,7 @@ def test_review_instructions_mention_pr_diff_when_pr_known(tmp_db):
     app = _make_app(tmp_db, push_calls)
     with TestClient(app) as client:
         client.post("/tasks", json=_impl_payload("impl-86b"))
+        record_dispatch_provenance(tmp_db, "impl-86b")
         client.post(
             "/tasks/impl-86b/result",
             json=_completed_result("impl-86b", pr_number=42),
@@ -123,6 +126,7 @@ def test_review_instructions_fallback_when_pr_number_missing(tmp_db):
     with TestClient(app) as client:
         client.post("/tasks", json=_impl_payload("impl-86c"))
         # impl posts result with pr_number=None
+        record_dispatch_provenance(tmp_db, "impl-86c")
         client.post(
             "/tasks/impl-86c/result",
             json=_completed_result("impl-86c", pr_number=None),

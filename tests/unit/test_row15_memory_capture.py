@@ -24,6 +24,7 @@ from agent_crew.memory import MemoryRequest, shadow_retrieve
 from scripts.migrate_memory_project_keys import migrate
 import scripts.migrate_memory_project_keys as migration_module
 from scripts.import_shadow_memory import import_file
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def test_task_outcomes_write_canonical_evidence_without_promoting_procedure(tmp_path):
@@ -623,6 +624,7 @@ def test_result_capture_is_gated_and_never_changes_result(
         queue = TaskQueue(db)
         queue.enqueue(TaskRequest(task_id="capture-test", task_type="discuss",
                                   description="discussion", project="agent_crew"))
+        record_dispatch_provenance(queue, "capture-test")
         response = api.post(
             "/tasks/capture-test/result",
             json={"task_id": "capture-test", "status": status,
@@ -660,6 +662,7 @@ def test_mcp_result_uses_same_capture_path(tmp_path, monkeypatch):
     queue.enqueue(TaskRequest(task_id="mcp-capture", task_type="discuss",
                               description="discussion", project="agent_crew"))
     mcp = build_mcp_server(db)
+    record_dispatch_provenance(queue, "mcp-capture")
     response = mcp._tool_manager._tools["submit_result"].fn(
         task_id="mcp-capture", status="needs_human", summary="needs owner")
     assert response["acknowledged"] is True

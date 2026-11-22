@@ -53,7 +53,7 @@ from agent_crew.protocol import (
 from agent_crew.memory_capture import capture_result_best_effort
 from agent_crew.queue import (
     AdmissionRefused, CompletedReviewRejected, DuplicateReviewResult, InvalidReviewResult,
-    LateResultRejected, PausedError as _PausedError, TaskQueue, claim_lease_seconds,
+    LateResultRejected, ParkedResultRejected, PausedError as _PausedError, TaskQueue, claim_lease_seconds,
 )
 from agent_crew.role_mapping import (
     KNOWN_ROLE_AGENTS, RoleResolutionError, TASK_TYPE_TO_ROLE, anonymous_pull_refusal,
@@ -317,7 +317,9 @@ def build_mcp_server(
         try:
             task_type = queue.submit_result(task_id, result, nonce=_nonce,
                                             presenter=_presenter,
-                                            validate_review=True)
+                                            validate_review=True,
+                                            # #1050: the worker-facing entry point.
+                                            worker_entry=True)
             capture_result_best_effort(queue.db_path, task_id, result)
         except AdmissionRefused as exc:
             # Both transports or neither: HTTP answers 409 for a refused P2
@@ -333,6 +335,10 @@ def build_mcp_server(
                     "task_id": task_id, "prior_status": exc.status, "error": str(exc)}
         except CompletedReviewRejected as exc:
             return {"acknowledged": False, "accepted": False, "error": str(exc)}
+        except ParkedResultRejected as exc:
+            # #1050: same refusal as HTTP's 409 — nothing was written.
+            return {"acknowledged": False, "parked": True, "accepted": False,
+                    "task_id": task_id, "prior_status": exc.status, "error": str(exc)}
         except DuplicateReviewResult:
             return {"acknowledged": True, "task_id": task_id, "task_type": "review",
                     "duplicate": True}

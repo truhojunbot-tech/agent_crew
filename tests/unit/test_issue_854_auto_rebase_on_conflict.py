@@ -10,6 +10,7 @@ from agent_crew.pipeline import verify_rebase_artifact
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 PR = 854
@@ -63,6 +64,7 @@ def _rebase_rounds(queue):
 def test_conflict_enqueues_one_rebase_round_without_failure_notice(harness):
     client, queue, notices, _ = harness
 
+    record_dispatch_provenance(queue, "test-original")
     response = _conflict(client)
 
     assert response.status_code == 200, response.text
@@ -84,6 +86,7 @@ def test_conflict_enqueues_one_rebase_round_without_failure_notice(harness):
     assert "force-push" in task.description
     assert notices == []
 
+    record_dispatch_provenance(queue, "test-original")
     replay = _conflict(client)
     assert replay.status_code == 200, replay.text
     assert len(_rebase_rounds(queue)) == 1
@@ -97,6 +100,7 @@ def test_terminal_or_unknown_pr_does_not_enqueue_rebase(harness, monkeypatch, pr
     client, queue, notices, _ = harness
     monkeypatch.setattr(github, "pr_state", lambda *args, **kwargs: pr_state)
 
+    record_dispatch_provenance(queue, "test-original")
     response = _conflict(client)
 
     assert response.status_code == 200, response.text
@@ -109,6 +113,7 @@ def test_moved_or_unreadable_pr_head_does_not_enqueue_rebase(harness, current_he
     client, queue, notices, head = harness
     head["sha"] = current_head
 
+    record_dispatch_provenance(queue, "test-original")
     response = _conflict(client)
 
     assert response.status_code == 200, response.text
@@ -118,6 +123,7 @@ def test_moved_or_unreadable_pr_head_does_not_enqueue_rebase(harness, current_he
 
 def test_second_conflict_on_rebase_lineage_notifies_without_new_round(harness):
     client, queue, notices, head = harness
+    record_dispatch_provenance(queue, "test-original")
     assert _conflict(client).status_code == 200
     rebase_id = _rebase_rounds(queue)[0].task_id
     queue.enqueue(TaskRequest(
@@ -136,6 +142,7 @@ def test_second_conflict_on_rebase_lineage_notifies_without_new_round(harness):
                  "reviewed_sha": HEAD_2}), ingress="http.tasks")
     head["sha"] = HEAD_2
 
+    record_dispatch_provenance(queue, "test-second")
     response = _conflict(client, "test-second", HEAD_2)
 
     assert response.status_code == 200, response.text
@@ -148,6 +155,7 @@ def test_kill_switch_preserves_old_terminal_notice(harness, monkeypatch):
     client, queue, notices, _ = harness
     monkeypatch.setenv("AGENT_CREW_AUTO_REBASE_ON_CONFLICT", "0")
 
+    record_dispatch_provenance(queue, "test-original")
     response = _conflict(client)
 
     assert response.status_code == 200, response.text
@@ -158,6 +166,7 @@ def test_kill_switch_preserves_old_terminal_notice(harness, monkeypatch):
 def test_other_not_run_reason_is_unchanged(harness):
     client, queue, notices, _ = harness
 
+    record_dispatch_provenance(queue, "test-original")
     response = _conflict(client, reason="exit_code_2")
 
     assert response.status_code == 200, response.text

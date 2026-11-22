@@ -12,6 +12,7 @@ from agent_crew.github import post_review_comment as format_review_comment
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _port_file(tmp_path):
@@ -291,6 +292,7 @@ def test_server_forwards_files_reviewed_to_comment_writer(tmp_db, monkeypatch):
     app = create_app(db_path=tmp_db, project="demo", watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "review-950")
         response = client.post("/tasks/review-950/result", json={
             "task_id": "review-950", "status": "completed",
             "summary": "Reviewed the changed files and approved the patch.",
