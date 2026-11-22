@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +130,7 @@ def test_u208_explicit_request_changes_verdict_passed_through(tmp_db, monkeypatc
     app = _make_app(tmp_db, push_calls)
     with TestClient(app) as client:
         client.post("/tasks", json=_review_payload("review-208c", pr_number=99))
+        record_dispatch_provenance(tmp_db, "review-208c")
         response = client.post(
             "/tasks/review-208c/result",
             json=_result_payload("review-208c", verdict="request_changes",

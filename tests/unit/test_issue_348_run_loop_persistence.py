@@ -11,6 +11,7 @@ from agent_crew.cli import crew
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 pytestmark = pytest.mark.usefixtures("admit_crew_run")  # #1006: subject is not admission
 
@@ -34,6 +35,7 @@ def _submit_http(db_path, task_id="impl-348", stop=False, **overrides):
         task_id=task_id, task_type="implement", description="work", branch="main",
         priority=3, context={"coordinator_managed": True},
     ))
+    record_dispatch_provenance(db_path, task_id)
     if stop:
         TaskQueue(db_path).set_stop_epoch(True, incident="issue-348")
 
@@ -97,6 +99,7 @@ def test_retry_child_drops_parent_result_refs_and_empty_result_stays_empty(tmp_p
         priority=3, context={"risk_tier": 1, "result_branch": "fix/stale",
                              "result_commit": COMMIT},
     ))
+    record_dispatch_provenance(db_path, "impl-parent")
 
     async def submit_failed_parent():
         app = _app(db_path)
@@ -129,6 +132,7 @@ def test_mcp_submit_persists_result_refs_fail_soft(tmp_path, monkeypatch):
     queue.enqueue(TaskRequest(task_id="mcp-348", task_type="discuss", description="work",
                               branch="main", context={}))
     tool = mcp_server.build_mcp_server(db_path)._tool_manager._tools["submit_result"].fn
+    record_dispatch_provenance(queue, "mcp-348")
     ack = asyncio.run(tool(task_id="mcp-348", summary="done", branch="fix/mcp", commit=COMMIT)) \
         if asyncio.iscoroutinefunction(tool) else tool(
             task_id="mcp-348", summary="done", branch="fix/mcp", commit=COMMIT)
@@ -140,6 +144,7 @@ def test_mcp_submit_persists_result_refs_fail_soft(tmp_path, monkeypatch):
     monkeypatch.setattr(TaskQueue, "merge_task_context", lambda *args: (_ for _ in ()).throw(OSError("disk")))
     queue.enqueue(TaskRequest(task_id="mcp-fail-soft", task_type="discuss", description="work",
                               branch="main", context={}))
+    record_dispatch_provenance(queue, "mcp-fail-soft")
     ack = asyncio.run(tool(task_id="mcp-fail-soft", summary="done", branch="fix/mcp", commit=COMMIT)) \
         if asyncio.iscoroutinefunction(tool) else tool(
             task_id="mcp-fail-soft", summary="done", branch="fix/mcp", commit=COMMIT)

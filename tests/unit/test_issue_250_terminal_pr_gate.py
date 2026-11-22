@@ -28,6 +28,7 @@ from agent_crew.pipeline import (
 )
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 BRANCH = "agent/claude/239-context-pack"
 #: ⛔Deliberately NOT a real PR. This file used 241 — a real, merged PR — and
@@ -343,6 +344,7 @@ def test_merge_during_an_in_flight_review_creates_no_follow_up(tmp_db, monkeypat
     push = _Push()
     with TestClient(_server(tmp_db, push)) as c:
         _enqueue_review(c, "review-late")
+        record_dispatch_provenance(tmp_db, "review-late")
         assert _result(c, "review-late").status_code == 200
         # ⛔The result stays durable and auditable — that is not what we trim.
         stored = c.get("/tasks/review-late").json()
@@ -365,6 +367,7 @@ def test_an_open_pr_still_produces_a_fix_through_the_handler(tmp_db, monkeypatch
     push = _Push()
     with TestClient(_server(tmp_db, push)) as c:
         _enqueue_review(c, "review-open")
+        record_dispatch_provenance(tmp_db, "review-open")
         _result(c, "review-open")
 
     fixes = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "implement"]
@@ -382,6 +385,7 @@ def test_a_github_outage_during_the_handler_loses_nothing(tmp_db, monkeypatch, g
     push = _Push()
     with TestClient(_server(tmp_db, push)) as c:
         _enqueue_review(c, "review-outage")
+        record_dispatch_provenance(tmp_db, "review-outage")
         assert _result(c, "review-outage").status_code == 200
         assert c.get("/tasks/review-outage").json()["status"] == "completed"
 
@@ -463,6 +467,7 @@ def test_http_result_omitting_the_pr_does_not_review_a_merged_pr(tmp_db, monkeyp
         c.post("/tasks", json={"task_id": "impl-http", "task_type": "implement",
                                "description": "impl", "branch": BRANCH, "priority": 3,
                                "context": {"pr_number": PR, "repo": "owner/repo"}, "project": ""})
+        record_dispatch_provenance(tmp_db, "impl-http")
         r = c.post("/tasks/impl-http/result",
                    json={"task_id": "impl-http", "status": "completed",
                          "summary": "done", "verdict": None, "findings": [],
@@ -485,6 +490,7 @@ def test_mcp_result_omitting_the_pr_does_not_review_a_merged_pr(tmp_db, monkeypa
     q.enqueue(TaskRequest(task_id="impl-mcp", task_type="implement", description="impl",
                           branch=BRANCH, context={"pr_number": PR, "repo": "owner/repo"}))
     q.dequeue(role="implementer")
+    record_dispatch_provenance(q, "impl-mcp")
 
     mcp = build_mcp_server(tmp_db)
     fn = mcp._tool_manager._tools["submit_result"].fn
@@ -505,6 +511,7 @@ def test_http_result_omitting_the_pr_still_reviews_an_open_pr(tmp_db, monkeypatc
         c.post("/tasks", json={"task_id": "impl-open", "task_type": "implement",
                                "description": "impl", "branch": BRANCH, "priority": 3,
                                "context": {"pr_number": PR, "repo": "owner/repo"}, "project": ""})
+        record_dispatch_provenance(tmp_db, "impl-open")
         c.post("/tasks/impl-open/result",
                json={"task_id": "impl-open", "status": "completed", "summary": "done",
                      "verdict": None, "findings": [], "pr_number": None})

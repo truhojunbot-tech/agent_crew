@@ -13,6 +13,7 @@ from agent_crew.conformance_gate import _conformance_gate_allows_merge
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 CHECKER = Path("/home/truhojun/alfred/tools/contract_registry.py")
@@ -98,6 +99,7 @@ def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
     test_record = ({"outcome": "PASSED", "head_sha": "a" * 40}
                    if test_record is None else test_record)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-615")
         response = client.post("/tasks/test-615/result", json={
             "task_id": "test-615", "status": "completed", "summary": "tests passed",
             "pr_number": 615, "error_info": {"script_test": test_record}})
@@ -203,6 +205,7 @@ def _post_followup_test(tmp_path, queue, task_id, review_id):
                      push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, task_id)
         response = client.post(f"/tasks/{task_id}/result", json={
             "task_id": task_id, "status": "completed", "summary": "tests passed",
             "pr_number": 615, "error_info": {"script_test": {
@@ -297,6 +300,7 @@ def test_opt_out_publishes_each_approved_head(tmp_path, monkeypatch, checker):
                      push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-615-r1")
         response = client.post("/tasks/test-615-r1/result", json={
             "task_id": "test-615-r1", "status": "completed",
             "summary": "tests passed", "pr_number": 615,
@@ -315,6 +319,7 @@ def test_opt_out_publishes_each_approved_head(tmp_path, monkeypatch, checker):
             "pr_number": 615, "repo": "owner/repo", "reviewed_sha": "b" * 40,
             "allow_duplicate_review": True}))
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "test-615-r1-retry")
         response = client.post("/tasks/test-615-r1-retry/result", json={
             "task_id": "test-615-r1-retry", "status": "completed",
             "summary": "tests passed", "pr_number": 615,

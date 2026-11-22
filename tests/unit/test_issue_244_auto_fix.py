@@ -32,6 +32,7 @@ from agent_crew.pipeline import (
 )
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 BRANCH = "agent/claude/244-x"
 
@@ -398,6 +399,7 @@ def test_http_request_changes_result_enqueues_a_fix(tmp_db, open_review_pr):
     push = _RecordingPush()
     with TestClient(_server(tmp_db, push)) as client:
         _enqueue_review(client, "review-http-1")
+        record_dispatch_provenance(tmp_db, "review-http-1")
         assert _post_review_result(client, "review-http-1").status_code == 200
 
     fixes = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "implement"]
@@ -413,6 +415,7 @@ def test_http_coordinator_managed_review_enqueues_fix(tmp_db, open_review_pr):
     push = _RecordingPush()
     with TestClient(_server(tmp_db, push)) as client:
         _enqueue_review(client, "review-http-2", {"coordinator_managed": True})
+        record_dispatch_provenance(tmp_db, "review-http-2")
         assert _post_review_result(client, "review-http-2").status_code == 200
 
     assert len([t for t in TaskQueue(tmp_db).list_tasks()
@@ -426,6 +429,7 @@ def test_http_approved_review_still_goes_to_test_not_fix(tmp_db, open_review_pr)
     push = _RecordingPush()
     with TestClient(_server(tmp_db, push)) as client:
         _enqueue_review(client, "review-http-3")
+        record_dispatch_provenance(tmp_db, "review-http-3")
         assert _post_review_result(client, "review-http-3", verdict="approve",
                                    findings=[], summary="Reviewed the changes and approved the implementation.").status_code == 200
 
@@ -446,6 +450,7 @@ def test_http_result_submission_survives_a_broken_cascade(tmp_db, monkeypatch, o
     push = _RecordingPush()
     with TestClient(_server(tmp_db, push)) as client:
         _enqueue_review(client, "review-http-4")
+        record_dispatch_provenance(tmp_db, "review-http-4")
         assert _post_review_result(client, "review-http-4").status_code == 200
 
 
@@ -607,7 +612,9 @@ def test_http_duplicate_result_post_enqueues_one_fix(tmp_db, open_review_pr):
     push = _RecordingPush()
     with TestClient(_server(tmp_db, push)) as client:
         _enqueue_review(client, "review-http-dup")
+        record_dispatch_provenance(tmp_db, "review-http-dup")
         assert _post_review_result(client, "review-http-dup").status_code == 200
+        record_dispatch_provenance(tmp_db, "review-http-dup")
         assert _post_review_result(client, "review-http-dup").status_code == 200
 
     fixes = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "implement"]

@@ -21,6 +21,7 @@ from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
+from tests.dispatch_provenance import record_dispatch_provenance
 from tests.unit.test_sev0_cea_s4c_dispatch_base_absent import (  # noqa: F401
     _baseless_implement, _row, hermetic_admission,
 )
@@ -180,6 +181,7 @@ def _approved_review(tmp_db, monkeypatch, head):
                           context={"pr_number": 887, "repo": "o/r",
                                    "reviewed_sha": REVIEWED}))
     q.dequeue(role="reviewer")
+    record_dispatch_provenance(q, "review-887")
     out = _mcp_tool(tmp_db, "submit_result")(
         task_id="review-887", status="completed", summary="approve: the change is correct and covered by tests",
         verdict="approve", findings=[], pr_number=887)

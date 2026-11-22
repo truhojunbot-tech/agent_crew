@@ -17,6 +17,7 @@ from agent_crew.server import create_app
 from agent_crew.server import _DispatchSlot
 from agent_crew.cli import crew
 from tests.contract.lineage_contract import assert_lineage_contract
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 INTENT = {"repo": "owner/repo", "issue": 773, "branch": "agent/773-work",
@@ -270,6 +271,7 @@ def test_server_retry_keeps_both_role_choices(tmp_db, monkeypatch):
     app = create_app(tmp_db, pane_map={}, watchdog_disabled=True, anomaly_disabled=True,
                      identity_required=False)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "impl-773")
         response = client.post("/tasks/impl-773/result", json={
             "task_id": "impl-773", "status": "failed", "summary": "usage limit hit",
             "findings": [], "error_info": {"kind": "transient"},

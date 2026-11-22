@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def test_get_task_matches_list_mapping_and_missing_is_none(tmp_db):
@@ -95,6 +96,7 @@ def test_result_http_uses_no_full_task_scan_including_fallback_check(
         monkeypatch.setattr(TaskQueue, "list_tasks", forbid_list)
         monkeypatch.setattr("agent_crew.server._pipeline_auto_enqueue_review",
                             lambda *_args, **_kwargs: None)
+        record_dispatch_provenance(queue, "impl-result")
         result = client.post("/tasks/impl-result/result", json={
             "task_id": "impl-result", "status": "completed", "summary": "corrected"})
     assert result.status_code == 200, result.text
@@ -115,6 +117,7 @@ def test_result_http_failed_path_uses_no_full_task_scan(tmp_db, monkeypatch):
                      pane_map={}, worktree_map={})
     with TestClient(app) as client:
         monkeypatch.setattr(TaskQueue, "list_tasks", forbid_list)
+        record_dispatch_provenance(queue, "impl-failed")
         result = client.post("/tasks/impl-failed/result", json={
             "task_id": "impl-failed", "status": "failed", "summary": "worker error"})
     assert result.status_code == 200, result.text

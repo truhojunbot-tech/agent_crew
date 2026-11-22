@@ -12,6 +12,7 @@ from agent_crew.cli import crew
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _app(tmp_db, pane_map=None, state_path=None):
@@ -141,6 +142,7 @@ def test_result_after_cancel_is_rejected_without_cascade(tmp_db):
     app = _app(tmp_db)
     with TestClient(app) as client:
         assert client.delete("/tasks/late").status_code == 200
+        record_dispatch_provenance(queue, "late")
         response = client.post("/tasks/late/result", json={
             "task_id": "late", "status": "completed", "summary": "worker kept running",
         })

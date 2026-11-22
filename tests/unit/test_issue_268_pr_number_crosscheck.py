@@ -40,6 +40,7 @@ from agent_crew.pipeline import (
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 BRANCH = "agent/codex/268-x"
 REQUESTED = 268          # the PR the task was dispatched for
@@ -192,6 +193,7 @@ def test_http_a_mismatched_review_is_stored_and_stops_there(tmp_db, monkeypatch,
     with TestClient(_server(tmp_db, push)) as c:
         _enqueue(c, "review-mm", "review", {"pr_number": REQUESTED})
         dispatched = len(push.calls)   # the original dispatch is not the cascade
+        record_dispatch_provenance(tmp_db, "review-mm")
         assert _submit(c, "review-mm").status_code == 200
         stored = c.get("/tasks/review-mm").json()
 
@@ -215,6 +217,7 @@ def test_http_the_response_says_the_result_was_held(tmp_db, monkeypatch, github_
     monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
     with TestClient(_server(tmp_db, _Push())) as c:
         _enqueue(c, "review-body", "review", {"pr_number": REQUESTED})
+        record_dispatch_provenance(tmp_db, "review-body")
         body = _submit(c, "review-body").json()
 
     assert body.get("held") == "pr_number_mismatch"
@@ -232,6 +235,7 @@ def test_http_an_agreeing_review_still_cascades(tmp_db, monkeypatch, github_writ
         # than inferring from process cwd — supply one so this test keeps
         # exercising the #268 control, not the repo-identity guard.
         _enqueue(c, "review-ok", "review", {"pr_number": REQUESTED, "repo": "truhojunbot-tech/agent_crew"})
+        record_dispatch_provenance(tmp_db, "review-ok")
         assert _submit(c, "review-ok", pr_number=REQUESTED).json().get("held") is None
         assert c.get("/tasks/review-ok").json()["status"] == "completed"
 
@@ -247,6 +251,7 @@ def test_http_an_implement_result_may_still_name_the_pr_it_just_opened(tmp_db, m
     with TestClient(_server(tmp_db, _Push())) as c:
         # canonical-repo-identity remediation: see test_http_an_agreeing_review_still_cascades.
         _enqueue(c, "impl-new", "implement", {"issue": 268, "repo": "truhojunbot-tech/agent_crew"})
+        record_dispatch_provenance(tmp_db, "impl-new")
         r = _submit(c, "impl-new", verdict=None, findings=[], summary="opened the PR")
         assert r.json().get("held") is None
 
@@ -289,6 +294,7 @@ def _mcp_submit(tmp_db, **kwargs):
     from agent_crew.mcp_server import build_mcp_server
 
     fn = build_mcp_server(tmp_db)._tool_manager._tools["submit_result"].fn
+    record_dispatch_provenance(tmp_db, kwargs["task_id"])
     return asyncio.run(fn(**kwargs)) if asyncio.iscoroutinefunction(fn) else fn(**kwargs)
 
 
@@ -384,6 +390,7 @@ def test_http_a_hash_prefixed_pr_number_agrees_and_cascades(tmp_db, monkeypatch,
     with TestClient(_server(tmp_db, _Push())) as c:
         # canonical-repo-identity remediation: see test_http_an_agreeing_review_still_cascades.
         _enqueue(c, "review-hash", "review", {"pr_number": REQUESTED, "repo": "truhojunbot-tech/agent_crew"})
+        record_dispatch_provenance(tmp_db, "review-hash")
         r = _submit(c, "review-hash", pr_number=f"#{REQUESTED}")
         assert r.status_code == 200, r.text
         assert r.json().get("held") is None
@@ -397,6 +404,7 @@ def test_http_a_hash_prefixed_pr_number_can_still_mismatch(tmp_db, monkeypatch, 
     monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
     with TestClient(_server(tmp_db, _Push())) as c:
         _enqueue(c, "review-hash-mm", "review", {"pr_number": REQUESTED})
+        record_dispatch_provenance(tmp_db, "review-hash-mm")
         body = _submit(c, "review-hash-mm", pr_number=f"#{REPORTED}").json()
 
     assert body.get("held") == "pr_number_mismatch"

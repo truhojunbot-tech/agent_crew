@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _prepare(db, fallback_status=None, original_status="failed"):
@@ -37,6 +38,7 @@ def _prepare(db, fallback_status=None, original_status="failed"):
 def _late_post(db):
     app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(db, "impl-root")
         return client.post("/tasks/impl-root/result", json={
             "task_id": "impl-root", "status": "completed", "summary": "original finished",
             "commit": "a" * 40,

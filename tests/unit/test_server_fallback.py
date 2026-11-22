@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +81,7 @@ def test_successor_cea_blocks_belong_to_own_receipt(tmp_db, summary, successor_p
             },
         })
 
+        record_dispatch_provenance(queue, "receipt-parent")
         response = client.post("/tasks/receipt-parent/result",
                                json=_result("receipt-parent", summary=summary))
         assert response.status_code == 200
@@ -109,6 +111,7 @@ def test_u_fb01_rate_limit_never_substitutes_implementer(tmp_db):
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("impl-1"))
         # Implementer reports rate-limit failure.
+        record_dispatch_provenance(tmp_db, "impl-1")
         client.post("/tasks/impl-1/result", json=_result("impl-1"))
 
     # Same-role retry is allowed; no alternate provider receives this role.
@@ -129,11 +132,13 @@ def test_u_fb02_repeated_rate_limit_has_no_fallback_chain(tmp_db):
 
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("impl-2"))
+        record_dispatch_provenance(tmp_db, "impl-2")
         client.post("/tasks/impl-2/result", json=_result("impl-2", summary="usage limit"))
         retry_task = next(
             t for t in TaskQueue(tmp_db).list_tasks()
             if t.task_id.startswith("retry-impl-2-")
         )
+        record_dispatch_provenance(tmp_db, retry_task.task_id)
         client.post(f"/tasks/{retry_task.task_id}/result",
                     json=_result(retry_task.task_id, summary="quota exceeded"))
 
@@ -166,6 +171,7 @@ def test_rate_limit_retry_exhaustion_records_one_escalation(tmp_db):
     with TestClient(app) as client:
         assert client.post("/tasks", json=_task_payload(task_id)).status_code == 201
         for attempt in range(3):
+            record_dispatch_provenance(tmp_db, task_id)
             response = client.post(f"/tasks/{task_id}/result",
                                    json=_result(task_id, summary="rate limit reached",
                                                 error_info={"kind": "provider_limit"}))
@@ -188,6 +194,7 @@ def test_u_fb04_non_rate_limit_failure_skips_fallback(tmp_db):
 
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("impl-4"))
+        record_dispatch_provenance(tmp_db, "impl-4")
         client.post(
             "/tasks/impl-4/result",
             json=_result(
@@ -219,6 +226,7 @@ def test_u_fb05_disabled_via_env(tmp_db, monkeypatch):
 
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("impl-5"))
+        record_dispatch_provenance(tmp_db, "impl-5")
         client.post("/tasks/impl-5/result", json=_result("impl-5", summary="rate limit"))
 
     # No fallback path was taken; the existing retry path was used instead.

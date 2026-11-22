@@ -26,6 +26,7 @@ pytestmark = pytest.mark.usefixtures("legacy_gemini_tester_policy")
 from agent_crew.context_identity import detect_context_compaction, extract_claude_session_id
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +572,7 @@ def test_u_i202_attribution_terminal_state_on_agent_success(tmp_db, tmp_path, *,
             append_attribution_jsonl(attr_jsonl_path, q.get_attribution("succ-1"))
 
             # Simulate the agent CLI's own completion callback.
+            record_dispatch_provenance(q, "succ-1")
             resp = client.post("/tasks/succ-1/result", json={
                 "task_id": "succ-1", "status": "completed", "summary": "done",
             })
@@ -725,6 +727,7 @@ def test_u_i235_retry_completion_finalizes_outcome_and_keeps_original_start(
                                worktree_path=str(wt_paths["claude"]),
                                context_id="ctx-retry-1")
 
+            record_dispatch_provenance(q, "retry-1")
             resp = client.post("/tasks/retry-1/result", json={
                 "task_id": "retry-1", "status": "completed", "summary": "ok"})
             assert resp.status_code == 200
@@ -769,6 +772,7 @@ def test_u_i235_jsonl_reconciles_to_one_task_without_double_counting(
             _dispatch_snapshot(q, attr_jsonl_path, "fold-1",
                                worktree_path=str(wt_paths["claude"]),
                                context_id="ctx-fold-1")
+            record_dispatch_provenance(q, "fold-1")
             client.post("/tasks/fold-1/result", json={
                 "task_id": "fold-1", "status": "completed", "summary": "ok"})
 
@@ -814,6 +818,7 @@ def test_u_i235_terminal_outcome_survives_a_restart(tmp_db, tmp_path, *, unused_
             _dispatch_snapshot(q, attr_jsonl_path, "durable-1",
                                worktree_path=str(wt_paths["claude"]),
                                context_id="ctx-durable-1")
+            record_dispatch_provenance(q, "durable-1")
             client.post("/tasks/durable-1/result", json={
                 "task_id": "durable-1", "status": "failed", "summary": "nope",
                 "error_info": {"reason": "agy_quota_exhausted"}})

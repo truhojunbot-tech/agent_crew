@@ -13,6 +13,7 @@ from agent_crew.pipeline import auto_enqueue_test, auto_fallback_failed_task
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _gemini_tester_state(tmp_db):
@@ -167,6 +168,7 @@ def test_post_recovery_test_reports_outcome_on_pr(
                                  "pr_number": 42, "repo": "owner/repo"}))
     app = create_app(tmp_db, pane_map={}, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, task_id)
         response = client.post(f"/tasks/{task_id}/result", json={
             "task_id": task_id, "status": status, "summary": "verification finished",
             "findings": [], "pr_number": 42,

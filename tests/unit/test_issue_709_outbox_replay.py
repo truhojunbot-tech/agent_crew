@@ -12,6 +12,7 @@ from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 from agent_crew.pipeline import stale_review_task_id
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 @pytest.fixture
@@ -139,6 +140,7 @@ def test_superseded_parent_expires_without_replay(tmp_path, monkeypatch):
                  "coordinator_managed": True, "risk_tier": 2},
     ))
     with TestClient(_app(queue)) as client:
+        record_dispatch_provenance(queue, "review-stale")
         response = client.post("/tasks/review-stale/result", json={
             "task_id": "review-stale", "status": "completed",
             "summary": "Review found a blocker in the current PR changes",

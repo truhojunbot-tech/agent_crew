@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _git(cwd, *args):
@@ -79,6 +80,7 @@ def test_missing_refs_use_only_descendant_dispatched_worktree_head(
         monkeypatch.setattr("agent_crew.pipeline.pr_is_actionable",
                             lambda *args, **kwargs: (True, "open"))
     with caplog.at_level(logging.INFO), TestClient(app) as client:
+        record_dispatch_provenance(queue, "impl-573")
         response = client.post("/tasks/impl-573/result", json={
             "task_id": "impl-573", "status": "completed", "summary": "work done",
         })
@@ -126,6 +128,7 @@ def test_late_revision_cannot_adopt_another_tasks_worktree_head(tmp_path, monkey
                      pane_map={}, identity_required=False,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "impl-a")
         failed = client.post("/tasks/impl-a/result", json={
             "task_id": "impl-a", "status": "failed", "summary": "first task failed",
         })
@@ -143,6 +146,7 @@ def test_late_revision_cannot_adopt_another_tasks_worktree_head(tmp_path, monkey
         _git(worker, "commit", "-m", "other task")
         _git(worker, "push", "origin", "agent/other-task")
 
+        record_dispatch_provenance(queue, "impl-a")
         late = client.post("/tasks/impl-a/result", json={
             "task_id": "impl-a", "status": "completed", "summary": "late completion",
         })

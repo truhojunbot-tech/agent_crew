@@ -2819,6 +2819,14 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             )
             raise click.exceptions.Exit(0)
 
+        # #1050: a pool-parked row never ran, so this deadline says nothing
+        # about it. Leave it queued for the next open; posting a failure here
+        # would spend a retry attempt and log a false wrapper_timeout.
+        if task_status_now == "waiting_pool":
+            click.echo(f"Task {task_id!r} parked waiting_pool; still queued. "
+                       f"Check: crew status {project or '(project)'}")
+            raise click.exceptions.Exit(3)
+
         # The dispatcher owns a running task and enforces its own hard and
         # output-idle limits. A pane-less provider has no tmux activity for
         # this wrapper to inspect, so its deadline cannot decide failure.

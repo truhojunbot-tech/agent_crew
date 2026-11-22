@@ -19,6 +19,7 @@ from agent_crew.loop import (
     handle_test_result,
 )
 from agent_crew.protocol import TaskResult
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 pytestmark = pytest.mark.integration
@@ -57,10 +58,12 @@ def _make_result(task_id: str, status: str = "completed",
 # I-LO01: implement → review(approve) → test(pass) → done
 def test_i_lo01_approve_first_review(task_queue, test_client):
     impl_id = enqueue_implement(task_queue, DESC, BRANCH)
+    record_dispatch_provenance(task_queue, impl_id)
     _submit(test_client, impl_id, summary="Login implemented")
 
     review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id,
                                context={"risk_tier": 1})
+    record_dispatch_provenance(task_queue, review_id)
     _submit(test_client, review_id, summary="LGTM", verdict="approve")
 
     outcome = handle_review_result(
@@ -70,6 +73,7 @@ def test_i_lo01_approve_first_review(task_queue, test_client):
 
     # The HTTP review result already cascaded a test; adopt that successor.
     test_id = enqueue_test(task_queue, DESC, BRANCH, prev_task_id=review_id)
+    record_dispatch_provenance(task_queue, test_id)
     _submit(test_client, test_id, summary="All tests pass")
 
     assert handle_test_result(_make_result(test_id)) == "passed"
@@ -160,9 +164,11 @@ def test_i_lo04_no_tester(task_queue, test_client):
 # I-LO05: test failure → re-enqueue implement
 def test_i_lo05_test_failure_reimplements(task_queue, test_client):
     impl_id = enqueue_implement(task_queue, DESC, BRANCH)
+    record_dispatch_provenance(task_queue, impl_id)
     _submit(test_client, impl_id, summary="Done")
 
     review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id, context={"risk_tier": 1})
+    record_dispatch_provenance(task_queue, review_id)
     _submit(test_client, review_id, summary="LGTM", verdict="approve")
 
     handle_review_result(_make_result(review_id, verdict="approve"),
@@ -170,6 +176,7 @@ def test_i_lo05_test_failure_reimplements(task_queue, test_client):
 
     # The HTTP review result already cascaded a test; adopt that successor.
     test_id = enqueue_test(task_queue, DESC, BRANCH, prev_task_id=review_id)
+    record_dispatch_provenance(task_queue, test_id)
     _submit(test_client, test_id, status="failed", summary="3 tests failed",
             error_info={"kind": "test_failure"})
 

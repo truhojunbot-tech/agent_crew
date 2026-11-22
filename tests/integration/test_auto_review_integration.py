@@ -7,13 +7,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 pytestmark = pytest.mark.integration
 
 
 # I-AR01: impl completed → auto-enqueue review with prev_task_id
-def test_i_ar01_impl_completion_auto_enqueues_review(test_client):
+def test_i_ar01_impl_completion_auto_enqueues_review(test_client, tmp_db):
     """Test that submitting impl result auto-creates a review task."""
     impl_payload = {
         "task_id": "impl-ar01",
@@ -35,6 +36,7 @@ def test_i_ar01_impl_completion_auto_enqueues_review(test_client):
         "verdict": None,
         "pr_number": None,
     }
+    record_dispatch_provenance(tmp_db, "impl-ar01")
     resp = test_client.post("/tasks/impl-ar01/result", json=result_payload)
     assert resp.status_code == 200
 
@@ -50,7 +52,7 @@ def test_i_ar01_impl_completion_auto_enqueues_review(test_client):
 
 
 # I-AR02: impl failed → no auto-enqueue review
-def test_i_ar02_impl_failed_no_auto_review(test_client):
+def test_i_ar02_impl_failed_no_auto_review(test_client, tmp_db):
     """Test that failed impl tasks do not trigger auto-review."""
     impl_payload = {
         "task_id": "impl-ar02",
@@ -69,6 +71,7 @@ def test_i_ar02_impl_failed_no_auto_review(test_client):
         "summary": "Implementation failed",
         "findings": [],
     }
+    record_dispatch_provenance(tmp_db, "impl-ar02")
     resp = test_client.post("/tasks/impl-ar02/result", json=result_payload)
     assert resp.status_code == 200
 
@@ -79,7 +82,7 @@ def test_i_ar02_impl_failed_no_auto_review(test_client):
 
 
 # I-AR03: auto-created review preserves checklist context
-def test_i_ar03_auto_review_preserves_checklist(test_client):
+def test_i_ar03_auto_review_preserves_checklist(test_client, tmp_db):
     """Test that auto-created review task includes proper checklist context."""
     impl_payload = {
         "task_id": "impl-ar03",
@@ -97,6 +100,7 @@ def test_i_ar03_auto_review_preserves_checklist(test_client):
         "summary": "Completed",
         "findings": [],
     }
+    record_dispatch_provenance(tmp_db, "impl-ar03")
     test_client.post("/tasks/impl-ar03/result", json=result_payload)
 
     # Get auto-created review task
@@ -114,7 +118,7 @@ def test_i_ar03_auto_review_preserves_checklist(test_client):
 
 
 # I-AR04: multiple impl tasks each create their own review
-def test_i_ar04_multiple_impl_tasks_create_reviews(test_client):
+def test_i_ar04_multiple_impl_tasks_create_reviews(test_client, tmp_db):
     """Test that multiple impl tasks each trigger their own review creation."""
     for i in range(2):
         impl_payload = {
@@ -133,6 +137,7 @@ def test_i_ar04_multiple_impl_tasks_create_reviews(test_client):
             "summary": f"Completed feature {i}",
             "findings": [],
         }
+        record_dispatch_provenance(tmp_db, f"impl-ar04-{i}")
         test_client.post(f"/tasks/impl-ar04-{i}/result", json=result_payload)
 
     # Verify 2 review tasks were created

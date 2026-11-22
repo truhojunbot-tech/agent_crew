@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from tests.unit.test_sev0_cea_s2c_writer_callsites import WIRED, admitted
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 BASE = "a" * 40
@@ -251,6 +252,7 @@ def test_other_no_artifact_hold_does_not_request_missing_refs(tmp_path, monkeypa
                         lambda *_a, **_k: (False, "reported commit is the dispatch base (no new artifact)"))
     app = create_app(db, watchdog_disabled=True, anomaly_disabled=True, worktree_map={})
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "impl-base")
         response = client.post("/tasks/impl-base/result", json={
             "task_id": "impl-base", "status": "completed", "summary": "done", "commit": BASE})
     assert response.status_code == 200, response.text

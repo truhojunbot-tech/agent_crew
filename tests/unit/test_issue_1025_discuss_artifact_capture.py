@@ -13,6 +13,7 @@ from agent_crew.discuss_artifacts import (
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _git(wt, *args):
@@ -91,6 +92,7 @@ def test_untracked_answer_survives_prep_clean(harness, worktree):
     (worktree / "cases").mkdir()
     (worktree / "cases" / "move.md").write_text(answer)
 
+    record_dispatch_provenance(queue, "codex-1025a")
     response = _post(app, "codex-1025a", summary="wrote assessment to cases/move.md")
     assert response.status_code == 200, response.text
     _prep_clean(worktree)
@@ -111,6 +113,7 @@ def test_modified_tracked_file_is_captured(harness, worktree):
     _dispatch(queue, "codex-1025b", worktree)
     (worktree / "README.md").write_text("tracked\nedited by worker\n")
 
+    record_dispatch_provenance(queue, "codex-1025b")
     assert _post(app, "codex-1025b").status_code == 200
     _prep_clean(worktree)
 
@@ -125,6 +128,7 @@ def test_over_cap_content_is_truncated(harness, worktree):
     big = "a" * (DISCUSS_ARTIFACT_CAP_BYTES + 1000)
     (worktree / "big.txt").write_text(big)
 
+    record_dispatch_provenance(queue, "codex-1025c")
     assert _post(app, "codex-1025c").status_code == 200
 
     [entry] = _artifacts(queue, "codex-1025c")
@@ -139,6 +143,7 @@ def test_binary_file_records_path_and_hash_only(harness, worktree):
     blob = b"\x89PNG\x00\x01\xff"
     (worktree / "chart.png").write_bytes(blob)
 
+    record_dispatch_provenance(queue, "codex-1025d")
     assert _post(app, "codex-1025d").status_code == 200
 
     [entry] = _artifacts(queue, "codex-1025d")
@@ -151,6 +156,7 @@ def test_missing_pointer_warns_once_and_stays_completed(harness, worktree):
     app, queue, notices = harness
     _dispatch(queue, "codex-1025e", worktree)
 
+    record_dispatch_provenance(queue, "codex-1025e")
     response = _post(app, "codex-1025e",
                      summary="DART-only report written to cases/regime/h2a.md")
     assert response.status_code == 200, response.text
@@ -169,6 +175,7 @@ def test_pointer_with_findings_does_not_warn(harness, worktree):
     app, queue, notices = harness
     _dispatch(queue, "codex-1025f", worktree)
 
+    record_dispatch_provenance(queue, "codex-1025f")
     assert _post(app, "codex-1025f", summary="see cases/x.md",
                  findings=["the full answer"]).status_code == 200
 

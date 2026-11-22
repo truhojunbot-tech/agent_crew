@@ -14,6 +14,7 @@ from agent_crew.github import publish_independent_review_status as real_publish_
 from agent_crew.cli import _conformance_gate_allows_merge, _registry_capability_for_paths
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 CHECKER = Path("/home/truhojun/alfred/tools/contract_registry.py")
@@ -354,11 +355,13 @@ def _server_review_fixture(tmp_path, monkeypatch, *, reviewer, head, publish=Tru
     app = create_app(db_path=db, pane_map={}, push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(q, "review-server")
         response = client.post("/tasks/review-server/result", json={
             "task_id": "review-server", "status": "completed",
             "summary": "Reviewed the PR head and found no blocking changes.",
             "verdict": "approve", "findings": [], "pr_number": 606})
         assert response.status_code == 200, response.text
+        record_dispatch_provenance(q, "test-review-server")
         response = client.post("/tasks/test-review-server/result", json={
             "task_id": "test-review-server", "status": "completed",
             "summary": "passed", "pr_number": 606,

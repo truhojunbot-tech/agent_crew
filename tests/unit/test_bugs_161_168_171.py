@@ -357,6 +357,7 @@ class TestAutoRetryReviewNoPrForBranchGuard:
 
 from fastapi.testclient import TestClient
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def _review_task_payload(task_id: str, branch: str) -> dict:
@@ -397,6 +398,7 @@ class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
         app = create_app(db_path=tmp_db, watchdog_disabled=True)
         with TestClient(app) as client, \
              patch("agent_crew.github.branch_has_pr", return_value=None):
+            record_dispatch_provenance(queue, "review-216-unknown")
             response = client.post("/tasks/review-216-unknown/result",
                                    json=_failed_result_payload("review-216-unknown"))
         assert response.status_code == 200
@@ -455,6 +457,7 @@ class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
         with TestClient(app) as client, \
              patch("agent_crew.github.branch_has_pr") as mock_bhp:
             client.post("/tasks", json=payload)
+            record_dispatch_provenance(tmp_db, "review-216d")
             client.post("/tasks/review-216d/result", json=_failed_result_payload("review-216d"))
 
         mock_bhp.assert_not_called()

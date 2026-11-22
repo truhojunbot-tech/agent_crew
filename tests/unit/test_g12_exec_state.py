@@ -20,6 +20,7 @@ from agent_crew import provenance
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import EXEC_STATE_COLUMNS, TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "pre_g12_tasks.db"
 NEW_COLUMNS = [c for c in EXEC_STATE_COLUMNS if c != "push_at"]
@@ -223,6 +224,7 @@ def test_cancelled_result_is_rejected_without_row_or_artifact_mutation(tmp_db):
     with TestClient(app, raise_server_exceptions=False) as client:
         client.post("/tasks", json={"task_id": "late", "task_type": "implement", "description": "d", "branch": "main"})
         assert client.delete("/tasks/late").status_code == 200
+        record_dispatch_provenance(tmp_db, "late")
         response = client.post("/tasks/late/result", json={"task_id": "late", "status": "completed", "summary": "late", "commit": "d" * 40})
     assert response.status_code == 409
     assert "LATE_RESULT_REJECTED" in response.text

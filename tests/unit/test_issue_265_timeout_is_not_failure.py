@@ -22,6 +22,7 @@ import pytest
 
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 @pytest.fixture(autouse=True)
@@ -270,6 +271,7 @@ def test_a_late_result_is_recorded_as_an_event(tmp_db, tmp_path, monkeypatch, *,
     app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as c:
+        record_dispatch_provenance(q, tid)
         r = c.post(f"/tasks/{tid}/result",
                    json={"task_id": tid, "status": "completed",
                          "summary": "actually finished", "verdict": None,
@@ -378,6 +380,7 @@ def test_the_late_result_is_evidence_only(tmp_db, tmp_path, *, unused_tcp_port):
     app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as c:
+        record_dispatch_provenance(q, tid)
         response = c.post(f"/tasks/{tid}/result",
                json={"task_id": tid, "status": "completed",
                      "summary": "Root-caused the starvation", "verdict": None,

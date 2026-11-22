@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from agent_crew.queue import TaskQueue  # noqa: E402
 from agent_crew.protocol import TaskRequest  # noqa: E402
 from agent_crew import pause  # noqa: E402
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def mk(i, tt="implement"):
@@ -45,6 +46,7 @@ class TestResultCascadeGate(Base):
         self.assertIsNotNone(t)
         pause.set_pause(self.sd, True, source="test", incident="alfred#39")
         c = self._client()
+        record_dispatch_provenance(self.q, t.task_id)
         r = c.post(f"/tasks/{t.task_id}/result",
                    json={"task_id": t.task_id, "status": "completed", "summary": "done", "pr_number": 42})
         self.assertEqual(r.status_code, 200)
@@ -62,6 +64,7 @@ class TestResultCascadeGate(Base):
         self.q.enqueue(mk(2, "implement"))
         t = self.q.dequeue(role="implementer")
         c = self._client()
+        record_dispatch_provenance(self.q, t.task_id)
         r = c.post(f"/tasks/{t.task_id}/result",
                    json={"task_id": t.task_id, "status": "completed", "summary": "done"})
         self.assertEqual(r.status_code, 200)
@@ -76,6 +79,7 @@ class TestResultCascadeGate(Base):
         with open(os.path.join(self.sd, "pause.json"), "w") as f:
             f.write("{ broken ")
         c = self._client()
+        record_dispatch_provenance(self.q, t.task_id)
         r = c.post(f"/tasks/{t.task_id}/result",
                    json={"task_id": t.task_id, "status": "completed", "summary": "x", "pr_number": 1})
         self.assertTrue(r.json().get("suppressed_by_pause"), "손상 pause state → fail-closed 억제")
@@ -126,6 +130,7 @@ class TestDeterministicRace(Base):
         t = self.q.dequeue(role="reviewer")
         pause.set_pause(self.sd, True, source="test")
         c = self._client()
+        record_dispatch_provenance(self.q, t.task_id)
         r = c.post(f"/tasks/{t.task_id}/result",
                    json={"task_id": t.task_id, "status": "completed", "verdict": "request_changes",
                          "summary": "The review found changes needed before this can be approved.",
@@ -141,6 +146,7 @@ class TestResumeReplay(Base):
         t = self.q.dequeue(role="implementer")
         pause.set_pause(self.sd, True, source="test", incident="alfred#39")
         c = self._client()
+        record_dispatch_provenance(self.q, t.task_id)
         r = c.post(f"/tasks/{t.task_id}/result",
                    json={"task_id": t.task_id, "status": "completed", "summary": "done"})
         self.assertTrue(r.json().get("suppressed_by_pause"))
@@ -182,6 +188,7 @@ class TestReplaySideEffectBoundary(Base):
         self.q.enqueue(mk(1, "implement"))
         t = self.q.dequeue(role="implementer")
         pause.set_pause(self.sd, True, source="test", incident="alfred#39")
+        record_dispatch_provenance(self.q, t.task_id)
         r = c.post(f"/tasks/{t.task_id}/result",
                    json={"task_id": t.task_id, "status": "completed", "summary": "done"})
         self.assertTrue(r.json().get("suppressed_by_pause"))
@@ -223,6 +230,7 @@ class TestReviewCommentReconciliation(Base):
             self.q.dequeue(role="reviewer")
             # crash 시뮬레이션: 게시는 됐지만 done 기록 전 죽어 reserved만 남은 상태
             self.q.external_op_reserve("comment:review:rev-x", pr_number=77)
+            record_dispatch_provenance(self.q, "rev-x")
             r = c.post("/tasks/rev-x/result",
                        json={"task_id": "rev-x", "status": "completed", "verdict": "approve",
                              "summary": "Reviewed the proposed change and found no blocking issues.",
@@ -250,6 +258,7 @@ class TestReviewCommentReconciliation(Base):
                                        project="testproj"))
             self.q.dequeue(role="reviewer")
             self.q.external_op_reserve("comment:review:rev-y", pr_number=78)  # 기존 reserved
+            record_dispatch_provenance(self.q, "rev-y")
             r = c.post("/tasks/rev-y/result",
                        json={"task_id": "rev-y", "status": "completed", "verdict": "approve",
                              "summary": "Reviewed the proposed change and found no blocking issues.",
@@ -302,6 +311,7 @@ class TestRequiredRegressionsNotYetNamed(Base):
         self._inflight()
         pause.set_pause(self.sd, True, reason="incident", incident="alfred#39")
         before = {t.task_id for t in self.q.list_tasks()}
+        record_dispatch_provenance(self.q, "t1")
         r = self._client().post("/tasks/t1/result", json={
             "task_id": "t1", "status": "failed", "summary": "rate limit"})
         self.assertEqual(r.status_code, 200, r.text)
@@ -316,6 +326,7 @@ class TestRequiredRegressionsNotYetNamed(Base):
         self.assertIsNotNone(self.q.dequeue_discuss_for_agent("claude"))
         pause.set_pause(self.sd, True, reason="incident")
         before = {t.task_id for t in self.q.list_tasks()}
+        record_dispatch_provenance(self.q, "d1")
         r = self._client().post("/tasks/d1/result", json={
             "task_id": "d1", "status": "completed", "summary": "done"})
         self.assertEqual(r.status_code, 200, r.text)
@@ -329,6 +340,7 @@ class TestRequiredRegressionsNotYetNamed(Base):
         pause.set_pause(self.sd, True, reason="incident")
         first = self._client()
         first.__exit__(None, None, None)          # restart boundary
+        record_dispatch_provenance(self.db, "t1")
         r = self._client().post("/tasks/t1/result", json={
             "task_id": "t1", "status": "completed", "summary": "done"})
         self.assertEqual(r.status_code, 200, r.text)
@@ -366,6 +378,7 @@ class TestMcpTransportParity(Base):
         self.assertIsNotNone(self.q.dequeue(role="implementer"))
         pause.set_pause(self.sd, True, reason="incident", incident="alfred#39")
 
+        record_dispatch_provenance(self.q, "t1")
         ack = self._mcp("submit_result", task_id="t1", status="completed", summary="done")
         self.assertTrue(ack.get("acknowledged"), ack)
         self.assertTrue(ack.get("suppressed_by_pause"), ack)
@@ -378,6 +391,7 @@ class TestMcpTransportParity(Base):
                                    branch="main", priority=1, context={}, project="testproj"))
         self.q.dequeue(role="implementer")
         pause.set_pause(self.sd, True, reason="incident")
+        record_dispatch_provenance(self.q, "t1")
         self._mcp("submit_result", task_id="t1", status="completed", summary="done")
 
         q2 = TaskQueue(self.db)
@@ -439,6 +453,7 @@ class TestMcpTransportParity(Base):
             return _real(queue, task_id, **kw)
 
         with mock.patch.object(mcp_server, "auto_enqueue_review", _stop_lands_mid_cascade):
+            record_dispatch_provenance(self.q, "t1")
             ack = self._mcp("submit_result", task_id="t1", status="completed", summary="done")
 
         self.assertTrue(ack.get("acknowledged"), ack)
@@ -475,6 +490,7 @@ class TestMcpTransportParity(Base):
                                    branch="main", priority=1,
                                    context={"crew_run_branch": True}, project="testproj"))
         self.q.dequeue(role="implementer")
+        record_dispatch_provenance(self.q, "t1")
         ack = self._mcp("submit_result", task_id="t1", status="completed", summary="done")
         self.assertTrue(ack.get("acknowledged"), ack)
         self.assertFalse(ack.get("suppressed_by_pause"))

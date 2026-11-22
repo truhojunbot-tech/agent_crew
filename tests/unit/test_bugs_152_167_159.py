@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +101,7 @@ def test_auto_retry_skips_agent_reported_implement_failure(
         ).status_code == 201
         if task_type == "test":
             assert getattr(app.state, "script_test_thread", None) is None
+        record_dispatch_provenance(tmp_db, "self-report-probe")
         response = client.post("/tasks/self-report-probe/result", json={
             "task_id": "self-report-probe", "status": "failed",
             "summary": "agent failed", "error_info": error_info,
@@ -318,6 +320,7 @@ class TestFallbackCancellation:
             # Enqueue a task that has already been retried twice (at max).
             _post_task(client, "A", ctx={"retry_attempt": 2})
             # Agent submits failure with retry_count=0 (agents never fill this).
+            record_dispatch_provenance(tmp_db, "A")
             _post_result(client, "A", status="failed", summary="generic failure")
 
         q = TaskQueue(tmp_db)

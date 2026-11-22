@@ -18,6 +18,7 @@ from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 from agent_crew.server import create_app
+from tests.dispatch_provenance import record_dispatch_provenance
 
 pytestmark = pytest.mark.usefixtures("admit_crew_run")  # #1006: subject is not admission
 
@@ -854,6 +855,7 @@ def test_approved_review_cascades_into_a_script_test(project, server, monkeypatc
                                                          "base_branch": "main"}))
     with TestClient(app) as client:
         assert queue.dequeue(role="reviewer") is not None
+        record_dispatch_provenance(queue, review)
         resp = client.post(f"/tasks/{review}/result", headers={"X-Agent-Crew-Project": "proj"},
                            json={"task_id": review, "status": "completed",
                                  "summary": "Approved: the change is small and covered by tests.",

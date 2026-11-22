@@ -10,6 +10,7 @@ from agent_crew import contract_emit
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app, _record_exit_response_telemetry
+from tests.dispatch_provenance import record_dispatch_provenance
 
 
 def test_result_post_triggers_one_emit_for_project(tmp_path, monkeypatch):
@@ -22,6 +23,7 @@ def test_result_post_triggers_one_emit_for_project(tmp_path, monkeypatch):
     app = create_app(db, project="agent_crew", pane_map={}, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as client:
+        record_dispatch_provenance(queue, "discuss-contract")
         response = client.post("/tasks/discuss-contract/result",
                                json={"task_id": "discuss-contract", "status": "completed",
                                      "summary": "done"},
@@ -115,6 +117,7 @@ def test_slow_emitter_adds_less_than_50ms_to_http_result(tmp_path, monkeypatch):
     try:
         with TestClient(app) as client:
             monkeypatch.setenv("AGENT_CREW_CONTRACT_EMIT_CMD", "emitter")
+            record_dispatch_provenance(queue, "slow")
             response = client.post("/tasks/slow/result",
                                    json={"task_id": "slow", "status": "completed",
                                          "summary": "done"},
