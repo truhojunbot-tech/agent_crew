@@ -28,14 +28,50 @@ def _wrapper_timeout(task_id):
             "findings": [], "verdict": None, "pr_number": None}
 
 
+def _result(task_id, status, reason):
+    """A result body for ``task_id``; ``reason=None`` sends no error_info."""
+    body = {"task_id": task_id, "status": status, "summary": f"{status} report",
+            "findings": [], "verdict": None, "pr_number": None,
+            "error_info": None if reason is None else {"kind": "x", "reason": reason}}
+    if status == "completed":
+        body.update(branch="agent/x", commit="a" * 40, pr_number=1)
+    return body
+
+
 def _lineage(queue, task_id):
     return [t.task_id for t in queue.list_tasks() if t.task_id != task_id]
 
 
-def test_parked_row_wrapper_timeout_is_409_and_row_resumes(tmp_path, monkeypatch, notices):
-    path = _signal(tmp_path, monkeypatch, "hold")
+@pytest.mark.parametrize("reason", ["wrapper_timeout", "other", None])
+@pytest.mark.parametrize("status", ["completed", "failed", "needs_human"])
+def test_waiting_pool_refuses_every_result(tmp_path, monkeypatch, notices, status, reason):
+    """A waiting_pool row refuses every result, whatever the status or reason."""
+    _signal(tmp_path, monkeypatch, "hold")
     app, queue, dispatched = _app(tmp_path, monkeypatch, CLAUDE_IMPL)
     task_id = _impl(queue)
+    body = _result(task_id, status, reason)
+    with TestClient(app) as client:
+        assert _wait(lambda: queue.get_task_status(task_id) == "waiting_pool")
+        before = [e["event"] for e in queue.get_exec_state(task_id)["events"]]
+        with pytest.raises(ParkedResultRejected):
+            queue.submit_result(task_id, TaskResult(**body))
+        resp = client.post(f"/tasks/{task_id}/result", json=body, headers=HDR)
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["prior_status"] == "waiting_pool"
+        assert queue.get_task_status(task_id) == "waiting_pool"
+        assert queue.get_result(task_id) is None
+        assert [e["event"] for e in queue.get_exec_state(task_id)["events"]] == before
+        assert _events(queue, task_id, "result") == []
+        assert _lineage(queue, task_id) == []
+        assert dispatched == []
+
+
+def test_parked_row_wrapper_timeout_is_409_and_row_resumes(tmp_path, monkeypatch, notices):
+    """The 8101 incident end to end (alpha_engine ``impl-48142056``, 11-21):
+    parked by the #1033 gate, then a ``crew run`` wrapper timeout POST."""
+    path = _signal(tmp_path, monkeypatch, "hold")
+    app, queue, dispatched = _app(tmp_path, monkeypatch, CLAUDE_IMPL)
+    task_id = _impl(queue, task_id="impl-48142056")
     with TestClient(app) as client:
         assert _wait(lambda: queue.get_task_status(task_id) == "waiting_pool")
         before = [e["event"] for e in queue.get_exec_state(task_id)["events"]]
@@ -130,3 +166,18 @@ def test_cli_wait_deadline_on_waiting_pool_posts_nothing(tmp_db, tmp_path, unuse
     assert result.exit_code != 0
     assert q.get_task_status("run-parked-1") == "waiting_pool"
     assert q.get_result("run-parked-1") is None
+
+
+def test_undispatched_pending_completed_result_still_accepted(tmp_path):
+    """Pins the narrowed #1050 scope (issue comment "Scope decision (agent-crew
+    coordinator, 11-22 01:1xZ)"): only waiting_pool rows and wrapper timeouts on
+    never-dispatched pending rows are refused. Any other result on an
+    undispatched pending row keeps its existing path; refusing all of them broke
+    187 existing tests that submit straight onto a pending row."""
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("pending-1", "implement", "work", branch="main",
+                              context={"risk_tier": 1}))
+    assert queue.get_task_status("pending-1") == "pending"
+    queue.submit_result("pending-1", TaskResult(**_result("pending-1", "completed", None)))
+    assert queue.get_task_status("pending-1") == "completed"
+    assert queue.get_result("pending-1") is not None

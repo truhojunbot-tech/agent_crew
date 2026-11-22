@@ -5867,6 +5867,7 @@ class TaskQueue:
         Every result for a ``waiting_pool`` row is refused. On a pending row
         only a wrapper timeout is, and only when the row was never dispatched:
         other results on undispatched pending rows keep their existing path.
+        Scope: #1050 comment "Scope decision (agent-crew coordinator, 11-22 01:1xZ)".
         """
         if prior_status == "waiting_pool":
             return True
