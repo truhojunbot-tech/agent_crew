@@ -28,11 +28,12 @@ def test_all_test_role_config_paths_refuse_gemini_family(agent, tmp_path):
     with pytest.raises(ValueError):
         validate_explicit_role_agents({"implementer": "codex", "reviewer": "claude",
                                        "tester": agent})
-    legacy, _ = effective_role_mapping({"roles": [{"role": "tester", "agent": agent}]})
-    assert legacy["tester"] == "script"
+    with pytest.raises(RoleResolutionError, match="gemini_athena_only"):
+        effective_role_mapping({"roles": [{"role": "tester", "agent": agent}]})
     path = tmp_path / "fallback_chains.json"
     path.write_text('{"test": ["gemini", "agy", "script"]}')
-    assert fallback.load_fallback_chains(str(tmp_path / "state.json"))["test"] == ["script"]
+    with pytest.raises(RoleResolutionError, match="gemini_athena_only"):
+        fallback.load_fallback_chains(str(tmp_path / "state.json"))
 
 
 @pytest.mark.parametrize("ci_state,expected_status", [
@@ -90,7 +91,8 @@ def test_workflow_detection_reads_tested_commit(tmp_path):
 
 
 def test_custom_fallback_cannot_pick_gemini_for_test():
-    assert fallback.next_agent("test", None, [], {"test": ["gemini", "agy", "script"]}) == "script"
+    with pytest.raises(RoleResolutionError, match="gemini_athena_only"):
+        fallback.next_agent("test", None, [], {"test": ["gemini", "agy", "script"]})
 
 
 @pytest.mark.parametrize("tester", ["gemini", "agy", "claude"])
@@ -101,8 +103,12 @@ def test_refused_explicit_tester_refuses_entire_mapping(tester):
         "roles": [{"role": "reviewer", "agent": "claude"}],
     }
 
-    with pytest.raises(ValueError, match="invalid_role_agents"):
-        effective_role_mapping(state, project="demo")
+    if tester in ("gemini", "agy"):
+        with pytest.raises(RoleResolutionError, match="gemini_athena_only"):
+            effective_role_mapping(state, project="demo")
+    else:
+        with pytest.raises(ValueError, match="invalid_role_agents"):
+            effective_role_mapping(state, project="demo")
 
 
 def test_unmapped_gemini_override_claims_review_only(tmp_path):
