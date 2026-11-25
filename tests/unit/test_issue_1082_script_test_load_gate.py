@@ -100,25 +100,28 @@ _CMD = f"{sys.executable} -m pytest -q"
 
 
 @pytest.mark.usefixtures("xdist_present")
-@pytest.mark.parametrize(("addopts", "command", "expected", "status"), [
-    (None, _CMD, "--maxprocesses=4", "capped"),
-    ("-n 8 -q", _CMD, "-n 8 -q --maxprocesses=4", "capped"),
-    ("--maxprocesses=8", _CMD, "--maxprocesses=8 --maxprocesses=4", "capped"),
-    ("--maxprocesses 2", _CMD, "--maxprocesses 2", "already_capped"),
-    ("--maxprocesses=4", _CMD, "--maxprocesses=4", "already_capped"),
+@pytest.mark.parametrize(("addopts", "command", "expected", "injection"), [
+    # -q hides xdist's worker count, so one -v restores the line we certify from.
+    (None, _CMD, "--maxprocesses=4 -v", "injected"),
+    (None, f"{sys.executable} -m pytest", "--maxprocesses=4", "injected"),
+    ("-n 8 -q", _CMD, "-n 8 -q --maxprocesses=4 -v", "injected"),
+    ("--maxprocesses=8", _CMD, "--maxprocesses=8 --maxprocesses=4 -v", "injected"),
+    ("--maxprocesses 2", _CMD, "--maxprocesses 2 -v", "already_configured"),
+    ("--maxprocesses=4", _CMD, "--maxprocesses=4 -v", "already_configured"),
     # Duplicates: the last one is effective, not any low one (review of #1083).
     ("--maxprocesses=2 --maxprocesses=8 -n 8", _CMD,
-     "--maxprocesses=2 --maxprocesses=8 -n 8 --maxprocesses=4", "capped"),
-    ("--maxprocesses=8 --maxprocesses=2", _CMD, "--maxprocesses=8 --maxprocesses=2",
-     "already_capped"),
+     "--maxprocesses=2 --maxprocesses=8 -n 8 --maxprocesses=4 -v", "injected"),
+    ("--maxprocesses=8 --maxprocesses=2", _CMD, "--maxprocesses=8 --maxprocesses=2 -v",
+     "already_configured"),
     # A command value at or under the cap stays within it after ours.
-    (None, f"{_CMD} -n 8 --maxprocesses=3", "--maxprocesses=4", "capped"),
+    (None, f"{_CMD} -n 8 --maxprocesses=3", "--maxprocesses=4 -v", "injected"),
 ])
-def test_cap_goes_into_pytest_addopts(addopts, command, expected, status):
+def test_cap_goes_into_pytest_addopts(addopts, command, expected, injection):
     env = {"PATH": "/bin"} if addopts is None else {"PATH": "/bin", "PYTEST_ADDOPTS": addopts}
     capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd="/")
     assert capped["PYTEST_ADDOPTS"] == expected and capped["PATH"] == "/bin"
-    assert evidence["status"] == status and evidence["cap"] == 4
+    assert evidence["injection"] == injection and evidence["cap"] == 4
+    assert "status" not in evidence                       # injection certifies nothing
     assert env.get("PYTEST_ADDOPTS") == addopts           # the input is not mutated
 
 
@@ -140,7 +143,7 @@ def test_unresolvable_invocations_record_cap_unenforced(command, env, reason):
     capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd="/")
     assert capped == env                                   # nothing injected
     assert evidence == {"cap": 4, "mechanism": "PYTEST_ADDOPTS --maxprocesses",
-                        "status": "cap_unenforced", "reason": reason}
+                        "injection": "skipped", "reason": reason}
 
 
 def test_xdist_is_probed_in_the_target_interpreter_not_the_crew(tmp_path):
@@ -161,7 +164,7 @@ def test_xdist_is_probed_in_the_target_interpreter_not_the_crew(tmp_path):
                             (f"{_CMD} unit && pytest e2e", "xdist_unavailable"),
                             ("venv/bin/py.test", "pytest_launcher_unresolved")]:
         capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd=str(tmp_path))
-        assert (evidence["status"], evidence["reason"]) == ("cap_unenforced", reason), command
+        assert (evidence["injection"], evidence["reason"]) == ("skipped", reason), command
         assert capped == env
     assert script_tester._target_has_xdist(str(tmp_path / "nope"), env, str(tmp_path)) is False
 
@@ -189,7 +192,8 @@ def test_record_workers():
 def test_real_shell_command_keeps_its_redirect_and_implicit_workers_are_capped(
         tmp_path, implicit):
     """A redirecting shell command, with ``-n 8`` from ini addopts or from a
-    configured PYTEST_ADDOPTS (not the command), runs with at most 2 workers."""
+    configured PYTEST_ADDOPTS (not the command), runs with at most 2 workers.
+    Its output went to the file, so the run did not show it: not certified."""
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_w.py").write_text(_WORKER_COUNT_TEST)
     out = tmp_path / "workers.txt"
@@ -204,22 +208,70 @@ def test_real_shell_command_keeps_its_redirect_and_implicit_workers_are_capped(
     env, evidence = script_tester.cap_xdist_workers(
         command, script_tester.test_environment(str(tmp_path), {"test_env": test_env}), 2,
         cwd=str(tmp_path))
-    assert evidence["status"] == "capped"
+    assert evidence["injection"] == "injected"
     outcome = script_tester.run_command(command, str(tmp_path), 120, env=env)
     assert outcome.exit_code == 0, outcome.output_tail
     assert "shell-ok" in outcome.output_tail                 # && still chains
     assert "1 passed" in (tmp_path / "result.log").read_text()  # > still redirects
     assert out.read_text() == "2"
+    receipt = script_tester.certify_worker_cap(evidence, outcome)
+    assert (receipt["status"], receipt["observed_workers"]) == ("cap_unenforced", None)
+
+
+@pytest.mark.skipif(not script_tester._target_has_xdist(sys.executable, dict(os.environ), "."),
+                    reason="needs pytest-xdist")
+def test_real_quiet_run_reports_its_workers_and_is_certified(tmp_path):
+    """``-q`` hides xdist's count; the injected -v brings it back, so the
+    receipt rests on the 2 workers the run reported."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_w.py").write_text(_WORKER_COUNT_TEST)
+    out = tmp_path / "workers.txt"
+    command = "python3 -m pytest -q -n 8 -p no:cacheprovider tests"
+    env, evidence = script_tester.cap_xdist_workers(
+        command, script_tester.test_environment(
+            str(tmp_path), {"test_env": {"WORKERS_OUT": str(out)}}), 2, cwd=str(tmp_path))
+    outcome = script_tester.run_command(command, str(tmp_path), 120, env=env)
+    assert outcome.exit_code == 0 and out.read_text() == "2", outcome.output_tail
+    receipt = script_tester.certify_worker_cap(evidence, outcome)
+    assert (receipt["status"], receipt["observed_workers"]) == ("cap_enforced", 2)
 
 
 def test_real_cli_cap_after_addopts_is_reported_unenforced(tmp_path):
     """The command's own --maxprocesses=8 is read after PYTEST_ADDOPTS and wins,
-    so the cap is not claimed and the env is left as configured."""
+    so the cap is not injected and the env is left as configured."""
     command = "python3 -m pytest -n 8 --maxprocesses=8 tests > result.log"
     base = script_tester.test_environment(str(tmp_path), {})
     env, evidence = script_tester.cap_xdist_workers(command, base, 2, cwd=str(tmp_path))
-    assert evidence["status"] == "cap_unenforced"
+    assert evidence["injection"] == "skipped"
     assert evidence["reason"] == "command_overrides_cap" and env == base
+
+
+def _reported(output, exit_code=0):
+    """A fake run that printed ``output``, parsed as run_command parses it."""
+    counts, ids = script_tester.parse_test_output(output)
+    return script_tester.RunOutcome(
+        exit_code=exit_code, counts=counts, failing_ids=ids, output_tail=output,
+        observed_workers=script_tester.observed_xdist_workers(output, counts))
+
+
+_XDIST_8 = "created: 8/8 workers\n8 workers [12 items]\n\n....\n12 passed in 3.1s\n"
+_XDIST_2 = "created: 2/2 workers\n2 workers [12 items]\n\n....\n12 passed in 3.1s\n"
+
+
+@pytest.mark.usefixtures("xdist_present")
+@pytest.mark.parametrize(("command", "output", "status", "observed"), [
+    # Review of #1083: a shell-local assignment overrides the injected env.
+    (f"PYTEST_ADDOPTS='-n 8 --maxprocesses=8' {_CMD} tests", _XDIST_8, "cap_unenforced", 8),
+    (f"{_CMD} -n 8 --maxprocesses=2 --maxprocesses=2 tests", _XDIST_2, "cap_enforced", 2),
+    (f"{_CMD} tests", "....\n12 passed in 3.1s\n", "cap_enforced", 1),       # no xdist
+    (f"{_CMD} tests", "bringing up nodes...\n12 passed in 3.1s\n", "cap_unenforced", None),
+    (f"{_CMD} tests > out.log", "", "cap_unenforced", None),                   # redirected
+])
+def test_receipt_rests_on_the_workers_the_run_reported(command, output, status, observed):
+    _, injection = script_tester.cap_xdist_workers(command, {"PATH": "/bin"}, 4, cwd="/")
+    receipt = script_tester.certify_worker_cap(injection, _reported(output))
+    assert (receipt["status"], receipt["observed_workers"], receipt["cap"]) == (
+        status, observed, 4)
 
 
 def test_env_overrides_and_invalid_env_falls_back(monkeypatch):
@@ -236,10 +288,10 @@ def test_env_overrides_and_invalid_env_falls_back(monkeypatch):
         assert script_tester.max_workers() == 4
 
 
-def _recording_env_runner(calls):
+def _recording_env_runner(calls, output=_XDIST_2):
     def runner(command, cwd, timeout_s, *, env=None):
         calls.append((command, (env or {}).get("PYTEST_ADDOPTS")))
-        return script_tester.RunOutcome(exit_code=0, counts={"passed": 1})
+        return _reported(output)
     return runner
 
 
@@ -253,8 +305,10 @@ def test_full_suite_runs_with_capped_workers_and_gate(project, tmp_path, monkeyp
         cache_dir=str(tmp_path / "cache"), runner=_recording_env_runner(calls),
         load_gate=_gate(host))
     record = result.error_info["script_test"]
-    assert calls == [(f"{PYTEST} -n 8 > out.log", "--maxprocesses=3")]
-    assert record["worker_cap"]["status"] == "capped" and record["worker_cap"]["cap"] == 3
+    assert calls == [(f"{PYTEST} -n 8 > out.log", "--maxprocesses=3 -v")]
+    assert record["worker_cap"] == {
+        "cap": 3, "mechanism": "PYTEST_ADDOPTS --maxprocesses", "injection": "injected",
+        "observed_workers": 2, "status": "cap_enforced"}
     assert record["command"] == f"{PYTEST} -n 8 > out.log"
     assert host.sleeps == [120.0]
     assert [a["load_contended"] for a in record["host_load"]] == [False]
@@ -272,17 +326,26 @@ def test_isolated_reruns_keep_the_configured_command(project, tmp_path):
         if cmd.endswith(node):
             return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
         if os.path.exists(os.path.join(cwd, "tests", "test_b.py")):
-            return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
-        return script_tester.RunOutcome(exit_code=0)
+            return _reported(f"created: 4/4 workers\nFAILED {node}\n1 failed in 1s\n", 1)
+        return _reported("created: 8/8 workers\n1 passed in 1s\n")
 
     record = script_tester.run_script_test(
         repo, base_sha=_git_rev(repo, "origin/main"), head_sha=head,
         state={"test_command": command}, cache_dir=str(tmp_path / "cache"), runner=runner,
         load_gate=_gate(FakeHost([1.0])))
-    capped = (command, "--maxprocesses=4")
+    capped = (command, "--maxprocesses=4 -v")
     assert calls[:2] == [capped, capped]                       # head + base full suites
     assert calls[2:] == [(f"{command} {node}", None)] * 2      # reruns unchanged
     assert len(record["host_load"]) == 2
+    # Head and base each keep their own worker evidence, so parity shows both.
+    assert (record["worker_cap"]["status"], record["worker_cap"]["observed_workers"]) == (
+        "cap_enforced", 4)
+    assert (record["base"]["worker_cap"]["status"],
+            record["base"]["worker_cap"]["observed_workers"]) == ("cap_unenforced", 8)
+    cached, was_cached = script_tester.base_outcome(
+        repo, _git_rev(repo, "origin/main"), command, record["timeout_s"], str(tmp_path / "cache"),
+        {"test_command": command}, runner, worker_cap=4)
+    assert was_cached and cached.worker_cap == record["base"]["worker_cap"]
 
 
 def _git_rev(repo, ref):

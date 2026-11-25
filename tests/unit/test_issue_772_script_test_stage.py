@@ -214,7 +214,7 @@ def test_new_failure_is_judged_from_isolated_head_reruns(
     assert all(command.endswith(" " + node) for command, _, _ in rerun_calls)
     # #1082: only the full suite carries the worker cap; reruns keep the rest.
     head_env = dict(calls[0][2])
-    if head_env.get("PYTEST_ADDOPTS") == "--maxprocesses=4":
+    if head_env.get("PYTEST_ADDOPTS") == "--maxprocesses=4 -v":
         del head_env["PYTEST_ADDOPTS"]
     assert all(cwd == calls[0][1] and env == head_env
                for _, cwd, env in rerun_calls)

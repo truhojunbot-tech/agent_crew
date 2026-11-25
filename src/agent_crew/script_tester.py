@@ -224,25 +224,26 @@ def _target_has_xdist(interpreter: str, env: Mapping[str, str], cwd: str) -> boo
 
 def cap_xdist_workers(command: str, env: Mapping[str, str], cap: int, *,
                       cwd: str) -> tuple[dict[str, str], dict]:
-    """Cap a full suite's xdist workers at ``cap`` through ``PYTEST_ADDOPTS``.
+    """Inject a full suite's xdist worker cap ``cap`` through ``PYTEST_ADDOPTS``.
 
     The command is never rewritten: it runs under ``/bin/sh -c``, so redirects,
     pipes, variables and chained commands keep their meaning (review of #1083).
     pytest reads ini ``addopts``, then ``PYTEST_ADDOPTS``, then the command's
     own arguments, and the last ``--maxprocesses`` wins; xdist then bounds any
-    ``-n`` by it. So the cap is enforced only when it is the effective value:
-    appended last to ``PYTEST_ADDOPTS``, with no larger or unreadable value in
-    the command, and every pytest the command launches able to load xdist (it
-    rejects the option otherwise). Anything this cannot resolve leaves the env
-    unchanged and records ``cap_unenforced`` with a ``reason``, never ``capped``.
-    Returns the env and a typed ``worker_cap`` record whose ``status`` is
-    ``capped``, ``already_capped`` or ``cap_unenforced``.
+    ``-n`` by it. The option is injected only where pytest accepts it: every
+    pytest the command launches can load xdist, and no larger or unreadable
+    value follows in the command. Otherwise the env is unchanged and
+    ``injection`` is ``skipped`` with a ``reason``.
+
+    Shell-local assignments and launchers can still change what runs, so this
+    certifies nothing: ``certify_worker_cap`` decides from the workers the run
+    reported. ``-q`` hides xdist's worker count, so one ``-v`` is added with it.
     """
     env = dict(env)
     evidence: dict = {"cap": cap, "mechanism": f"PYTEST_ADDOPTS {_MAXPROCESSES}"}
 
     def unenforced(reason: str) -> tuple[dict[str, str], dict]:
-        return env, {**evidence, "status": "cap_unenforced", "reason": reason}
+        return env, {**evidence, "injection": "skipped", "reason": reason}
 
     addopts = env.get("PYTEST_ADDOPTS", "")
     try:
@@ -263,10 +264,39 @@ def cap_xdist_workers(command: str, env: Mapping[str, str], cap: int, *,
         return unenforced("xdist_unavailable")
     addopt_values = _maxprocesses_values(addopt_words)
     if addopt_values and _within(addopt_values[-1], cap):
-        return env, {**evidence, "status": "already_capped",
-                     "configured": int(addopt_values[-1])}
-    env["PYTEST_ADDOPTS"] = f"{addopts} {_MAXPROCESSES}={cap}".strip()
-    return env, {**evidence, "status": "capped"}
+        extra, evidence = [], {**evidence, "injection": "already_configured",
+                               "configured": int(addopt_values[-1])}
+    else:
+        extra, evidence = [f"{_MAXPROCESSES}={cap}"], {**evidence, "injection": "injected"}
+    if any(re.fullmatch(r"-q+|--quiet", word) for word in words + addopt_words):
+        extra.append("-v")
+    if extra:
+        env["PYTEST_ADDOPTS"] = " ".join([addopts, *extra]).strip()
+    return env, evidence
+
+
+_XDIST_WORKERS_RE = re.compile(
+    r"^(?:created: \d+/(\d+) workers?|(\d+) workers? \[\d+ items?\])\s*$", re.M)
+
+
+def observed_xdist_workers(output: str, counts: Mapping) -> Optional[int]:
+    """The workers pytest-xdist reported in ``output``, or None when it is unknown.
+
+    No xdist line means one worker only when pytest's own summary (``counts``)
+    is there too; a redirected or crashed run shows neither.
+    """
+    workers = [int(a or b) for a, b in _XDIST_WORKERS_RE.findall(output)]
+    if workers:
+        return max(workers)
+    return 1 if counts and "bringing up nodes" not in output else None
+
+
+def certify_worker_cap(injection: Mapping, outcome: "RunOutcome") -> dict:
+    """``cap_enforced`` only when the run reported at most ``cap`` workers."""
+    observed = outcome.observed_workers
+    enforced = observed is not None and observed <= injection["cap"]
+    return {**injection, "observed_workers": observed,
+            "status": "cap_enforced" if enforced else "cap_unenforced"}
 
 
 CI_GATE_ENV = "AGENT_CREW_SCRIPT_TEST_CI_GATE"
@@ -299,6 +329,8 @@ class RunOutcome:
     timed_out: bool = False
     duration_s: float = 0.0
     output_tail: str = ""
+    observed_workers: Optional[int] = None        # None: the run did not report it
+    worker_cap: Optional[dict] = None
 
     @property
     def clean(self) -> bool:
@@ -307,14 +339,18 @@ class RunOutcome:
     def to_dict(self) -> dict:
         return {"exit_code": self.exit_code, "counts": dict(self.counts),
                 "failing_ids": list(self.failing_ids), "timed_out": self.timed_out,
-                "duration_s": round(self.duration_s, 3)}
+                "duration_s": round(self.duration_s, 3),
+                "observed_workers": self.observed_workers,
+                **({"worker_cap": dict(self.worker_cap)} if self.worker_cap else {})}
 
     @classmethod
     def from_dict(cls, data: Mapping) -> "RunOutcome":
         return cls(exit_code=data.get("exit_code"), counts=dict(data.get("counts") or {}),
                    failing_ids=list(data.get("failing_ids") or []),
                    timed_out=bool(data.get("timed_out")),
-                   duration_s=float(data.get("duration_s") or 0.0))
+                   duration_s=float(data.get("duration_s") or 0.0),
+                   observed_workers=data.get("observed_workers"),
+                   worker_cap=data.get("worker_cap"))
 
 
 def resolve_test_config(state: Optional[Mapping], checkout: str) -> TestConfig:
@@ -527,7 +563,8 @@ def run_command(command: str, cwd: str, timeout_s: float,
     return RunOutcome(exit_code=None if timed_out else proc.returncode, counts=counts,
                       failing_ids=ids, timed_out=timed_out,
                       duration_s=time.monotonic() - started,
-                      output_tail=(output or "")[-_OUTPUT_TAIL_CHARS:])
+                      output_tail=(output or "")[-_OUTPUT_TAIL_CHARS:],
+                      observed_workers=observed_xdist_workers(output or "", counts))
 
 
 def _git(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -625,7 +662,7 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
     """The base outcome, cached per base sha, command and test environment."""
     identity = _test_environment_identity(state, timeout_s)
     if worker_cap is not None:
-        identity = f"{identity}-w{worker_cap}"
+        identity = f"{identity}-observed-w{worker_cap}"
     path = _cache_path(cache_dir, base_sha, command, identity)
     try:
         with open(path) as f:
@@ -636,8 +673,10 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
     with Checkout(repo, base_sha) as checkout:
         env = test_environment(checkout, state)
         if worker_cap is not None:
-            env, _ = cap_xdist_workers(command, env, worker_cap, cwd=checkout)
+            env, injection = cap_xdist_workers(command, env, worker_cap, cwd=checkout)
         outcome = runner(command, checkout, timeout_s, env=env)
+        if worker_cap is not None:
+            outcome.worker_cap = certify_worker_cap(injection, outcome)
     if not outcome.timed_out:
         os.makedirs(cache_dir, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
@@ -668,10 +707,10 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 return record
             head_env = test_environment(checkout, state)
             cap = max_workers()
-            suite_env, record["worker_cap"] = cap_xdist_workers(
-                command, head_env, cap, cwd=checkout)
+            suite_env, injection = cap_xdist_workers(command, head_env, cap, cwd=checkout)
             _admit_full_suite(load_gate, record)
             head = runner(command, checkout, timeout_s, env=suite_env)
+            record["worker_cap"] = certify_worker_cap(injection, head)
             record["head"] = head.to_dict()
             record["counts"] = dict(head.counts)
             record["duration_s"] = head.duration_s
