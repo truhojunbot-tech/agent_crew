@@ -7,7 +7,10 @@ import json
 import os
 from typing import Any, Optional
 
-from agent_crew.role_mapping import PANE_PROVIDERS, refuse_gemini_outside_athena
+from agent_crew.role_mapping import (
+    KNOWN_ROLE_AGENTS, PANE_PROVIDERS, RoleResolutionError,
+    refuse_gemini_outside_athena,
+)
 
 DEFAULT_CHAINS: dict[str, list[str]] = {
     "implement": ["claude", "codex"],
@@ -32,34 +35,35 @@ def load_fallback_chains(state_path: Optional[str]) -> dict[str, list[str]]:
     """Read the per-project fallback chain override and merge over defaults.
 
     Override file lives next to ``state.json`` at ``fallback_chains.json``.
-    Missing file or malformed JSON quietly returns the defaults; we never
-    want a config typo to disable the fallback policy. A chain naming a
-    gemini-family agent outside Athena raises ``gemini_athena_only`` (#924b).
+    An absent override uses defaults. An unreadable or malformed declared
+    override refuses dispatch through the shared role-resolution error.
+    Gemini-family agents outside Athena raise gemini_athena_only (#924b).
     """
     chains: dict[str, list[str]] = {k: list(v) for k, v in DEFAULT_CHAINS.items()}
     if not state_path:
         return chains
     override_path = os.path.join(os.path.dirname(state_path), "fallback_chains.json")
-    if not os.path.isfile(override_path):
-        return chains
     try:
         with open(override_path) as f:
             raw = json.load(f)
-    except Exception:
+    except FileNotFoundError:
         return chains
+    except (OSError, ValueError) as exc:
+        raise RoleResolutionError("invalid_fallback_chains", override_path) from exc
     if not isinstance(raw, dict):
-        return chains
+        raise RoleResolutionError("invalid_fallback_chains", "override must be an object")
     for task_type, agents in raw.items():
-        if not isinstance(agents, list):
-            continue
-        cleaned = [a for a in agents if isinstance(a, str) and a]
-        # Judged on the declared chain, before the script-only tester trim:
-        # a gemini-naming chain is refused whole for every task type.
-        refuse_gemini_outside_athena(_state_project(state_path), cleaned)
+        # Check the declared chain before validation or the script-only trim.
+        refuse_gemini_outside_athena(_state_project(state_path), agents)
+        if (not isinstance(agents, list) or not agents
+                or any(not isinstance(a, str) or a not in KNOWN_ROLE_AGENTS for a in agents)):
+            raise RoleResolutionError("invalid_fallback_chains", f"invalid chain for {task_type!r}")
+        cleaned = list(agents)
         if task_type == "test":
             cleaned = [a for a in cleaned if a == "script"]
-        if cleaned:
-            chains[task_type] = cleaned
+        if not cleaned:
+            raise RoleResolutionError("invalid_fallback_chains", f"no allowed agents for {task_type!r}")
+        chains[task_type] = cleaned
     return chains
 
 

@@ -107,6 +107,7 @@ from agent_crew import script_tester as _script_tester
 from agent_crew import pool_signal as _pool_signal
 from agent_crew import contract_emit as _contract_emit
 from agent_crew.cea import wiring as cea_wiring
+from agent_crew.fallback import load_fallback_chains
 from agent_crew.role_mapping import (
     EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, ROLE_BOUND_PROVIDERS,
     GEMINI_ATHENA_ONLY, TASK_TYPE_TO_ROLE, RoleResolutionError, anonymous_pull_refusal,
@@ -2605,8 +2606,9 @@ def _load_discuss_worktrees(state_path: Optional[str]) -> dict[str, str]:
 
 def _load_role_to_agent_with_source(state_path: Optional[str]) -> tuple[dict[str, str], str]:
     """Load the effective provider-neutral mapping and its source label."""
-    if not state_path or not os.path.exists(state_path):
+    if not state_path:
         return effective_role_mapping(None)
+    load_fallback_chains(state_path)
     try:
         with open(state_path) as f:
             state = json.load(f)
@@ -4572,11 +4574,14 @@ def create_app(
     def _role_map_stamp():
         if not state_path:
             return None
-        try:
-            stat = os.stat(state_path)
-            return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
-        except OSError:
-            return None
+        stamps = []
+        for path in (state_path, os.path.join(os.path.dirname(state_path), "fallback_chains.json")):
+            try:
+                stat = os.stat(path)
+                stamps.append((stat.st_mtime_ns, stat.st_size, stat.st_ino, stat.st_mode))
+            except OSError:
+                stamps.append(None)
+        return tuple(stamps)
 
     _role_map_cached_stamp = _role_map_stamp()
     logger.info("dispatcher: effective role map at startup: %s", _DISPATCH_ROLE_TO_AGENT)

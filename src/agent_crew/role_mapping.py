@@ -247,7 +247,7 @@ def effective_role_mapping(
         return default_role_mapping(), DEFAULT_SOURCE
 
     explicit = state.get("role_agents")
-    if explicit is not None:
+    if "role_agents" in state:
         # Before validation, so a gemini tester is refused as gemini_athena_only
         # rather than as a generic invalid_role_agents.
         refuse_gemini_outside_athena(project, explicit)
