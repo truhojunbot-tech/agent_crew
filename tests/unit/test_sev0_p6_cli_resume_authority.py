@@ -59,7 +59,10 @@ def test_project_resume_checks_signed_t0_in_fresh_cli_process(
                "resume", project, "--base", str(tmp_path),
                "--generation", str(stopped_epoch + 1), "--source", source,
                "--decision-id", decision_id]
-    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
+    # A fresh CLI process imports the whole package; under full-suite load on
+    # the gate box 30s was not enough (#1014/#1076). 150s stays inside the
+    # outer --timeout=180 so a hang still fails cleanly here.
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=150)
     assert result.stdout, f"fresh CLI produced no stdout; stderr={result.stderr!r}"
     payload = json.loads(result.stdout)
     assert payload["resumed"] is allowed, result.stdout + result.stderr
