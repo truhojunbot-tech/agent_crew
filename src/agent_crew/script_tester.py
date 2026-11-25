@@ -162,42 +162,109 @@ class HostLoadGate:
 
 
 _MAXPROCESSES = "--maxprocesses"
+_SHELL_EXPANSION = re.compile(r"[$`]")
 
 
-def _xdist_available() -> bool:
-    """Whether pytest-xdist is importable for the interpreter tests run with."""
-    import importlib.util
-    return importlib.util.find_spec("xdist") is not None
+def _maxprocesses_values(words: list[str]) -> list[str]:
+    """Every ``--maxprocesses`` value in ``words``, in order (argparse: last wins)."""
+    values = []
+    for index, word in enumerate(words):
+        if word.startswith(_MAXPROCESSES + "="):
+            values.append(word[len(_MAXPROCESSES) + 1:])
+        elif word == _MAXPROCESSES:
+            values.append(words[index + 1] if index + 1 < len(words) else "")
+    return values
 
 
-def cap_xdist_workers(env: Mapping[str, str], cap: int) -> tuple[dict[str, str], dict]:
+def _within(value: str, cap: int) -> bool:
+    return bool(re.fullmatch(r"\d+", value)) and 0 < int(value) <= cap
+
+
+def _pytest_interpreters(words: list[str], env: Mapping[str, str],
+                         cwd: str) -> Optional[list[str]]:
+    """The interpreter of every pytest launcher in ``words``; None if any is unknown."""
+    interpreters = []
+    for index, word in enumerate(words):
+        name = os.path.basename(word)
+        if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", name) and words[index + 1:index + 3] == [
+                "-m", "pytest"]:
+            interpreter = word
+        elif name in {"pytest", "py.test"} and words[index - 1:index] != ["-m"]:
+            launcher = shutil.which(word, path=env.get("PATH", os.defpath)) if (
+                os.sep not in word) else os.path.join(cwd, word)
+            try:
+                with open(launcher or "", "rb") as f:
+                    shebang = f.readline().decode(errors="replace")[2:].split()
+            except OSError:
+                return None
+            if shebang[:1] and os.path.basename(shebang[0]) == "env":
+                shebang = shebang[1:]
+            if not shebang or not re.fullmatch(r"python(?:\d+(?:\.\d+)?)?",
+                                               os.path.basename(shebang[0])):
+                return None                       # an sh wrapper or unknown launcher
+            interpreter = shebang[0]
+        else:
+            continue
+        resolved = (shutil.which(interpreter, path=env.get("PATH", os.defpath))
+                    if os.sep not in interpreter else os.path.join(cwd, interpreter))
+        if not resolved:
+            return None
+        interpreters.append(resolved)
+    return interpreters or None
+
+
+def _target_has_xdist(interpreter: str, env: Mapping[str, str], cwd: str) -> bool:
+    """Whether the interpreter the command runs pytest with can import xdist."""
+    try:
+        return subprocess.run([interpreter, "-c", "import xdist"], cwd=cwd, env=dict(env),
+                              capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def cap_xdist_workers(command: str, env: Mapping[str, str], cap: int, *,
+                      cwd: str) -> tuple[dict[str, str], dict]:
     """Cap a full suite's xdist workers at ``cap`` through ``PYTEST_ADDOPTS``.
 
     The command is never rewritten: it runs under ``/bin/sh -c``, so redirects,
     pipes, variables and chained commands keep their meaning (review of #1083).
-    ``--maxprocesses`` bounds whatever worker count pytest ends up with, whether
-    it came from the command's ``-n``, an ini ``addopts`` or ``PYTEST_ADDOPTS``,
-    and leaves a serial run serial. Returns the env to run with and a typed
-    ``worker_cap`` record; ``status`` is ``capped``, ``already_capped`` or
-    ``unsupported`` (env unchanged, ``reason`` says why).
+    pytest reads ini ``addopts``, then ``PYTEST_ADDOPTS``, then the command's
+    own arguments, and the last ``--maxprocesses`` wins; xdist then bounds any
+    ``-n`` by it. So the cap is enforced only when it is the effective value:
+    appended last to ``PYTEST_ADDOPTS``, with no larger or unreadable value in
+    the command, and every pytest the command launches able to load xdist (it
+    rejects the option otherwise). Anything this cannot resolve leaves the env
+    unchanged and records ``cap_unenforced`` with a ``reason``, never ``capped``.
+    Returns the env and a typed ``worker_cap`` record whose ``status`` is
+    ``capped``, ``already_capped`` or ``cap_unenforced``.
     """
     env = dict(env)
     evidence: dict = {"cap": cap, "mechanism": f"PYTEST_ADDOPTS {_MAXPROCESSES}"}
-    if not _xdist_available():
-        # Without xdist pytest rejects the option, so adding it would fail the run.
-        return env, {**evidence, "status": "unsupported", "reason": "xdist_unavailable"}
+
+    def unenforced(reason: str) -> tuple[dict[str, str], dict]:
+        return env, {**evidence, "status": "cap_unenforced", "reason": reason}
+
     addopts = env.get("PYTEST_ADDOPTS", "")
     try:
-        words = shlex.split(addopts)
+        words, addopt_words = shlex.split(command), shlex.split(addopts)
     except ValueError:
-        return env, {**evidence, "status": "unsupported",
-                     "reason": "pytest_addopts_unparseable"}
-    for index, word in enumerate(words):
-        value = (word[len(_MAXPROCESSES) + 1:] if word.startswith(_MAXPROCESSES + "=")
-                 else words[index + 1] if word == _MAXPROCESSES and index + 1 < len(words)
-                 else None)
-        if value is not None and re.fullmatch(r"\d+", value) and 0 < int(value) <= cap:
-            return env, {**evidence, "status": "already_capped", "configured": int(value)}
+        return unenforced("unparseable")
+    if any(_SHELL_EXPANSION.search(word) for word in words):
+        return unenforced("command_expands_at_runtime")
+    if "PYTEST_DISABLE_PLUGIN_AUTOLOAD" in env or "no:xdist" in words + addopt_words:
+        return unenforced("xdist_disabled")
+    command_values = _maxprocesses_values(words)
+    if not all(_within(value, cap) for value in command_values):
+        return unenforced("command_overrides_cap")
+    interpreters = _pytest_interpreters(words, env, cwd)
+    if interpreters is None:
+        return unenforced("pytest_launcher_unresolved")
+    if not all(_target_has_xdist(interpreter, env, cwd) for interpreter in interpreters):
+        return unenforced("xdist_unavailable")
+    addopt_values = _maxprocesses_values(addopt_words)
+    if addopt_values and _within(addopt_values[-1], cap):
+        return env, {**evidence, "status": "already_capped",
+                     "configured": int(addopt_values[-1])}
     env["PYTEST_ADDOPTS"] = f"{addopts} {_MAXPROCESSES}={cap}".strip()
     return env, {**evidence, "status": "capped"}
 
@@ -569,7 +636,7 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
     with Checkout(repo, base_sha) as checkout:
         env = test_environment(checkout, state)
         if worker_cap is not None:
-            env, _ = cap_xdist_workers(env, worker_cap)
+            env, _ = cap_xdist_workers(command, env, worker_cap, cwd=checkout)
         outcome = runner(command, checkout, timeout_s, env=env)
     if not outcome.timed_out:
         os.makedirs(cache_dir, exist_ok=True)
@@ -601,7 +668,8 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 return record
             head_env = test_environment(checkout, state)
             cap = max_workers()
-            suite_env, record["worker_cap"] = cap_xdist_workers(head_env, cap)
+            suite_env, record["worker_cap"] = cap_xdist_workers(
+                command, head_env, cap, cwd=checkout)
             _admit_full_suite(load_gate, record)
             head = runner(command, checkout, timeout_s, env=suite_env)
             record["head"] = head.to_dict()

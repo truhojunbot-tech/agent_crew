@@ -6,6 +6,7 @@ No test here really sleeps: the gate's reader, sleep and clock are injected.
 import os
 import sqlite3
 import subprocess
+import sys
 
 import pytest
 
@@ -89,35 +90,89 @@ def test_read_load_5m_parses_proc_loadavg(tmp_path, monkeypatch):
 
 @pytest.fixture
 def xdist_present(monkeypatch):
-    monkeypatch.setattr(script_tester, "_xdist_available", lambda: True)
+    probed = []
+    monkeypatch.setattr(script_tester, "_target_has_xdist",
+                        lambda interpreter, env, cwd: probed.append(interpreter) or True)
+    return probed
+
+
+_CMD = f"{sys.executable} -m pytest -q"
 
 
 @pytest.mark.usefixtures("xdist_present")
-@pytest.mark.parametrize(("addopts", "expected", "status"), [
-    (None, "--maxprocesses=4", "capped"),
-    ("-n 8 -q", "-n 8 -q --maxprocesses=4", "capped"),
-    ("--maxprocesses=8", "--maxprocesses=8 --maxprocesses=4", "capped"),
-    ("--maxprocesses 2", "--maxprocesses 2", "already_capped"),
-    ("--maxprocesses=4", "--maxprocesses=4", "already_capped"),
+@pytest.mark.parametrize(("addopts", "command", "expected", "status"), [
+    (None, _CMD, "--maxprocesses=4", "capped"),
+    ("-n 8 -q", _CMD, "-n 8 -q --maxprocesses=4", "capped"),
+    ("--maxprocesses=8", _CMD, "--maxprocesses=8 --maxprocesses=4", "capped"),
+    ("--maxprocesses 2", _CMD, "--maxprocesses 2", "already_capped"),
+    ("--maxprocesses=4", _CMD, "--maxprocesses=4", "already_capped"),
+    # Duplicates: the last one is effective, not any low one (review of #1083).
+    ("--maxprocesses=2 --maxprocesses=8 -n 8", _CMD,
+     "--maxprocesses=2 --maxprocesses=8 -n 8 --maxprocesses=4", "capped"),
+    ("--maxprocesses=8 --maxprocesses=2", _CMD, "--maxprocesses=8 --maxprocesses=2",
+     "already_capped"),
+    # A command value at or under the cap stays within it after ours.
+    (None, f"{_CMD} -n 8 --maxprocesses=3", "--maxprocesses=4", "capped"),
 ])
-def test_cap_goes_into_pytest_addopts(addopts, expected, status):
+def test_cap_goes_into_pytest_addopts(addopts, command, expected, status):
     env = {"PATH": "/bin"} if addopts is None else {"PATH": "/bin", "PYTEST_ADDOPTS": addopts}
-    capped, evidence = script_tester.cap_xdist_workers(env, 4)
+    capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd="/")
     assert capped["PYTEST_ADDOPTS"] == expected and capped["PATH"] == "/bin"
     assert evidence["status"] == status and evidence["cap"] == 4
     assert env.get("PYTEST_ADDOPTS") == addopts           # the input is not mutated
 
 
-def test_cap_is_unsupported_without_xdist_or_with_unparseable_addopts(monkeypatch):
-    monkeypatch.setattr(script_tester, "_xdist_available", lambda: False)
-    env = {"PYTEST_ADDOPTS": "-q"}
-    assert script_tester.cap_xdist_workers(env, 4) == (
-        env, {"cap": 4, "mechanism": "PYTEST_ADDOPTS --maxprocesses",
-              "status": "unsupported", "reason": "xdist_unavailable"})
-    monkeypatch.setattr(script_tester, "_xdist_available", lambda: True)
-    env = {"PYTEST_ADDOPTS": "-k 'unterminated"}
-    capped, evidence = script_tester.cap_xdist_workers(env, 4)
-    assert capped == env and evidence["reason"] == "pytest_addopts_unparseable"
+@pytest.mark.usefixtures("xdist_present")
+@pytest.mark.parametrize(("command", "env", "reason"), [
+    # pytest reads the command after PYTEST_ADDOPTS, so a larger value wins.
+    (f"{_CMD} -n 8 --maxprocesses=8", {}, "command_overrides_cap"),
+    (f"{_CMD} -n 8 --maxprocesses 3 --maxprocesses 8", {}, "command_overrides_cap"),
+    (f"{_CMD} --maxprocesses=$N", {}, "command_expands_at_runtime"),
+    ("make test", {}, "pytest_launcher_unresolved"),
+    ("missing-python3 -m pytest", {}, "pytest_launcher_unresolved"),
+    (f"{_CMD} -p no:xdist", {}, "xdist_disabled"),
+    (_CMD, {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}, "xdist_disabled"),
+    (f"{_CMD} -k 'unterminated", {}, "unparseable"),
+    (_CMD, {"PYTEST_ADDOPTS": "-k 'unterminated"}, "unparseable"),
+])
+def test_unresolvable_invocations_record_cap_unenforced(command, env, reason):
+    env = {"PATH": "/bin", **env}
+    capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd="/")
+    assert capped == env                                   # nothing injected
+    assert evidence == {"cap": 4, "mechanism": "PYTEST_ADDOPTS --maxprocesses",
+                        "status": "cap_unenforced", "reason": reason}
+
+
+def test_xdist_is_probed_in_the_target_interpreter_not_the_crew(tmp_path):
+    """The crew has xdist; a venv pytest without it must not get the option."""
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True)
+    bare = venv / "python3"           # -I -S: no user site, so no xdist
+    bare.write_text('#!/bin/sh\nexec %s -I -S "$@"\n' % sys.executable)
+    bare.chmod(0o755)
+    (venv / "pytest").write_text(f"#!{bare}\nimport pytest\n")
+    (venv / "py.test").write_text("#!/bin/sh\nexec python3 -m pytest\n")
+    for launcher in ("pytest", "py.test"):
+        (venv / launcher).chmod(0o755)
+    env = {"PATH": f"{venv}:/bin"}
+    for command, reason in [(f"{bare} -m pytest tests", "xdist_unavailable"),
+                            ("pytest tests", "xdist_unavailable"),
+                            ("venv/bin/pytest tests", "xdist_unavailable"),
+                            (f"{_CMD} unit && pytest e2e", "xdist_unavailable"),
+                            ("venv/bin/py.test", "pytest_launcher_unresolved")]:
+        capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd=str(tmp_path))
+        assert (evidence["status"], evidence["reason"]) == ("cap_unenforced", reason), command
+        assert capped == env
+    assert script_tester._target_has_xdist(str(tmp_path / "nope"), env, str(tmp_path)) is False
+
+
+def test_every_pytest_launcher_in_the_command_is_probed(xdist_present, tmp_path):
+    launcher = tmp_path / "pytest"
+    launcher.write_text("#!/usr/bin/env python3\n")
+    script_tester.cap_xdist_workers(f"{_CMD} unit && ./pytest e2e", {"PATH": "/usr/bin:/bin"},
+                                    4, cwd=str(tmp_path))
+    assert xdist_present[0] == sys.executable and len(xdist_present) == 2
+    assert os.path.basename(xdist_present[1]).startswith("python3")
 
 
 _WORKER_COUNT_TEST = """import os
@@ -128,8 +183,9 @@ def test_record_workers():
 """
 
 
-@pytest.mark.skipif(not script_tester._xdist_available(), reason="needs pytest-xdist")
-@pytest.mark.parametrize("implicit", ["ini", "env"])
+@pytest.mark.skipif(not script_tester._target_has_xdist(sys.executable, dict(os.environ), "."),
+                    reason="needs pytest-xdist")
+@pytest.mark.parametrize("implicit", ["ini", "env", "ini_cap"])
 def test_real_shell_command_keeps_its_redirect_and_implicit_workers_are_capped(
         tmp_path, implicit):
     """A redirecting shell command, with ``-n 8`` from ini addopts or from a
@@ -140,18 +196,30 @@ def test_real_shell_command_keeps_its_redirect_and_implicit_workers_are_capped(
     test_env = {"WORKERS_OUT": str(out)}
     if implicit == "ini":
         (tmp_path / "pytest.ini").write_text("[pytest]\naddopts = -n 8\n")
+    elif implicit == "ini_cap":        # a looser ini cap is read before ours
+        (tmp_path / "pytest.ini").write_text("[pytest]\naddopts = -n 8 --maxprocesses=8\n")
     else:
         test_env["PYTEST_ADDOPTS"] = "-n 8"
+    command = "python3 -m pytest -p no:cacheprovider tests > result.log 2>&1 && echo shell-ok"
     env, evidence = script_tester.cap_xdist_workers(
-        script_tester.test_environment(str(tmp_path), {"test_env": test_env}), 2)
+        command, script_tester.test_environment(str(tmp_path), {"test_env": test_env}), 2,
+        cwd=str(tmp_path))
     assert evidence["status"] == "capped"
-    outcome = script_tester.run_command(
-        "python3 -m pytest -p no:cacheprovider tests > result.log 2>&1 && echo shell-ok",
-        str(tmp_path), 120, env=env)
+    outcome = script_tester.run_command(command, str(tmp_path), 120, env=env)
     assert outcome.exit_code == 0, outcome.output_tail
     assert "shell-ok" in outcome.output_tail                 # && still chains
     assert "1 passed" in (tmp_path / "result.log").read_text()  # > still redirects
     assert out.read_text() == "2"
+
+
+def test_real_cli_cap_after_addopts_is_reported_unenforced(tmp_path):
+    """The command's own --maxprocesses=8 is read after PYTEST_ADDOPTS and wins,
+    so the cap is not claimed and the env is left as configured."""
+    command = "python3 -m pytest -n 8 --maxprocesses=8 tests > result.log"
+    base = script_tester.test_environment(str(tmp_path), {})
+    env, evidence = script_tester.cap_xdist_workers(command, base, 2, cwd=str(tmp_path))
+    assert evidence["status"] == "cap_unenforced"
+    assert evidence["reason"] == "command_overrides_cap" and env == base
 
 
 def test_env_overrides_and_invalid_env_falls_back(monkeypatch):
