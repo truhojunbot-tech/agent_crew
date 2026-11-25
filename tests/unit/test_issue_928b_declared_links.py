@@ -50,7 +50,7 @@ def test_dependency_and_phase_are_declared_not_parsed_from_body():
              "labels": []}
     parsed = triage.parse_issues([issue])[0]
     assert parsed["parents"] == [] and parsed["phase"] is None
-    issue["parent"] = {"number": 5, "state": "OPEN"}
+    issue["blockedBy"] = [{"number": 5, "state": "OPEN"}]
     issue["labels"] = [{"name": "phase:2"}]
     parsed = triage.parse_issues([issue])[0]
     assert parsed["parents"] == [5] and parsed["phase"] == 2
@@ -90,7 +90,9 @@ def test_graphql_parent_and_tracked_links_reach_triage(monkeypatch):
 
     monkeypatch.setattr(triage.subprocess, "run", api)
     issue = triage.parse_issues(triage.fetch_issues_from_gh("owner/repo"))[0]
-    assert issue["parents"] == [5, 4]
+    assert issue["parents"] == []
+    assert triage.filter_blocked([issue], set()) == [issue]
+    assert watch.unblocked([issue], [issue]) == [issue]
     assert issue["dependency_unknown"] is False
 
 
