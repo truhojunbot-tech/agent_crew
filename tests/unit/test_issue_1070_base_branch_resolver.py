@@ -312,3 +312,45 @@ def test_the_resolver_is_the_only_env_reader():
     assert "AGENT_CREW_MAIN_BRANCH" in RESOLVER.read_text()
     assert _violations(RESOLVER) == [] or all(
         "AGENT_CREW_MAIN_BRANCH" in hit for hit in _violations(RESOLVER))
+
+
+# --- (e) a missing checkout answers without spawning git ----------------------
+
+def test_missing_checkout_resolves_without_spawning_git(tmp_path, monkeypatch):
+    """#1070 fix round 2: ``_launch_ref`` resolves against the validated cloud
+    checkout. Tests stub that checkout with a path that does not exist and
+    count ``time.sleep`` calls; ``subprocess.run(timeout=...)`` waits for its
+    child in a ``time.sleep`` loop, so one git probe per launch leaked
+    thousands of "sleeps" into test_issue_826. A path that is not a directory
+    has no default branch to read and must not spawn anything."""
+    from agent_crew import worktree_default_branch
+
+    monkeypatch.setattr(worktree_default_branch, "_DEFAULT_BRANCHES", {})
+    monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(f"git spawned for a missing checkout: {args[0]}")
+
+    monkeypatch.setattr(worktree_default_branch.subprocess, "run", forbidden)
+    missing = str(tmp_path / "fixture" / "claude")
+    assert remote_default_branch(missing) == ""
+    assert resolve_base_branch({}, missing) == DEFAULT_BASE_BRANCH
+    monkeypatch.setenv("AGENT_CREW_MAIN_BRANCH", "develop")
+    assert resolve_base_branch({}, missing) == "develop"
+    assert resolve_base_branch({"base_branch": "release"}, missing) == "release"
+
+
+def test_cloud_launch_ref_on_a_missing_checkout_spawns_no_git(tmp_path, monkeypatch):
+    from agent_crew import claude_cloud, worktree_default_branch
+
+    monkeypatch.setattr(worktree_default_branch, "_DEFAULT_BRANCHES", {})
+    monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    spawned = []
+    monkeypatch.setattr(subprocess, "run",
+                        lambda argv, **kw: spawned.append(argv) or (_ for _ in ()).throw(
+                            AssertionError(f"git spawned: {argv}")))
+    task = TaskRequest(task_id="impl-1070", task_type="implement", description="x",
+                       branch="fix/1070", project="agent_crew",
+                       context={"repo": "owner/repo"})
+    assert claude_cloud._launch_ref(task, str(tmp_path / "fixture" / "claude"), None) == "main"
+    assert spawned == []

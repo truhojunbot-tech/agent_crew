@@ -19,6 +19,13 @@ def remote_default_branch(worktree_path: str, *, deadline: float | None = None) 
     cached = _DEFAULT_BRANCHES.get(key)
     if cached:
         return cached
+    if not os.path.isdir(worktree_path):
+        # A path that is not a checkout has no default to read. Answer without
+        # spawning git: ``subprocess.run(timeout=...)`` waits on the child in a
+        # ``time.sleep`` loop, and the cloud launch path reaches here with a
+        # stubbed, non-existent checkout under tests that count sleeps (#1070
+        # fix round 2: test_issue_826 saw thousands of extra "sleeps").
+        return ""
 
     def probe_timeout() -> float:
         if deadline is None:
