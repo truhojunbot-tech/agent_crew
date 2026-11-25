@@ -8,6 +8,7 @@ by hand. The grant now rides in the task context, is carried to every
 successor, and ``auto_enqueue_fix`` takes ``min(ceiling, grant)``.
 """
 
+import json
 import uuid
 
 import pytest
@@ -20,6 +21,7 @@ from agent_crew.pipeline import (
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import MalformedStoredRow, TaskQueue
 from agent_crew.server import create_app
+from agent_crew.tokenomics_canary import CANARY_ENV, ROUNDS_CAP_ENV
 
 FINDING = "HIGH trader.py:12 - order size unchecked"
 BRANCH = "agent/codex/1039-x"
@@ -209,6 +211,84 @@ def test_review_and_test_successors_carry_the_grant(q):
     test_id = auto_enqueue_test(q, review_id, pr_state_fn=_open)
     assert test_id is not None
     assert q.get_task(test_id).context["fix_round_grant"] == 1
+
+
+def test_resumed_canary_cap_is_clamped_to_a_narrowed_grant(q, monkeypatch):
+    """A settled switch-on receipt saved cap=3 before the grant narrowed to 1.
+
+    The restored counterfactual cap must not bypass the lineage minimum: the
+    review carries fix_round=1, so round 2 is over the grant and no fix may
+    be created (review of PR #1072, finding 1).
+    """
+    sent, comments = [], []
+    impl_id = _implement(q, {})
+    monkeypatch.setenv(CANARY_ENV, impl_id)
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    review = _request_changes(q, impl_id, {"fix_round": 1, "fix_round_grant": 1})
+    q.record_tokenomics_canary_receipt(
+        impl_id, decision_source="quota_core_contract", recommendation={},
+        applied=False, reason="switch_on:fresh_reresolved",
+        counterfactual=json.dumps({
+            "baseline_cap": 3, "counterfactual_cap": 3, "round": 2,
+            "would_fire": False, "pending_reresolve": False, "switch_on": True,
+            "verdict_at": 1.0, "review_task_id": review,
+        }))
+
+    assert _fix(q, review, sent=sent, comments=comments) is None
+
+    assert q.get_task(fix_task_id(review, 2)) is None
+    assert q.get_task(review).context["lineage_terminal_reason"] == (
+        "successor_refused: fix_grant_exhausted")
+    assert _events(q, review).count("fix_grant_exhausted") == 1
+    assert len(sent) == 1 and "round=2 max=1 grant=1" in sent[0]
+    assert len(comments) == 1
+
+
+def _failed_test(q, prev_task_id, context):
+    test_id = f"test-{uuid.uuid4().hex[:8]}"
+    q.enqueue(TaskRequest(task_id=test_id, task_type="test", description="test",
+                          branch=BRANCH,
+                          context={"prev_task_id": prev_task_id, "pr_number": PR, **context}))
+    # An ACTIONABLE failure: handle_test_result reads this kind (#772).
+    q.submit_result(test_id, TaskResult(task_id=test_id, status="failed",
+                                        summary="tests failed", findings=[FINDING],
+                                        pr_number=PR, error_info={"kind": "test_failure"}))
+    return test_id
+
+
+def test_failed_test_over_the_grant_records_exhaustion_once(q):
+    """grant=0: an actionable failed test gets no fix, but the lineage end is
+    typed as grant exhaustion with exactly one coordinator notice, also on
+    replay (review of PR #1072, finding 2)."""
+    sent, comments = [], []
+    impl_id = _implement(q, {"fix_round_grant": 0})
+    test_id = _failed_test(q, impl_id, {"fix_round": 0})
+
+    for _ in range(2):  # a replayed result POST must not record or notify twice
+        assert _fix(q, test_id, sent=sent, comments=comments) is None
+
+    assert [t for t in q.list_tasks() if t.task_type == "implement"
+            and t.task_id != impl_id] == []
+    assert q.get_task(test_id).context["lineage_terminal_reason"] == (
+        "successor_refused: fix_grant_exhausted")
+    assert _events(q, test_id).count("fix_grant_exhausted") == 1
+    assert len(sent) == 1
+    assert "kind=successor_refused" in sent[0] and "round=1 max=0 grant=0" in sent[0]
+    assert comments == []  # a failed test has no reviewer comment to publish
+
+
+def test_failed_test_over_the_port_ceiling_leaves_notice_to_result_handler(q):
+    """Without a grant the ceiling case is unchanged from #914: no marker, no
+    notice here — the server's lineage_end notice is the one notice."""
+    sent, comments = [], []
+    impl_id = _implement(q, {})
+    test_id = _failed_test(q, impl_id, {"fix_round": 3})
+
+    assert _fix(q, test_id, sent=sent, comments=comments) is None
+
+    assert "lineage_terminal_reason" not in q.get_task(test_id).context
+    assert "fix_grant_exhausted" not in _events(q, test_id)
+    assert sent == [] and comments == []
 
 
 def _payload(**context):

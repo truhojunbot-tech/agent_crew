@@ -2161,7 +2161,10 @@ def auto_enqueue_fix(
         switch_enabled = _tokenomics_canary.rounds_cap_enabled()
         canary_pinned = _round_cap_pinned(tasks_by_id, review_task, queue, server_project)
         if prior_switch_on and not prior_counterfactual.get("pending_reresolve"):
-            counterfactual_cap = prior_counterfactual["counterfactual_cap"]
+            # #1039: the saved cap predates any grant that narrowed the lineage
+            # since (review of PR #1072). The restored decision is durable, but
+            # it may only narrow the cap in force, never widen it past the grant.
+            counterfactual_cap = min(prior_counterfactual["counterfactual_cap"], baseline_cap)
             canary_citation = json.loads((held or {}).get("canary_recommendation_json") or "{}")
             canary_reason = (held or {}).get("canary_reason") or canary_reason
         max_rounds = counterfactual_cap if switch_enabled and canary_pinned else baseline_cap
@@ -2283,16 +2286,16 @@ def auto_enqueue_fix(
                 f"the automated fix budget is spent (round {fix_round} > "
                 f"max {max_rounds}) — stopping, this needs a human"
             )
-            if failed_test:
-                # A failed test has no reviewer comment to publish. The server
-                # sends its coordinator notice when no fix was created.
-                return None
             # #914: the PR comment needs a PR and is skipped on replay; the
             # durable marker and notice do not. A canary hold is a HUMAN_GATE
             # that may still release the fix, so it is not a terminal refusal.
-            if not canary_fired:
-                grant_exhausted = (fix_round_grant is not None
-                                   and fix_round > fix_round_grant)
+            grant_exhausted = (fix_round_grant is not None
+                               and fix_round > fix_round_grant)
+            # A failed test over the PORT ceiling leaves its one notice to the
+            # server's lineage_end (#914). Over the GRANT it is typed here like a
+            # review (review of PR #1072): the successor_refused marker makes
+            # lineage_end stand down, so the coordinator still hears exactly once.
+            if not canary_fired and (grant_exhausted or not failed_test):
                 if grant_exhausted and not review_ctx.get("lineage_terminal_reason"):
                     # #1039: the typed event tells the lineage's grant apart
                     # from the port ceiling in GET /tasks/{id} and tasks.db.
@@ -2312,6 +2315,9 @@ def auto_enqueue_fix(
                     f"round={fix_round} max={max_rounds}"
                     + (f" grant={fix_round_grant}" if fix_round_grant is not None else ""),
                     coordinator_notify_fn)
+            if failed_test:
+                # A failed test has no reviewer comment to publish.
+                return None
             # #314 §4 P0: replay 중에는 exhaustion PR comment를 게시하지 않는다(중복 방지).
             if suppress_side_effects:
                 logger.debug(f"auto_enqueue_fix: replay 중 — fix-budget exhaustion comment skip "
