@@ -8170,6 +8170,28 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def record_exec_event(self, task_id: str, event: str, *, at: Optional[float] = None,
+                          **fields) -> None:
+        """Append one event to a task's exec history without touching its row.
+
+        For provenance a reconciler owes an operator but no snapshot column
+        holds (#1036: which sibling reply a chatgpt review adopted). Append-only
+        and non-raising, like :meth:`record_worker_orphaned`: the note must never
+        become a second incident on the path that writes it.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._append_exec_event_on(conn, task_id, event,
+                                       time.time() if at is None else float(at), **fields)
+            conn.execute("COMMIT")
+        except Exception:
+            logger.exception("exec-state: %s record failed task_id=%s", event, task_id)
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+
     def expire_stale(self, older_than_seconds: float = 600.0, *,
                      on_cancelled: Optional[Callable[[str], None]] = None,
                      dry_run: bool = False) -> List[str]:
