@@ -200,13 +200,25 @@ def test_dispatcher_parks_real_quota_failure_without_fallback(tmp_path, monkeypa
 
 @pytest.mark.parametrize("fingerprint,now,expected", [
     ("old", 200, False), ("new", 200, True),
-    ("old", 500, True), ("old", 501, True),
+    ("old", 500, True),
 ])
 def test_cli_reset_controls_readiness(fingerprint, now, expected):
     marker = {"failed_at": 100, "reset_at": 500, "account_fingerprint": "old"}
     cache = {"fetched_at": 150, "account_fingerprint": fingerprint,
              "base_remaining_pct": 78}
     assert _codex_quota_ready(marker, cache, now) is expected
+
+
+@pytest.mark.parametrize("fetched_at,remaining,expected", [
+    pytest.param(150, 78, True, id="fresh-cache-with-headroom"),
+    pytest.param(150, 0, False, id="fresh-cache-without-headroom"),
+    pytest.param(99, 78, False, id="stale-cache-with-headroom"),
+])
+def test_no_cli_reset_uses_fresh_pooled_headroom(fetched_at, remaining, expected):
+    marker = {"failed_at": 100, "reset_at": None, "account_fingerprint": "old"}
+    cache = {"fetched_at": fetched_at, "account_fingerprint": "old",
+             "base_remaining_pct": remaining}
+    assert _codex_quota_ready(marker, cache, now=200) is expected
 
 
 def test_reparking_probe_replay_keeps_five_row_cohort_parked(tmp_path, monkeypatch):
