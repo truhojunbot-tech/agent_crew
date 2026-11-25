@@ -161,50 +161,45 @@ class HostLoadGate:
             self.sleep(min(self.recheck_s, self.max_wait_s - waited))
 
 
-_WORKERS_LONG = "--numprocesses"
+_MAXPROCESSES = "--maxprocesses"
 
 
-def cap_xdist_workers(command: str, cap: int) -> str:
-    """Lower a plain pytest command's ``-n``/``--numprocesses`` to ``cap``.
+def _xdist_available() -> bool:
+    """Whether pytest-xdist is importable for the interpreter tests run with."""
+    import importlib.util
+    return importlib.util.find_spec("xdist") is not None
 
-    Only an explicit worker option is capped; a command without one runs
-    serially already. Anything that is not a plain pytest call is unchanged.
+
+def cap_xdist_workers(env: Mapping[str, str], cap: int) -> tuple[dict[str, str], dict]:
+    """Cap a full suite's xdist workers at ``cap`` through ``PYTEST_ADDOPTS``.
+
+    The command is never rewritten: it runs under ``/bin/sh -c``, so redirects,
+    pipes, variables and chained commands keep their meaning (review of #1083).
+    ``--maxprocesses`` bounds whatever worker count pytest ends up with, whether
+    it came from the command's ``-n``, an ini ``addopts`` or ``PYTEST_ADDOPTS``,
+    and leaves a serial run serial. Returns the env to run with and a typed
+    ``worker_cap`` record; ``status`` is ``capped``, ``already_capped`` or
+    ``unsupported`` (env unchanged, ``reason`` says why).
     """
+    env = dict(env)
+    evidence: dict = {"cap": cap, "mechanism": f"PYTEST_ADDOPTS {_MAXPROCESSES}"}
+    if not _xdist_available():
+        # Without xdist pytest rejects the option, so adding it would fail the run.
+        return env, {**evidence, "status": "unsupported", "reason": "xdist_unavailable"}
+    addopts = env.get("PYTEST_ADDOPTS", "")
     try:
-        words = shlex.split(command)
+        words = shlex.split(addopts)
     except ValueError:
-        return command
-    if not words or not (
-            os.path.basename(words[0]) in {"pytest", "py.test"}
-            or (re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", os.path.basename(words[0]))
-                and words[1:3] == ["-m", "pytest"])):
-        return command
-
-    def capped(value: str) -> Optional[str]:
-        if value in {"auto", "logical"}:
-            return str(cap)
-        if re.fullmatch(r"\d+", value):
-            return str(min(int(value), cap)) if int(value) > 0 else value
-        return None
-
-    changed = False
-    index = 1
-    while index < len(words):
-        word = words[index]
-        if word in {"-n", _WORKERS_LONG} and index + 1 < len(words):
-            new = capped(words[index + 1])
-            if new is not None and new != words[index + 1]:
-                words[index + 1], changed = new, True
-            index += 2
-            continue
-        for prefix in (_WORKERS_LONG + "=", "-n"):
-            if word.startswith(prefix) and len(word) > len(prefix):
-                new = capped(word[len(prefix):])
-                if new is not None and prefix + new != word:
-                    words[index], changed = prefix + new, True
-                break
-        index += 1
-    return shlex.join(words) if changed else command
+        return env, {**evidence, "status": "unsupported",
+                     "reason": "pytest_addopts_unparseable"}
+    for index, word in enumerate(words):
+        value = (word[len(_MAXPROCESSES) + 1:] if word.startswith(_MAXPROCESSES + "=")
+                 else words[index + 1] if word == _MAXPROCESSES and index + 1 < len(words)
+                 else None)
+        if value is not None and re.fullmatch(r"\d+", value) and 0 < int(value) <= cap:
+            return env, {**evidence, "status": "already_capped", "configured": int(value)}
+    env["PYTEST_ADDOPTS"] = f"{addopts} {_MAXPROCESSES}={cap}".strip()
+    return env, {**evidence, "status": "capped"}
 
 
 CI_GATE_ENV = "AGENT_CREW_SCRIPT_TEST_CI_GATE"
@@ -558,10 +553,13 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
                  cache_dir: str, state: Optional[Mapping],
                  runner: Callable = run_command, *,
                  load_gate: Optional[HostLoadGate] = None,
-                 record: Optional[dict] = None) -> tuple[RunOutcome, bool]:
+                 record: Optional[dict] = None,
+                 worker_cap: Optional[int] = None) -> tuple[RunOutcome, bool]:
     """The base outcome, cached per base sha, command and test environment."""
-    path = _cache_path(cache_dir, base_sha, command,
-                       _test_environment_identity(state, timeout_s))
+    identity = _test_environment_identity(state, timeout_s)
+    if worker_cap is not None:
+        identity = f"{identity}-w{worker_cap}"
+    path = _cache_path(cache_dir, base_sha, command, identity)
     try:
         with open(path) as f:
             return RunOutcome.from_dict(json.load(f)), True
@@ -569,8 +567,10 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
         pass
     _admit_full_suite(load_gate, record)
     with Checkout(repo, base_sha) as checkout:
-        outcome = runner(command, checkout, timeout_s,
-                         env=test_environment(checkout, state))
+        env = test_environment(checkout, state)
+        if worker_cap is not None:
+            env, _ = cap_xdist_workers(env, worker_cap)
+        outcome = runner(command, checkout, timeout_s, env=env)
     if not outcome.timed_out:
         os.makedirs(cache_dir, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
@@ -586,7 +586,7 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
     """Run the stage and return its durable record (``outcome`` is the verdict).
 
     Full suites (head and uncached base) wait on ``load_gate`` and run with
-    their xdist workers capped; isolated reruns use the configured command.
+    their xdist workers capped; isolated reruns use the plain environment.
     """
     record: dict = {"executor": SCRIPT_TESTER, "provider_calls": 0,
                     "base_sha": base_sha, "head_sha": head_sha, "rebased": True,
@@ -599,12 +599,11 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
             if not command:
                 record["outcome"] = SKIPPED_NO_TEST_COMMAND
                 return record
-            suite_command = cap_xdist_workers(command, max_workers())
-            if suite_command != command:
-                record["suite_command"] = suite_command
             head_env = test_environment(checkout, state)
+            cap = max_workers()
+            suite_env, record["worker_cap"] = cap_xdist_workers(head_env, cap)
             _admit_full_suite(load_gate, record)
-            head = runner(suite_command, checkout, timeout_s, env=head_env)
+            head = runner(command, checkout, timeout_s, env=suite_env)
             record["head"] = head.to_dict()
             record["counts"] = dict(head.counts)
             record["duration_s"] = head.duration_s
@@ -612,9 +611,10 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 record.update(outcome=INCOMPLETE, reason="script_test_timeout")
                 return record
             if head.failing_ids:
-                base, cached = base_outcome(repo, base_sha, suite_command, timeout_s,
+                base, cached = base_outcome(repo, base_sha, command, timeout_s,
                                             cache_dir, state, runner,
-                                            load_gate=load_gate, record=record)
+                                            load_gate=load_gate, record=record,
+                                            worker_cap=cap)
                 record["base"] = {**base.to_dict(), "cached": cached}
                 record["duration_s"] += base.duration_s
                 if base.timed_out:

@@ -212,7 +212,11 @@ def test_new_failure_is_judged_from_isolated_head_reruns(
     assert len(record["reruns"][node]) == expected_reruns
     rerun_calls = [call for call in calls if call[0] != PYTEST]
     assert all(command.endswith(" " + node) for command, _, _ in rerun_calls)
-    assert all(cwd == calls[0][1] and env == calls[0][2]
+    # #1082: only the full suite carries the worker cap; reruns keep the rest.
+    head_env = dict(calls[0][2])
+    if head_env.get("PYTEST_ADDOPTS") == "--maxprocesses=4":
+        del head_env["PYTEST_ADDOPTS"]
+    assert all(cwd == calls[0][1] and env == head_env
                for _, cwd, env in rerun_calls)
     result = script_tester.record_to_result("test-flake", record)
     assert result.status == ("completed" if expected_flaky else "failed")
