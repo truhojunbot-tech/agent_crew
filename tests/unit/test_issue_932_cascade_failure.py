@@ -1,5 +1,6 @@
 """A broken cascade is visible, and an unknown review status is not adopted."""
 
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -9,8 +10,24 @@ from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 
 
+def _busy_error():
+    exc = sqlite3.OperationalError("busy")
+    exc.sqlite_errorcode = 5  # SQLITE_BUSY; Python 3.10 does not export this constant.
+    return exc
+
+
+@pytest.mark.parametrize("exc,kind", [
+    (RuntimeError("broken"), "config_error"),
+    (RuntimeError("database is locked"), "config_error"),
+    (sqlite3.OperationalError("database is locked"), "transient"),
+    (sqlite3.OperationalError("database table is locked: tasks"), "transient"),
+    (_busy_error(), "transient"),
+    (sqlite3.OperationalError("SQLITE_BUSY"), "transient"),
+    (sqlite3.OperationalError("no such table: tasks"), "config_error"),
+    (sqlite3.OperationalError("disk I/O error"), "config_error"),
+])
 @pytest.mark.parametrize("step", ["review", "fix", "test"])
-def test_enqueue_exception_records_typed_reason_and_one_notice(tmp_db, monkeypatch, step):
+def test_enqueue_exception_records_typed_reason_and_one_notice(tmp_db, monkeypatch, step, exc, kind):
     queue = TaskQueue(tmp_db)
     if step == "review":
         task = TaskRequest(task_id="impl-932", task_type="implement",
@@ -35,14 +52,14 @@ def test_enqueue_exception_records_typed_reason_and_one_notice(tmp_db, monkeypat
     queue.enqueue(task)
     queue.submit_result(task.task_id, result)
     monkeypatch.setattr(pipeline, "_enqueue_with_inherited_risk",
-                        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("broken")))
+                        lambda *args, **kwargs: (_ for _ in ()).throw(exc))
     sent = []
     notify = lambda message: sent.append(message) or True
     for _ in range(2):
         assert enqueue(notify) is None
     info = queue.get_task(task.task_id).error_info
     assert info["reason"] == "cascade_enqueue_failed"
-    assert info["kind"] == "config_error"
+    assert info["kind"] == kind
     assert info["cascade_step"] == step
     assert len(sent) == 1
     assert "reason_code=cascade_enqueue_failed" in sent[0]

@@ -34,7 +34,7 @@ from typing import Optional
 from agent_crew.fallback import (
     default_agent_for_role,
 )
-from agent_crew.failure_kind import FailureKind
+from agent_crew.failure_kind import FailureKind, exception_failure_kind
 from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.role_mapping import default_agent_for_role as baseline_agent_for_role
 from agent_crew.protocol import (
@@ -1411,7 +1411,7 @@ def _enqueue_with_inherited_risk(queue: TaskQueue, task: TaskRequest,
                           _successor_provenance=successor_provenance)
             break
         except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower():
+            if exception_failure_kind(exc) != FailureKind.TRANSIENT:
                 raise
             if attempt < 2:
                 time.sleep(0.05 * (2 ** attempt))
@@ -1485,7 +1485,7 @@ def record_cascade_enqueue_failure(queue: TaskQueue, task_id: str, step: str,
         logger.exception("cascade lock marker lookup failed for %s", task_id)
     try:
         queue.annotate_error_info(task_id, {
-            "kind": FailureKind.TRANSIENT.value if locked else FailureKind.CONFIG_ERROR.value,
+            "kind": exception_failure_kind(exc).value,
             "reason": "cascade_enqueue_failed",
             "cascade_step": step,
             "cascade_error_type": type(exc).__name__,

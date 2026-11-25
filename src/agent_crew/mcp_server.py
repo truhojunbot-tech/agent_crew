@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover — surfaced loud at import time
 
 from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.discuss_artifacts import MISSING_WARNING as DISCUSS_ARTIFACT_MISSING, capture_discuss_result
-from agent_crew.failure_kind import FailureKind
+from agent_crew.failure_kind import exception_failure_kind
 from agent_crew.pipeline import (
     auto_enqueue_fix,
     auto_enqueue_review,
@@ -178,11 +178,11 @@ def build_mcp_server(
             return {"task_id": task.task_id, "dispatch_refused": str(exc)}
         try:
             return _task_to_dict(task, nonce=nonce)
-        except Exception:
+        except Exception as exc:
             logger.exception("MCP task guard failed for %s", task.task_id)
             queue.submit_result(task.task_id, TaskResult(
                 task_id=task.task_id, status="needs_human", summary="task guard unavailable",
-                error_info={"kind": FailureKind.CONFIG_ERROR.value,
+                error_info={"kind": exception_failure_kind(exc).value,
                             "reason": "guard_unavailable", "final": True}),
                 expected_status="in_progress")
             return {"task_id": task.task_id, "dispatch_refused": "guard_unavailable"}
@@ -202,11 +202,11 @@ def build_mcp_server(
             return {"task_id": task.task_id, "dispatch_refused": str(exc)}
         try:
             return _task_to_dict(task, nonce=nonce)
-        except Exception:
+        except Exception as exc:
             logger.exception("MCP discuss guard failed for %s", task.task_id)
             queue.submit_result(task.task_id, TaskResult(
                 task_id=task.task_id, status="needs_human", summary="task guard unavailable",
-                error_info={"kind": FailureKind.CONFIG_ERROR.value,
+                error_info={"kind": exception_failure_kind(exc).value,
                             "reason": "guard_unavailable", "final": True}),
                 expected_status="in_progress")
             return {"task_id": task.task_id, "dispatch_refused": "guard_unavailable"}

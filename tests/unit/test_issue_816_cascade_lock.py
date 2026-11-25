@@ -61,15 +61,16 @@ def test_first_locked_enqueue_retries_to_one_successor(tmp_path, monkeypatch, st
     assert "cascade_enqueue_failure" not in queue.get_task(parent).context
 
 
+@pytest.mark.parametrize("message", ["database is locked", "database table is locked", "SQLITE_BUSY"])
 @pytest.mark.parametrize("stage", ["review", "fix", "test"])
-def test_persistent_locked_enqueue_records_one_notice(tmp_path, monkeypatch, stage):
+def test_persistent_locked_enqueue_records_one_notice(tmp_path, monkeypatch, stage, message):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     parent = _parent(queue, stage)
     calls, notices = [], []
 
     def locked(task, *args, **kwargs):
         calls.append(task.task_id)
-        raise sqlite3.OperationalError("database is locked")
+        raise sqlite3.OperationalError(message)
 
     monkeypatch.setattr(queue, "enqueue", locked)
     monkeypatch.setattr("agent_crew.notify.notify_telegram",
@@ -78,6 +79,7 @@ def test_persistent_locked_enqueue_records_one_notice(tmp_path, monkeypatch, sta
     assert _cascade(queue, stage, parent) is None
     assert len(calls) == 6  # three bounded attempts per cascade invocation
     assert not [task for task in queue.list_tasks() if task.task_id != parent]
+    assert queue.get_task(parent).error_info["kind"] == "transient"
     failure = queue.get_task(parent).context["cascade_enqueue_failure"]
     assert failure["missing_step"] == stage
     assert failure["reason"] == "database is locked"
@@ -120,3 +122,20 @@ def test_real_write_lock_delivers_one_notice_without_db_claim(tmp_path, monkeypa
         fallback_on_claim_lock=True,
     )
     assert len(notices) == 1
+
+
+def test_non_contention_operational_error_is_not_retried(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    parent = _parent(queue, "review")
+    calls, notices = [], []
+
+    def broken(task, *args, **kwargs):
+        calls.append(task.task_id)
+        raise sqlite3.OperationalError("no such table: tasks")
+
+    monkeypatch.setattr(queue, "enqueue", broken)
+    assert _cascade(queue, "review", parent,
+                    coordinator_notify_fn=lambda message: notices.append(message) or True) is None
+    assert len(calls) == 1
+    assert len(notices) == 1
+    assert queue.get_task(parent).error_info["kind"] == "config_error"
