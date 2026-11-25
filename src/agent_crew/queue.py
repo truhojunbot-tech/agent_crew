@@ -7943,6 +7943,24 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def waiting_pool_rows_by_park_code(self, code: str) -> List[TaskRequest]:
+        """``waiting_pool`` rows whose latest ``pool_hold_parked`` event carries
+        ``code`` (#1037), oldest first. The park code tells the #1033 pool
+        sweep and the #1037 review cap which parked rows are theirs: a row
+        parked under one must not be resumed by the other."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT t.* FROM tasks t WHERE t.status='waiting_pool' "
+                "AND t.quarantine_field='' AND ("
+                "SELECT json_extract(e.fields, '$.code') FROM task_exec_events e "
+                "WHERE e.task_id=t.task_id AND e.event='pool_hold_parked' "
+                "ORDER BY e.event_id DESC LIMIT 1) = ? "
+                "ORDER BY t.created_at ASC, t.rowid ASC", (code,)).fetchall()
+            return [self._task_from_row(r) for r in rows]
+        finally:
+            conn.close()
+
     _POOL_GRANT_USES_SQL = (
         "SELECT COUNT(*) FROM task_exec_events WHERE event='pool_grant_used' "
         "AND json_extract(fields, '$.grant_id')=?")
