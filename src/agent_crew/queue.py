@@ -18,6 +18,7 @@ from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import datetime, timezone
 from typing import Callable, List, Mapping, Optional, Sequence
 
+from agent_crew.worktree_default_branch import resolve_base_branch
 from agent_crew.anomaly import _extract_repo_from_url, auto_detect_expected_repos
 from agent_crew.cea import adapters as _cea_adapters
 from agent_crew.cea import callsites as _cea_callsites
@@ -3987,7 +3988,9 @@ class TaskQueue:
             context["risk_tier"] = max(tiers)
         context["duplicate_review_lineage_from"] = blocked.task_id
         branch = survivor["branch"]
-        base = context.get("base_branch") or os.getenv("AGENT_CREW_MAIN_BRANCH") or "main"
+        # #1070: the queue holds no checkout, so this is context, then the
+        # fleet fallback; a checkout-aware caller resolves the repo default.
+        base = resolve_base_branch(context)
         if blocked.branch and (not branch or branch == base):
             context["cascade_branch"] = blocked.branch
         conn.execute(

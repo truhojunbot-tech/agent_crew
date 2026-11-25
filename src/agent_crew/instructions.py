@@ -501,7 +501,8 @@ You write production code following TDD where practical:
    gh pr create --head <pushed-branch> --base <base_branch> --title "..." --body "..."
    ```
 
-   `<base_branch>` is the context's `base_branch`, else `main`. Report
+   `<base_branch>` is the context's `base_branch`, else the repo's default
+   branch (`git symbolic-ref refs/remotes/origin/HEAD`). Report
    `pr_number` only from the PR `gh pr create` actually printed (or
    `gh pr view <pushed-branch> --json number`) — never a guessed number.
 

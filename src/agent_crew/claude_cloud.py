@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from agent_crew import github as _github
+from agent_crew.worktree_default_branch import resolve_base_branch
 from agent_crew.failure_kind import FailureKind
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.role_mapping import provider_family
@@ -926,7 +927,7 @@ def _launch_ref(task: TaskRequest, checkout: str, prior_pr_head: Optional[str]) 
     base_sha = context.get("worktree_base_sha")
     if isinstance(base_sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", base_sha):
         return base_sha
-    base_branch = context.get("base_branch") or "main"
+    base_branch = resolve_base_branch(context, checkout)
     return base_branch if _publishable_ref(base_branch) else ""
 
 
@@ -1071,7 +1072,7 @@ def _derived_cloud_branch(task: TaskRequest) -> str:
             or "fix_round" in context):
         return ""
     branch = (task.branch or "").strip()
-    base = context.get("base_branch") or "main"
+    base = resolve_base_branch(context)
     if branch and branch not in {"main", "master", base}:
         return ""
     derived = f"agent/{task.project}/{task.task_id}" if task.project else f"agent/{task.task_id}"
@@ -1081,7 +1082,7 @@ def _derived_cloud_branch(task: TaskRequest) -> str:
 def _cloud_preflight_reason(task: TaskRequest, repo: str) -> str:
     if task.task_type == "implement" and not _derived_cloud_branch(task):
         branch = (task.branch or "").strip()
-        base = (task.context or {}).get("base_branch") or "main"
+        base = resolve_base_branch(task.context)
         if branch in {"main", "master", base} or not _publishable_ref(branch):
             return "cloud_branch_unpublishable"
     if not repo or not _github._repo_slug(repo):

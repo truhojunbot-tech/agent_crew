@@ -31,6 +31,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import NamedTuple, Optional
 
+from agent_crew.worktree_default_branch import resolve_base_branch
 from agent_crew.protocol import TaskResult
 
 logger = logging.getLogger(__name__)
@@ -612,7 +613,10 @@ def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: s
             if not gh_repo:
                 raise RuntimeError("missing context.repo for PR base branch lookup")
             base_branch = pr_base_branch(pr_number, gh_repo)
-        base_branch = base_branch or "main"
+        # #1070: the project checkout's own default branch, never the fleet
+        # constant. Three trader script tests merged against a stale `main`
+        # on a `master` repo and failed with merge_conflict (2026-11-25).
+        base_branch = resolve_base_branch({"base_branch": base_branch}, repo)
         base_sha, head_sha = resolve_refs(
             repo, base_branch=base_branch, pr_number=pr_number,
             head_sha=ctx.get("reviewed_sha") or ctx.get("expected_head_sha") or "",

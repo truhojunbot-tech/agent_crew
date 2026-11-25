@@ -72,11 +72,13 @@ def test_no_remote_default_or_main_or_master_refuses(tmp_path, monkeypatch):
     assert exc.value.reason == "worktree_base_unresolved"
 
 
-def test_explicit_env_branch_wins_over_origin_head(tmp_path, monkeypatch):
+def test_origin_head_wins_over_env_branch(tmp_path, monkeypatch):
+    """#1070 inverted the #555 order: the repo's own default beats the fleet
+    constant, which is now the fallback for a repo whose default is unreadable."""
     worker, commits = _worktree(tmp_path, default="trunk", extra=("master",))
     monkeypatch.setenv("AGENT_CREW_MAIN_BRANCH", "master")
 
-    assert _prepared_base(worker) == commits["master"]
+    assert _prepared_base(worker) == commits["trunk"]
 
 
 def test_context_base_branch_keeps_priority_over_env(tmp_path, monkeypatch):
@@ -131,7 +133,7 @@ def test_cli_sync_falls_back_to_master_without_origin_head(tmp_path, monkeypatch
     ("configured_main", "branch_args", "expected_base", "expected_run_branch"),
     [
         pytest.param(None, [], "master", False, id="implicit-master"),
-        pytest.param("main", [], "main", False, id="configured-main-wins"),
+        pytest.param("main", [], "master", False, id="repo-default-beats-configured-main"),
         pytest.param(None, ["--branch", "main"], "master", True,
                      id="explicit-main-is-a-run-branch"),
     ],
