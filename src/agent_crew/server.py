@@ -4649,9 +4649,18 @@ def create_app(
             worktree_path=repo_path, git_branch=task.branch or "",
             status="in_progress", provider_session_id=None, started_at=time.time(),
         )
+        # #1082: a loaded host holds the full suite. The row stays in_progress;
+        # each load reading is a heartbeat so the watchdog does not expire the
+        # wait, and one typed event marks the start of each wait.
+        load_gate = _script_tester.HostLoadGate.from_env(
+            on_wait_start=lambda fields: q().record_exec_event(
+                task.task_id, _script_tester.HOST_BUSY_WAIT_EVENT, **fields),
+            on_check=lambda _reading: q().record_heartbeat(
+                task.task_id, source=_script_tester.HOST_BUSY_WAIT_EVENT))
         result = _script_tester.execute_test_task(
             task, repo=repo_path, state=state,
-            cache_dir=os.path.join(os.path.dirname(db_path), "script_test_cache"))
+            cache_dir=os.path.join(os.path.dirname(db_path), "script_test_cache"),
+            load_gate=load_gate)
         if isinstance(result.error_info["script_test"].get("head"), dict):
             # The suite ran and made no LLM calls. A setup error or explicit
             # no-command skip has no such observation and keeps tokens NULL.

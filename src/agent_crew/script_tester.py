@@ -84,6 +84,129 @@ def _rerun_limit(state: Mapping, key: str, env_key: str, default: int | float,
         return default
 
 
+MAX_LOAD_ENV = "AGENT_CREW_SCRIPT_TEST_MAX_LOAD"
+WORKERS_ENV = "AGENT_CREW_SCRIPT_TEST_WORKERS"
+DEFAULT_MAX_LOAD = 20.0
+DEFAULT_WORKERS = 4
+LOAD_RECHECK_S = 120.0
+LOAD_MAX_WAIT_S = 3600.0
+HOST_BUSY_WAIT_EVENT = "host_busy_wait"
+_LOADAVG_PATH = "/proc/loadavg"
+
+
+def read_load_5m() -> Optional[float]:
+    """The host's 5-minute load average; ``None`` when it cannot be read."""
+    try:
+        with open(_LOADAVG_PATH) as f:
+            value = float(f.read().split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def max_load() -> float:
+    """``AGENT_CREW_SCRIPT_TEST_MAX_LOAD``: 5-min load under which a full suite starts."""
+    return float(_rerun_limit({}, "max_load", MAX_LOAD_ENV, DEFAULT_MAX_LOAD, integer=False))
+
+
+def max_workers() -> int:
+    """``AGENT_CREW_SCRIPT_TEST_WORKERS``: xdist worker cap for a full suite."""
+    return int(_rerun_limit({}, "workers", WORKERS_ENV, DEFAULT_WORKERS, integer=True))
+
+
+@dataclass
+class HostLoadGate:
+    """#1082: hold a full suite while the host is loaded, for a bounded time.
+
+    The load is read every ``recheck_s`` for at most ``max_wait_s``; after that
+    the suite runs anyway and the record says ``load_contended``. ``sleep``,
+    ``clock`` and ``read_load`` are injectable so tests never really wait.
+    ``on_wait_start`` fires once per wait; ``on_check`` on every reading.
+    """
+    max_load: float = DEFAULT_MAX_LOAD
+    recheck_s: float = LOAD_RECHECK_S
+    max_wait_s: float = LOAD_MAX_WAIT_S
+    read_load: Optional[Callable[[], Optional[float]]] = None
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], float] = time.monotonic
+    on_wait_start: Optional[Callable[[dict], None]] = None
+    on_check: Optional[Callable[[dict], None]] = None
+
+    @classmethod
+    def from_env(cls, **kwargs) -> "HostLoadGate":
+        return cls(max_load=max_load(), **kwargs)
+
+    def admit(self) -> dict:
+        """Block until the suite may start; return the admission evidence."""
+        read = self.read_load or read_load_5m
+        started = self.clock()
+        readings: list = []
+        while True:
+            load = read()
+            waited = self.clock() - started
+            readings.append({"load_5m": load, "waited_s": round(waited, 3)})
+            if self.on_check:
+                self.on_check(readings[-1])
+            if load is None or load < self.max_load:
+                return {"max_load": self.max_load, "readings": readings,
+                        "waited_s": round(waited, 3), "load_contended": False,
+                        **({"load_unavailable": True} if load is None else {})}
+            if waited >= self.max_wait_s:
+                return {"max_load": self.max_load, "readings": readings,
+                        "waited_s": round(waited, 3), "load_contended": True}
+            if len(readings) == 1 and self.on_wait_start:
+                self.on_wait_start({"load_5m": load, "max_load": self.max_load,
+                                    "recheck_s": self.recheck_s,
+                                    "max_wait_s": self.max_wait_s})
+            self.sleep(min(self.recheck_s, self.max_wait_s - waited))
+
+
+_WORKERS_LONG = "--numprocesses"
+
+
+def cap_xdist_workers(command: str, cap: int) -> str:
+    """Lower a plain pytest command's ``-n``/``--numprocesses`` to ``cap``.
+
+    Only an explicit worker option is capped; a command without one runs
+    serially already. Anything that is not a plain pytest call is unchanged.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return command
+    if not words or not (
+            os.path.basename(words[0]) in {"pytest", "py.test"}
+            or (re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", os.path.basename(words[0]))
+                and words[1:3] == ["-m", "pytest"])):
+        return command
+
+    def capped(value: str) -> Optional[str]:
+        if value in {"auto", "logical"}:
+            return str(cap)
+        if re.fullmatch(r"\d+", value):
+            return str(min(int(value), cap)) if int(value) > 0 else value
+        return None
+
+    changed = False
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word in {"-n", _WORKERS_LONG} and index + 1 < len(words):
+            new = capped(words[index + 1])
+            if new is not None and new != words[index + 1]:
+                words[index + 1], changed = new, True
+            index += 2
+            continue
+        for prefix in (_WORKERS_LONG + "=", "-n"):
+            if word.startswith(prefix) and len(word) > len(prefix):
+                new = capped(word[len(prefix):])
+                if new is not None and prefix + new != word:
+                    words[index], changed = prefix + new, True
+                break
+        index += 1
+    return shlex.join(words) if changed else command
+
+
 CI_GATE_ENV = "AGENT_CREW_SCRIPT_TEST_CI_GATE"
 # #1038: CI states that establish no job ran a step: no check at all, or every
 # failure is an Actions job with no runner and no steps (billing block). Only
@@ -420,9 +543,22 @@ def _cache_path(cache_dir: str, base_sha: str, command: str,
     return os.path.join(cache_dir, f"{base_sha}-{digest}.json")
 
 
+def _admit_full_suite(load_gate: Optional[HostLoadGate], record: Optional[dict]) -> None:
+    """Hold a full suite on host load (#1082) and keep the evidence in ``record``."""
+    if load_gate is None:
+        return
+    admission = load_gate.admit()
+    if record is not None:
+        record.setdefault("host_load", []).append(admission)
+        if admission["load_contended"]:
+            record["load_contended"] = True
+
+
 def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
                  cache_dir: str, state: Optional[Mapping],
-                 runner: Callable = run_command) -> tuple[RunOutcome, bool]:
+                 runner: Callable = run_command, *,
+                 load_gate: Optional[HostLoadGate] = None,
+                 record: Optional[dict] = None) -> tuple[RunOutcome, bool]:
     """The base outcome, cached per base sha, command and test environment."""
     path = _cache_path(cache_dir, base_sha, command,
                        _test_environment_identity(state, timeout_s))
@@ -431,6 +567,7 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
             return RunOutcome.from_dict(json.load(f)), True
     except (OSError, ValueError):
         pass
+    _admit_full_suite(load_gate, record)
     with Checkout(repo, base_sha) as checkout:
         outcome = runner(command, checkout, timeout_s,
                          env=test_environment(checkout, state))
@@ -444,8 +581,13 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
 
 
 def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[Mapping],
-                    cache_dir: str, runner: Callable = run_command) -> dict:
-    """Run the stage and return its durable record (``outcome`` is the verdict)."""
+                    cache_dir: str, runner: Callable = run_command,
+                    load_gate: Optional[HostLoadGate] = None) -> dict:
+    """Run the stage and return its durable record (``outcome`` is the verdict).
+
+    Full suites (head and uncached base) wait on ``load_gate`` and run with
+    their xdist workers capped; isolated reruns use the configured command.
+    """
     record: dict = {"executor": SCRIPT_TESTER, "provider_calls": 0,
                     "base_sha": base_sha, "head_sha": head_sha, "rebased": True,
                     "pre_existing": [], "new_failures": [], "flaky": [], "reruns": {}}
@@ -457,8 +599,12 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
             if not command:
                 record["outcome"] = SKIPPED_NO_TEST_COMMAND
                 return record
+            suite_command = cap_xdist_workers(command, max_workers())
+            if suite_command != command:
+                record["suite_command"] = suite_command
             head_env = test_environment(checkout, state)
-            head = runner(command, checkout, timeout_s, env=head_env)
+            _admit_full_suite(load_gate, record)
+            head = runner(suite_command, checkout, timeout_s, env=head_env)
             record["head"] = head.to_dict()
             record["counts"] = dict(head.counts)
             record["duration_s"] = head.duration_s
@@ -466,8 +612,9 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 record.update(outcome=INCOMPLETE, reason="script_test_timeout")
                 return record
             if head.failing_ids:
-                base, cached = base_outcome(repo, base_sha, command, timeout_s,
-                                            cache_dir, state, runner)
+                base, cached = base_outcome(repo, base_sha, suite_command, timeout_s,
+                                            cache_dir, state, runner,
+                                            load_gate=load_gate, record=record)
                 record["base"] = {**base.to_dict(), "cached": cached}
                 record["duration_s"] += base.duration_s
                 if base.timed_out:
@@ -597,7 +744,8 @@ def head_has_workflows(repo: str, head_sha: str) -> bool:
 
 
 def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: str,
-                      runner: Callable = run_command) -> TaskResult:
+                      runner: Callable = run_command,
+                      load_gate: Optional[HostLoadGate] = None) -> TaskResult:
     """Run one ``test`` task by script. Never raises; never calls a provider."""
     ctx = task.context if isinstance(task.context, dict) else {}
     pr_number = ctx.get("pr_number")
@@ -618,7 +766,7 @@ def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: s
             head_sha=ctx.get("reviewed_sha") or ctx.get("expected_head_sha") or "",
             branch=task.branch or "")
         record = run_script_test(repo, base_sha=base_sha, head_sha=head_sha, state=state,
-                                 cache_dir=cache_dir, runner=runner)
+                                 cache_dir=cache_dir, runner=runner, load_gate=load_gate)
         record["base_branch"] = base_branch
         if record.get("outcome") == PASSED and head_has_workflows(repo, head_sha):
             from agent_crew.github import get_repo, head_checks_state
