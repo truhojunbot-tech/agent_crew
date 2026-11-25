@@ -1,7 +1,8 @@
 """#1081 slice a: one transition table, one status writer.
 
-The guard scans ``src/`` for SQL that writes ``tasks.status`` anywhere except
-``task_state.py`` and compares it with an explicit allowlist of today's
+The guard compiles every SQL write literal under ``src/`` (except
+``task_state.py``) against the repo schema, lets SQLite's authorizer say which
+ones write ``tasks.status``, and compares it with an explicit allowlist of today's
 writers (file + function, with a count, never line numbers). A new writer
 fails this test; a writer moved into :func:`task_state.transition` must be
 removed from the allowlist in the same PR. Later slices shrink it to empty.
@@ -10,7 +11,9 @@ removed from the allowlist in the same PR. Later slices shrink it to empty.
 from __future__ import annotations
 
 import ast
+import itertools
 import json
+import os
 import random
 import re
 import sqlite3
@@ -21,6 +24,7 @@ import pytest
 
 from agent_crew import queue as queue_mod
 from agent_crew import task_state as ts
+from agent_crew.cea import store as cea_store
 from agent_crew.queue import TaskQueue
 from agent_crew.protocol import TaskRequest
 
@@ -50,58 +54,195 @@ ALLOWLIST = Counter({
     ("queue.py", "force_fail_pending"): 1,
 })
 
-# SQLite identifiers may be bare, "double-quoted", `backticked`, [bracketed]
-# or (legacy) 'single-quoted', and a table may be schema-qualified.
-_IDENT = r"""(?:"[^"]*"|`[^`]*`|\[[^\]]*\]|'[^']*'|[A-Za-z_]\w*)"""
+# ── the guard: SQLite decides what a statement writes ───────────────────
+#
+# Three rounds of regex were bypassed by ordinary SQL (comments, a quoted
+# 'WHERE', a subquery in SET). So the guard does not read SQL text: it lets
+# SQLite compile each candidate statement against the repo's own schema with
+# an authorizer that records SQLITE_UPDATE on tasks.status. Compile only —
+# statements run under EXPLAIN, which never executes them, on a throwaway
+# in-memory copy of the schema.
+
+#: Stands in for a non-literal fragment (an f-string field, a ``+``'d name).
+_HOLE = "\x01"
+#: What a hole is tried as, in order. Its content is unknowable statically, so
+#: the guard sees only the literal parts; it needs the statement to compile.
+_FILLERS = ("rowid", "NULL", "rowid=rowid", "", ", rowid=rowid")
+_MAX_HOLES = 3
+#: Which literals are SQL writes at all. Deliberately loose: a false candidate
+#: (prose, ``update-ref``) fails to compile and fails the guard loudly, while a
+#: missed one would pass silently. Excluded only: a bare word, a word that
+#: continues (``updated``), a lone ``-``.
+_WRITE_HEAD = re.compile(r"(?:UPDATE|INSERT|REPLACE|WITH)(?![\w$]|-(?!-))\s*\S", re.I)
+_DDL_HEAD = re.compile(r"(?:CREATE|ALTER)\b", re.I)
+_LEADING = re.compile(r"(?:\s+|--[^\n]*(?:\n|\Z)|/\*.*?(?:\*/|\Z))*", re.S)
+_BINDINGS = re.compile(r"The current statement uses (\d+)")
+_NO_FUNCTION = re.compile(r"no such function: (\w+)$")
 
 
-def _quoted(name: str) -> str:
-    return rf"""(?:"{name}"|`{name}`|\[{name}\]|'{name}'|(?<![\w"`\]']){name}(?![\w"`\[']))"""
+class Unpreparable(Exception):
+    pass
 
 
-_TASKS = rf"(?:{_IDENT}\s*\.\s*)?{_quoted('tasks')}"
-_STATUS = _quoted("status")
-_UPDATE_TASKS = re.compile(
-    rf"\bUPDATE\s+(?:OR\s+\w+\s+)?{_TASKS}\s+(?:AS\s+{_IDENT}\s+)?"
-    rf"(?:INDEXED\s+BY\s+{_IDENT}\s+|NOT\s+INDEXED\s+)?"
-    r"SET\b(?P<set>.*?)(?:\bWHERE\b|$)", re.I | re.S)
-_STATUS_ASSIGN = re.compile(rf"(?<!\.){_STATUS}\s*=", re.I)
-# SET (a, status, b) = (...): a row-value assignment.
-_STATUS_ROW_ASSIGN = re.compile(rf"\([^()]*(?<!\.){_STATUS}[^()]*\)\s*=", re.I)
-_INSERT_TASKS_UPSERT = re.compile(
-    rf"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+{_TASKS}.*\bDO\s+UPDATE\s+SET\b(?P<set>.*)",
-    re.I | re.S)
+def _fold(e: ast.AST):
+    """The string an expression builds, with a hole per non-literal part, or
+    None if it is not a string expression at all."""
+    if isinstance(e, ast.Constant) and isinstance(e.value, str):
+        return e.value
+    if isinstance(e, ast.JoinedStr):
+        return "".join(v.value if isinstance(v, ast.Constant) else _HOLE for v in e.values)
+    if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Add):
+        left, right = _fold(e.left), _fold(e.right)
+        if left is None and right is None:
+            return None
+        return (_HOLE if left is None else left) + (_HOLE if right is None else right)
+    return None
 
 
-# One SQLite token at a time: a quoted literal/identifier is kept verbatim, a
-# comment (``-- …`` to end of line, ``/* … */`` or an unterminated ``/*`` to
-# end of input) is replaced by the whitespace SQLite treats it as.
-_SQL_TOKEN = re.compile(
-    r"""'(?:[^']|'')*'?|"(?:[^"]|"")*"?|`(?:[^`]|``)*`?|\[[^\]]*\]?"""
-    r"|(?P<comment>--[^\n]*|/\*.*?(?:\*/|\Z))|[^'\"`\[/-]+|.", re.S)
+def _string_exprs(tree: ast.AST):
+    """(node, text) for every outermost string expression; docstrings skipped."""
+    inner: set = set()
+    for n in ast.walk(tree):
+        if id(n) in inner:
+            continue
+        if isinstance(n, ast.Expr) and _fold(n.value) is not None:
+            inner.update(id(sub) for sub in ast.walk(n.value))
+            continue
+        text = _fold(n)
+        if text is None:
+            continue
+        inner.update(id(sub) for sub in ast.walk(n))
+        yield n, text
 
 
-def _strip_sql_comments(sql: str) -> str:
-    return "".join(" " if m.group("comment") else m.group(0)
-                   for m in _SQL_TOKEN.finditer(sql))
+def _statements(text: str):
+    """Split on ``;`` where SQLite's own tokenizer says a statement ends."""
+    buf = ""
+    for ch in text:
+        buf += ch
+        if ch == ";" and sqlite3.complete_statement(buf):
+            yield buf
+            buf = ""
+    if buf.strip():
+        yield buf
 
 
-def _sql_pieces(node: ast.AST) -> str:
-    """Every string literal under ``node``, joined — covers implicit and ``+``
-    concatenation and the literal parts of f-strings. Pieces are joined by a
-    newline so a ``--`` comment in one piece cannot hide the next."""
-    return "\n".join(n.value for n in ast.walk(node)
-                    if isinstance(n, ast.Constant) and isinstance(n.value, str))
+def _head(stmt: str) -> str:
+    return stmt[_LEADING.match(stmt).end():]
 
 
-def _sets_status(set_clause: str) -> bool:
-    return bool(_STATUS_ASSIGN.search(set_clause) or _STATUS_ROW_ASSIGN.search(set_clause))
+def _allow_all(*_):
+    return sqlite3.SQLITE_OK
 
 
-def _writes_status(sql: str) -> int:
-    sql = _strip_sql_comments(sql)
-    hits = sum(1 for m in _UPDATE_TASKS.finditer(sql) if _sets_status(m.group("set")))
-    hits += sum(1 for m in _INSERT_TASKS_UPSERT.finditer(sql) if _sets_status(m.group("set")))
+def _status_writes(conn: sqlite3.Connection, stmt: str) -> tuple:
+    """(own, triggers): whether compiling ``stmt`` writes tasks.status itself,
+    and the names of triggers it fires that do. Raises Unpreparable."""
+    holes = stmt.count(_HOLE)
+    if holes > _MAX_HOLES:
+        raise Unpreparable(f"{holes} non-literal fragments")
+    first_columns = tuple(
+        cols[0][1] for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        if (cols := conn.execute(f"PRAGMA table_info({name!r})").fetchall()))
+    error = None
+    for fill in itertools.product(_FILLERS + first_columns, repeat=holes):
+        sql = stmt
+        for f in fill:
+            sql = sql.replace(_HOLE, f, 1)
+        writes, inserts = [], []
+
+        def auth(action, arg1, arg2, _db, trigger):
+            table = (arg1 or "").lower()
+            if action == sqlite3.SQLITE_UPDATE and table == "tasks" and (arg2 or "").lower() == "status":
+                writes.append(trigger)
+            elif action == sqlite3.SQLITE_INSERT and table == "tasks" and trigger is None:
+                inserts.append(True)
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(auth)
+        try:
+            try:
+                program = conn.execute("EXPLAIN " + sql).fetchall()
+            except sqlite3.ProgrammingError as e:
+                m = _BINDINGS.search(str(e))
+                if not m:
+                    raise
+                program = conn.execute("EXPLAIN " + sql, (None,) * int(m.group(1))).fetchall()
+        except sqlite3.OperationalError as e:
+            m = _NO_FUNCTION.match(str(e))
+            if m:  # an application-defined SQL function: any stub compiles
+                conn.create_function(m.group(1), -1, lambda *a: None)
+                return _status_writes(conn, stmt)
+            error = error or e
+            continue
+        except sqlite3.Error as e:
+            error = error or e
+            continue
+        finally:
+            conn.set_authorizer(_allow_all)  # 3.10 cannot clear an authorizer
+        # INSERT creates a row; REPLACE (a Delete in the program) overwrites one.
+        replaces = bool(inserts) and any(op[1] == "Delete" for op in program)
+        return (None in writes or replaces), {t for t in writes if t is not None}
+    raise Unpreparable(str(error))
+
+
+def _schema_db(tmp_dir: Path) -> sqlite3.Connection:
+    """In-memory copy of the repo's schema: what TaskQueue and the CEA store
+    create (their migrations build columns dynamically), then every literal
+    CREATE/ALTER under src/ until a fixpoint, for the other modules' tables."""
+    path = tmp_dir / "schema.db"
+    TaskQueue(str(path))
+    disk = sqlite3.connect(path)
+    cea_store.ensure_schema(disk)
+    disk.commit()
+    conn = sqlite3.connect(":memory:", cached_statements=0)  # a cached statement skips the authorizer
+    disk.backup(conn)
+    disk.close()
+    pending = [st for p in sorted(SRC.rglob("*.py"))
+               for _, text in _string_exprs(ast.parse(p.read_text(encoding="utf-8")))
+               if _HOLE not in text
+               for st in _statements(text) if _DDL_HEAD.match(_head(st))]
+    while pending:
+        left = []
+        for st in pending:
+            try:
+                conn.execute(st)
+            except sqlite3.Error:
+                left.append(st)
+        if len(left) == len(pending):
+            break
+        pending = left
+    return conn
+
+
+@pytest.fixture(scope="module")
+def schema(tmp_path_factory):
+    with pytest.MonkeyPatch.context() as mp:
+        for k in [k for k in os.environ if k.startswith("AGENT_CREW_")]:
+            mp.delenv(k)
+        conn = _schema_db(tmp_path_factory.mktemp("schema1081"))
+    yield conn
+    conn.close()
+
+
+@pytest.fixture
+def fixture_db(schema):
+    """The repo schema plus the unrelated tables the SQL fixtures name."""
+    conn = sqlite3.connect(":memory:", cached_statements=0)
+    schema.backup(conn)
+    for ddl in ("CREATE TABLE subtasks (id, status)", "CREATE TABLE tasks_archive (id, status)",
+                "CREATE TABLE t (id, name)", "CREATE TABLE other (id, name)"):
+        conn.execute(ddl)
+    return conn
+
+
+def _writes_status(conn: sqlite3.Connection, sql: str) -> int:
+    hits = 0
+    for st in _statements(sql):
+        if _WRITE_HEAD.match(_head(st)):
+            own, triggers = _status_writes(conn, st)
+            hits += own + len(triggers)
     return hits
 
 
@@ -120,20 +261,37 @@ def _writes_status(sql: str) -> int:
     "UPDATE tasks NOT INDEXED SET status=?",
     "UPDATE tasks SET summary=?, (status, verdict) = (?, ?) WHERE task_id=?",
     "UPDATE tasks SET (summary, \"status\") = (?, ?)",
-    "INSERT INTO main.\"tasks\" (task_id) VALUES (?) "
+    "INSERT INTO main.\"tasks\" (task_id, task_type, description, created_at) VALUES (?, ?, ?, ?) "
     "ON CONFLICT(task_id) DO UPDATE SET \"status\"=excluded.status",
-    # A comment is whitespace to SQLite, so it must be to the scanner too.
+    "REPLACE INTO tasks (task_id, task_type, description, created_at, status) VALUES (?, ?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO tasks (task_id, task_type, description, created_at) VALUES (?, ?, ?, ?)",
+    "UPDATE tasks SET status=:status WHERE task_id=:task_id",
+    "WITH x(v) AS (SELECT 'completed') UPDATE tasks SET status=(SELECT v FROM x)",
+    # A comment is whitespace to SQLite, so it is to the guard too.
     "UPDATE tasks /* migration note */ SET status=? WHERE task_id=?",
     "UPDATE tasks SET status /* x */ = ? WHERE task_id=?",
     "UPDATE tasks -- note\nSET status=? WHERE task_id=?",
     "UPDATE tasks SET status -- why\n= ? WHERE task_id=?",
     "UPDATE/**/tasks/**/SET/**/status/**/=?",
+    "/* lead */ UPDATE tasks SET status=?",
+    "UPDATE--c\ntasks SET status=?",
     "UPDATE main./* q */tasks AS t /* a */ SET summary=?, \"status\"/**/=?",
     "UPDATE tasks SET summary='--', status=? WHERE task_id=?",
-    "UPDATE tasks SET summary='/*', status=? WHERE note='*/'",
+    "UPDATE tasks SET summary='/*', status=? WHERE summary='*/'",
+    # Round 3: clause keywords inside a literal or a subquery are not clauses.
+    "UPDATE tasks SET summary='WHERE', status=? WHERE task_id=?",
+    "UPDATE tasks SET summary='WHERE', status='completed' WHERE task_id=?",
+    "UPDATE tasks SET summary=(SELECT name FROM t WHERE id=1), status=?",
+    "UPDATE tasks SET summary=(SELECT name FROM other WHERE id=1), status='completed' WHERE task_id=?",
 ])
-def test_writes_status_sees_quoted_and_qualified_sql(sql):
-    assert _writes_status(sql) == 1, sql
+def test_writes_status_sees_every_sqlite_spelling(fixture_db, sql):
+    assert _writes_status(fixture_db, sql) == 1, sql
+
+
+def test_every_statement_in_a_literal_is_compiled(fixture_db):
+    assert _writes_status(fixture_db, "UPDATE tasks SET summary=? ; UPDATE tasks SET status=?") == 1
+    assert _writes_status(fixture_db, "UPDATE tasks SET summary='a;b'; UPDATE tasks SET status=?;"
+                                      "UPDATE tasks SET status=?") == 2
 
 
 @pytest.mark.parametrize("sql", [
@@ -141,22 +299,38 @@ def test_writes_status_sees_quoted_and_qualified_sql(sql):
     'UPDATE "tasks" SET "status_changed_at"=? WHERE task_id=?',
     "UPDATE tasks SET context=? WHERE task_id=? AND status=?",
     'UPDATE "tasks" SET context=? WHERE "status"=?',
-    "UPDATE gates SET status=? WHERE id=?",
+    "UPDATE gates SET status=? WHERE rowid=?",
     'UPDATE "task_attribution" SET "status"=? WHERE task_id=?',
     "UPDATE main.tasks_archive SET status=?",
     "UPDATE subtasks SET status=?",
     "UPDATE tasks SET (summary, verdict) = (?, ?) WHERE status=?",
-    "INSERT INTO tasks (task_id, status) VALUES (?, ?)",
+    "INSERT INTO tasks (task_id, task_type, description, created_at, status) VALUES (?, ?, ?, ?, ?)",
+    "INSERT OR IGNORE INTO tasks (task_id, task_type, description, created_at) VALUES (?, ?, ?, ?)",
     "UPDATE tasks SET summary=? /* status = ? */ WHERE task_id=?",
     "UPDATE tasks SET summary=? -- , status=?\nWHERE task_id=?",
+    # status text only inside a literal value
     "UPDATE tasks SET summary='status = ?' WHERE task_id=?",
+    "UPDATE tasks SET summary='x'', status=''completed' WHERE task_id=?",
+    "UPDATE tasks SET summary=\"status\" WHERE task_id=?",
+    "UPDATE subtasks SET status=(SELECT status FROM tasks WHERE task_id=?)",
+    "WITH x AS (SELECT status FROM tasks) UPDATE subtasks SET status=(SELECT status FROM x)",
 ])
-def test_writes_status_ignores_non_status_writes(sql):
-    assert _writes_status(sql) == 0, sql
+def test_writes_status_ignores_non_status_writes(fixture_db, sql):
+    assert _writes_status(fixture_db, sql) == 0, sql
 
 
-def _scan(root: Path = SRC) -> Counter:
+def test_unpreparable_write_is_a_guard_failure_not_a_pass(fixture_db):
+    with pytest.raises(Unpreparable):
+        _writes_status(fixture_db, "UPDATE tasks SET no_such_column=? WHERE task_id=?")
+    with pytest.raises(Unpreparable):
+        _writes_status(fixture_db, "UPDATE temp.tasks SET status=?")
+
+
+def _scan(conn: sqlite3.Connection, root: Path = SRC) -> tuple:
+    """(writers, unpreparable, triggers) for every .py under ``root``."""
     found: Counter = Counter()
+    unpreparable: list = []
+    triggers: set = set()
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root / "agent_crew").as_posix() if (root / "agent_crew") in path.parents else path.as_posix()
         if rel == "task_state.py":
@@ -167,26 +341,27 @@ def _scan(root: Path = SRC) -> Counter:
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for n in ast.walk(fn):
                     owner[id(n)] = fn.name  # innermost wins: inner defs walk later
-        seen: set = set()
-        for n in ast.walk(tree):
-            if isinstance(n, ast.Call) and n.args:
-                target = n.args[0]
-            elif isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
-                target = n.value
-            else:
-                continue
-            if id(target) in seen:
-                continue
-            for sub in ast.walk(target):
-                seen.add(id(sub))
-            hits = _writes_status(_sql_pieces(target))
-            if hits:
-                found[(rel, owner.get(id(n), "<module>"))] += hits
-    return found
+        for node, text in _string_exprs(tree):
+            for st in _statements(text):
+                if not _WRITE_HEAD.match(_head(st)):
+                    continue
+                try:
+                    own, fired = _status_writes(conn, st)
+                except Unpreparable as e:
+                    unpreparable.append(f"{rel}:{node.lineno}: {e}: {st.strip()[:120]!r}")
+                    continue
+                if own:
+                    found[(rel, owner.get(id(node), "<module>"))] += 1
+                triggers |= fired
+    return found, unpreparable, triggers
 
 
-def test_no_status_writer_outside_the_allowlist():
-    found = _scan()
+def test_no_status_writer_outside_the_allowlist(schema):
+    found, unpreparable, triggers = _scan(schema)
+    assert not unpreparable, (
+        "SQL the guard cannot compile against the repo schema, so cannot vouch "
+        f"for: {unpreparable}")
+    assert not triggers, f"trigger(s) {sorted(triggers)} write tasks.status (#1081)"
     new = found - ALLOWLIST
     gone = ALLOWLIST - found
     assert not new, (
@@ -197,28 +372,44 @@ def test_no_status_writer_outside_the_allowlist():
         "remove them from ALLOWLIST so the list only shrinks (#1081)")
 
 
-def test_scanner_catches_a_new_writer(tmp_path):
+def test_scanner_catches_a_new_writer(schema, tmp_path):
     pkg = tmp_path / "agent_crew"
     pkg.mkdir()
     (pkg / "rogue.py").write_text(
+        '"""Update the status of tasks — a docstring, never executed."""\n'
         "def sneak(conn):\n"
         "    conn.execute(\"UPDATE tasks SET summary=?, \"\n"
         "                 \"status='completed' WHERE task_id=?\", ('x', 't'))\n"
         "SQL = 'UPDATE tasks SET status = ? WHERE task_id = ?'\n"
         "def harmless(conn):\n"
-        "    conn.execute('UPDATE tasks SET status_changed_at=? WHERE task_id=?')\n"
-        "    conn.execute('UPDATE gates SET status=? WHERE id=?')\n"
+        "    conn.execute('UPDATE tasks SET summary=? WHERE task_id=?')\n"
+        "    conn.execute('UPDATE gates SET status=? WHERE rowid=?')\n"
         "    conn.execute('UPDATE tasks SET context=? WHERE task_id=? AND status=?')\n"
+        "    conn.execute(\"UPDATE tasks SET summary='status=1' WHERE task_id=?\")\n"
         "def quoted(conn):\n"
         "    conn.execute('UPDATE \"tasks\" SET \"status\" = ? WHERE task_id = ?')\n"
         "    conn.execute(f'UPDATE main.[tasks] SET [status] = {1} WHERE task_id = ?')\n"
         "def commented(conn):\n"
         "    conn.execute('UPDATE tasks /* migration note */ SET status=? WHERE task_id=?')\n"
-        "    conn.execute('UPDATE tasks SET status /* x */ = ? WHERE task_id=?')\n")
-    assert _scan(tmp_path) == Counter({("rogue.py", "sneak"): 1,
-                                       ("rogue.py", "<module>"): 1,
-                                       ("rogue.py", "quoted"): 2,
-                                       ("rogue.py", "commented"): 2})
+        "    conn.execute('UPDATE tasks SET status /* x */ = ? WHERE task_id=?')\n"
+        "def clause_words(conn):\n"
+        "    conn.execute(\"UPDATE tasks SET summary='WHERE', status='completed' WHERE task_id=?\")\n"
+        "    conn.execute('UPDATE tasks SET summary=(SELECT branch FROM tasks WHERE rowid=1), '\n"
+        "                 \"status='completed'\")\n"
+        "def dynamic(conn, cols):\n"
+        "    conn.execute('UPDATE tasks SET ' + cols + ', status=? WHERE task_id=?')\n"
+        "def broken(conn):\n"
+        "    conn.execute('UPDATE tasks SET no_such_column=? WHERE task_id=?')\n")
+    found, unpreparable, triggers = _scan(schema, tmp_path)
+    assert found == Counter({("rogue.py", "sneak"): 1,
+                             ("rogue.py", "<module>"): 1,
+                             ("rogue.py", "quoted"): 2,
+                             ("rogue.py", "commented"): 2,
+                             ("rogue.py", "clause_words"): 2,
+                             ("rogue.py", "dynamic"): 1})
+    assert len(unpreparable) == 1 and unpreparable[0].startswith("rogue.py:24:"), unpreparable
+    assert triggers == set()
+
 
 
 def test_every_writer_is_a_table_row():
