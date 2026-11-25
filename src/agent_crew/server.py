@@ -7975,9 +7975,14 @@ def create_app(
             # #1070: a producer-posted task without a base inherits the
             # lineage's, else the repo's own default. Only a real answer is
             # written; the fleet fallback is left for the stage to resolve
-            # against its own checkout.
+            # against its own checkout. A task bound to an existing PR never
+            # takes the repo default: its base is the PR's own, which the
+            # stage reads from GitHub only while the field is empty — a PR
+            # into `release` on a `master` repo would otherwise test on master.
+            pr_bound = (normalize_pr_number(task.pr_number) is not None
+                        or normalize_pr_number(ctx.get("pr_number")) is not None)
             resolved = _lineage_base_branch(ctx)
-            if not resolved and worktree:
+            if not resolved and worktree and not pr_bound:
                 try:
                     resolved = remote_default_branch(worktree)
                 except (OSError, subprocess.TimeoutExpired):

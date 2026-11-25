@@ -210,12 +210,19 @@ def test_admission_fills_base_branch_from_lineage_then_repo(tmp_db, tmp_path):
     assert inherited.status_code == 201, inherited.text
     assert queue.get_task("test-lineage").context["base_branch"] == "release"
 
-    # No lineage: the repo's own default, not the stale `main`.
-    fresh = _post(app, {"task_id": "review-fresh", "task_type": "review",
-                        "description": "review", "branch": "feature",
-                        "context": {"pr_number": 42}})
+    # No lineage, no PR: the repo's own default, not the stale `main`.
+    fresh = _post(app, {"task_id": "impl-fresh", "task_type": "implement",
+                        "description": "impl", "branch": "feature", "context": {}})
     assert fresh.status_code == 201, fresh.text
-    assert queue.get_task("review-fresh").context["base_branch"] == "master"
+    assert queue.get_task("impl-fresh").context["base_branch"] == "master"
+
+    # No lineage but bound to a PR: left unset so the stage reads the PR's
+    # own base, never a guessed repo default (fix round 3).
+    pr_bound = _post(app, {"task_id": "review-fresh", "task_type": "review",
+                           "description": "review", "branch": "feature",
+                           "context": {"pr_number": 42}})
+    assert pr_bound.status_code == 201, pr_bound.text
+    assert "base_branch" not in queue.get_task("review-fresh").context
 
     # A declared base is never overwritten.
     declared = _post(app, {"task_id": "test-declared", "task_type": "test",
@@ -223,6 +230,48 @@ def test_admission_fills_base_branch_from_lineage_then_repo(tmp_db, tmp_path):
                            "context": {"pr_number": 43, "base_branch": "main"}})
     assert declared.status_code == 201, declared.text
     assert queue.get_task("test-declared").context["base_branch"] == "main"
+
+
+@pytest.mark.usefixtures("no_env")
+def test_pr_into_a_non_default_branch_is_tested_against_the_pr_base(
+        tmp_db, tmp_path, monkeypatch):
+    """Fix round 3: admission → test stage for a PR into ``release`` on a
+    ``master`` repo. Admission must not record ``master``; the stage must ask
+    the PR for its base and merge against ``release``."""
+    clone, tips = _repo(tmp_path, default="master")
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    _git("-C", seed, "checkout", "-b", "release", tips["master"] + "~1")
+    (seed / "release.txt").write_text("release")
+    _git("-C", seed, "add", "release.txt")
+    _git("-C", seed, "commit", "-m", "release")
+    _git("-C", seed, "push", "origin", "release")
+    tips["release"] = _git("-C", seed, "rev-parse", "HEAD")
+    _git("-C", seed, "push", "origin", f"{tips['feature']}:refs/pull/45/head")
+    assert remote.exists()
+
+    app = _app(tmp_db, clone)
+    posted = _post(app, {"task_id": "test-release-pr", "task_type": "test",
+                         "description": "test", "branch": "feature",
+                         "context": {"pr_number": 45, "repo": "owner/repo",
+                                     "risk_tier": 1}})
+    assert posted.status_code == 201, posted.text
+    row = TaskQueue(tmp_db).get_task("test-release-pr")
+    assert "base_branch" not in row.context
+
+    looked_up = []
+    monkeypatch.setattr(script_tester, "pr_base_branch",
+                        lambda pr, repo="": looked_up.append((pr, repo)) or "release")
+    _stub_script_run(monkeypatch)
+    result = script_tester.execute_test_task(
+        row, repo=str(clone), state=None, cache_dir=str(tmp_path / "cache"))
+
+    assert result.status == "completed", result.summary
+    assert looked_up == [(45, "owner/repo")]
+    assert result.error_info["script_test"]["base_branch"] == "release"
+    fetched_base = _git("-C", clone, "rev-parse", "refs/agent_crew/script_test/base")
+    assert fetched_base == tips["release"]
+    assert fetched_base != tips["master"]
 
 
 @pytest.mark.usefixtures("no_env")
