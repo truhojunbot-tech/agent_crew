@@ -440,18 +440,30 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         the budget and nothing else went wrong, it is retried once with
         ``LATENCY_RETRY_BUDGET_MULTIPLIER`` times the budget. A non-timeout
         error falls back at once, and a retry that is still too slow falls
-        back and is counted, as before. The retry is skipped when the caller
-        has already served its own fallback (``fallback_marker`` set), because
-        a result nobody will read is not worth a second pass under load.
+        back and is counted, as before.
+
+        Only an in-process caller (no ``fallback_marker``, e.g. the deploy
+        gate in alfred/tools/decision_rule_gate.py) gets the retry. A caller
+        that passes a marker serves its own fallback on its own deadline (the
+        server's 300 ms ``wait_for``); every budget check here fires at or
+        after that deadline, so a retried result could never be read and the
+        second pass would only burn CPU under the load that caused the
+        timeout. Sampling the marker is not enough: the caller sets it from
+        its event loop, which may run after this worker reaches the retry
+        boundary (review of PR #1074).
+
+        ``latency_ms`` is end to end across attempts, so a slow first attempt
+        plus a fast retry is not reported as a sub-budget retrieval for the
+        R7 p95; ``attempt_latency_ms`` is the returned attempt's own time.
         """
+        started = time.perf_counter()
         budget = LATENCY_BUDGET_SECONDS
-        for attempt in range(LATENCY_RETRY_ATTEMPTS + 1):
-            retry_allowed = (attempt < LATENCY_RETRY_ATTEMPTS and
-                             not (fallback_marker is not None and fallback_marker.is_set()))
+        attempts = LATENCY_RETRY_ATTEMPTS if fallback_marker is None else 0
+        for attempt in range(attempts + 1):
             try:
-                return self._retrieve_ranked_once(
+                result = self._retrieve_ranked_once(
                     scope, query, role, k, byte_budget, budget,
-                    retry_allowed=retry_allowed, fallback_marker=fallback_marker,
+                    retry_allowed=attempt < attempts, fallback_marker=fallback_marker,
                     response_state=response_state)
             except RetrievalBudgetExceeded as exc:
                 # Only raised when retry_allowed; the gate's hand-built store
@@ -460,9 +472,13 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 self.budget_retry_count = getattr(self, "budget_retry_count", 0) + 1
                 next_budget = budget * LATENCY_RETRY_BUDGET_MULTIPLIER
                 logger.warning("memory retrieval budget retry %d/%d: %s (budget %.0f ms -> %.0f ms)",
-                               attempt + 1, LATENCY_RETRY_ATTEMPTS, exc,
+                               attempt + 1, attempts, exc,
                                budget * 1000, next_budget * 1000)
                 budget = next_budget
+                continue
+            result["attempt_latency_ms"] = result["latency_ms"]
+            result["latency_ms"] = (time.perf_counter() - started) * 1000
+            return result
         raise AssertionError("unreachable: final attempt never raises RetrievalBudgetExceeded")
 
     def _retrieve_ranked_once(self, scope: MemoryScope, query: str, role: str,

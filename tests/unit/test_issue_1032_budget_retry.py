@@ -113,6 +113,62 @@ def test_no_retry_once_the_caller_already_served_a_fallback(store):
     assert store.budget_retry_count == 0
 
 
+def test_marker_set_during_the_first_attempt_is_not_retried(store):
+    """Review of PR #1074: the server's 300 ms ``wait_for`` fires while the
+    worker's first attempt is still inside a 350 ms candidate read. The
+    timeout handler records the counted fallback and sets the marker; the
+    worker must not spend a second 600 ms pass on a result nobody reads."""
+    marker = threading.Event()
+    original = store._candidates
+    calls = []
+
+    def stub(db, scope, query=""):
+        calls.append(1)
+        time.sleep(SLOW_ONCE)
+        store._record_fallback(marker)  # what _ranked_timeout_response does at 300 ms
+        return original(db, scope, query)
+
+    store._candidates = stub
+    result = query(store, fallback_marker=marker)
+    assert result["mode"] == "fallback"
+    assert len(calls) == 1
+    assert store.fallback_count == 1  # the caller's count; the worker adds none
+    assert store.budget_retry_count == 0
+
+
+def test_deadline_bound_caller_gets_no_retry_before_its_marker_is_set(store):
+    """The marker is set from the caller's event loop, which under load may run
+    after the worker reaches the retry boundary. A caller that passed a marker
+    is deadline-bound regardless, so the retry is off for it, not merely
+    suppressed once the marker happens to be visible."""
+    calls = slow_candidates(store, [SLOW_ONCE, 0.0])
+    marker = threading.Event()
+    result = query(store, fallback_marker=marker)
+    assert result["mode"] == "fallback"
+    assert len(calls) == 1
+    assert marker.is_set()
+    assert store.fallback_count == 1
+    assert store.budget_retry_count == 0
+
+
+def test_latency_ms_is_end_to_end_across_the_retry(store):
+    """A 350 ms first attempt plus a fast retry is not a sub-300 ms retrieval
+    for the ADR-001 R7 p95; the retried attempt's own time is reported apart."""
+    slow_candidates(store, [SLOW_ONCE, 0.0])
+    result = query(store)
+    assert result["mode"] == "lexical_only"
+    assert result["latency_ms"] >= SLOW_ONCE * 1000
+    assert result["attempt_latency_ms"] < LATENCY_BUDGET_SECONDS * 1000
+    assert result["attempt_latency_ms"] <= result["latency_ms"]
+
+
+def test_latency_fields_agree_without_a_retry(store):
+    result = query(store)
+    assert result["mode"] == "lexical_only"
+    assert result["attempt_latency_ms"] <= result["latency_ms"]
+    assert result["latency_ms"] - result["attempt_latency_ms"] < 50
+
+
 def test_hand_built_store_without_retry_counter_still_retries(tmp_path):
     """alfred/tools/decision_rule_gate.py builds the store with __new__ and sets
     only path/embedder/model_id/fallback_count/_fallback_lock."""
