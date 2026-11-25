@@ -249,3 +249,82 @@ def test_dispatcher_tick_parks_then_resumes_on_terminal(tmp_path, monkeypatch, n
     assert len(_events(queue, r3, "pool_hold_parked")) == 1
     assert len(_events(queue, r3, "pool_hold_resumed")) == 1
     assert [n[:2] for n in notices] == [(r3, "review_open_cap_parked")]
+
+
+# ── disabling the cap releases its parks (review of PR #1071) ─────────────
+
+def test_unset_cap_releases_cap_parked_reviews(tmp_path, monkeypatch, notices):
+    """Documented rollback: unset ``AGENT_CREW_REVIEW_OPEN_CAP``. Rows parked
+    under REVIEW_OPEN_CAP must not stay ``waiting_pool`` for ever: the pool
+    sweep skips them (the cap owns that park) so the cap sweep drains them
+    when it finds itself disabled."""
+    app, queue, _ = _cap_app(tmp_path, monkeypatch, 1)
+    with TestClient(app):
+        r1, r2 = _review(queue, "review-1"), _review(queue, "review-2")
+        assert app.state.apply_review_open_cap()["parked"] == [r2]
+        monkeypatch.delenv(pool_signal.REVIEW_OPEN_CAP_ENV)
+        assert queue.cancel(r1)
+        assert app.state.apply_pool_signal()["resumed"] == []   # not the pool sweep's park
+        out = app.state.apply_review_open_cap()
+        assert out == {"cap": None, "parked": [], "resumed": [r2]}
+        assert queue.get_task_status(r2) == "pending"
+        resumed = _events(queue, r2, "pool_hold_resumed")
+        assert len(resumed) == 1 and resumed[0]["rule"] == pool_signal.REVIEW_OPEN_CAP_RULE
+        assert "cap disabled" in resumed[0]["reason"]
+        # Exactly once, and no new parks while disabled.
+        assert app.state.apply_review_open_cap() == {"cap": None, "parked": [], "resumed": []}
+        assert len(_events(queue, r2, "pool_hold_resumed")) == 1
+        assert len(notices) == 1   # the park notice only; nothing new on release
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0"])
+def test_empty_or_invalid_cap_also_releases_cap_parked_reviews(tmp_path, monkeypatch,
+                                                                 notices, raw):
+    """An empty or malformed value resolves to no cap: recovery is the same
+    as unsetting the variable."""
+    app, queue, _ = _cap_app(tmp_path, monkeypatch, 1)
+    with TestClient(app):
+        r1, r2 = _review(queue, "review-1"), _review(queue, "review-2")
+        assert app.state.apply_review_open_cap()["parked"] == [r2]
+        monkeypatch.setenv(pool_signal.REVIEW_OPEN_CAP_ENV, raw)
+        assert app.state.apply_review_open_cap()["resumed"] == [r2]
+        assert _statuses(queue, r1, r2) == ["pending", "pending"]
+
+
+def test_unset_cap_release_leaves_pool_hold_parks_alone(tmp_path, monkeypatch, notices):
+    app, queue, _ = _cap_app(tmp_path, monkeypatch, 1)
+    with TestClient(app):
+        r1, r2 = _review(queue, "review-1"), _review(queue, "review-2")
+        assert app.state.apply_review_open_cap()["parked"] == [r2]
+        held = _review(queue, "review-held")
+        assert queue.park_pool_hold(held, reason="hold", rule="hold", code="POOL_HOLD")
+        monkeypatch.delenv(pool_signal.REVIEW_OPEN_CAP_ENV)
+        assert app.state.apply_review_open_cap()["resumed"] == [r2]
+        assert _statuses(queue, r2, held) == ["pending", "waiting_pool"]
+
+
+def test_unset_cap_release_respects_stop(tmp_path, monkeypatch, notices):
+    app, queue, _ = _cap_app(tmp_path, monkeypatch, 1)
+    with TestClient(app):
+        r1, r2 = _review(queue, "review-1"), _review(queue, "review-2")
+        assert app.state.apply_review_open_cap()["parked"] == [r2]
+        monkeypatch.delenv(pool_signal.REVIEW_OPEN_CAP_ENV)
+        with monkeypatch.context() as m:   # STOP active: the row stays parked
+            m.setattr(TaskQueue, "_stop_active_in_txn", lambda self, conn, point=None: True)
+            assert app.state.apply_review_open_cap()["resumed"] == []
+        assert queue.get_task_status(r2) == "waiting_pool"
+        assert app.state.apply_review_open_cap()["resumed"] == [r2]   # STOP lifted
+        assert queue.get_task_status(r2) == "pending"
+
+
+def test_dispatcher_tick_releases_cap_parks_after_unset(tmp_path, monkeypatch, notices):
+    """Restart-with-the-variable-unset path: the real tick drains the park."""
+    app, queue, dispatched = _cap_app(tmp_path, monkeypatch, 1, loop=True)
+    r1, r2 = _review(queue, "review-1"), _review(queue, "review-2")
+    with TestClient(app):
+        assert _wait(lambda: queue.get_task_status(r2) == "waiting_pool")
+        assert _wait(lambda: dispatched == [r1])
+        monkeypatch.delenv(pool_signal.REVIEW_OPEN_CAP_ENV)
+        assert _wait(lambda: r2 in dispatched)
+    assert dispatched.count(r2) == 1
+    assert len(_events(queue, r2, "pool_hold_resumed")) == 1

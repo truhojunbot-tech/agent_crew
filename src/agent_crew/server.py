@@ -3862,10 +3862,20 @@ def create_app(
         coordinator notice each. Under the cap, that provider's cap-parked
         rows resume oldest first, exactly once (the status predicate is the
         claim). Rows parked by the #1033 pool sweep keep their park: only
-        REVIEW_OPEN_CAP rows are resumed here. Unset cap: no-op."""
+        REVIEW_OPEN_CAP rows are resumed here. No cap (unset, empty or
+        invalid value): nothing is parked and every REVIEW_OPEN_CAP park is
+        released, since the pool sweep never touches them (review of PR
+        #1071: the documented rollback stranded them). STOP still keeps
+        them parked, inside ``resume_pool_hold``."""
         cap = _pool_signal.review_open_cap()
         out: dict = {"cap": cap, "parked": [], "resumed": []}
         if cap is None:
+            for task in q().waiting_pool_rows_by_park_code(_pool_signal.REVIEW_OPEN_CAP_REASON):
+                reason = f"{_pool_signal.REVIEW_OPEN_CAP_ENV} cap disabled"
+                if q().resume_pool_hold(task.task_id, rule=_pool_signal.REVIEW_OPEN_CAP_RULE,
+                                        reason=reason):
+                    logger.info("review open cap: resumed %s — %s", task.task_id, reason)
+                    out["resumed"].append(task.task_id)
             return out
         open_by_provider: dict[str, int] = {}
         pending_by_provider: dict[str, list] = {}
