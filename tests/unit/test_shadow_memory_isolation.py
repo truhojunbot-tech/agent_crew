@@ -65,11 +65,15 @@ def test_inherited_live_style_memory_db_remains_untouched(tmp_path):
     # HOME isolation hides user-site packages from the child interpreter.
     env["PYTHONPATH"] = os.pathsep.join((str(root / "src"),
                                           str(Path(pytest.__file__).resolve().parent.parent)))
-    # A child pytest imports the whole suite's conftest; under full-suite load
-    # on the gate box that alone exceeded 60s (#1076). 150s stays inside the
-    # outer --timeout=180 so a hang still fails cleanly here.
+    # #1076: without --basetemp the child creates its own numbered dir under
+    # /tmp/pytest-of-<user> and pytest's keep-3 cleanup makes it delete the
+    # previous full-suite trees (40k entries, ~750MB each) first; measured at
+    # 155s wall for 6s CPU. A basetemp under this test's tmp_path never
+    # touches that pool. The 150s bound (was 60s) covers the import cost of a
+    # loaded box and stays inside the outer --timeout=180.
     run = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         f"--basetemp={tmp_path / 'child-basetemp'}",
          str(Path(__file__)), "-k", "test_capture_child_cannot_reach_inherited_sentinel"],
         cwd=root, env=env, text=True, capture_output=True, timeout=150,
     )
