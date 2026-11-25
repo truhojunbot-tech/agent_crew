@@ -62,6 +62,11 @@ def assign_perspectives(agents: list[str], perspectives: list[str] | None = None
     return {agent: pool[i % len(pool)] for i, agent in enumerate(agents)}
 
 
+# #997: `crew discuss` has no synthesizer step. Until one exists the Decision
+# section must say so instead of a fabricated "Proceed as discussed.".
+DISCUSS_NO_DECISION = "none (panel opinions only; no synthesizer)"
+
+
 def build_synthesis(
     results: list[dict],
     topic: str = "",

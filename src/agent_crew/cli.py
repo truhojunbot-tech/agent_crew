@@ -3308,6 +3308,60 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
     return data["data"]["addDiscussionComment"]["comment"]["id"]
 
 
+
+_POST_TO_RE = re.compile(r"^(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#)?(?P<num>[1-9][0-9]*)$")
+
+
+def _parse_post_to(value: str) -> tuple[str, int]:
+    """Parse `--post-to` as `N` or `OWNER/REPO#N` (#997) -> (repo, issue).
+
+    Empty input means "do not post" and returns ("", 0). A bare number leaves
+    `repo` empty so the caller resolves it from the project's own checkout.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return "", 0
+    match = _POST_TO_RE.match(raw)
+    if match is None:
+        raise click.UsageError(
+            f"--post-to must be an issue number or OWNER/REPO#N, got {raw!r}")
+    return match.group("repo") or "", int(match.group("num"))
+
+
+def _discuss_post_repo(project: str, project_state: dict | None) -> str:
+    """Resolve the GitHub repo `--post-to` should target from PROJECT's own
+    registered checkouts (#997).
+
+    `get_repo()` without `cwd` reads the caller's working directory, which for
+    a cross-project `crew discuss` is a different repository: on 2026-11-05
+    an apify-forge synthesis landed on alfred#150. So the repo comes from the
+    project's `state.json` worktrees (then `repo_path`), and never from cwd.
+    Raises ClickException when nothing resolves, so the caller aborts before
+    spending any provider call on a discussion it cannot deliver.
+    """
+    from agent_crew.github import get_repo
+
+    state = project_state if isinstance(project_state, dict) else {}
+    candidates: list[str] = []
+    worktrees = state.get("worktrees")
+    if isinstance(worktrees, dict):
+        candidates.extend(path for path in worktrees.values() if isinstance(path, str) and path)
+    repo_path = state.get("repo_path")
+    if isinstance(repo_path, str) and repo_path:
+        candidates.append(repo_path)
+    for path in candidates:
+        if not os.path.isdir(path):
+            continue
+        repo = get_repo(cwd=path)
+        if repo:
+            return repo
+    raise click.ClickException(
+        f"--post-to: cannot resolve the GitHub repo for project {project!r} from its "
+        f"registered worktrees ({', '.join(candidates) or 'none registered'}). "
+        "Refusing to fall back to the current directory's repo; run `crew setup` "
+        "for the project or pass --post-to OWNER/REPO#N."
+    )
+
 @crew.command()
 @click.argument("topic")
 @click.option("--agents", default="",
@@ -3335,17 +3389,20 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
               help="Post each agent opinion as a GitHub Discussion comment "
                    "(https://github.com/OWNER/REPO/discussions/NNN). "
                    "Each comment is prefixed with [agent: NAME].")
-@click.option("--post-to", default=0, type=int, metavar="ISSUE",
+@click.option("--post-to", default="", metavar="ISSUE",
               help="Post the final synthesis as a comment on this GitHub issue "
-                   "number once the discussion completes (#219). No effect with "
+                   "once the discussion completes (#219). Either a bare number, "
+                   "resolved against the --project's registered worktree repo "
+                   "(never the caller's cwd, #997), or OWNER/REPO#N. No effect with "
                    "--nowait, since there's no synthesis yet when that returns.")
 def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: int | None,
             then_run: bool,
             db: str, project: str, allow_cross_project: bool, base: str, output: str, branch: str,
-            timeout: int, nowait: bool, github_discussion: str, post_to: int):
+            timeout: int, nowait: bool, github_discussion: str, post_to: str):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""
     if not topic.strip():
         raise click.UsageError("topic must not be empty")
+    post_to_repo, post_to_issue = _parse_post_to(post_to)
     if risk_tier is None:
         raw_tier = os.getenv("AGENT_CREW_DEFAULT_RISK_TIER", "").strip()
         if raw_tier not in {"0", "1", "2", "3"}:
@@ -3361,7 +3418,8 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
         db = project_state["db"]
 
     from agent_crew.discussion import (
-        DEFAULT_PERSPECTIVES, assign_perspectives, build_synthesis, enqueue_panel_tasks
+        DEFAULT_PERSPECTIVES, DISCUSS_NO_DECISION, assign_perspectives, build_synthesis,
+        enqueue_panel_tasks,
     )
     from agent_crew.loop import enqueue_implement
     import time
@@ -3465,6 +3523,12 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
             click.echo(f"  {agent} ({perspectives_map[agent]}): {tid}")
         return
 
+    # #997: pin the --post-to repo before any panel task is enqueued. With
+    # --project this is the project's own checkout, never the caller's cwd;
+    # an unresolvable repo aborts here, before a provider call is spent.
+    if post_to_issue and not post_to_repo and project:
+        post_to_repo = _discuss_post_repo(project, project_state or _read_state(base, project))
+
     # GitHub Discussion setup — resolve node ID once before the rounds loop.
     _gh_node_id: str = ""
     if github_discussion:
@@ -3535,17 +3599,20 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
                 except Exception as e:
                     click.echo(f"  WARNING: failed to post GitHub comment for {pr['agent']}: {e}", err=True)
 
+        # #997: no synthesizer step exists yet, so say so. The sections below
+        # hold panel opinions only; a decision nobody made must not be posted.
         synthesis_label = (
             f"Round {round_num} synthesis."
             if not missing
             else f"Round {round_num} PARTIAL synthesis ({len(panel_results)}/{len(task_ids)} agents; "
                  f"missing task_ids: {', '.join(missing)})."
-        )
+        ) + " No synthesizer ran; the panel opinions above are the complete output."
         final_synthesis = build_synthesis(
             panel_results,
             topic=topic,
             synthesis=synthesis_label,
-            decision="Proceed as discussed." if not missing else "Review partial before deciding.",
+            decision=DISCUSS_NO_DECISION if not missing
+            else DISCUSS_NO_DECISION + " Review the partial panel before deciding.",
         )
         prior_synthesis = final_synthesis
 
@@ -3558,13 +3625,15 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: 
         with open(output, "w") as f:
             f.write(final_synthesis)
 
-        if post_to:
+        if post_to_issue:
             from agent_crew.github import post_discussion_comment
-            if post_discussion_comment(post_to, topic, final_synthesis):
-                click.echo(f"Synthesis posted to issue #{post_to}")
+            target = f"{post_to_repo}#{post_to_issue}" if post_to_repo else f"#{post_to_issue}"
+            if post_discussion_comment(post_to_issue, topic, final_synthesis,
+                                       repo=post_to_repo or None):
+                click.echo(f"Synthesis posted to issue {target}")
             else:
                 click.echo(
-                    f"Warning: failed to post synthesis to issue #{post_to} "
+                    f"Warning: failed to post synthesis to issue {target} "
                     f"(gh not installed, no repo detected, or the gh call failed) "
                     f"— synthesis is still in {output}",
                     err=True,
