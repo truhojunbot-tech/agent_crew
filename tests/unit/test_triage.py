@@ -2,6 +2,8 @@ import json
 import re
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from click.testing import CliRunner
 
 from agent_crew.triage import build_prompt, filter_processed, parse_issues, parse_response
@@ -194,7 +196,7 @@ from agent_crew.triage import (  # noqa: E402
 
 # U-T11: dependencies and phase come from GitHub links and labels
 def test_u_t11_parse_dependencies_basic():
-    deps = parse_dependencies({"parent": {"number": 54},
+    deps = parse_dependencies({"blockedBy": [{"number": 54}],
                                "labels": [{"name": "phase:2"}]})
     assert deps["parents"] == [54]
     assert deps["phase"] == 2
@@ -218,8 +220,7 @@ def test_u_t11d_parse_dependencies_none_body():
 
 
 def test_u_t11e_parse_dependencies_dedupes():
-    deps = parse_dependencies({"parent": {"number": 54},
-                               "blockedBy": [{"number": 54}]})
+    deps = parse_dependencies({"blockedBy": [{"number": 54}, {"number": 54}]})
     assert deps["parents"] == [54]
 
 
@@ -231,7 +232,7 @@ def test_u_t12_parse_issues_carries_dependencies():
             "title": "Build consumer",
             "labels": [{"name": "phase:2"}],
             "body": "Parent: #54 | Phase 2",
-            "parent": {"number": 54},
+            "blockedBy": [{"number": 54}],
         }
     ]
     result = parse_issues(raw)
@@ -371,3 +372,45 @@ def test_u_t17_triage_run_picks_blocker_over_nice_to_have(tmp_db):
     assert len(seen_prompts) == 1
     assert "#888" not in seen_prompts[0], "nice-to-have leaked into blocker-tier prompt"
     assert "#875" in seen_prompts[0] or "#876" in seen_prompts[0]
+
+
+@pytest.mark.parametrize("relation,state,selectable", [
+    ("parent", "OPEN", True),
+    ("trackedInIssues", "OPEN", True),
+    ("blockedBy", "OPEN", False),
+    ("blockedBy", "CLOSED", True),
+])
+@pytest.mark.parametrize("related_in_candidates", [False, True])
+def test_declared_relations_control_eligibility(relation, state, selectable,
+                                               related_in_candidates):
+    child = make_issue(100, "Child work", ["p1"])
+    link = {"number": 54, "state": state}
+    child[relation] = link if relation == "parent" else [link]
+    raw = [child]
+    if related_in_candidates and state == "OPEN":
+        raw.append(make_issue(54, "Related issue"))
+    parsed = parse_issues(raw)
+    eligible = filter_blocked(parsed, set())
+    assert (100 in [issue["number"] for issue in eligible]) is selectable
+    if relation != "blockedBy":
+        assert parsed[0]["parents"] == []
+        assert parsed[0]["open_parents"] == []
+
+
+def test_triage_selects_top_child_of_open_epic(tmp_db):
+    from agent_crew.triage import run
+    from agent_crew.queue import TaskQueue
+
+    child = make_issue(100, "Top child", ["p1"])
+    child["parent"] = {"number": 54, "state": "OPEN"}
+    agent = MagicMock(return_value="ISSUE: 100\nDESCRIPTION: Implement top child")
+    with (
+        patch("agent_crew.triage.fetch_issues_from_gh",
+              return_value=[make_issue(54, "Open epic"), child]),
+        patch("agent_crew.triage.fetch_closed_issue_numbers", return_value=set()),
+    ):
+        result = run(TaskQueue(tmp_db), "org/repo", agent, merge_history="Merged work")
+    assert result["parsed"]["issue"] == 100
+    prompt = agent.call_args.args[0]
+    assert "#100: Top child" in prompt
+    assert "#54: Open epic" not in prompt

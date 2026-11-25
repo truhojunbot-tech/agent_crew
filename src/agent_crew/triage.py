@@ -28,10 +28,12 @@ def _severity_score(labels: list[str]) -> int:
 
 
 def parse_dependencies(issue: dict) -> dict:
-    """Read GitHub's declared parent/blocker links and phase label."""
+    """Read GitHub blockedBy dependencies and phase label.
+
+    The legacy "parents" key holds blockers, never parent/tracking context.
+    """
     parents = []
-    for parent in [issue.get("parent"), *(issue.get("trackedInIssues") or []),
-                   *(issue.get("blockedBy") or [])]:
+    for parent in issue.get("blockedBy") or []:
         number = parent.get("number") if isinstance(parent, dict) else None
         if isinstance(number, int) and not isinstance(number, bool) and number > 0:
             if number not in parents:
@@ -50,8 +52,7 @@ def parse_issues(data: list[dict]) -> list[dict]:
     result = []
     for item in data:
         deps = parse_dependencies(item)
-        links = [item.get("parent"), *(item.get("trackedInIssues") or []),
-                 *(item.get("blockedBy") or [])]
+        links = item.get("blockedBy") or []
         result.append({
             "number": item["number"],
             "title": item["title"],
@@ -72,10 +73,10 @@ def filter_processed(issues: list[dict]) -> list[dict]:
 
 
 def filter_blocked(issues: list[dict], closed_issue_numbers: set[int]) -> list[dict]:
-    """Drop issues whose declared parents are still open.
+    """Drop issues whose declared blockedBy dependencies are still open.
 
     `closed_issue_numbers` is the set of issue numbers that are already
-    closed (i.e. completed). An issue with parent #54 is unblocked once #54
+    closed (i.e. completed). An issue blocked by #54 is unblocked once #54
     is in that set.
     """
     open_set = {i["number"] for i in issues}
@@ -294,8 +295,8 @@ def run(
     agent_fn(prompt: str) -> str: callable that returns the triage agent's response text.
 
     Dependency-aware selection (Issue #82):
-    - GitHub parent/blocker links and phase labels provide ordering.
-    - Issues whose declared parent is still open are filtered out — the
+    - GitHub blockedBy links and phase labels provide ordering.
+    - Issues whose declared blocker is still open are filtered out — the
       triage agent only sees unblocked candidates.
     - When the caller passes the default merge_history ("none"), we
       auto-fetch the project's recent merged PRs so the agent sees what's
