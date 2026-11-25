@@ -22,11 +22,14 @@ from prose broke merges). Every ambiguity ends ``needs_human``; silence ends
 #1036: a reply may carry the task id of a TERMINAL sibling review (same
 lineage, same PR, same full sha) because ChatGPT answered the thread it already
 knew, not the re-review's request. Such a reply, posted after that sibling's
-``result_posted_at`` and inside this task's deadline, is adopted as this task's
-verdict and logged as a ``sibling_reply_adopted`` exec event. So is a
-``[CHATGPT][DUPLICATE_REQUEST_DISPOSITION]`` addressed to this task whose
+``result_posted_at`` AND after the lineage's standing verdict (the newest
+``result_posted_at`` among those siblings that carry a verdict), inside this
+task's deadline and not already consumed by any task in the lineage, is adopted
+as this task's verdict and logged as a ``sibling_reply_adopted`` exec event. So
+is a ``[CHATGPT][DUPLICATE_REQUEST_DISPOSITION]`` addressed to this task whose
 ``DUPLICATE_OF task=<sibling>`` points at such a reply. Nothing else is: a
-different sha, an older reply or a sibling on another PR stays ignored.
+different sha, an older reply, a reply superseded by a later terminal review,
+a reply some sibling already took, or a sibling on another PR stays ignored.
 """
 from __future__ import annotations
 
@@ -667,22 +670,44 @@ def _lineage_root(queue: TaskQueue, task: TaskRequest) -> str:
         current = parent
 
 
-def _terminal_siblings(queue: TaskQueue, task: TaskRequest, pr_number: int,
-                       sha: str) -> dict[str, float]:
-    """``{task_id: result_posted_at}`` of the ended review rows in this task's
-    lineage pinned to the same PR and full sha. A row without a posted result
-    (ended by a dispatcher force-fail) has no standing verdict and is skipped."""
+@dataclass(frozen=True)
+class LineageReviews:
+    """What this task's lineage already settled, for :func:`_adoptable_sibling_reply`."""
+    #: ``{task_id: result_posted_at}`` of the ended review rows pinned to the
+    #: same PR and full sha. A row without a posted result (ended by a
+    #: dispatcher force-fail) has no standing verdict and is skipped.
+    siblings: dict[str, float]
+    #: ``result_posted_at`` of the standing review: the newest among the
+    #: siblings above that carry a verdict. ``None`` when none does.
+    standing_at: Optional[float]
+    #: comment ids any task in the lineage already took as its reply
+    #: (``chatgpt_reply_comment_id``), direct or adopted; never twice.
+    consumed: frozenset[int]
+
+
+def _lineage_reviews(queue: TaskQueue, task: TaskRequest, pr_number: int,
+                     sha: str) -> LineageReviews:
     siblings: dict[str, float] = {}
+    standing_at: Optional[float] = None
+    consumed: set[int] = set()
     for sibling in queue.list_tasks_for_lineage(_lineage_root(queue, task)):
-        if (sibling.task_id == task.task_id or sibling.task_type != "review"
-                or sibling.status not in TERMINAL_TASK_STATUSES
+        if sibling.task_id == task.task_id:
+            continue
+        sibling_context = sibling.context if isinstance(sibling.context, dict) else {}
+        taken = sibling_context.get("chatgpt_reply_comment_id")
+        if isinstance(taken, int) and not isinstance(taken, bool):
+            consumed.add(taken)
+        if (sibling.task_type != "review" or sibling.status not in TERMINAL_TASK_STATUSES
                 or _pinned(sibling) != (pr_number, sha)):
             continue
         state = queue.get_exec_state(sibling.task_id) or {}
         posted = state.get("result_posted_at")
-        if isinstance(posted, (int, float)) and not isinstance(posted, bool):
-            siblings[sibling.task_id] = float(posted)
-    return siblings
+        if not isinstance(posted, (int, float)) or isinstance(posted, bool):
+            continue
+        siblings[sibling.task_id] = float(posted)
+        if sibling.verdict and (standing_at is None or float(posted) > standing_at):
+            standing_at = float(posted)
+    return LineageReviews(siblings, standing_at, frozenset(consumed))
 
 
 def _first_line(row: dict) -> str:
@@ -697,15 +722,20 @@ def _adoptable_sibling_reply(
     """The sibling reply this task may take as its own verdict, or ``None``.
 
     Eligible: a strict ``[CHATGPT][CREW-REVIEW]`` reply whose header names a
-    terminal sibling (see :func:`_terminal_siblings`) and this task's exact
-    sha, posted after that sibling's ``result_posted_at`` (the reply that ended
-    the sibling is already consumed) and no later than this task's deadline.
-    The reply may predate this task's request: that is the #1036 case. A
-    ``DUPLICATE_OF task=<sibling>`` disposition addressed to this task picks
-    which eligible reply answers it; without one, the newest eligible reply
-    does. Anything garbled, older, on another sha or another PR is ignored.
+    terminal sibling (see :func:`_lineage_reviews`) and this task's exact sha,
+    posted after that sibling's ``result_posted_at`` (the reply that ended the
+    sibling is already consumed) and after the lineage's standing verdict --
+    a reply older than a later terminal review is superseded by it and must
+    not replace its findings (review of PR #1069) -- no later than this task's
+    deadline, and not already taken by any task in the lineage, so one comment
+    ends at most one row even when clocks disagree. The reply may predate this
+    task's request: that is the #1036 case. A ``DUPLICATE_OF task=<sibling>``
+    disposition addressed to this task picks which eligible reply answers it;
+    without one, the newest eligible reply does. Anything garbled, older,
+    superseded, consumed, on another sha or another PR is ignored.
     """
-    siblings = _terminal_siblings(queue, task, pr_number, sha)
+    lineage = _lineage_reviews(queue, task, pr_number, sha)
+    siblings = lineage.siblings
     if not siblings:
         return None
     rows: list[tuple[dict, float]] = []
@@ -722,8 +752,10 @@ def _adoptable_sibling_reply(
         if header is None or header.group(1) not in siblings or header.group(2) != sha:
             continue
         sibling = header.group(1)
-        if created <= siblings[sibling]:
-            continue
+        if created <= max(siblings[sibling], lineage.standing_at or 0.0):
+            continue  # not newer than the tagged sibling, or superseded
+        if row["id"] in lineage.consumed:
+            continue  # a sibling already ended on this very comment
         parsed = parse_reply(str(row.get("body") or ""), task_id=sibling, sha=sha)
         if parsed.kind != "accepted" or (parsed.verdict == "request_changes"
                                          and len(parsed.text) < 10):

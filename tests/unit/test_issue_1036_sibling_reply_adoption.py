@@ -17,6 +17,7 @@ from tests.unit.test_issue_1000_chatgpt_reviewer import (  # noqa: F401 (fixture
 
 R0 = "review-impl-1000-r0"
 R1 = "review-impl-1000-r1"
+R2 = "review-impl-1000-r2"
 OTHER_PR = 1001
 
 
@@ -45,24 +46,44 @@ def _close_r0_request_changes(queue, gh, carrier):
     return posted_at
 
 
-def _open_r1(queue, gh, *, now, pr_number=PR, sha=SHA):
-    context = {"pr_number": pr_number, "reviewed_sha": sha, "repo": REPO, "prev_task_id": R0,
+def _open_review(queue, gh, task_id, prev, *, now, pr_number=PR, sha=SHA):
+    """Enqueue and dispatch a same-sha re-review ``task_id`` following ``prev``."""
+    context = {"pr_number": pr_number, "reviewed_sha": sha, "repo": REPO, "prev_task_id": prev,
                "lineage_root_task_id": "impl-1000", "issue_number": 1000,
                "implementer_agent": "claude",
                # how a coordinator admits a same-sha re-review past the duplicate gate
                "allow_duplicate_review": True}
-    queue.enqueue(TaskRequest(task_id=R1, task_type="review", description="Re-review PR",
+    queue.enqueue(TaskRequest(task_id=task_id, task_type="review", description="Re-review PR",
                               branch="agent/chatgpt", project="agent_crew", context=context))
     outcome = _dispatch(queue, gh, now=now)
     assert outcome.action == "dispatched", outcome
-    return queue.get_task(R1).context["chatgpt_request_comment_id"]
+    return queue.get_task(task_id).context["chatgpt_request_comment_id"]
 
 
-def _reconcile_r1(queue, gh, *, now):
+def _open_r1(queue, gh, *, now, pr_number=PR, sha=SHA):
+    return _open_review(queue, gh, R1, R0, now=now, pr_number=pr_number, sha=sha)
+
+
+def _reconcile(queue, gh, task_id, *, now):
     submit, submitted = _submit_into(queue)
     outcomes = chatgpt.reconcile_chatgpt_reviews(queue, gh=gh, now=now,
                                                  submit_review_result_fn=submit)
-    return [o for o in outcomes if o.task_id == R1], submitted
+    return [o for o in outcomes if o.task_id == task_id], submitted
+
+
+def _reconcile_r1(queue, gh, *, now):
+    return _reconcile(queue, gh, R1, now=now)
+
+
+def _pin_result_posted_at(queue, task_id, at):
+    """Stand in for the clock: ``submit_result`` stamps ``result_posted_at`` with
+    ``time.time()``, while these tests place GitHub comments at chosen offsets."""
+    conn = queue._connect()
+    try:
+        conn.execute("UPDATE tasks SET result_posted_at=? WHERE task_id=?", (at, task_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _adopted_events(queue, task_id=R1):
@@ -186,6 +207,73 @@ def test_sibling_reply_on_a_different_pr_is_not_adopted(queue, gh, notices, monk
     outcomes, submitted = _reconcile_r1(queue, gh, now=posted_at + 300)
     assert [o.action for o in outcomes] == ["still_waiting"]
     assert submitted == [] and _adopted_events(queue) == []
+
+
+def test_sibling_reply_superseded_by_a_later_terminal_review_is_not_adopted(queue, gh, notices,
+                                                                          carrier):
+    """Fix round 1 (review of PR #1069): r0 rc at t, approve tagged r0 at t+100, r1
+    ends request_changes on its own reply at t+300 -- the standing review is now r1.
+    An open r2 must not take the t+100 approve over r1's newer findings."""
+    posted_at = _close_r0_request_changes(queue, gh, carrier)
+    gh.reply(*_thread(carrier), _reply(task_id=R0, verdict="VERDICT: approve",
+                                        text="re-review: findings addressed"),
+             created_at=posted_at + 100)
+    stale_approve_id = gh.next_id
+    _open_r1(queue, gh, now=posted_at + 200)
+    gh.reply(*_thread(carrier), _reply(task_id=R1, text=FINDING), created_at=posted_at + 300)
+    outcomes, _ = _reconcile_r1(queue, gh, now=posted_at + 310)
+    assert [o.action for o in outcomes] == ["review_completed"]
+    assert queue.get_task(R1).verdict == "request_changes"
+    _pin_result_posted_at(queue, R1, posted_at + 300)
+
+    _open_review(queue, gh, R2, R1, now=posted_at + 400)
+    outcomes, submitted = _reconcile(queue, gh, R2, now=posted_at + 500)
+    assert [o.action for o in outcomes] == ["still_waiting"]
+    assert submitted == [] and _adopted_events(queue, R2) == []
+    assert queue.get_task(R2).status == "in_progress"
+    assert notices == []
+
+    # A reply newer than the standing review is still adopted, even when its
+    # header names the older sibling: the bound is the standing result, not
+    # the tagged one.
+    gh.reply(*_thread(carrier), _reply(task_id=R0, verdict="VERDICT: approve",
+                                        text="re-review: r1 findings addressed"),
+             created_at=posted_at + 450)
+    fresh_approve_id = gh.next_id
+    outcomes, submitted = _reconcile(queue, gh, R2,
+                                     now=posted_at + 500 + chatgpt.poll_seconds())  # next poll
+    assert [o.action for o in outcomes] == ["review_completed"]
+    assert submitted[0][1].verdict == "approve"
+    assert queue.get_task(R2).context["chatgpt_reply_comment_id"] == fresh_approve_id
+    assert fresh_approve_id != stale_approve_id
+    event, = _adopted_events(queue, R2)
+    assert event["comment_id"] == fresh_approve_id and event["sibling_task_id"] == R0
+
+
+def test_a_reply_already_adopted_by_a_sibling_is_not_adopted_again(queue, gh, notices, carrier):
+    """Fix round 1 (review of PR #1069): r1 adopted the r0-tagged approve; a later
+    open r2 must not consume the same comment a second time. ``result_posted_at``
+    is left on the real clock here, so only the consumed-comment check can stop it."""
+    posted_at = _close_r0_request_changes(queue, gh, carrier)
+    gh.reply(*_thread(carrier), _reply(task_id=R0, verdict="VERDICT: approve",
+                                        text="re-review: findings addressed"),
+             created_at=posted_at + 100)
+    approve_id = gh.next_id
+    _open_r1(queue, gh, now=posted_at + 200)
+    outcomes, _ = _reconcile_r1(queue, gh, now=posted_at + 300)
+    assert [o.action for o in outcomes] == ["review_completed"]
+    assert queue.get_task(R1).context["chatgpt_reply_comment_id"] == approve_id
+    assert queue.get_exec_state(R1)["result_posted_at"] < posted_at + 100  # real clock
+
+    _open_review(queue, gh, R2, R1, now=posted_at + 400)
+    outcomes, submitted = _reconcile(queue, gh, R2, now=posted_at + 500)
+    assert [o.action for o in outcomes] == ["still_waiting"]
+    assert submitted == [] and _adopted_events(queue, R2) == []
+    assert queue.get_task(R2).status == "in_progress"
+    # r1 keeps the adoption it made; nothing was replayed or moved.
+    assert queue.get_task(R1).verdict == "approve"
+    assert len(_adopted_events(queue, R1)) == 1
+    assert notices == []
 
 
 def test_sibling_reply_after_the_deadline_still_times_out(queue, gh, notices, carrier):
