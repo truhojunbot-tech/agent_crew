@@ -384,3 +384,69 @@ def test_allow_stale_base_is_admitted_at_post_tasks(tmp_db):
     stored = TaskQueue(tmp_db).get_task("impl-1065-stale")
     assert stored is not None
     assert stored.context["allow_stale_base"] is True
+
+
+# --- crew run: the comparison refs must be fresh (PR #1066 review r2) ---------
+
+def _cache_default_at_stale_tip(worker, tips, *, default="master", stale="main"):
+    """Pin the clone's cached origin/<default> at the stale tip.
+
+    This is the shape after an interrupted or failed refresh: the remote's
+    default has moved on, but the local tracking ref still sits where the
+    stale branch is, so a comparison against cached refs measures a gap of 0.
+    """
+    _git("-C", worker, "update-ref", f"refs/remotes/origin/{default}", tips[stale])
+    assert stale_base_gap(str(worker), stale, default) == 0
+
+
+@pytest.mark.usefixtures("admit_crew_run")
+def test_b_failed_sync_fetch_refuses_explicit_stale_base(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    worker, tips = _repo(tmp_path, stale="main", advance=3)
+    _cache_default_at_stale_tip(worker, tips)
+    # Every fetch now fails (exit 128): origin points at a repository that is
+    # not there. Only cached refs remain, and they say main == master.
+    _git("-C", worker, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+    result, captured = _run(tmp_path, monkeypatch, worker, "--branch", "main")
+
+    assert result.exit_code != 0, result.output
+    assert captured == []
+    assert "origin/master" in result.output
+    assert "--allow-stale-base" in result.output
+    assert _git("-C", worker, "rev-parse", "HEAD") == tips["main"]
+
+    # The explicit override keeps today's behaviour, with a warning.
+    result, captured = _run(tmp_path, monkeypatch, worker,
+                            "--branch", "main", "--allow-stale-base")
+    assert result.exit_code == 0, result.output
+    assert "Warning" in result.output and "origin/master" in result.output
+    (_queue, _task, branch), kwargs = captured[0]
+    assert branch == "main"
+    assert kwargs["context"]["allow_stale_base"] is True
+
+
+@pytest.mark.usefixtures("admit_crew_run")
+def test_b_timed_out_sync_fetch_refuses_explicit_stale_base(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    worker, tips = _repo(tmp_path, stale="main", advance=3)
+    _cache_default_at_stale_tip(worker, tips)
+
+    real_run = subprocess.run
+    fetches = []
+
+    def timing_out_fetch(cmd, *args, **kwargs):
+        if isinstance(cmd, (list, tuple)) and "fetch" in cmd:
+            fetches.append(list(cmd))
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", timing_out_fetch)
+
+    result, captured = _run(tmp_path, monkeypatch, worker, "--branch", "main")
+
+    assert fetches, "the run never tried to refresh origin"
+    assert result.exit_code != 0, result.output
+    assert captured == []
+    assert "origin/master" in result.output
+    assert "--allow-stale-base" in result.output

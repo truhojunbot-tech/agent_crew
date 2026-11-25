@@ -20,7 +20,7 @@ from agent_crew.conformance_gate import (
     _conformance_gate_allows_merge, _registry_capability_for_paths,
     test_pass_for_head,
 )
-from agent_crew.pipeline import ARTIFACT_KINDS
+from agent_crew.pipeline import ARTIFACT_KINDS, git_fetch_origin
 from agent_crew.protocol import normalize_pr_number
 from agent_crew.queue import CANCEL_REASON_ATTEMPT, _TYPE_TO_ROLE
 from agent_crew.worktree_default_branch import remote_default_branch, stale_base_gap
@@ -2435,15 +2435,36 @@ def _resolve_run_base(worktrees: dict) -> tuple[str, str]:
 def _refuse_stale_run_base(wt_path: str, base: str, *, allow_stale_base: bool) -> None:
     """Refuse a ``crew run`` whose base is strictly behind the repo default (#1065).
 
-    Reads only already-fetched ``origin/*`` refs; the pre-enqueue sync fetched
-    them moments ago. A base origin does not know, or one that is ahead of or
-    diverged from the default, is not stale and passes.
+    A base origin does not know, or one that is ahead of or diverged from the
+    default, is not stale and passes.
+
+    The pre-enqueue sync discards its fetch result, so ``origin/<default>`` is
+    refreshed here before the gap is measured. When that refresh fails or
+    times out the comparison refs may be stale: a cached ``origin/<default>``
+    pinned at the same commit as ``origin/<base>`` measures a gap of 0 and
+    would enqueue from the stale base (PR #1066 review). Freshness that cannot
+    be established refuses, unless ``--allow-stale-base`` was given.
     """
     try:
         default = remote_default_branch(wt_path)
-        gap = stale_base_gap(wt_path, base, default) if default else 0
     except (OSError, subprocess.TimeoutExpired) as exc:
         click.echo(f"Warning: could not compare {base!r} with the repo default: {exc}")
+        return
+    if not default or default == base:
+        return
+    fetch = git_fetch_origin(wt_path, default)
+    if fetch.returncode != 0:
+        _refuse_unknown_run_base_freshness(
+            f"could not refresh origin/{default} to check base branch {base!r} against "
+            f"the repo default: {(fetch.stderr or '').strip() or f'exit {fetch.returncode}'}",
+            allow_stale_base=allow_stale_base)
+        return
+    try:
+        gap = stale_base_gap(wt_path, base, default)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _refuse_unknown_run_base_freshness(
+            f"could not compare base branch {base!r} with the repo default {default!r} "
+            f"(origin/{default}): {exc}", allow_stale_base=allow_stale_base)
         return
     if not gap:
         return
@@ -2455,6 +2476,16 @@ def _refuse_stale_run_base(wt_path: str, base: str, *, allow_stale_base: bool) -
     raise click.ClickException(
         f"{message}. Refusing to start from a stale base; pass --branch {default} "
         f"or --allow-stale-base to override (#1065).")
+
+
+def _refuse_unknown_run_base_freshness(message: str, *, allow_stale_base: bool) -> None:
+    """Fail closed when the stale-base check cannot trust its refs (#1065)."""
+    if allow_stale_base:
+        click.echo(f"Warning: {message}; proceeding because --allow-stale-base was given.")
+        return
+    raise click.ClickException(
+        f"{message}. Refusing to start from a base whose freshness is unknown; "
+        f"pass --allow-stale-base to override (#1065).")
 
 
 def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
