@@ -3621,13 +3621,13 @@ def create_app(
     def _refuse_self_review(task: TaskRequest, agent: str) -> bool:
         if task.task_type != "review":
             return False
-        implementer = _review_implementer_agent(task)
-        if not implementer or provider_family(implementer) != provider_family(agent):
+        families = q().implementer_families(task)
+        if provider_family(agent) not in families:
             return False
         reason = f"reviewer_matches_implementer: {agent}"
         logger.error("dispatcher: refusing review task=%s — %s", task.task_id, reason)
         _fail_if_active(task.task_id, reason, status="needs_human",
-                        details={"implementer_agent": implementer,
+                        details={"implementer_families": sorted(families),
                                  "reviewer_agent": agent})
         return True
 

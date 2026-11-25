@@ -112,3 +112,81 @@ def test_session_continuity_does_not_add_unrelated_implementer(queue):
     add(queue, "review", "review", "codex")
     assert queue.bind_independent_reviews("codex", ["codex", "chatgpt"]) == {
         "bound": [], "blocked": []}
+
+
+@pytest.mark.parametrize("operation", ["dequeue", "bind", "reroute"])
+def test_lineage_scan_once_per_project_per_transaction(queue, monkeypatch, operation):
+    mixed(queue)
+    for index in range(6):
+        add(queue, f"review-{index}", "review", "codex")
+    statements = []
+    connect = queue._connect
+
+    def traced_connect():
+        conn = connect()
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(queue, "_connect", traced_connect)
+    if operation == "dequeue":
+        assert queue.dequeue(agent="codex", role="reviewer") is None
+    elif operation == "bind":
+        queue.bind_independent_reviews("codex", ["chatgpt"])
+    else:
+        queue.reroute_stale_provider_bindings("codex", (), reviewer_holder="claude")
+    scans = [sql for sql in statements
+             if sql.startswith("SELECT task_id, task_type, pr_number,")]
+    assert len(scans) == 1, scans
+
+
+@pytest.mark.parametrize("reviewer,independent", [("codex", False), ("chatgpt", True)])
+def test_merge_authority_checks_all_rounds(queue, monkeypatch, reviewer, independent):
+    from agent_crew import github
+
+    mixed(queue)
+    add(queue, "review", "review", reviewer, prev_task_id="fix-r1")
+    queue.record_attribution("fix-r1", agent="claude", task_type="implement")
+    queue.record_attribution("review", agent=reviewer, task_type="review")
+    with queue._connect() as conn:
+        conn.execute("UPDATE tasks SET status='completed', verdict='approve' WHERE task_id='review'")
+    monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: SHA)
+    result = github.independent_review_for_head(queue, 512, "owner/repo")
+    assert bool(result[0]) is independent, result
+
+
+@pytest.mark.parametrize("reviewer,refused", [("codex", True), ("chatgpt", False)])
+def test_dispatch_refusal_checks_all_rounds(tmp_path, queue, reviewer, refused):
+    import json
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"project": "athena"}))
+    app = create_app(db_path=str(tmp_path / "tasks.db"), state_path=str(state),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    mixed(queue)
+    add(queue, "review", "review", reviewer, prev_task_id="fix-r1")
+    queue.record_attribution("fix-r1", agent="claude", task_type="implement")
+    review = queue.dequeue(role="reviewer")
+    with TestClient(app):
+        assert app.state.refuse_self_review(review, reviewer) is refused
+
+
+def test_lineage_cache_is_not_reused_after_new_implementation(queue):
+    add(queue, "first", "implement", "claude")
+    add(queue, "review", "review", "codex")
+    assert queue.bind_independent_reviews("codex", ["chatgpt"])["bound"] == []
+    add(queue, "later", "implement", "codex")
+    assert queue.bind_independent_reviews("codex", ["chatgpt"])["bound"] == ["review"]
+
+
+def test_merge_requires_dispatch_evidence_not_context_hint(queue, monkeypatch):
+    from agent_crew import github
+
+    add(queue, "review", "review", "chatgpt")
+    queue.record_attribution("review", agent="chatgpt", task_type="review")
+    with queue._connect() as conn:
+        conn.execute("UPDATE tasks SET status='completed', verdict='approve' WHERE task_id='review'")
+    monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: SHA)
+    assert github.independent_review_for_head(queue, 512, "owner/repo") == (
+        "", "", "", "author or reviewer attribution unavailable")

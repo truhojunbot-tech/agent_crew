@@ -3791,7 +3791,41 @@ class TaskQueue:
                 and _CEA_COMMIT_RE.fullmatch(sha.strip()) else "")
 
     @staticmethod
-    def _implementer_families_in_txn(conn, project, pr_number, context, task_id):
+    def _implementation_lineage_in_txn(conn, project):
+        """Read compact lineage metadata once per project/transaction.
+
+        Project sweeps pass a local cache; it must never survive the transaction
+        because another implementation round can add a provider at any time.
+        """
+        keys = ("lineage_root_task_id", "prev_task_id", "provider_capacity_root",
+                *_CEA_LINEAGE_PARENT_KEYS)
+        paths = ", ".join(f"'$.{key}'" for key in ("pr_number", *keys))
+        rows = conn.execute(
+            "SELECT task_id, task_type, pr_number, "
+            f"json_extract(context, {paths}) AS lineage, dispatch_agent, "
+            "(SELECT agent FROM task_attribution WHERE task_id=tasks.task_id) "
+            "AS attributed_agent FROM tasks "
+            "WHERE project=? AND quarantine_field=''", (project,)).fetchall()
+        graph, implementations, by_pr = {}, {}, {}
+        for row in rows:
+            values = json.loads(row["lineage"])
+            tid = row["task_id"]
+            related = {tid} | {value for value in values[1:]
+                               if isinstance(value, str) and value}
+            for link in related:
+                graph.setdefault(link, set()).add(tid)
+            graph.setdefault(tid, set()).update(related)
+            row_pr = (_normalize_pr_number(values[0])
+                      or _normalize_pr_number(row["pr_number"]))
+            if row_pr is not None:
+                by_pr.setdefault(row_pr, set()).add(tid)
+            if row["task_type"] in ("implement", "fix"):
+                implementations[tid] = provider_family(row["attributed_agent"] or row["dispatch_agent"])
+        return graph, implementations, by_pr
+
+    @staticmethod
+    def _implementer_families_in_txn(conn, project, pr_number, context, task_id,
+                                    *, lineage_cache=None):
         """All implementation providers for this PR/lineage, including failed rounds.
 
         Dispatch attribution is authoritative; the last implementer in context
@@ -3802,29 +3836,14 @@ class TaskQueue:
         pr = _normalize_pr_number(context.get("pr_number")) or _normalize_pr_number(pr_number)
         keys = ("lineage_root_task_id", "prev_task_id", "provider_capacity_root",
                 *_CEA_LINEAGE_PARENT_KEYS)
-
-        def links(tid, ctx):
-            return {tid} | {ctx[k] for k in keys if isinstance(ctx.get(k), str) and ctx[k]}
-
-        rows = conn.execute(
-            "SELECT task_id, task_type, pr_number, context, dispatch_agent FROM tasks "
-            "WHERE project=? AND quarantine_field=''", (project,)).fetchall()
-        graph = {}
-        implementations = {}
-        pending = list(links(task_id, context))
-        for row in rows:
-            ctx = _stored_context(row["context"], row["task_id"])
-            tid = row["task_id"]
-            related = links(tid, ctx)
-            for link in related:
-                graph.setdefault(link, set()).add(tid)
-            graph.setdefault(tid, set()).update(related)
-            row_pr = (_normalize_pr_number(ctx.get("pr_number"))
-                      or _normalize_pr_number(row["pr_number"]))
-            if pr is not None and row_pr == pr:
-                pending.append(tid)
-            if row["task_type"] in ("implement", "fix"):
-                implementations[tid] = provider_family(row["dispatch_agent"])
+        if lineage_cache is None:
+            lineage_cache = {}
+        if project not in lineage_cache:
+            lineage_cache[project] = TaskQueue._implementation_lineage_in_txn(conn, project)
+        graph, implementations, by_pr = lineage_cache[project]
+        pending = [task_id, *(context[k] for k in keys
+                              if isinstance(context.get(k), str) and context[k]),
+                   *by_pr.get(pr, ())]
         seen = set()
         while pending:
             tid = pending.pop()
@@ -3836,6 +3855,22 @@ class TaskQueue:
                 families.add(family)
             pending.extend(graph.get(tid, set()) - seen)
         return families
+
+    def implementer_families(self, task: TaskRequest, *, attributed_only=False) -> set[str]:
+        """Provider families excluded from reviewing this task's PR/lineage.
+
+        Merge authority requires dispatch evidence, so it disables the legacy
+        context hint with ``attributed_only``.
+        """
+        context = dict(task.context or {})
+        if attributed_only:
+            context.pop("implementer_agent", None)
+        conn = self._connect()
+        try:
+            return self._implementer_families_in_txn(
+                conn, task.project, task.pr_number, context, task.task_id)
+        finally:
+            conn.close()
 
     @staticmethod
     def _duplicate_review_in_txn(conn, task: TaskRequest, context: dict, *,
@@ -5429,6 +5464,7 @@ class TaskQueue:
         try:
             conn.execute("BEGIN IMMEDIATE")
             ids = []
+            lineage_cache = {}
             for task_id, task_type, project, pr_number, raw_context in conn.execute(
                     "SELECT task_id, task_type, project, pr_number, context"
                     " FROM tasks WHERE status = 'pending'"
@@ -5437,7 +5473,8 @@ class TaskQueue:
                 context = _stored_context(raw_context, task_id)
                 held_reason = context.get("reroute_held_reason")
                 families = (self._implementer_families_in_txn(
-                    conn, project, pr_number, context, task_id) if task_type == "review" else set())
+                    conn, project, pr_number, context, task_id,
+                    lineage_cache=lineage_cache) if task_type == "review" else set())
                 implementer = ", ".join(sorted(families))
                 if (task_type == "review" and reviewer_holder
                         and provider_family(reviewer_holder) in families):
@@ -5494,12 +5531,14 @@ class TaskQueue:
                 "SELECT task_id, project, pr_number, context FROM tasks WHERE status = 'pending'"
                 " AND task_type = 'review'"
                 " ORDER BY priority ASC, created_at ASC").fetchall()
+            lineage_cache = {}
             for row in rows:
                 task_id = row["task_id"]
                 context = json.loads(row["context"] or "{}")
                 implementer = context.get("implementer_agent")
                 families = self._implementer_families_in_txn(
-                    conn, row["project"], row["pr_number"], context, task_id)
+                    conn, row["project"], row["pr_number"], context, task_id,
+                    lineage_cache=lineage_cache)
                 if not families:
                     continue
                 family = ", ".join(sorted(families))
@@ -5796,13 +5835,15 @@ class TaskQueue:
             skipped = set(skip_task_ids or ())
             if agent:
                 family = provider_family(agent)
+                lineage_cache = {}
                 skipped.update(
                     review["task_id"] for review in conn.execute(
                         "SELECT task_id, project, pr_number, context FROM tasks"
                         " WHERE status = 'pending' AND task_type = 'review'").fetchall()
                     if family in self._implementer_families_in_txn(
                         conn, review["project"], review["pr_number"],
-                        _stored_context(review["context"], review["task_id"]), review["task_id"]))
+                        _stored_context(review["context"], review["task_id"]), review["task_id"],
+                        lineage_cache=lineage_cache))
             skipped = sorted(skipped)
             skip_sql = f" AND task_id NOT IN ({','.join('?' for _ in skipped)})" if skipped else ""
             if agent and independent_review_only:
