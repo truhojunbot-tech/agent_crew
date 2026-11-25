@@ -7,7 +7,7 @@ import json
 import os
 from typing import Any, Optional
 
-from agent_crew.role_mapping import PANE_PROVIDERS
+from agent_crew.role_mapping import PANE_PROVIDERS, refuse_gemini_outside_athena
 
 DEFAULT_CHAINS: dict[str, list[str]] = {
     "implement": ["claude", "codex"],
@@ -16,12 +16,25 @@ DEFAULT_CHAINS: dict[str, list[str]] = {
 }
 
 
+def _state_project(state_path: str) -> str:
+    """The project ``state.json`` declares, else its directory (#924b)."""
+    try:
+        with open(state_path) as f:
+            declared = json.load(f).get("project")
+    except Exception:
+        declared = None
+    if isinstance(declared, str) and declared.strip():
+        return declared.strip()
+    return os.path.basename(os.path.dirname(os.path.abspath(state_path)))
+
+
 def load_fallback_chains(state_path: Optional[str]) -> dict[str, list[str]]:
     """Read the per-project fallback chain override and merge over defaults.
 
     Override file lives next to ``state.json`` at ``fallback_chains.json``.
     Missing file or malformed JSON quietly returns the defaults; we never
-    want a config typo to disable the fallback policy.
+    want a config typo to disable the fallback policy. A chain naming a
+    gemini-family agent outside Athena raises ``gemini_athena_only`` (#924b).
     """
     chains: dict[str, list[str]] = {k: list(v) for k, v in DEFAULT_CHAINS.items()}
     if not state_path:
@@ -40,6 +53,9 @@ def load_fallback_chains(state_path: Optional[str]) -> dict[str, list[str]]:
         if not isinstance(agents, list):
             continue
         cleaned = [a for a in agents if isinstance(a, str) and a]
+        # Judged on the declared chain, before the script-only tester trim:
+        # a gemini-naming chain is refused whole for every task type.
+        refuse_gemini_outside_athena(_state_project(state_path), cleaned)
         if task_type == "test":
             cleaned = [a for a in cleaned if a == "script"]
         if cleaned:
@@ -52,6 +68,8 @@ def next_agent(
     current_agent: Optional[str],
     excluded: Optional[list[str]],
     chains: Optional[dict[str, list[str]]] = None,
+    *,
+    project: Optional[str] = None,
 ) -> Optional[str]:
     """Pick the next agent in the fallback chain.
 
@@ -62,8 +80,12 @@ def next_agent(
        from the head.
     3. Skip anything in ``excluded``. Returns ``None`` when the chain is
        exhausted.
+
+    ``project`` is the server's own identity. A chain naming a gemini-family
+    agent outside Athena is refused whole, test chains included (#924b).
     """
     chain = (chains or DEFAULT_CHAINS).get(task_type, [])
+    refuse_gemini_outside_athena(project, chain)
     excluded_set = set(excluded or [])
     if current_agent and current_agent in excluded_set:
         pass  # current agent already excluded; just walk from start

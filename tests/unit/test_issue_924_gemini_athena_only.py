@@ -8,8 +8,10 @@ from agent_crew.cea.engine import DEFAULT_ROLE_AGENTS
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.role_mapping import (
-    effective_role_mapping, role_policy_refusal, validate_explicit_role_agents,
+    RoleResolutionError, effective_role_mapping, role_policy_refusal, validate_explicit_role_agents,
 )
+
+pytestmark = pytest.mark.gemini_policy
 
 
 def test_general_defaults_assign_no_gemini_test_work():
@@ -26,11 +28,12 @@ def test_all_test_role_config_paths_refuse_gemini_family(agent, tmp_path):
     with pytest.raises(ValueError):
         validate_explicit_role_agents({"implementer": "codex", "reviewer": "claude",
                                        "tester": agent})
-    legacy, _ = effective_role_mapping({"roles": [{"role": "tester", "agent": agent}]})
-    assert legacy["tester"] == "script"
+    with pytest.raises(RoleResolutionError, match="gemini_athena_only"):
+        effective_role_mapping({"roles": [{"role": "tester", "agent": agent}]})
     path = tmp_path / "fallback_chains.json"
     path.write_text('{"test": ["gemini", "agy", "script"]}')
-    assert fallback.load_fallback_chains(str(tmp_path / "state.json"))["test"] == ["script"]
+    with pytest.raises(RoleResolutionError, match="gemini_athena_only"):
+        fallback.load_fallback_chains(str(tmp_path / "state.json"))
 
 
 @pytest.mark.parametrize("ci_state,expected_status", [
@@ -88,7 +91,8 @@ def test_workflow_detection_reads_tested_commit(tmp_path):
 
 
 def test_custom_fallback_cannot_pick_gemini_for_test():
-    assert fallback.next_agent("test", None, [], {"test": ["gemini", "agy", "script"]}) == "script"
+    with pytest.raises(RoleResolutionError, match="gemini_athena_only"):
+        fallback.next_agent("test", None, [], {"test": ["gemini", "agy", "script"]})
 
 
 @pytest.mark.parametrize("tester", ["gemini", "agy", "claude"])
@@ -99,20 +103,22 @@ def test_refused_explicit_tester_refuses_entire_mapping(tester):
         "roles": [{"role": "reviewer", "agent": "claude"}],
     }
 
-    with pytest.raises(ValueError, match="invalid_role_agents"):
-        effective_role_mapping(state, project="demo")
+    if tester in ("gemini", "agy"):
+        with pytest.raises(RoleResolutionError, match="gemini_athena_only"):
+            effective_role_mapping(state, project="demo")
+    else:
+        with pytest.raises(ValueError, match="invalid_role_agents"):
+            effective_role_mapping(state, project="demo")
 
 
 def test_unmapped_gemini_override_claims_review_only(tmp_path):
+    """#924b: outside Athena a gemini override is refused, not claimed."""
     queue = TaskQueue(str(tmp_path / "tasks.db"))
-    queue.enqueue(TaskRequest(task_id="old-implement", task_type="implement",
-                              description="old", branch="main",
-                              context={"agent_override": "gemini", "risk_tier": 1}))
-    queue.enqueue(TaskRequest(task_id="review", task_type="review",
-                              description="review", branch="main",
-                              context={"agent_override": "gemini", "risk_tier": 1}))
+    for task_id, task_type in (("old-implement", "implement"), ("review", "review")):
+        with pytest.raises(RoleResolutionError, match="gemini_athena_only"):
+            queue.enqueue(TaskRequest(task_id=task_id, task_type=task_type,
+                                      description=task_id, branch="main",
+                                      context={"agent_override": "gemini", "risk_tier": 1}))
 
-    claimed = queue.dequeue(agent="gemini", override_task_type="review")
-
-    assert claimed is not None and claimed.task_id == "review"
-    assert queue.get_task("old-implement").status == "pending"
+    assert queue.dequeue(agent="gemini", override_task_type="review") is None
+    assert queue.get_task("review") is None

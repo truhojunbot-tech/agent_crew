@@ -2,6 +2,7 @@ import uuid
 
 from agent_crew.loop import _adapter_project, _post_task_http
 from agent_crew.protocol import TaskRequest
+from agent_crew.role_mapping import refuse_gemini_outside_athena
 
 DEFAULT_PERSPECTIVES: list[str] = ["analyst", "critic", "advocate", "risk"]
 
@@ -25,7 +26,11 @@ def enqueue_panel_tasks(
     Pass `project` to name the project these tasks are admitted under; it
     otherwise comes from the queue's own identity (§7.1 step 2, s4j). Before
     s4j this adapter named none, and admission raised out of it.
+
+    #924b: a panel naming any gemini-family agent outside Athena is refused
+    whole before any task is enqueued, never trimmed to the other members.
     """
+    refuse_gemini_outside_athena(getattr(queue, "queue_project", ""), agents)
     perspective_map = perspectives or assign_perspectives(agents)
     panel_project = _adapter_project(queue, project)
     task_ids = []
