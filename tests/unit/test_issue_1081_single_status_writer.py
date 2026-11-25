@@ -73,10 +73,24 @@ _INSERT_TASKS_UPSERT = re.compile(
     re.I | re.S)
 
 
+# One SQLite token at a time: a quoted literal/identifier is kept verbatim, a
+# comment (``-- …`` to end of line, ``/* … */`` or an unterminated ``/*`` to
+# end of input) is replaced by the whitespace SQLite treats it as.
+_SQL_TOKEN = re.compile(
+    r"""'(?:[^']|'')*'?|"(?:[^"]|"")*"?|`(?:[^`]|``)*`?|\[[^\]]*\]?"""
+    r"|(?P<comment>--[^\n]*|/\*.*?(?:\*/|\Z))|[^'\"`\[/-]+|.", re.S)
+
+
+def _strip_sql_comments(sql: str) -> str:
+    return "".join(" " if m.group("comment") else m.group(0)
+                   for m in _SQL_TOKEN.finditer(sql))
+
+
 def _sql_pieces(node: ast.AST) -> str:
     """Every string literal under ``node``, joined — covers implicit and ``+``
-    concatenation and the literal parts of f-strings."""
-    return " ".join(n.value for n in ast.walk(node)
+    concatenation and the literal parts of f-strings. Pieces are joined by a
+    newline so a ``--`` comment in one piece cannot hide the next."""
+    return "\n".join(n.value for n in ast.walk(node)
                     if isinstance(n, ast.Constant) and isinstance(n.value, str))
 
 
@@ -85,6 +99,7 @@ def _sets_status(set_clause: str) -> bool:
 
 
 def _writes_status(sql: str) -> int:
+    sql = _strip_sql_comments(sql)
     hits = sum(1 for m in _UPDATE_TASKS.finditer(sql) if _sets_status(m.group("set")))
     hits += sum(1 for m in _INSERT_TASKS_UPSERT.finditer(sql) if _sets_status(m.group("set")))
     return hits
@@ -107,6 +122,15 @@ def _writes_status(sql: str) -> int:
     "UPDATE tasks SET (summary, \"status\") = (?, ?)",
     "INSERT INTO main.\"tasks\" (task_id) VALUES (?) "
     "ON CONFLICT(task_id) DO UPDATE SET \"status\"=excluded.status",
+    # A comment is whitespace to SQLite, so it must be to the scanner too.
+    "UPDATE tasks /* migration note */ SET status=? WHERE task_id=?",
+    "UPDATE tasks SET status /* x */ = ? WHERE task_id=?",
+    "UPDATE tasks -- note\nSET status=? WHERE task_id=?",
+    "UPDATE tasks SET status -- why\n= ? WHERE task_id=?",
+    "UPDATE/**/tasks/**/SET/**/status/**/=?",
+    "UPDATE main./* q */tasks AS t /* a */ SET summary=?, \"status\"/**/=?",
+    "UPDATE tasks SET summary='--', status=? WHERE task_id=?",
+    "UPDATE tasks SET summary='/*', status=? WHERE note='*/'",
 ])
 def test_writes_status_sees_quoted_and_qualified_sql(sql):
     assert _writes_status(sql) == 1, sql
@@ -123,6 +147,9 @@ def test_writes_status_sees_quoted_and_qualified_sql(sql):
     "UPDATE subtasks SET status=?",
     "UPDATE tasks SET (summary, verdict) = (?, ?) WHERE status=?",
     "INSERT INTO tasks (task_id, status) VALUES (?, ?)",
+    "UPDATE tasks SET summary=? /* status = ? */ WHERE task_id=?",
+    "UPDATE tasks SET summary=? -- , status=?\nWHERE task_id=?",
+    "UPDATE tasks SET summary='status = ?' WHERE task_id=?",
 ])
 def test_writes_status_ignores_non_status_writes(sql):
     assert _writes_status(sql) == 0, sql
@@ -184,10 +211,14 @@ def test_scanner_catches_a_new_writer(tmp_path):
         "    conn.execute('UPDATE tasks SET context=? WHERE task_id=? AND status=?')\n"
         "def quoted(conn):\n"
         "    conn.execute('UPDATE \"tasks\" SET \"status\" = ? WHERE task_id = ?')\n"
-        "    conn.execute(f'UPDATE main.[tasks] SET [status] = {1} WHERE task_id = ?')\n")
+        "    conn.execute(f'UPDATE main.[tasks] SET [status] = {1} WHERE task_id = ?')\n"
+        "def commented(conn):\n"
+        "    conn.execute('UPDATE tasks /* migration note */ SET status=? WHERE task_id=?')\n"
+        "    conn.execute('UPDATE tasks SET status /* x */ = ? WHERE task_id=?')\n")
     assert _scan(tmp_path) == Counter({("rogue.py", "sneak"): 1,
                                        ("rogue.py", "<module>"): 1,
-                                       ("rogue.py", "quoted"): 2})
+                                       ("rogue.py", "quoted"): 2,
+                                       ("rogue.py", "commented"): 2})
 
 
 def test_every_writer_is_a_table_row():
@@ -232,6 +263,20 @@ def test_legacy_reopens_are_exactly_the_documented_exceptions():
             for to in t.to_statuses:
                 if ts.is_reopen(frm, to):
                     assert t.allows(frm, to) == ((t.event, frm, to) in EXPECTED_LEGACY_REOPENS)
+
+
+def test_next_statuses_agrees_with_allows_for_every_pair():
+    for event in sorted(ts.TABLE):
+        spec = ts.TABLE[event]
+        for frm in sorted(ts.STATUSES):
+            assert ts.next_statuses(frm, event) == frozenset(
+                to for to in ts.STATUSES if spec.allows(frm, to)), (event, frm)
+    assert ts.next_statuses("no_such_event", "pending") == frozenset()
+
+
+def test_next_statuses_does_not_advertise_a_refused_reopen():
+    assert not {"needs_human", "blocked"} & ts.next_statuses("completed", "result")
+    assert {"needs_human", "blocked"} <= ts.next_statuses("failed", "result")
 
 
 @pytest.mark.parametrize("prior,to", [

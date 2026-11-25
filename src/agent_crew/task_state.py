@@ -251,7 +251,7 @@ def next_statuses(from_status: str, event: str) -> frozenset:
     spec = TABLE.get(event)
     if spec is None or from_status not in spec.from_statuses:
         return frozenset()
-    return spec.to_statuses
+    return frozenset(to for to in spec.to_statuses if spec.allows(from_status, to))
 
 
 @dataclass(frozen=True)
