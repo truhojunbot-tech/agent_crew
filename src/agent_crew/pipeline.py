@@ -31,7 +31,9 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Optional
 
-from agent_crew.worktree_default_branch import fallback_base_branch, resolve_base_branch
+from agent_crew.worktree_default_branch import (
+    fallback_base_branch, remote_default_branch, resolve_base_branch,
+)
 from agent_crew.fallback import (
     default_agent_for_role,
 )
@@ -1286,17 +1288,23 @@ def _default_branches(review_ctx: dict, repo_cwd: str = "", *,
                       repo: str = "", require_repo_default: bool = False) -> Optional[set]:
     """Branches an automated fix must never target (#457).
 
-    The same sources the dispatcher already trusts for "the base" (#1070):
-    the resolved base — the task's own ``base_branch``, else the remote's
-    advertised default when a checkout is available — plus the fleet
-    fallback (``AGENT_CREW_MAIN_BRANCH``, default ``main``), which stays
-    protected even when the repo answers. MCP has no checkout, so it
-    requires the named repository's GitHub default branch and fails closed
-    if unavailable.
+    Every source the dispatcher trusts for "the base" (#1070), each
+    protected on its own rather than only the one the resolver would pick:
+    the task's declared ``base_branch``, the fleet fallback
+    (``AGENT_CREW_MAIN_BRANCH``, default ``main``) and — when a checkout is
+    available — the repository's own default. A task that declares
+    ``base_branch=release`` on a ``trunk`` repository must still refuse a fix
+    on ``trunk`` (review of PR #1073). MCP has no checkout, so it requires
+    the named repository's GitHub default branch and fails closed if
+    unavailable.
     """
-    names = {_normalize_branch(resolve_base_branch(review_ctx, repo_cwd)),
-             _normalize_branch(fallback_base_branch()),
-             _normalize_branch(review_ctx.get("base_branch"))}
+    names = {_normalize_branch(review_ctx.get("base_branch")),
+             _normalize_branch(fallback_base_branch())}
+    if repo_cwd:
+        try:
+            names.add(_normalize_branch(remote_default_branch(repo_cwd)))
+        except (OSError, subprocess.TimeoutExpired):
+            logger.debug("_default_branches: repo default lookup failed in %s", repo_cwd)
     # MCP has no checkout. Its explicit repository identity must supply a
     # verified default branch; assuming `main` would allow a fix on `trunk`.
     if require_repo_default:
