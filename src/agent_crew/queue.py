@@ -3791,6 +3791,53 @@ class TaskQueue:
                 and _CEA_COMMIT_RE.fullmatch(sha.strip()) else "")
 
     @staticmethod
+    def _implementer_families_in_txn(conn, project, pr_number, context, task_id):
+        """All implementation providers for this PR/lineage, including failed rounds.
+
+        Dispatch attribution is authoritative; the last implementer in context
+        remains a fallback for older rows. Explicit lineage links include rounds
+        that predate assignment of the PR number. Session continuity is not lineage.
+        """
+        families = {provider_family(context.get("implementer_agent"))} - {""}
+        pr = _normalize_pr_number(context.get("pr_number")) or _normalize_pr_number(pr_number)
+        keys = ("lineage_root_task_id", "prev_task_id", "provider_capacity_root",
+                *_CEA_LINEAGE_PARENT_KEYS)
+
+        def links(tid, ctx):
+            return {tid} | {ctx[k] for k in keys if isinstance(ctx.get(k), str) and ctx[k]}
+
+        rows = conn.execute(
+            "SELECT task_id, task_type, pr_number, context, dispatch_agent FROM tasks "
+            "WHERE project=? AND quarantine_field=''", (project,)).fetchall()
+        graph = {}
+        implementations = {}
+        pending = list(links(task_id, context))
+        for row in rows:
+            ctx = _stored_context(row["context"], row["task_id"])
+            tid = row["task_id"]
+            related = links(tid, ctx)
+            for link in related:
+                graph.setdefault(link, set()).add(tid)
+            graph.setdefault(tid, set()).update(related)
+            row_pr = (_normalize_pr_number(ctx.get("pr_number"))
+                      or _normalize_pr_number(row["pr_number"]))
+            if pr is not None and row_pr == pr:
+                pending.append(tid)
+            if row["task_type"] in ("implement", "fix"):
+                implementations[tid] = provider_family(row["dispatch_agent"])
+        seen = set()
+        while pending:
+            tid = pending.pop()
+            if tid in seen:
+                continue
+            seen.add(tid)
+            family = implementations.get(tid)
+            if family:
+                families.add(family)
+            pending.extend(graph.get(tid, set()) - seen)
+        return families
+
+    @staticmethod
     def _duplicate_review_in_txn(conn, task: TaskRequest, context: dict, *,
                                  dispatch: bool = False,
                                  now: Optional[float] = None,
@@ -3827,7 +3874,7 @@ class TaskQueue:
             return None
         rows = conn.execute(
             "SELECT task_id, branch, pr_number, context, status, created_at, "
-            "last_activity_at FROM tasks "
+            "last_activity_at, dispatch_agent FROM tasks "
             "WHERE project=? AND task_type=? AND task_id<>? "
             "AND quarantine_field='' "
             "AND (status IN ('pending', 'in_progress') "
@@ -3836,6 +3883,9 @@ class TaskQueue:
             "ORDER BY created_at",
             (task.project, task.task_type, task.task_id),
         ).fetchall()
+        implementers = (TaskQueue._implementer_families_in_txn(
+            conn, task.project, task.pr_number, context, task.task_id)
+            if task.task_type == "review" else set())
         for row in rows:
             # Capacity re-admission creates the replacement before cancelling
             # its active predecessor. Only that trusted predecessor is ignored;
@@ -3855,6 +3905,11 @@ class TaskQueue:
             elif (old_pr is not None or row["branch"] != task.branch
                   or old.get("prev_task_id") != context.get("prev_task_id")):
                 continue
+            if task.task_type == "review":
+                reviewer = (row["dispatch_agent"] or old.get("agent_override")
+                            or old.get("reviewer_agent"))
+                if provider_family(reviewer) in implementers:
+                    continue
             old_sha = (old.get("reviewed_sha") if dispatch else
                        old.get("reviewed_sha") or old.get("expected_head_sha")
                        or old.get("head_sha"))
@@ -5374,14 +5429,18 @@ class TaskQueue:
         try:
             conn.execute("BEGIN IMMEDIATE")
             ids = []
-            for task_id, task_type, implementer, held_reason in conn.execute(
-                    "SELECT task_id, task_type, json_extract(context, '$.implementer_agent'),"
-                    " json_extract(context, '$.reroute_held_reason')"
+            for task_id, task_type, project, pr_number, raw_context in conn.execute(
+                    "SELECT task_id, task_type, project, pr_number, context"
                     " FROM tasks WHERE status = 'pending'"
                     " AND json_extract(context, '$.agent_override') = ?" + held_sql,
                     (provider, *held)).fetchall():
-                if (task_type == "review" and reviewer_holder and implementer
-                        and provider_family(implementer) == provider_family(reviewer_holder)):
+                context = _stored_context(raw_context, task_id)
+                held_reason = context.get("reroute_held_reason")
+                families = (self._implementer_families_in_txn(
+                    conn, project, pr_number, context, task_id) if task_type == "review" else set())
+                implementer = ", ".join(sorted(families))
+                if (task_type == "review" and reviewer_holder
+                        and provider_family(reviewer_holder) in families):
                     if held_reason is None:
                         reason = (f"no_independent_reviewer: reviewer role holder "
                                   f"{reviewer_holder} matches implementer {implementer}; "
@@ -5412,9 +5471,9 @@ class TaskQueue:
     ) -> dict[str, list[str]]:
         """Give each pending review an independent, dispatchable reviewer (#986).
 
-        A review needs one when its ``context.implementer_agent`` is the same
-        provider family as its effective reviewer (``agent_override``, else the
-        role-map ``reviewer_holder``). ``dispatchable`` lists the providers the
+        A review needs one when any implementation round in its PR/lineage
+        shares a provider family with its effective reviewer (``agent_override``,
+        else the role-map ``reviewer_holder``). ``dispatchable`` lists the providers the
         caller can actually dispatch a review to right now, in preference order.
 
         - An existing override that is already independent AND dispatchable is
@@ -5432,30 +5491,31 @@ class TaskQueue:
         try:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT task_id, pr_number, context FROM tasks WHERE status = 'pending'"
+                "SELECT task_id, project, pr_number, context FROM tasks WHERE status = 'pending'"
                 " AND task_type = 'review'"
-                " AND json_extract(context, '$.implementer_agent') IS NOT NULL"
                 " ORDER BY priority ASC, created_at ASC").fetchall()
             for row in rows:
                 task_id = row["task_id"]
                 context = json.loads(row["context"] or "{}")
                 implementer = context.get("implementer_agent")
-                if not isinstance(implementer, str) or not implementer.strip():
+                families = self._implementer_families_in_txn(
+                    conn, row["project"], row["pr_number"], context, task_id)
+                if not families:
                     continue
-                family = provider_family(implementer)
+                family = ", ".join(sorted(families))
                 override = context.get("agent_override")
                 effective = override or reviewer_holder
                 holder_is_impl = bool(reviewer_holder) and provider_family(
-                    reviewer_holder) == family
+                    reviewer_holder) in families
                 # An independent override only needs checking when dropping it
                 # would land the review on the implementer's family, or when we
                 # bound it ourselves (a retry/reroute stays independent).
-                if not effective or (provider_family(effective) != family and not (
+                if not effective or (provider_family(effective) not in families and not (
                         override and (holder_is_impl
                                       or context.get("independent_review_binding")))):
                     continue
                 candidates = [p for p in dispatchable
-                              if p and provider_family(p) != family]
+                              if p and provider_family(p) not in families]
                 if override and override in candidates:
                     target = override
                 else:
@@ -5467,6 +5527,7 @@ class TaskQueue:
                     context["agent_override"] = target
                     context["independent_review_binding"] = {
                         "provider": target, "implementer_agent": implementer,
+                        "implementer_families": sorted(families),
                         "replaced": effective if effective != target else None,
                         "at": now,
                     }
@@ -5484,15 +5545,16 @@ class TaskQueue:
                     "op": "review", "task_id": task_id,
                     "pr_number": row["pr_number"] or context.get("pr_number"),
                     "implementer_agent": implementer,
+                    "implementer_families": sorted(families),
                     "reviewer_agent": effective,
                     "owner": owner,
                     "resume_trigger": (
-                        f"make a non-{family} reviewer dispatchable on this crew "
+                        f"make a reviewer outside implementation families [{family}] dispatchable "
                         "(AGENT_CREW_CLOUD_ENABLED=1 for claude_cloud, or map reviewer "
-                        f"to a non-{family} provider), then re-enqueue this review"),
+                        "to an independent provider), then re-enqueue this review"),
                     "at": now,
                 }
-                summary = (f"{INDEPENDENT_REVIEW_UNAVAILABLE}: implementer {implementer}; "
+                summary = (f"{INDEPENDENT_REVIEW_UNAVAILABLE}: implementation families [{family}]; "
                            f"reviewer {effective} is the same family and no independent "
                            "reviewer is dispatchable")
                 context["independent_review_block"] = block
@@ -5696,8 +5758,8 @@ class TaskQueue:
         ``override_task_type`` limits the override-only claim for checkout
         workers without a default role.
 
-        #986: ``agent`` never claims a review whose ``implementer_agent`` is its
-        own provider family -- that claim could only be refused into
+        #986/#1056: ``agent`` never claims a review whose implementation lineage
+        includes its own provider family -- that claim could only be refused into
         ``needs_human``. ``independent_review_only`` lets a role-bound backend
         that does not hold the reviewer role claim exactly the reviews bound to
         it for independence (``independent_review_binding``), and nothing else.
@@ -5735,11 +5797,12 @@ class TaskQueue:
             if agent:
                 family = provider_family(agent)
                 skipped.update(
-                    tid for tid, impl in conn.execute(
-                        "SELECT task_id, json_extract(context, '$.implementer_agent') FROM tasks"
-                        " WHERE status = 'pending' AND task_type = 'review'"
-                        " AND json_extract(context, '$.implementer_agent') IS NOT NULL")
-                    if isinstance(impl, str) and impl and provider_family(impl) == family)
+                    review["task_id"] for review in conn.execute(
+                        "SELECT task_id, project, pr_number, context FROM tasks"
+                        " WHERE status = 'pending' AND task_type = 'review'").fetchall()
+                    if family in self._implementer_families_in_txn(
+                        conn, review["project"], review["pr_number"],
+                        _stored_context(review["context"], review["task_id"]), review["task_id"]))
             skipped = sorted(skipped)
             skip_sql = f" AND task_id NOT IN ({','.join('?' for _ in skipped)})" if skipped else ""
             if agent and independent_review_only:
