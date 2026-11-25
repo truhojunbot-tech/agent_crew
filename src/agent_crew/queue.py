@@ -7509,6 +7509,15 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def record_exec_event(self, task_id: str, event: str, **fields) -> None:
+        """Append one typed, best-effort instrumentation event for a task."""
+        conn = self._connect()
+        try:
+            self._append_exec_event_on(conn, task_id, event, time.time(), **fields)
+            conn.commit()
+        finally:
+            conn.close()
+
     def get_exec_state(self, task_id: str) -> Optional[dict]:
         """Snapshot columns plus the ordered event history, for GET /tasks/{id}."""
         conn = self._connect()
