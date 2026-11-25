@@ -23,13 +23,23 @@ from .memory_runtime import (
 )
 
 logger = logging.getLogger(__name__)
+# ADR-001 §9 fixes the retrieval budget at 300 ms; it stays the first-attempt
+# budget. #1032: a first attempt that failed *only* by exceeding that budget is
+# retried once with a larger budget, so CPU contention alone does not turn a
+# correct lookup into a counted fallback. Any other error still fails closed.
 LATENCY_BUDGET_SECONDS = 0.300
+LATENCY_RETRY_BUDGET_MULTIPLIER = 2.0
+LATENCY_RETRY_ATTEMPTS = 1
 LAZY_EMBED_LIMIT = 32
 LAZY_EMBED_BATCH = 2
 RRF_K = 60
 HEAD_PRINCIPLE_BYTES = 3600
 HEAD_STANDING_BYTES = 2000
 MIDDLE_CANDIDATE_LIMIT = 96
+
+
+class RetrievalBudgetExceeded(TimeoutError):
+    """A ranked retrieval stage exceeded its wall-clock budget (the only retryable cause)."""
 
 
 def _body_sql(alias: str) -> str:
@@ -244,6 +254,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         self.embedder = embedder if embedder is not None else configured_embedder()
         self.model_id = str(getattr(self.embedder, "model_id", "")) if self.embedder else ""
         self.fallback_count = 0
+        self.budget_retry_count = 0
         self._fallback_lock = threading.Lock()
         self.last_retrieval_mode = "lexical_only"
 
@@ -423,8 +434,45 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                         k: int, byte_budget: int, *,
                         fallback_marker: Optional[threading.Event] = None,
                         response_state: Optional[dict] = None) -> dict:
+        """Ranked retrieval with one timeout-only retry (#1032).
+
+        The first attempt runs under the ADR-001 300 ms budget. If it exceeded
+        the budget and nothing else went wrong, it is retried once with
+        ``LATENCY_RETRY_BUDGET_MULTIPLIER`` times the budget. A non-timeout
+        error falls back at once, and a retry that is still too slow falls
+        back and is counted, as before. The retry is skipped when the caller
+        has already served its own fallback (``fallback_marker`` set), because
+        a result nobody will read is not worth a second pass under load.
+        """
+        budget = LATENCY_BUDGET_SECONDS
+        for attempt in range(LATENCY_RETRY_ATTEMPTS + 1):
+            retry_allowed = (attempt < LATENCY_RETRY_ATTEMPTS and
+                             not (fallback_marker is not None and fallback_marker.is_set()))
+            try:
+                return self._retrieve_ranked_once(
+                    scope, query, role, k, byte_budget, budget,
+                    retry_allowed=retry_allowed, fallback_marker=fallback_marker,
+                    response_state=response_state)
+            except RetrievalBudgetExceeded as exc:
+                # Only raised when retry_allowed; the gate's hand-built store
+                # (alfred/tools/decision_rule_gate.py) skips __init__, so the
+                # counter may not exist yet.
+                self.budget_retry_count = getattr(self, "budget_retry_count", 0) + 1
+                next_budget = budget * LATENCY_RETRY_BUDGET_MULTIPLIER
+                logger.warning("memory retrieval budget retry %d/%d: %s (budget %.0f ms -> %.0f ms)",
+                               attempt + 1, LATENCY_RETRY_ATTEMPTS, exc,
+                               budget * 1000, next_budget * 1000)
+                budget = next_budget
+        raise AssertionError("unreachable: final attempt never raises RetrievalBudgetExceeded")
+
+    def _retrieve_ranked_once(self, scope: MemoryScope, query: str, role: str,
+                              k: int, byte_budget: int, budget_seconds: float, *,
+                              retry_allowed: bool,
+                              fallback_marker: Optional[threading.Event],
+                              response_state: Optional[dict]) -> dict:
         started = time.perf_counter()
-        deadline = started + LATENCY_BUDGET_SECONDS
+        deadline = started + budget_seconds
+        budget_ms = budget_seconds * 1000
         head = self.render_head(scope.project, scope.fleet)
         if response_state is not None:
             response_state["head"] = head
@@ -432,18 +480,18 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         pending = 0
         try:
             if time.perf_counter() >= deadline:
-                raise TimeoutError("head exceeded retrieval budget")
+                raise RetrievalBudgetExceeded("head exceeded retrieval budget")
             with closing(sqlite3.connect(self.path)) as db:
                 candidates = self._candidates(db, scope, query)
             if time.perf_counter() >= deadline:
-                raise TimeoutError("candidate lookup exceeded retrieval budget")
+                raise RetrievalBudgetExceeded("candidate lookup exceeded retrieval budget")
             head_ids = {r["rowid"] for r in head["records"]}
             middle = [r for r in candidates if r["rowid"] not in head_ids]
             pending = self._lazy_embed(middle, deadline)
             if response_state is not None:
                 response_state["pending"] = pending
             if time.perf_counter() >= deadline:
-                raise TimeoutError("embedding exceeded retrieval budget")
+                raise RetrievalBudgetExceeded("embedding exceeded retrieval budget")
             middle, vector_used = self._rank_middle(middle, query)
             overflow_ids = {r["rowid"] for r in head["standing_overflow"]}
             middle = head["standing_overflow"] + [r for r in middle
@@ -470,10 +518,12 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 )} if ids else set()
             selected = _servable([r for r in selected if r["rowid"] in fresh])
             elapsed = (time.perf_counter() - started) * 1000
-            if elapsed > LATENCY_BUDGET_SECONDS * 1000:
-                raise TimeoutError("retrieval exceeded 300 ms")
+            if elapsed > budget_ms:
+                raise RetrievalBudgetExceeded(f"retrieval exceeded {budget_ms:.0f} ms")
             mode = "hybrid" if vector_used else "lexical_only"
         except Exception as exc:
+            if retry_allowed and isinstance(exc, RetrievalBudgetExceeded):
+                raise
             logger.warning("memory retrieval fallback: %s: %s", type(exc).__name__, exc)
             self._record_fallback(fallback_marker)
             terms = set(query.lower().replace("-", " ").split())
@@ -507,7 +557,9 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         rendered_head = json.dumps(head["records"], sort_keys=True, ensure_ascii=False).encode()
         head["head_hash"] = hashlib.sha256(rendered_head).hexdigest()
         elapsed = (time.perf_counter() - started) * 1000
-        if elapsed > LATENCY_BUDGET_SECONDS * 1000 and mode != "fallback":
+        if elapsed > budget_ms and mode != "fallback":
+            if retry_allowed:
+                raise RetrievalBudgetExceeded(f"render exceeded {budget_ms:.0f} ms")
             self._record_fallback(fallback_marker)
             mode = "fallback"
             selected = []
@@ -517,7 +569,6 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 "trimmed_bytes": trimmed, "standing_trimmed": head["standing_trimmed"],
                 "model_id": self.model_id, "head_hash": head["head_hash"],
                 "head_bytes": len(rendered_head), "superseded_served": 0}
-
 
 def memory_storage_from_env(path: str, *, embedder=None) -> MemoryStorage:
     if os.getenv("AGENT_CREW_MEMORY_BACKEND", "").strip().lower() == "hybrid":
