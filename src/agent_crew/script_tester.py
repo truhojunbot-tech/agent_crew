@@ -180,16 +180,26 @@ def _within(value: str, cap: int) -> bool:
     return bool(re.fullmatch(r"\d+", value)) and 0 < int(value) <= cap
 
 
+def _pytest_launcher(words: list[str], index: int) -> Optional[str]:
+    """``module`` for ``python -m pytest``, ``script`` for ``pytest``, else None."""
+    name = os.path.basename(words[index])
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", name) and words[index + 1:index + 3] == [
+            "-m", "pytest"]:
+        return "module"
+    if name in {"pytest", "py.test"} and words[index - 1:index] != ["-m"]:
+        return "script"
+    return None
+
+
 def _pytest_interpreters(words: list[str], env: Mapping[str, str],
                          cwd: str) -> Optional[list[str]]:
     """The interpreter of every pytest launcher in ``words``; None if any is unknown."""
     interpreters = []
     for index, word in enumerate(words):
-        name = os.path.basename(word)
-        if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", name) and words[index + 1:index + 3] == [
-                "-m", "pytest"]:
+        launcher_kind = _pytest_launcher(words, index)
+        if launcher_kind == "module":
             interpreter = word
-        elif name in {"pytest", "py.test"} and words[index - 1:index] != ["-m"]:
+        elif launcher_kind == "script":
             launcher = shutil.which(word, path=env.get("PATH", os.defpath)) if (
                 os.sep not in word) else os.path.join(cwd, word)
             try:
@@ -235,68 +245,68 @@ def cap_xdist_workers(command: str, env: Mapping[str, str], cap: int, *,
     value follows in the command. Otherwise the env is unchanged and
     ``injection`` is ``skipped`` with a ``reason``.
 
-    Shell-local assignments and launchers can still change what runs, so this
-    certifies nothing: ``certify_worker_cap`` decides from the workers the run
-    reported. ``-q`` hides xdist's worker count, so one ``-v`` is added with it.
+    Shell-local assignments, ini settings and launchers can still change what
+    runs, so the cap is a request, never a claim: ``worker_cap_receipt``
+    records it next to the workers the run explicitly reported, if any.
     """
     env = dict(env)
-    evidence: dict = {"cap": cap, "mechanism": f"PYTEST_ADDOPTS {_MAXPROCESSES}"}
+    evidence: dict = {"cap_requested": cap, "mechanism": f"PYTEST_ADDOPTS {_MAXPROCESSES}"}
 
-    def unenforced(reason: str) -> tuple[dict[str, str], dict]:
+    def skipped(reason: str) -> tuple[dict[str, str], dict]:
         return env, {**evidence, "injection": "skipped", "reason": reason}
 
     addopts = env.get("PYTEST_ADDOPTS", "")
     try:
         words, addopt_words = shlex.split(command), shlex.split(addopts)
     except ValueError:
-        return unenforced("unparseable")
+        return skipped("unparseable")
     if any(_SHELL_EXPANSION.search(word) for word in words):
-        return unenforced("command_expands_at_runtime")
+        return skipped("command_expands_at_runtime")
     if "PYTEST_DISABLE_PLUGIN_AUTOLOAD" in env or "no:xdist" in words + addopt_words:
-        return unenforced("xdist_disabled")
+        return skipped("xdist_disabled")
     command_values = _maxprocesses_values(words)
     if not all(_within(value, cap) for value in command_values):
-        return unenforced("command_overrides_cap")
+        return skipped("command_overrides_cap")
     interpreters = _pytest_interpreters(words, env, cwd)
     if interpreters is None:
-        return unenforced("pytest_launcher_unresolved")
+        return skipped("pytest_launcher_unresolved")
     if not all(_target_has_xdist(interpreter, env, cwd) for interpreter in interpreters):
-        return unenforced("xdist_unavailable")
+        return skipped("xdist_unavailable")
     addopt_values = _maxprocesses_values(addopt_words)
     if addopt_values and _within(addopt_values[-1], cap):
-        extra, evidence = [], {**evidence, "injection": "already_configured",
-                               "configured": int(addopt_values[-1])}
-    else:
-        extra, evidence = [f"{_MAXPROCESSES}={cap}"], {**evidence, "injection": "injected"}
-    if any(re.fullmatch(r"-q+|--quiet", word) for word in words + addopt_words):
-        extra.append("-v")
-    if extra:
-        env["PYTEST_ADDOPTS"] = " ".join([addopts, *extra]).strip()
-    return env, evidence
+        return env, {**evidence, "injection": "already_configured",
+                     "configured": int(addopt_values[-1])}
+    env["PYTEST_ADDOPTS"] = " ".join([addopts, f"{_MAXPROCESSES}={cap}"]).strip()
+    return env, {**evidence, "injection": "injected"}
 
 
 _XDIST_WORKERS_RE = re.compile(
     r"^(?:created: \d+/(\d+) workers?|(\d+) workers? \[\d+ items?\])\s*$", re.M)
 
 
-def observed_xdist_workers(output: str, counts: Mapping) -> Optional[int]:
-    """The workers pytest-xdist reported in ``output``, or None when it is unknown.
+def observed_xdist_workers(output: str) -> Optional[int]:
+    """The worker count of an explicit xdist line in ``output``, else None.
 
-    No xdist line means one worker only when pytest's own summary (``counts``)
-    is there too; a redirected or crashed run shows neither.
+    A summary without such a line proves nothing: quiet flags, plugins and
+    redirected invocations all hide it, so the count stays unknown.
     """
     workers = [int(a or b) for a, b in _XDIST_WORKERS_RE.findall(output)]
-    if workers:
-        return max(workers)
-    return 1 if counts and "bringing up nodes" not in output else None
+    return max(workers) if workers else None
 
 
-def certify_worker_cap(injection: Mapping, outcome: "RunOutcome") -> dict:
-    """``cap_enforced`` only when the run reported at most ``cap`` workers."""
-    observed = outcome.observed_workers
-    enforced = observed is not None and observed <= injection["cap"]
-    return {**injection, "observed_workers": observed,
-            "status": "cap_enforced" if enforced else "cap_unenforced"}
+def worker_cap_receipt(injection: Mapping, command: str, outcome: "RunOutcome") -> dict:
+    """The requested cap and the observed workers; never a claim of enforcement.
+
+    ``observed_workers`` is kept only when the command visibly launches exactly
+    one pytest, so the output cannot belong to a different invocation.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = []
+    launches = sum(_pytest_launcher(words, index) is not None for index in range(len(words)))
+    return {**injection,
+            "observed_workers": outcome.observed_workers if launches == 1 else None}
 
 
 CI_GATE_ENV = "AGENT_CREW_SCRIPT_TEST_CI_GATE"
@@ -564,7 +574,7 @@ def run_command(command: str, cwd: str, timeout_s: float,
                       failing_ids=ids, timed_out=timed_out,
                       duration_s=time.monotonic() - started,
                       output_tail=(output or "")[-_OUTPUT_TAIL_CHARS:],
-                      observed_workers=observed_xdist_workers(output or "", counts))
+                      observed_workers=observed_xdist_workers(output or ""))
 
 
 def _git(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -662,7 +672,7 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
     """The base outcome, cached per base sha, command and test environment."""
     identity = _test_environment_identity(state, timeout_s)
     if worker_cap is not None:
-        identity = f"{identity}-observed-w{worker_cap}"
+        identity = f"{identity}-cap-w{worker_cap}"
     path = _cache_path(cache_dir, base_sha, command, identity)
     try:
         with open(path) as f:
@@ -676,7 +686,7 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
             env, injection = cap_xdist_workers(command, env, worker_cap, cwd=checkout)
         outcome = runner(command, checkout, timeout_s, env=env)
         if worker_cap is not None:
-            outcome.worker_cap = certify_worker_cap(injection, outcome)
+            outcome.worker_cap = worker_cap_receipt(injection, command, outcome)
     if not outcome.timed_out:
         os.makedirs(cache_dir, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
@@ -710,7 +720,7 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
             suite_env, injection = cap_xdist_workers(command, head_env, cap, cwd=checkout)
             _admit_full_suite(load_gate, record)
             head = runner(command, checkout, timeout_s, env=suite_env)
-            record["worker_cap"] = certify_worker_cap(injection, head)
+            record["worker_cap"] = worker_cap_receipt(injection, command, head)
             record["head"] = head.to_dict()
             record["counts"] = dict(head.counts)
             record["duration_s"] = head.duration_s
