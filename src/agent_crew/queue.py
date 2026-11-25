@@ -4686,6 +4686,11 @@ class TaskQueue:
             if ingress is not None:
                 validate_http_root_risk(context)
                 validate_local_inputs(context)
+                if task.task_type == "review":
+                    missing = [key for key in ("prev_task_id", "implementer_agent")
+                               if not isinstance(context.get(key), str) or not context[key].strip()]
+                    if missing:
+                        raise ValueError("review requires context keys: " + ", ".join(missing))
             if _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
                 if (ingress == "cascade.fix" and context.get("artifact_kind") != "rebase"
                         and (type(context.get("fix_round")) is not int
@@ -6933,6 +6938,34 @@ class TaskQueue:
                 (time.time(), parent_task_id))
             conn.commit()
             return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def defer_pr_cascade(self, task_id: str, *, stage: str, pr_number: int) -> None:
+        """Persist #250 deferral and its replay eligibility in one transaction."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT context FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                return
+            context = json.loads(row["context"] or "{}")
+            deferred = context.get("deferred_cascade") or {}
+            now = time.time()
+            attempts = int(deferred.get("attempts", 0)) + 1
+            context["deferred_cascade"] = {
+                "reason": "pr_state_unknown", "stage": stage, "pr_number": pr_number,
+                "first_deferred_at": deferred.get("first_deferred_at", now),
+                "attempts": attempts, "next_retry_at": now + min(60 * 2 ** min(attempts - 1, 5), 1800),
+            }
+            conn.execute("UPDATE tasks SET context=? WHERE task_id=?", (json.dumps(context), task_id))
+            conn.execute(
+                "UPDATE cascade_outbox SET state='pending', lease_owner=NULL, attempt_id=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE parent_task_id=? "
+                "AND state != 'replaying'", (now, task_id))
+            # A replay owns its lease until outbox_finish_claim; clearing it
+            # here would allow another sweep to enter the same cascade.
+            conn.commit()
         finally:
             conn.close()
 

@@ -49,7 +49,8 @@ def _dispatch(tmp_path, monkeypatch, port, *, agent, second, first=None,
 
         return Process()
 
-    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    # This test drives dispatch explicitly; a background dequeue would race it.
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     # (4) compares against claude's worktree scope: its #713 lineage reset is
     # a separate, pre-existing policy this change must not alter either way.
@@ -70,6 +71,8 @@ def _dispatch(tmp_path, monkeypatch, port, *, agent, second, first=None,
     with TestClient(app):
         queue = TaskQueue(db_path)
         for task, role in ([first] if first else []) + [second]:
+            if role == "reviewer":
+                task.context["implementer_agent"] = "claude" if agent == "codex" else "codex"
             queue.enqueue(task)
             if lineage_error and task is second[0]:
                 def _fail(*_a, **_kw):
