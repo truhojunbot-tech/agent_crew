@@ -50,10 +50,27 @@ ALLOWLIST = Counter({
     ("queue.py", "force_fail_pending"): 1,
 })
 
-_UPDATE_TASKS = re.compile(r"UPDATE\s+tasks\s+SET\b(?P<set>.*?)(?:\bWHERE\b|$)", re.I | re.S)
-_STATUS_ASSIGN = re.compile(r"(?<![\w.])status\s*=", re.I)
+# SQLite identifiers may be bare, "double-quoted", `backticked`, [bracketed]
+# or (legacy) 'single-quoted', and a table may be schema-qualified.
+_IDENT = r"""(?:"[^"]*"|`[^`]*`|\[[^\]]*\]|'[^']*'|[A-Za-z_]\w*)"""
+
+
+def _quoted(name: str) -> str:
+    return rf"""(?:"{name}"|`{name}`|\[{name}\]|'{name}'|(?<![\w"`\]']){name}(?![\w"`\[']))"""
+
+
+_TASKS = rf"(?:{_IDENT}\s*\.\s*)?{_quoted('tasks')}"
+_STATUS = _quoted("status")
+_UPDATE_TASKS = re.compile(
+    rf"\bUPDATE\s+(?:OR\s+\w+\s+)?{_TASKS}\s+(?:AS\s+{_IDENT}\s+)?"
+    rf"(?:INDEXED\s+BY\s+{_IDENT}\s+|NOT\s+INDEXED\s+)?"
+    r"SET\b(?P<set>.*?)(?:\bWHERE\b|$)", re.I | re.S)
+_STATUS_ASSIGN = re.compile(rf"(?<!\.){_STATUS}\s*=", re.I)
+# SET (a, status, b) = (...): a row-value assignment.
+_STATUS_ROW_ASSIGN = re.compile(rf"\([^()]*(?<!\.){_STATUS}[^()]*\)\s*=", re.I)
 _INSERT_TASKS_UPSERT = re.compile(
-    r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+tasks\b.*\bDO\s+UPDATE\s+SET\b(?P<set>.*)", re.I | re.S)
+    rf"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+{_TASKS}.*\bDO\s+UPDATE\s+SET\b(?P<set>.*)",
+    re.I | re.S)
 
 
 def _sql_pieces(node: ast.AST) -> str:
@@ -63,11 +80,52 @@ def _sql_pieces(node: ast.AST) -> str:
                     if isinstance(n, ast.Constant) and isinstance(n.value, str))
 
 
+def _sets_status(set_clause: str) -> bool:
+    return bool(_STATUS_ASSIGN.search(set_clause) or _STATUS_ROW_ASSIGN.search(set_clause))
+
+
 def _writes_status(sql: str) -> int:
-    hits = sum(1 for m in _UPDATE_TASKS.finditer(sql) if _STATUS_ASSIGN.search(m.group("set")))
-    hits += sum(1 for m in _INSERT_TASKS_UPSERT.finditer(sql)
-                if _STATUS_ASSIGN.search(m.group("set")))
+    hits = sum(1 for m in _UPDATE_TASKS.finditer(sql) if _sets_status(m.group("set")))
+    hits += sum(1 for m in _INSERT_TASKS_UPSERT.finditer(sql) if _sets_status(m.group("set")))
     return hits
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE tasks SET status = ? WHERE task_id = ?",
+    'UPDATE "tasks" SET "status" = ? WHERE task_id = ?',
+    "UPDATE `tasks` SET `status`=? WHERE task_id=?",
+    "UPDATE [tasks] SET [status]=? WHERE task_id=?",
+    "UPDATE 'tasks' SET 'status'=? WHERE task_id=?",
+    "UPDATE main.tasks SET status=? WHERE task_id=?",
+    'UPDATE "main"."tasks" SET "status"=? WHERE task_id=?',
+    "UPDATE main . [tasks] SET status=?",
+    "UPDATE OR IGNORE tasks SET status=? WHERE task_id=?",
+    "update Tasks set Status=? where task_id=?",
+    "UPDATE tasks AS t SET status=? WHERE t.task_id=?",
+    "UPDATE tasks NOT INDEXED SET status=?",
+    "UPDATE tasks SET summary=?, (status, verdict) = (?, ?) WHERE task_id=?",
+    "UPDATE tasks SET (summary, \"status\") = (?, ?)",
+    "INSERT INTO main.\"tasks\" (task_id) VALUES (?) "
+    "ON CONFLICT(task_id) DO UPDATE SET \"status\"=excluded.status",
+])
+def test_writes_status_sees_quoted_and_qualified_sql(sql):
+    assert _writes_status(sql) == 1, sql
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE tasks SET status_changed_at=? WHERE task_id=?",
+    'UPDATE "tasks" SET "status_changed_at"=? WHERE task_id=?',
+    "UPDATE tasks SET context=? WHERE task_id=? AND status=?",
+    'UPDATE "tasks" SET context=? WHERE "status"=?',
+    "UPDATE gates SET status=? WHERE id=?",
+    'UPDATE "task_attribution" SET "status"=? WHERE task_id=?',
+    "UPDATE main.tasks_archive SET status=?",
+    "UPDATE subtasks SET status=?",
+    "UPDATE tasks SET (summary, verdict) = (?, ?) WHERE status=?",
+    "INSERT INTO tasks (task_id, status) VALUES (?, ?)",
+])
+def test_writes_status_ignores_non_status_writes(sql):
+    assert _writes_status(sql) == 0, sql
 
 
 def _scan(root: Path = SRC) -> Counter:
@@ -123,9 +181,13 @@ def test_scanner_catches_a_new_writer(tmp_path):
         "def harmless(conn):\n"
         "    conn.execute('UPDATE tasks SET status_changed_at=? WHERE task_id=?')\n"
         "    conn.execute('UPDATE gates SET status=? WHERE id=?')\n"
-        "    conn.execute('UPDATE tasks SET context=? WHERE task_id=? AND status=?')\n")
+        "    conn.execute('UPDATE tasks SET context=? WHERE task_id=? AND status=?')\n"
+        "def quoted(conn):\n"
+        "    conn.execute('UPDATE \"tasks\" SET \"status\" = ? WHERE task_id = ?')\n"
+        "    conn.execute(f'UPDATE main.[tasks] SET [status] = {1} WHERE task_id = ?')\n")
     assert _scan(tmp_path) == Counter({("rogue.py", "sneak"): 1,
-                                       ("rogue.py", "<module>"): 1})
+                                       ("rogue.py", "<module>"): 1,
+                                       ("rogue.py", "quoted"): 2})
 
 
 def test_every_writer_is_a_table_row():
@@ -144,11 +206,50 @@ def test_terminal_set_matches_queue():
     assert ts.TERMINAL_STATUSES == queue_mod.TERMINAL_TASK_STATUSES
 
 
-def test_reopening_rows_are_explicit():
-    reopening = {t.event for t in ts.TABLE.values()
-                 if any(f in ts.TERMINAL_STATUSES for f in t.from_statuses)
-                 and any(s not in ts.TERMINAL_STATUSES for s in t.to_statuses)}
-    assert reopening == {t.event for t in ts.TABLE.values() if t.reopens_terminal}
+#: The exact terminal -> non-terminal moves today's writers make, written out
+#: here independently of the table. These are legacy exceptions kept so slice
+#: a changes no behaviour, not successor events: slice a does not establish
+#: "a terminal row moves on only through a successor". Growing this set needs
+#: a deliberate edit here and in the table.
+EXPECTED_LEGACY_REOPENS = frozenset(
+    {("premerge_gate_park", t, "needs_human")
+     for t in ("completed", "failed", "cancelled", "timed_out")}
+    | {("quarantine_legacy_row", t, "needs_human")
+       for t in ("completed", "failed", "cancelled", "timed_out")}
+    # submit_result: a worker-reported failure revised by a later result, and
+    # an implement timeout whose cancelled fallback was adopted.
+    | {("result", frm, to) for frm in ("failed", "timed_out")
+       for to in ("needs_human", "blocked")})
+
+
+def test_legacy_reopens_are_exactly_the_documented_exceptions():
+    table = {(t.event, frm, to) for t in ts.TABLE.values() for frm, to in t.legacy_reopens}
+    assert table == EXPECTED_LEGACY_REOPENS
+    for t in ts.TABLE.values():
+        assert all(ts.is_reopen(f, to) for f, to in t.legacy_reopens), t.event
+        # Every pair a row can express that would reopen and is not listed is refused.
+        for frm in t.from_statuses:
+            for to in t.to_statuses:
+                if ts.is_reopen(frm, to):
+                    assert t.allows(frm, to) == ((t.event, frm, to) in EXPECTED_LEGACY_REOPENS)
+
+
+@pytest.mark.parametrize("prior,to", [
+    ("cancelled", "needs_human"), ("cancelled", "blocked"),
+    ("completed", "needs_human"), ("completed", "blocked"),
+])
+def test_result_cannot_reopen_outside_the_legacy_exceptions(prior, to):
+    conn = _mem_db()
+    conn.execute("INSERT INTO tasks (task_id, status) VALUES ('t', ?)", (prior,))
+    out = ts.transition(conn, "t", "result", (prior,), to_status=to)
+    assert out.refusal == ts.ILLEGAL_TRANSITION and out.reason == "reopen_not_allowed"
+    assert conn.execute("SELECT status FROM tasks").fetchone()[0] == prior
+
+
+def test_result_legacy_exception_still_reopens_a_failed_row():
+    conn = _mem_db()
+    conn.execute("INSERT INTO tasks (task_id, status) VALUES ('t', 'failed')")
+    assert ts.transition(conn, "t", "result", ("failed",), to_status="needs_human").ok
 
 
 # ── transition() ─────────────────────────────────────────────────────────
@@ -260,6 +361,10 @@ STEPS = 25
 
 
 def test_random_event_walk_never_reopens_a_terminal_row_implicitly():
+    """Two separate checks. (1) transition() agrees with the table — that is
+    consistency, and by construction uses the table as its oracle. (2) The
+    invariant under test does *not* use the table: every successful
+    terminal -> non-terminal move must be one of EXPECTED_LEGACY_REOPENS."""
     rng = random.Random(1081)
     events = sorted(ts.TABLE)
     conn = _mem_db()
@@ -280,7 +385,7 @@ def test_random_event_walk_never_reopens_a_terminal_row_implicitly():
             if out.ok:
                 assert spec.allows(status, to) and expect == status
                 if status in ts.TERMINAL_STATUSES and to not in ts.TERMINAL_STATUSES:
-                    assert spec.reopens_terminal, (run, status, event, to)
+                    assert (event, status, to) in EXPECTED_LEGACY_REOPENS, (run, status, event, to)
                 status = to
             else:
                 refusals += 1

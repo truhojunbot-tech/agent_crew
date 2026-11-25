@@ -18,8 +18,13 @@ This module is the target shape:
 
 Slice a (this file's first version) changes no behaviour. Every row
 reproduces what its current writer does today, including the writers that
-move a terminal row back to a non-terminal status — those are flagged
-``reopens_terminal`` so they are explicit rather than accidental. Only the
+move a terminal row back to a non-terminal status. Those are *legacy
+exceptions*, not successor events: each row lists the exact ``(from, to)``
+pairs it may reopen in ``legacy_reopens`` and any other terminal ->
+non-terminal pair is refused. Slice a does **not** establish the invariant
+"a terminal row only moves on through a successor event" — there is no
+successor event yet; it only pins today's exceptions so they cannot grow
+silently. Only the
 cancel group is routed through :func:`transition` so far (``routed=True``);
 the other writers still issue their own SQL and are pinned by the allowlist in
 ``tests/unit/test_issue_1081_single_status_writer.py``. Later slices move them
@@ -74,21 +79,38 @@ class Transition:
     context_written: tuple = ()
     #: ``tasks.context`` keys this event removes.
     context_cleared: tuple = ()
-    #: True when this event may legitimately move a terminal row to a
-    #: non-terminal status. Anything else doing so is a bug.
-    reopens_terminal: bool = False
+    #: Legacy exceptions: the exact ``(terminal_from, non_terminal_to)``
+    #: pairs this event's current writer can produce. These are kept so slice
+    #: a changes no behaviour; they are not successor events. Any other
+    #: terminal -> non-terminal pair is refused even when both statuses are
+    #: in ``from_statuses`` / ``to_statuses``.
+    legacy_reopens: frozenset = frozenset()
     #: True once every writer of this event goes through :func:`transition`.
     routed: bool = False
     notes: str = ""
 
+    @property
+    def reopens_terminal(self) -> bool:
+        return bool(self.legacy_reopens)
+
     def allows(self, from_status: str, to_status: str) -> bool:
-        return from_status in self.from_statuses and to_status in self.to_statuses
+        if from_status not in self.from_statuses or to_status not in self.to_statuses:
+            return False
+        if is_reopen(from_status, to_status):
+            return (from_status, to_status) in self.legacy_reopens
+        return True
+
+
+def is_reopen(from_status: str, to_status: str) -> bool:
+    """A terminal row moved back to a non-terminal status."""
+    return from_status in TERMINAL_STATUSES and to_status not in TERMINAL_STATUSES
 
 
 def _row(event: str, frm: Iterable[str], to: Iterable[str], writers: Iterable[str],
-         **kw) -> Transition:
+         *, legacy_reopens: Iterable[tuple] = (), **kw) -> Transition:
     return Transition(event=event, from_statuses=frozenset(frm),
-                      to_statuses=frozenset(to), writers=tuple(writers), **kw)
+                      to_statuses=frozenset(to), writers=tuple(writers),
+                      legacy_reopens=frozenset(legacy_reopens), **kw)
 
 
 _ROWS = (
@@ -168,13 +190,14 @@ _ROWS = (
          preconditions=("row exists",),
          set_columns=("summary", "context"),
          context_written=("<caller extra keys>",),
-         reopens_terminal=True,
+         # mark_needs_human has no status guard: any terminal row is parked.
+         legacy_reopens={(t, "needs_human") for t in TERMINAL_STATUSES},
          notes="#588: parks an already-completed task after a PRE_MERGE BLOCK"),
     _row("quarantine_legacy_row", STATUSES, {"needs_human"},
          ["queue.py:_migrate_legacy_task_rows"],
          preconditions=("schema migration found an unparseable legacy field",),
          set_columns=("quarantine_field",),
-         reopens_terminal=True,
+         legacy_reopens={(t, "needs_human") for t in TERMINAL_STATUSES},
          notes="one-shot migration, not a lifecycle event"),
     # ── results / failures ─────────────────────────────────────────────
     _row("result", STATUSES, RESULT_STATUSES,
@@ -183,8 +206,14 @@ _ROWS = (
                         "completed review replay, late results, expected_status CAS)",),
          set_columns=("summary", "verdict", "findings", "pr_number", "error_info",
                       "status_changed_at"),
-         reopens_terminal=True,
-         notes="late results may land on cancelled/timed_out/failed rows"),
+         # submit_result turns a result for a cancelled/timed_out row, a
+         # system-failed row or a completed->non-completed revision into a
+         # late_result event without writing status. What still writes is a
+         # worker-reported ``failed`` revised by a later result, and an
+         # implement ``timed_out`` row whose cancelled fallback was adopted.
+         legacy_reopens={(frm, to) for frm in ("failed", "timed_out")
+                         for to in RESULT_STATUSES - TERMINAL_STATUSES},
+         notes="late results are recorded as late_result events, not status writes"),
     _row("force_fail", {"in_progress"}, {"failed"},
          ["queue.py:force_fail"],
          preconditions=("selected as in_progress under BEGIN IMMEDIATE",),
@@ -313,6 +342,8 @@ def transition(conn, task_id: str, event: str, expect_from: Iterable[str],
         return refuse(ILLEGAL_TRANSITION, "target_not_allowed", target=to_status)
     if not expect or not expect <= spec.from_statuses:
         return refuse(ILLEGAL_TRANSITION, "expect_from_not_allowed", target=to_status)
+    if any(not spec.allows(s, to_status) for s in expect):
+        return refuse(ILLEGAL_TRANSITION, "reopen_not_allowed", target=to_status)
     bad = [c for c in fields if c == "status" or not _COLUMN.match(c)
            or c not in spec.set_columns]
     if bad:
@@ -338,6 +369,6 @@ def transition(conn, task_id: str, event: str, expect_from: Iterable[str],
     if row is None:
         return refuse(STALE_TRANSITION, "task_missing", target=to_status)
     actual = row[0]
-    if actual in spec.from_statuses:
+    if spec.allows(actual, to_status):
         return refuse(STALE_TRANSITION, "status_moved", actual=actual, target=to_status)
     return refuse(ILLEGAL_TRANSITION, "from_not_allowed", actual=actual, target=to_status)
