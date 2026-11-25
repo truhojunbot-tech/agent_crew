@@ -7,9 +7,11 @@ writers (file + function, with a count, never line numbers). A new writer
 fails this test; a writer moved into :func:`task_state.transition` must be
 removed from the allowlist in the same PR. Later slices shrink it to empty.
 
-A write statement against ``tasks`` that is not fully literal (``+``,
-f-string, ``%``, ``.format``) is never certified by what a stand-in compiles
-to: it fails unless its (file, function) is in ``DYNAMIC_ALLOWLIST``.
+Non-literal SQL is checked where it runs: every ``.execute`` /
+``.executemany`` / ``.executescript`` call whose SQL argument is not a string
+literal (or a name assigned only from literals in its function or module)
+fails with file:line unless its (file, function) is in ``DYNAMIC_ALLOWLIST``,
+whatever that SQL might contain.
 """
 
 from __future__ import annotations
@@ -58,13 +60,41 @@ ALLOWLIST = Counter({
     ("queue.py", "force_fail_pending"): 1,
 })
 
-#: Write statements against ``tasks`` whose SQL is not fully literal (``+``,
-#: f-string, ``%``, ``.format``): (file, function) -> (sites, why). The guard
-#: does not try to prove what a non-literal fragment writes, so each one is
-#: listed here by hand; later migration slices route or remove them.
+#: SQL execution calls (.execute/.executemany/.executescript) whose SQL
+#: argument does not resolve statically to a literal: (file, function) ->
+#: (sites, why). The guard cannot see what such SQL writes, so each one is
+#: listed here by hand, whatever it contains; later slices route or remove them.
 DYNAMIC_ALLOWLIST = {
+    ("cea/store.py", "ensure_schema"): (
+        4, "receipt DDL: column list joined from _COLUMN_TYPES; loops over module DDL tuples"),
+    ("cea/store.py", "record_receipt"): (
+        1, "INSERT INTO authorization_receipts, columns from RECEIPT_COLUMNS"),
+    ("memory_hybrid.py", "_candidates"): (2, "SELECT on adr001_memory with _scope_sql clause"),
+    ("memory_hybrid.py", "_lazy_embed"): (1, "SELECT on adr001_memory with IN (?, ...) placeholders"),
+    ("memory_hybrid.py", "_rank_middle"): (2, "SELECTs on adr001_vec/adr001_fts with IN (?, ...)"),
+    ("memory_hybrid.py", "_retrieve_ranked_once"): (1, "SELECT on adr001_memory, IN (?, ...) + scope"),
+    ("memory_hybrid.py", "effective_rows"): (1, "SELECT on adr001_memory, IN (?, ...) + scope"),
+    ("memory_hybrid.py", "ensure_index_schema"): (
+        3, "adr001_fts rebuild and trigger DDL built with _body_sql"),
+    ("memory_hybrid.py", "render_head"): (2, "SELECTs on adr001_memory with scope prefix"),
+    ("memory_runtime.py", "has_active_task_decision"): (
+        1, "SELECT on adr001_memory, clauses by present columns"),
+    ("memory_runtime.py", "retrieve"): (1, "SELECT on adr001_memory, clauses by present columns"),
+    ("memory_runtime.py", "retrieve_shadow"): (1, "one SELECT of composed adr001_memory subqueries"),
+    ("queue.py", "execute"): (2, "timing Connection.execute wrapper: forwards its caller's SQL"),
+    ("queue.py", "_initialize_schema"): (7, "loops over module DDL/migration tuples and _DDL_INDEXES"),
     ("queue.py", "_record_end_on"): (
         1, "lease end: optional ', result_posted_at = ?' literal, no status column"),
+    ("queue.py", "_store_task_telemetry"): (1, "UPDATE task_attribution, SET list from telemetry"),
+    ("queue.py", "_terminalize_work_intent_on"): (1, "SELECT on tasks with IN (?, ...)"),
+    ("queue.py", "_test_selection_identities_on"): (1, "SELECT on task_attribution with IN (?, ...)"),
+    ("queue.py", "count_pool_grant_uses"): (1, "SELECT from class attribute _POOL_GRANT_USES_SQL"),
+    ("queue.py", "record_pool_grant_use"): (1, "SELECT from class attribute _POOL_GRANT_USES_SQL"),
+    ("queue.py", "dequeue"): (5, "SELECT * FROM tasks claim queries with f-string filters"),
+    ("queue.py", "get_exec_state"): (1, "SELECT on tasks, columns from EXEC_STATE_COLUMNS"),
+    ("queue.py", "reroute_stale_provider_bindings"): (1, "SELECT on tasks with held-type NOT IN"),
+    ("queue.py", "standing_request_changes_review"): (2, "SELECTs on tasks, ORDER BY _VERDICT_AT_SQL"),
+    ("watch.py", "_set"): (1, "UPDATE issue_claims, assignment from watch.py callers"),
 }
 
 # ── the guard: SQLite decides what a statement writes ───────────────────
@@ -217,45 +247,102 @@ def _status_writes(conn: sqlite3.Connection, stmt: str) -> tuple:
     raise Unpreparable(str(error))
 
 
-def _writes_tasks_dynamically(conn: sqlite3.Connection, stmt: str) -> bool:
-    """For a statement with a non-literal fragment: True unless *every*
-    filling that compiles writes only other tables. A hole's runtime content
-    is unknowable, so the guard does not try to prove what it writes; a
-    dynamic statement that may touch ``tasks`` at all — or that cannot be
-    compiled, so its target is unknown — needs an explicit allowlist entry."""
-    holes = stmt.count(_HOLE)
-    if holes > _MAX_HOLES:
-        return True
-    compiled = False
-    for fill in itertools.product(_FILLERS, repeat=holes):
-        sql = stmt
-        for f in fill:
-            sql = sql.replace(_HOLE, f, 1)
-        tables = set()
+# ── the call-site rule: SQL reaching sqlite must be literal ─────────────
+#
+# Classifying statements by their text missed SQL whose leading fragment is
+# itself non-literal (f"{verb} tasks SET ..."), and str.join is not folded at
+# all. So the dynamic rule is anchored where SQL runs: every
+# .execute/.executemany/.executescript call. Its SQL argument must resolve
+# statically to a literal, which the authorizer check above then compiles.
+# Anything else fails with file:line unless its (file, function) is in
+# DYNAMIC_ALLOWLIST, whatever that SQL might contain.
 
-        def auth(action, arg1, _arg2, _db, trigger):
-            if trigger is None and action in (sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_INSERT,
-                                              sqlite3.SQLITE_DELETE):
-                tables.add((arg1 or "").lower())
-            return sqlite3.SQLITE_OK
+_EXEC_METHODS = frozenset({"execute", "executemany", "executescript"})
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
-        conn.set_authorizer(auth)
-        try:
-            try:
-                conn.execute("EXPLAIN " + sql).fetchall()
-            except sqlite3.ProgrammingError as e:
-                m = _BINDINGS.search(str(e))
-                if not m:
-                    raise
-                conn.execute("EXPLAIN " + sql, (None,) * int(m.group(1))).fetchall()
-        except sqlite3.Error:
+
+def _literal(e) -> bool:
+    """A string expression with no non-literal part ('a' 'b', 'a' + 'b')."""
+    text = _fold(e)
+    return text is not None and _HOLE not in text
+
+
+def _bindings(scope: ast.AST, name: str) -> list:
+    """Every value ``scope`` binds to ``name`` itself (nested scopes excluded):
+    the assigned expression, or None for any binding that is not a plain
+    single-target assignment (parameter, loop, unpacking, +=, import...)."""
+    out = []
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        a = scope.args
+        params = a.posonlyargs + a.args + a.kwonlyargs + [v for v in (a.vararg, a.kwarg) if v]
+        if name in {x.arg for x in params}:
+            out.append(None)
+    body = scope.body if isinstance(scope.body, list) else [scope.body]
+    stack = list(body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, _SCOPES):
+            if getattr(n, "name", None) == name:
+                out.append(None)
+            stack.extend(n.decorator_list if not isinstance(n, ast.Lambda) else [])
             continue
-        finally:
-            conn.set_authorizer(_allow_all)
-        compiled = True
-        if "tasks" in tables:
-            return True
-    return not compiled
+        if isinstance(n, (ast.Assign, ast.AnnAssign)):
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                if isinstance(t, ast.Name):
+                    if t.id == name:
+                        out.append(n.value)
+                elif any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(t)):
+                    out.append(None)
+            if n.value is not None:
+                stack.append(n.value)
+            continue
+        if isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load):
+            out.append(None)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)) and any(
+                (al.asname or al.name.split(".")[0]) == name for al in n.names):
+            out.append(None)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
+            out.append(None)
+        elif isinstance(n, ast.ExceptHandler) and n.name == name:
+            out.append(None)
+        stack.extend(ast.iter_child_nodes(n))
+    return out
+
+
+def _sql_resolves(arg, chain: list) -> bool:
+    """Whether a call's SQL argument is a literal, or a Name that the nearest
+    scope binding it (innermost function outwards, then the module) assigns
+    only from literals."""
+    if _literal(arg):
+        return True
+    if not isinstance(arg, ast.Name):
+        return False
+    for scope in chain:
+        values = _bindings(scope, arg.id)
+        if values:
+            return all(v is not None and _literal(v) for v in values)
+    return False
+
+
+def _unresolved_exec_calls(tree: ast.Module, rel: str) -> dict:
+    """(file, function) -> ``file:line`` of each SQL execution call whose SQL
+    argument does not resolve to a literal."""
+    out: dict = {}
+
+    def visit(node, chain, fn_name):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                visit(child, [child] + chain, getattr(child, "name", fn_name))
+                continue
+            if (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+                    and child.func.attr in _EXEC_METHODS):
+                arg = child.args[0] if child.args else None
+                if arg is None or isinstance(arg, ast.Starred) or not _sql_resolves(arg, chain):
+                    out.setdefault((rel, fn_name), []).append(f"{rel}:{child.lineno}")
+            visit(child, chain, fn_name)
+
+    visit(tree, [tree], "<module>")
+    return out
 
 
 def _schema_db(tmp_dir: Path) -> sqlite3.Connection:
@@ -399,8 +486,8 @@ def test_unpreparable_write_is_a_guard_failure_not_a_pass(fixture_db):
 
 def _scan(conn: sqlite3.Connection, root: Path = SRC) -> tuple:
     """(writers, unpreparable, triggers, dynamic) for every .py under ``root``.
-    ``dynamic`` maps (file, function) to the ``file:line`` of each non-literal
-    write statement that may touch ``tasks``."""
+    ``dynamic`` maps (file, function) to the ``file:line`` of each SQL
+    execution call whose SQL argument is not statically literal."""
     found: Counter = Counter()
     unpreparable: list = []
     triggers: set = set()
@@ -415,17 +502,17 @@ def _scan(conn: sqlite3.Connection, root: Path = SRC) -> tuple:
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for n in ast.walk(fn):
                     owner[id(n)] = fn.name  # innermost wins: inner defs walk later
+        for where, locs in _unresolved_exec_calls(tree, rel).items():
+            dynamic.setdefault(where, []).extend(locs)
         for node, text in _string_exprs(tree):
             for st in _statements(text):
                 if not _WRITE_HEAD.match(_head(st)):
                     continue
                 where = (rel, owner.get(id(node), "<module>"))
-                if _HOLE in st and _writes_tasks_dynamically(conn, st):
-                    dynamic.setdefault(where, []).append(f"{rel}:{node.lineno}")
                 try:
                     own, fired = _status_writes(conn, st)
                 except Unpreparable as e:
-                    if _HOLE in st:  # already counted as dynamic: no proof needed
+                    if _HOLE in st:  # its call site answers to DYNAMIC_ALLOWLIST
                         continue
                     unpreparable.append(f"{rel}:{node.lineno}: {e}: {st.strip()[:120]!r}")
                     continue
@@ -436,7 +523,7 @@ def _scan(conn: sqlite3.Connection, root: Path = SRC) -> tuple:
 
 
 def _unallowed_dynamic(dynamic: dict, allowlist: dict = DYNAMIC_ALLOWLIST) -> list:
-    """``file:line`` of every dynamic tasks write not covered by ``allowlist``
+    """``file:line`` of every non-literal SQL call not covered by ``allowlist``
     (a function over its listed count reports all its sites)."""
     return sorted(loc for where, locs in dynamic.items()
                   if len(locs) > allowlist.get(where, (0, ""))[0] for loc in locs)
@@ -446,8 +533,8 @@ def test_no_status_writer_outside_the_allowlist(schema):
     found, unpreparable, triggers, dynamic = _scan(schema)
     bad = _unallowed_dynamic(dynamic)
     assert not bad, (
-        "non-literal SQL writing tasks — the guard cannot see what it writes, so "
-        f"it must be literal or listed in DYNAMIC_ALLOWLIST with a reason: {bad}")
+        "non-literal SQL at an execute call — the guard cannot see what it writes, "
+        f"so it must be literal or listed in DYNAMIC_ALLOWLIST with a reason: {bad}")
     stale = {w for w in DYNAMIC_ALLOWLIST if w not in dynamic}
     assert not stale, f"DYNAMIC_ALLOWLIST entries {sorted(stale)} no longer exist: remove them"
     assert not unpreparable, (
@@ -521,11 +608,15 @@ def test_scanner_catches_a_new_writer(schema, tmp_path):
                        ("rogue.py", "dyn_fstring"): ["rogue.py:28"],
                        ("rogue.py", "dyn_percent"): ["rogue.py:30"],
                        ("rogue.py", "dyn_format"): ["rogue.py:32"],
-                       ("rogue.py", "dyn_target"): ["rogue.py:34"]}, dynamic
+                       ("rogue.py", "dyn_target"): ["rogue.py:34"],
+                       # Round 5: the call-site rule does not look at what the
+                       # SQL writes, so a non-tasks dynamic write needs listing too.
+                       ("rogue.py", "dyn_other_table"): ["rogue.py:36"]}, dynamic
     assert _unallowed_dynamic(dynamic) == sorted(
         loc for locs in dynamic.values() for loc in locs)
     allow = {("rogue.py", f): (1, "test") for f in
-             ("quoted", "dynamic", "dyn_column", "dyn_fstring", "dyn_percent", "dyn_format")}
+             ("quoted", "dynamic", "dyn_column", "dyn_fstring", "dyn_percent", "dyn_format",
+              "dyn_other_table")}
     assert _unallowed_dynamic(dynamic, allow) == ["rogue.py:34"]
     allow[("rogue.py", "dyn_target")] = (1, "test")
     assert _unallowed_dynamic(dynamic, allow) == []
@@ -555,6 +646,83 @@ def test_dynamic_column_without_literal_status_is_not_certified(schema, tmp_path
 ])
 def test_fold_marks_every_non_literal_fragment(src, text):
     assert _fold(ast.parse(src, mode="eval").body) == text
+
+
+
+# Round 5: the dynamic rule lives at the execute call, not in the SQL's text.
+_CALLSITE_MODULE = (
+    "MOD_SQL = 'UPDATE tasks SET summary=? WHERE task_id=?'\n"
+    "def leading_hole(conn, verb, status, tid):\n"
+    "    conn.execute(f'{verb} tasks SET status=? WHERE task_id=?', (status, tid))\n"
+    "def joined(conn):\n"
+    "    conn.execute(' '.join(['UPDATE', 'tasks', 'SET status=?']), ('x',))\n"
+    "def passed_in(conn, sql):\n"
+    "    conn.execute(sql, ('x',))\n"
+    "def from_call(conn):\n"
+    "    conn.executemany(build_sql(), [])\n"
+    "def rebound(conn, cond):\n"
+    "    sql = 'UPDATE tasks SET summary=?'\n"
+    "    if cond:\n"
+    "        sql = sql + ', status=?'\n"
+    "    conn.execute(sql)\n"
+    "def looped(conn, stmts):\n"
+    "    for sql in stmts:\n"
+    "        conn.executescript(sql)\n"
+    "def no_args(conn):\n"
+    "    conn.execute(*args)\n"
+    "def literal_local(conn):\n"
+    "    sql = 'UPDATE tasks SET summary=? WHERE task_id=?'\n"
+    "    conn.execute(sql, ('x', 't'))\n"
+    "def literal_module(conn):\n"
+    "    conn.execute(MOD_SQL, ('x', 't'))\n"
+    "def literal_concat(conn):\n"
+    "    conn.execute('UPDATE tasks SET summary=? ' + 'WHERE task_id=?', ('x', 't'))\n"
+    "def shadowed(conn, MOD_SQL):\n"
+    "    conn.execute(MOD_SQL)\n")
+
+
+def _callsite_scan(schema, tmp_path):
+    pkg = tmp_path / "agent_crew"
+    pkg.mkdir()
+    (pkg / "c.py").write_text(_CALLSITE_MODULE)
+    return _scan(schema, tmp_path)
+
+
+def test_non_literal_sql_fails_at_its_execute_call(schema, tmp_path):
+    found, unpreparable, _, dynamic = _callsite_scan(schema, tmp_path)
+    assert dynamic == {("c.py", "leading_hole"): ["c.py:3"],  # the round-5 bypass
+                       ("c.py", "joined"): ["c.py:5"],
+                       ("c.py", "passed_in"): ["c.py:7"],
+                       ("c.py", "from_call"): ["c.py:9"],
+                       ("c.py", "rebound"): ["c.py:14"],
+                       ("c.py", "looped"): ["c.py:17"],
+                       ("c.py", "no_args"): ["c.py:19"],
+                       ("c.py", "shadowed"): ["c.py:28"]}, dynamic
+    # Literal SQL, directly or through a literal-only name, still goes through
+    # the authorizer and writes no status. The text scan cannot see `joined`
+    # (no fragment is a statement) or `rebound`'s ', status=?' (it follows a
+    # hole); only their call sites catch them.
+    assert found == Counter() and unpreparable == []
+    assert _unallowed_dynamic(dynamic) == sorted(l for ls in dynamic.values() for l in ls)
+
+
+def test_allowlisted_function_may_run_non_literal_sql(schema, tmp_path):
+    _, _, _, dynamic = _callsite_scan(schema, tmp_path)
+    allow = {w: (len(locs), "test") for w, locs in dynamic.items()}
+    assert _unallowed_dynamic(dynamic, allow) == []
+    del allow[("c.py", "leading_hole")]
+    assert _unallowed_dynamic(dynamic, allow) == ["c.py:3"]
+    # A listed count is a cap: a second site in the same function fails both.
+    assert _unallowed_dynamic({("c.py", "f"): ["c.py:1", "c.py:2"]},
+                              {("c.py", "f"): (1, "test")}) == ["c.py:1", "c.py:2"]
+
+
+def test_every_dynamic_allowlist_entry_has_a_reason_and_exact_count(schema):
+    _, _, _, dynamic = _scan(schema)
+    assert {w: len(locs) for w, locs in dynamic.items()} == {
+        w: n for w, (n, _) in DYNAMIC_ALLOWLIST.items()}
+    assert all(why.strip() for _, why in DYNAMIC_ALLOWLIST.values())
+    assert sum(n for n, _ in DYNAMIC_ALLOWLIST.values()) == 45
 
 
 
