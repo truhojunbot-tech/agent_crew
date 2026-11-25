@@ -7821,7 +7821,9 @@ class TaskQueue:
         try:
             rows = conn.execute(
                 "SELECT t.task_id, t.status, t.dispatched_at, t.dispatch_target, "
-                "e.at, e.fields FROM task_exec_events e "
+                "e.at, e.fields, EXISTS (SELECT 1 FROM task_exec_events parked "
+                "WHERE parked.task_id=e.task_id AND parked.event='codex_quota_parked' "
+                "AND parked.event_id>e.event_id) AS reparked FROM task_exec_events e "
                 "JOIN tasks t ON t.task_id=e.task_id "
                 "WHERE e.event='codex_quota_resumed' AND e.at>=? ORDER BY e.at DESC",
                 (since,)).fetchall()
@@ -7834,6 +7836,7 @@ class TaskQueue:
                     continue
                 probes.append({"task_id": row["task_id"], "status": row["status"],
                                "marker": {"probe": True, "resumed_at": row["at"]},
+                               "reparked": bool(row["reparked"]),
                                "dispatched_at": row["dispatched_at"],
                                "dispatch_target": row["dispatch_target"]})
             return probes
