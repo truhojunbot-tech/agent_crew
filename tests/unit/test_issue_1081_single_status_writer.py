@@ -6,6 +6,10 @@ ones write ``tasks.status``, and compares it with an explicit allowlist of today
 writers (file + function, with a count, never line numbers). A new writer
 fails this test; a writer moved into :func:`task_state.transition` must be
 removed from the allowlist in the same PR. Later slices shrink it to empty.
+
+A write statement against ``tasks`` that is not fully literal (``+``,
+f-string, ``%``, ``.format``) is never certified by what a stand-in compiles
+to: it fails unless its (file, function) is in ``DYNAMIC_ALLOWLIST``.
 """
 
 from __future__ import annotations
@@ -54,6 +58,15 @@ ALLOWLIST = Counter({
     ("queue.py", "force_fail_pending"): 1,
 })
 
+#: Write statements against ``tasks`` whose SQL is not fully literal (``+``,
+#: f-string, ``%``, ``.format``): (file, function) -> (sites, why). The guard
+#: does not try to prove what a non-literal fragment writes, so each one is
+#: listed here by hand; later migration slices route or remove them.
+DYNAMIC_ALLOWLIST = {
+    ("queue.py", "_record_end_on"): (
+        1, "lease end: optional ', result_posted_at = ?' literal, no status column"),
+}
+
 # ── the guard: SQLite decides what a statement writes ───────────────────
 #
 # Three rounds of regex were bypassed by ordinary SQL (comments, a quoted
@@ -84,11 +97,28 @@ class Unpreparable(Exception):
     pass
 
 
+#: printf-style and str.format fields: what ``%`` / ``.format`` fill in.
+_PRINTF_FIELD = re.compile(r"%(?:\([^)]*\))?[#0 +-]*(?:\*|\d+)?(?:\.(?:\*|\d+))?[hlL]?[diouxXeEfFgGcrsa]")
+_FORMAT_FIELD = re.compile(r"\{[^{}]*\}")
+
+
 def _fold(e: ast.AST):
     """The string an expression builds, with a hole per non-literal part, or
     None if it is not a string expression at all."""
     if isinstance(e, ast.Constant) and isinstance(e.value, str):
         return e.value
+    if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Mod):
+        left = _fold(e.left)
+        if left is None:
+            return None
+        return "%".join(_PRINTF_FIELD.sub(_HOLE, part) for part in left.split("%%"))
+    if (isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute)
+            and e.func.attr == "format"):
+        base = _fold(e.func.value)
+        if base is None:
+            return None
+        return "\x02".join(_FORMAT_FIELD.sub(_HOLE, part).replace("}}", "}")
+                            for part in base.split("{{")).replace("\x02", "{")
     if isinstance(e, ast.JoinedStr):
         return "".join(v.value if isinstance(v, ast.Constant) else _HOLE for v in e.values)
     if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Add):
@@ -185,6 +215,47 @@ def _status_writes(conn: sqlite3.Connection, stmt: str) -> tuple:
         replaces = bool(inserts) and any(op[1] == "Delete" for op in program)
         return (None in writes or replaces), {t for t in writes if t is not None}
     raise Unpreparable(str(error))
+
+
+def _writes_tasks_dynamically(conn: sqlite3.Connection, stmt: str) -> bool:
+    """For a statement with a non-literal fragment: True unless *every*
+    filling that compiles writes only other tables. A hole's runtime content
+    is unknowable, so the guard does not try to prove what it writes; a
+    dynamic statement that may touch ``tasks`` at all — or that cannot be
+    compiled, so its target is unknown — needs an explicit allowlist entry."""
+    holes = stmt.count(_HOLE)
+    if holes > _MAX_HOLES:
+        return True
+    compiled = False
+    for fill in itertools.product(_FILLERS, repeat=holes):
+        sql = stmt
+        for f in fill:
+            sql = sql.replace(_HOLE, f, 1)
+        tables = set()
+
+        def auth(action, arg1, _arg2, _db, trigger):
+            if trigger is None and action in (sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_INSERT,
+                                              sqlite3.SQLITE_DELETE):
+                tables.add((arg1 or "").lower())
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(auth)
+        try:
+            try:
+                conn.execute("EXPLAIN " + sql).fetchall()
+            except sqlite3.ProgrammingError as e:
+                m = _BINDINGS.search(str(e))
+                if not m:
+                    raise
+                conn.execute("EXPLAIN " + sql, (None,) * int(m.group(1))).fetchall()
+        except sqlite3.Error:
+            continue
+        finally:
+            conn.set_authorizer(_allow_all)
+        compiled = True
+        if "tasks" in tables:
+            return True
+    return not compiled
 
 
 def _schema_db(tmp_dir: Path) -> sqlite3.Connection:
@@ -327,10 +398,13 @@ def test_unpreparable_write_is_a_guard_failure_not_a_pass(fixture_db):
 
 
 def _scan(conn: sqlite3.Connection, root: Path = SRC) -> tuple:
-    """(writers, unpreparable, triggers) for every .py under ``root``."""
+    """(writers, unpreparable, triggers, dynamic) for every .py under ``root``.
+    ``dynamic`` maps (file, function) to the ``file:line`` of each non-literal
+    write statement that may touch ``tasks``."""
     found: Counter = Counter()
     unpreparable: list = []
     triggers: set = set()
+    dynamic: dict = {}
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root / "agent_crew").as_posix() if (root / "agent_crew") in path.parents else path.as_posix()
         if rel == "task_state.py":
@@ -345,19 +419,37 @@ def _scan(conn: sqlite3.Connection, root: Path = SRC) -> tuple:
             for st in _statements(text):
                 if not _WRITE_HEAD.match(_head(st)):
                     continue
+                where = (rel, owner.get(id(node), "<module>"))
+                if _HOLE in st and _writes_tasks_dynamically(conn, st):
+                    dynamic.setdefault(where, []).append(f"{rel}:{node.lineno}")
                 try:
                     own, fired = _status_writes(conn, st)
                 except Unpreparable as e:
+                    if _HOLE in st:  # already counted as dynamic: no proof needed
+                        continue
                     unpreparable.append(f"{rel}:{node.lineno}: {e}: {st.strip()[:120]!r}")
                     continue
                 if own:
-                    found[(rel, owner.get(id(node), "<module>"))] += 1
+                    found[where] += 1
                 triggers |= fired
-    return found, unpreparable, triggers
+    return found, unpreparable, triggers, dynamic
+
+
+def _unallowed_dynamic(dynamic: dict, allowlist: dict = DYNAMIC_ALLOWLIST) -> list:
+    """``file:line`` of every dynamic tasks write not covered by ``allowlist``
+    (a function over its listed count reports all its sites)."""
+    return sorted(loc for where, locs in dynamic.items()
+                  if len(locs) > allowlist.get(where, (0, ""))[0] for loc in locs)
 
 
 def test_no_status_writer_outside_the_allowlist(schema):
-    found, unpreparable, triggers = _scan(schema)
+    found, unpreparable, triggers, dynamic = _scan(schema)
+    bad = _unallowed_dynamic(dynamic)
+    assert not bad, (
+        "non-literal SQL writing tasks — the guard cannot see what it writes, so "
+        f"it must be literal or listed in DYNAMIC_ALLOWLIST with a reason: {bad}")
+    stale = {w for w in DYNAMIC_ALLOWLIST if w not in dynamic}
+    assert not stale, f"DYNAMIC_ALLOWLIST entries {sorted(stale)} no longer exist: remove them"
     assert not unpreparable, (
         "SQL the guard cannot compile against the repo schema, so cannot vouch "
         f"for: {unpreparable}")
@@ -399,8 +491,20 @@ def test_scanner_catches_a_new_writer(schema, tmp_path):
         "def dynamic(conn, cols):\n"
         "    conn.execute('UPDATE tasks SET ' + cols + ', status=? WHERE task_id=?')\n"
         "def broken(conn):\n"
-        "    conn.execute('UPDATE tasks SET no_such_column=? WHERE task_id=?')\n")
-    found, unpreparable, triggers = _scan(schema, tmp_path)
+        "    conn.execute('UPDATE tasks SET no_such_column=? WHERE task_id=?')\n"
+        "def dyn_column(conn, column, value, tid):\n"
+        "    conn.execute('UPDATE tasks SET ' + column + '=? WHERE task_id=?', (value, tid))\n"
+        "def dyn_fstring(conn, column):\n"
+        "    conn.execute(f'UPDATE tasks SET {column}=? WHERE task_id=?')\n"
+        "def dyn_percent(conn, column):\n"
+        "    conn.execute('UPDATE tasks SET %s=? WHERE task_id=?' % column)\n"
+        "def dyn_format(conn, column):\n"
+        "    conn.execute('UPDATE tasks SET {}=? WHERE task_id=?'.format(column))\n"
+        "def dyn_target(conn, table):\n"
+        "    conn.execute('UPDATE ' + table + ' SET summary=?')\n"
+        "def dyn_other_table(conn, column):\n"
+        "    conn.execute(f'UPDATE gates SET {column}=? WHERE rowid=?')\n")
+    found, unpreparable, triggers, dynamic = _scan(schema, tmp_path)
     assert found == Counter({("rogue.py", "sneak"): 1,
                              ("rogue.py", "<module>"): 1,
                              ("rogue.py", "quoted"): 2,
@@ -409,6 +513,48 @@ def test_scanner_catches_a_new_writer(schema, tmp_path):
                              ("rogue.py", "dynamic"): 1})
     assert len(unpreparable) == 1 and unpreparable[0].startswith("rogue.py:24:"), unpreparable
     assert triggers == set()
+    # Round 4: a non-literal tasks write is never certified by a filler that
+    # happens to compile; it needs its (file, function) allowlisted.
+    assert dynamic == {("rogue.py", "quoted"): ["rogue.py:13"],  # f-string, even a constant field
+                       ("rogue.py", "dynamic"): ["rogue.py:22"],
+                       ("rogue.py", "dyn_column"): ["rogue.py:26"],
+                       ("rogue.py", "dyn_fstring"): ["rogue.py:28"],
+                       ("rogue.py", "dyn_percent"): ["rogue.py:30"],
+                       ("rogue.py", "dyn_format"): ["rogue.py:32"],
+                       ("rogue.py", "dyn_target"): ["rogue.py:34"]}, dynamic
+    assert _unallowed_dynamic(dynamic) == sorted(
+        loc for locs in dynamic.values() for loc in locs)
+    allow = {("rogue.py", f): (1, "test") for f in
+             ("quoted", "dynamic", "dyn_column", "dyn_fstring", "dyn_percent", "dyn_format")}
+    assert _unallowed_dynamic(dynamic, allow) == ["rogue.py:34"]
+    allow[("rogue.py", "dyn_target")] = (1, "test")
+    assert _unallowed_dynamic(dynamic, allow) == []
+
+
+def test_dynamic_column_without_literal_status_is_not_certified(schema, tmp_path):
+    """The round-4 bypass: the first filler (rowid) compiles and writes no
+    status, but ``column='status'`` does at runtime."""
+    pkg = tmp_path / "agent_crew"
+    pkg.mkdir()
+    (pkg / "m.py").write_text(
+        "def set_col(conn, column, value, tid):\n"
+        "    conn.execute('UPDATE tasks SET ' + column + '=? WHERE task_id=?', (value, tid))\n")
+    found, unpreparable, _, dynamic = _scan(schema, tmp_path)
+    assert found == Counter() and unpreparable == []  # what the old guard concluded
+    assert _unallowed_dynamic(dynamic) == ["m.py:2"]
+    assert _unallowed_dynamic(dynamic, {("m.py", "set_col"): (1, "test")}) == []
+    assert _unallowed_dynamic(dynamic, {("m.py", "other"): (1, "test")}) == ["m.py:2"]
+
+
+@pytest.mark.parametrize("src,text", [
+    ("'SET %s=? WHERE x=%(k)s' % a", "SET \x01=? WHERE x=\x01"),
+    ("'100%% %d' % n", "100% \x01"),
+    ("'SET {}=? {name}'.format(a, name=b)", "SET \x01=? \x01"),
+    ("'{{lit}} {0}'.format(a)", "{lit} \x01"),
+    ("f'a{b}c' + d", "a\x01c\x01"),
+])
+def test_fold_marks_every_non_literal_fragment(src, text):
+    assert _fold(ast.parse(src, mode="eval").body) == text
 
 
 
