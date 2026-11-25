@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.failure_kind import provider_failure_from_log
-from agent_crew.server import create_app
+from agent_crew.server import create_app, _codex_quota_ready
 
 
 def _queued(tmp_path, task_id):
@@ -100,6 +100,7 @@ def test_fresher_cache_releases_one_probe_then_rest_without_duplicates(tmp_path,
         queue.record_dispatch("quota-a", channel="codex_exec", agent="codex")
         assert app.state.resume_codex_quota_holds() == []
         queue.bind_dispatch_target("quota-a", target="pid:1234")
+        assert app.state.resume_codex_quota_holds() == []
         queue.submit_result("quota-a", TaskResult(task_id="quota-a", status="completed",
                                                   summary="probe finished"))
         assert queue.get_task("quota-a").error_info is None
@@ -138,13 +139,13 @@ def test_stop_keeps_ready_quota_hold_blocked(tmp_path, monkeypatch):
     assert queue.get_task_status("quota-stopped") == "blocked"
 
 
-def test_dispatcher_tick_sees_fresh_cache_before_reset(tmp_path, monkeypatch):
+def test_dispatcher_tick_sees_changed_account_before_reset(tmp_path, monkeypatch):
     queue = _queued(tmp_path, "quota-tick")
     failed_at = time.time() - 10
     reset_at = time.time() + 3600
     queue.park_codex_quota("quota-tick", failed_at=failed_at,
                            reset_at=reset_at, account_fingerprint="old")
-    _cache(tmp_path, monkeypatch, fetched_at=time.time(), fingerprint="old", remaining=78)
+    _cache(tmp_path, monkeypatch, fetched_at=time.time(), fingerprint="new", remaining=78)
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", "0.02")
     app = create_app(queue.db_path, pane_map={}, worktree_map={},
@@ -195,3 +196,67 @@ def test_dispatcher_parks_real_quota_failure_without_fallback(tmp_path, monkeypa
     assert queue.get_task_status("quota-dispatch") == "blocked"
     assert isinstance(_marker(queue, "quota-dispatch")["reset_at"], float)
     assert [t.task_id for t in queue.list_tasks() if t.task_id.startswith("fallback-")] == []
+
+
+@pytest.mark.parametrize("fingerprint,now,expected", [
+    ("old", 200, False), ("new", 200, True),
+    ("old", 500, True),
+])
+def test_cli_reset_controls_readiness(fingerprint, now, expected):
+    marker = {"failed_at": 100, "reset_at": 500, "account_fingerprint": "old"}
+    cache = {"fetched_at": 150, "account_fingerprint": fingerprint,
+             "base_remaining_pct": 78}
+    assert _codex_quota_ready(marker, cache, now) is expected
+
+
+@pytest.mark.parametrize("fetched_at,remaining,expected", [
+    pytest.param(150, 78, True, id="fresh-cache-with-headroom"),
+    pytest.param(150, 0, False, id="fresh-cache-without-headroom"),
+    pytest.param(99, 78, False, id="stale-cache-with-headroom"),
+])
+def test_no_cli_reset_uses_fresh_pooled_headroom(fetched_at, remaining, expected):
+    marker = {"failed_at": 100, "reset_at": None, "account_fingerprint": "old"}
+    cache = {"fetched_at": fetched_at, "account_fingerprint": "old",
+             "base_remaining_pct": remaining}
+    assert _codex_quota_ready(marker, cache, now=200) is expected
+
+
+def test_reparking_probe_replay_keeps_five_row_cohort_parked(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    clock = [time.time()]
+    monkeypatch.setattr("agent_crew.server.time.time", lambda: clock[0])
+    for i in range(5):
+        task_id = f"quota-{i}"
+        queue.enqueue(TaskRequest(task_id, "implement", "work", context={"risk_tier": 1}))
+        assert queue.dequeue(role="implementer", agent="codex").task_id == task_id
+        assert queue.park_codex_quota(task_id, failed_at=clock[0] - 10,
+                                     reset_at=clock[0], account_fingerprint="old")
+    app = create_app(queue.db_path, pane_map={}, watchdog_disabled=True,
+                     anomaly_disabled=True)
+    with TestClient(app):
+        # Replay 07:05–08:30 at five-minute resets, with every probe failing.
+        for cycle in range(18):
+            resumed = app.state.resume_codex_quota_holds()
+            assert len(resumed) == 1
+            probe = resumed[0]
+            assert queue.dequeue(role="implementer", agent="codex").task_id == probe
+            queue.record_dispatch(probe, channel="codex_exec", agent="codex")
+            queue.bind_dispatch_target(probe, target="pid:1234")
+            assert app.state.resume_codex_quota_holds() == []
+            reset_at = clock[0] + 300
+            clock[0] += 1
+            assert queue.park_codex_quota(probe, failed_at=clock[0],
+                                         reset_at=reset_at, account_fingerprint="old")
+            for offset in (1, 150, 298):
+                clock[0] = reset_at - 300 + offset
+                _cache(tmp_path, monkeypatch, fetched_at=clock[0] + .5,
+                       fingerprint="old", remaining=78)
+                assert app.state.resume_codex_quota_holds() == []
+                assert all(queue.get_task_status(f"quota-{i}") == "blocked" for i in range(5))
+            clock[0] = reset_at
+        events = [e for i in range(5)
+                  for e in queue.get_exec_state(f"quota-{i}")["events"]
+                  if e["event"] == "codex_quota_resumed"]
+        assert len(events) == 18
+        assert all(e["probe"] is True for e in events)

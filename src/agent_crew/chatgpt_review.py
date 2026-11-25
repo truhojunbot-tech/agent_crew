@@ -18,6 +18,18 @@ thread. The lifecycle is the ``claude_cloud`` reviewer's (#712), not a new one:
 The reply is accepted only on its header and VERDICT line (#936: a verdict read
 from prose broke merges). Every ambiguity ends ``needs_human``; silence ends
 ``timed_out``. Nothing here ever turns into an approve by default.
+
+#1036: a reply may carry the task id of a TERMINAL sibling review (same
+lineage, same PR, same full sha) because ChatGPT answered the thread it already
+knew, not the re-review's request. Such a reply, posted after that sibling's
+``result_posted_at`` AND after the lineage's standing verdict (the newest
+``result_posted_at`` among those siblings that carry a verdict), inside this
+task's deadline and not already consumed by any task in the lineage, is adopted
+as this task's verdict and logged as a ``sibling_reply_adopted`` exec event. So
+is a ``[CHATGPT][DUPLICATE_REQUEST_DISPOSITION]`` addressed to this task whose
+``DUPLICATE_OF task=<sibling>`` points at such a reply. Nothing else is: a
+different sha, an older reply, a reply superseded by a later terminal review,
+a reply some sibling already took, or a sibling on another PR stays ignored.
 """
 from __future__ import annotations
 
@@ -28,13 +40,13 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable, List, Optional
 
 from agent_crew import github as _github
 from agent_crew.protocol import TaskRequest, TaskResult
-from agent_crew.queue import AdmissionRefused, TaskQueue
+from agent_crew.queue import TERMINAL_TASK_STATUSES, AdmissionRefused, TaskQueue
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +75,13 @@ _VERDICT_RE = re.compile(r"VERDICT: (approve|request_changes)")
 #: A line is a verdict line only when the word is followed by a colon, so prose
 #: such as "Verdict covers this exact SHA" is review text, not a 2nd verdict (#1016).
 _VERDICT_LINE_RE = re.compile(r"(?i)^\s*verdict\s*:")
+#: #1036: ChatGPT answers a request it judges a same-sha duplicate with this
+#: header instead of a verdict, naming the sibling task it already answered.
+DISPOSITION_PREFIX = "[CHATGPT][DUPLICATE_REQUEST_DISPOSITION]"
+_DISPOSITION_HEADER_RE = re.compile(
+    r"\[CHATGPT\]\[DUPLICATE_REQUEST_DISPOSITION\] task=(\S+) sha=(\S+)")
+_DUPLICATE_OF_RE = re.compile(r"DUPLICATE_OF task=([A-Za-z0-9][A-Za-z0-9_.:/-]*)")
+SIBLING_ADOPTED_EVENT = "sibling_reply_adopted"
 
 
 def _positive_env(name: str, default: float) -> float:
@@ -548,26 +567,29 @@ def reconcile_chatgpt_review(
             if parsed.kind == "rejected":
                 return _end(queue, task, "needs_human", "chatgpt_review_reply_rejected",
                             f"{parsed.reason} ({link})")
-            result = review_result(parsed, task_id=task.task_id, sha=sha, pr_number=pr_number)
             if parsed.verdict == "request_changes" and len(parsed.text) < 10:
                 return _end(queue, task, "needs_human", "chatgpt_review_reply_rejected",
                             f"request_changes without findings ({link})")
-            if submit_review_result_fn is None:
-                hold = "result handler unavailable"
-                break
-            try:
-                acknowledgement = submit_review_result_fn(task.task_id, result)
-            except Exception as exc:
-                logger.exception("chatgpt_review: result handler failed for %s", task.task_id)
-                return _end(queue, task, "needs_human", "chatgpt_review_handler_failed",
-                            f"result handler raised {type(exc).__name__} ({link})")
-            if isinstance(acknowledgement, dict) and acknowledgement.get("held"):
-                hold = f"result held: {acknowledgement['held']}"
-                break
-            queue.patch_context(task.task_id, {
-                "chatgpt_reply_comment_id": row["id"], "chatgpt_reply_url": row.get("html_url") or "",
-                "chatgpt_review_verdict": result.verdict, "chatgpt_ended_at": now})
-            return ChatGPTOutcome(task.task_id, "review_completed", result.verdict or "")
+            outcome, hold = _complete_with_reply(
+                queue, task, row, parsed, sha=sha, pr_number=pr_number,
+                submit_review_result_fn=submit_review_result_fn, now=now)
+            if outcome is not None:
+                return outcome
+            break
+        if not hold:
+            # #1036: nothing names this task. A reply may name a terminal
+            # sibling instead (ChatGPT answered the thread it already knew);
+            # the carrier used to ignore it and let this row time out while
+            # the verdict sat on the thread. Older than the sibling's own
+            # result, another sha or another PR is still not this verdict.
+            adopted = _adoptable_sibling_reply(queue, task, comments, request_id=request_id,
+                                               pr_number=pr_number, sha=sha, deadline=deadline)
+            if adopted is not None:
+                outcome, hold = _complete_with_reply(
+                    queue, task, adopted.row, adopted.parsed, sha=sha, pr_number=pr_number,
+                    submit_review_result_fn=submit_review_result_fn, now=now, adopted=adopted)
+                if outcome is not None:
+                    return outcome
     if (not timed_out and comments is not None and not hold
             and now - requested_at >= repost_seconds()
             and "chatgpt_reposted_at" not in context):
@@ -577,6 +599,181 @@ def reconcile_chatgpt_review(
                     f"no accepted reply within {int(timeout_seconds())}s"
                     + (f" ({hold})" if hold else ""))
     return ChatGPTOutcome(task.task_id, "still_waiting", hold)
+
+
+def _complete_with_reply(
+    queue: TaskQueue, task: TaskRequest, row: dict, parsed: ReplyParse, *, sha: str,
+    pr_number: int, submit_review_result_fn, now: float,
+    adopted: Optional["SiblingReply"] = None,
+) -> tuple[Optional[ChatGPTOutcome], str]:
+    """Submit an accepted reply as this task's review result.
+
+    ``(outcome, "")`` when the row ended -- ``review_completed``, or
+    ``needs_human`` when the handler raised; ``(None, hold)`` when the result
+    could not be submitted yet and the row keeps waiting."""
+    link = row.get("html_url") or f"comment {row['id']}"
+    result = review_result(parsed, task_id=task.task_id, sha=sha, pr_number=pr_number)
+    if submit_review_result_fn is None:
+        return None, "result handler unavailable"
+    try:
+        acknowledgement = submit_review_result_fn(task.task_id, result)
+    except Exception as exc:
+        logger.exception("chatgpt_review: result handler failed for %s", task.task_id)
+        return _end(queue, task, "needs_human", "chatgpt_review_handler_failed",
+                    f"result handler raised {type(exc).__name__} ({link})"), ""
+    if isinstance(acknowledgement, dict) and acknowledgement.get("held"):
+        return None, f"result held: {acknowledgement['held']}"
+    patch = {"chatgpt_reply_comment_id": row["id"], "chatgpt_reply_url": row.get("html_url") or "",
+             "chatgpt_review_verdict": result.verdict, "chatgpt_ended_at": now}
+    if adopted is not None:
+        provenance = {"comment_id": row["id"], "comment_url": row.get("html_url") or "",
+                      "sibling_task_id": adopted.sibling_task_id,
+                      "sibling_result_posted_at": adopted.sibling_result_posted_at,
+                      "reply_created_at": _created_epoch(row), "verdict": result.verdict,
+                      "via": adopted.via, "disposition_comment_id": adopted.disposition_comment_id}
+        patch["chatgpt_sibling_reply_adopted"] = provenance
+        # After the submit: the event must never claim an adoption that was held.
+        queue.record_exec_event(task.task_id, SIBLING_ADOPTED_EVENT, at=now, **provenance)
+        logger.info("chatgpt_review: %s adopted %s reply %s from sibling %s via %s",
+                    task.task_id, result.verdict, link, adopted.sibling_task_id, adopted.via)
+    queue.patch_context(task.task_id, patch)
+    return ChatGPTOutcome(task.task_id, "review_completed", result.verdict or ""), ""
+
+
+@dataclass(frozen=True)
+class SiblingReply:
+    """A reply tagged with a terminal sibling's task id that answers this task (#1036)."""
+    row: dict
+    parsed: ReplyParse
+    sibling_task_id: str
+    sibling_result_posted_at: float
+    #: "sibling_reply" (the reply itself) | "duplicate_of_disposition" (pointed at)
+    via: str
+    disposition_comment_id: Optional[int] = None
+
+
+def _lineage_root(queue: TaskQueue, task: TaskRequest) -> str:
+    context = task.context if isinstance(task.context, dict) else {}
+    root = context.get("lineage_root_task_id")
+    if isinstance(root, str) and root:
+        return root
+    current, seen = task, {task.task_id}
+    while True:  # same walk as _acceptance_text; contexts are operator-writable JSON
+        current_context = current.context if isinstance(current.context, dict) else {}
+        prev = current_context.get("prev_task_id")
+        if not isinstance(prev, str) or not prev or prev in seen:
+            return current.task_id
+        parent = queue.get_task(prev)
+        if parent is None:
+            return current.task_id
+        seen.add(prev)
+        current = parent
+
+
+@dataclass(frozen=True)
+class LineageReviews:
+    """What this task's lineage already settled, for :func:`_adoptable_sibling_reply`."""
+    #: ``{task_id: result_posted_at}`` of the ended review rows pinned to the
+    #: same PR and full sha. A row without a posted result (ended by a
+    #: dispatcher force-fail) has no standing verdict and is skipped.
+    siblings: dict[str, float]
+    #: ``result_posted_at`` of the standing review: the newest among the
+    #: siblings above that carry a verdict. ``None`` when none does.
+    standing_at: Optional[float]
+    #: comment ids any task in the lineage already took as its reply
+    #: (``chatgpt_reply_comment_id``), direct or adopted; never twice.
+    consumed: frozenset[int]
+
+
+def _lineage_reviews(queue: TaskQueue, task: TaskRequest, pr_number: int,
+                     sha: str) -> LineageReviews:
+    siblings: dict[str, float] = {}
+    standing_at: Optional[float] = None
+    consumed: set[int] = set()
+    for sibling in queue.list_tasks_for_lineage(_lineage_root(queue, task)):
+        if sibling.task_id == task.task_id:
+            continue
+        sibling_context = sibling.context if isinstance(sibling.context, dict) else {}
+        taken = sibling_context.get("chatgpt_reply_comment_id")
+        if isinstance(taken, int) and not isinstance(taken, bool):
+            consumed.add(taken)
+        if (sibling.task_type != "review" or sibling.status not in TERMINAL_TASK_STATUSES
+                or _pinned(sibling) != (pr_number, sha)):
+            continue
+        state = queue.get_exec_state(sibling.task_id) or {}
+        posted = state.get("result_posted_at")
+        if not isinstance(posted, (int, float)) or isinstance(posted, bool):
+            continue
+        siblings[sibling.task_id] = float(posted)
+        if sibling.verdict and (standing_at is None or float(posted) > standing_at):
+            standing_at = float(posted)
+    return LineageReviews(siblings, standing_at, frozenset(consumed))
+
+
+def _first_line(row: dict) -> str:
+    lines = str(row.get("body") or "").strip().splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def _adoptable_sibling_reply(
+    queue: TaskQueue, task: TaskRequest, comments: list, *, request_id: int, pr_number: int,
+    sha: str, deadline: float,
+) -> Optional[SiblingReply]:
+    """The sibling reply this task may take as its own verdict, or ``None``.
+
+    Eligible: a strict ``[CHATGPT][CREW-REVIEW]`` reply whose header names a
+    terminal sibling (see :func:`_lineage_reviews`) and this task's exact sha,
+    posted after that sibling's ``result_posted_at`` (the reply that ended the
+    sibling is already consumed) and after the lineage's standing verdict --
+    a reply older than a later terminal review is superseded by it and must
+    not replace its findings (review of PR #1069) -- no later than this task's
+    deadline, and not already taken by any task in the lineage, so one comment
+    ends at most one row even when clocks disagree. The reply may predate this
+    task's request: that is the #1036 case. A ``DUPLICATE_OF task=<sibling>``
+    disposition addressed to this task picks which eligible reply answers it;
+    without one, the newest eligible reply does. Anything garbled, older,
+    superseded, consumed, on another sha or another PR is ignored.
+    """
+    lineage = _lineage_reviews(queue, task, pr_number, sha)
+    siblings = lineage.siblings
+    if not siblings:
+        return None
+    rows: list[tuple[dict, float]] = []
+    for row in comments:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), int):
+            continue
+        created = _created_epoch(row)
+        if created is not None and created <= deadline:
+            rows.append((row, created))
+    rows.sort(key=lambda item: item[0]["id"])
+    replies: dict[str, SiblingReply] = {}  # sibling -> its newest eligible reply
+    for row, created in rows:
+        header = _HEADER_RE.fullmatch(_first_line(row))
+        if header is None or header.group(1) not in siblings or header.group(2) != sha:
+            continue
+        sibling = header.group(1)
+        if created <= max(siblings[sibling], lineage.standing_at or 0.0):
+            continue  # not newer than the tagged sibling, or superseded
+        if row["id"] in lineage.consumed:
+            continue  # a sibling already ended on this very comment
+        parsed = parse_reply(str(row.get("body") or ""), task_id=sibling, sha=sha)
+        if parsed.kind != "accepted" or (parsed.verdict == "request_changes"
+                                         and len(parsed.text) < 10):
+            continue
+        replies[sibling] = SiblingReply(row, parsed, sibling, siblings[sibling], "sibling_reply")
+    if not replies:
+        return None
+    for row, _created in reversed(rows):
+        if row["id"] <= request_id:
+            break  # a disposition answers a request, so it follows this task's
+        header = _DISPOSITION_HEADER_RE.fullmatch(_first_line(row))
+        if header is None or header.group(1) != task.task_id or header.group(2) != sha:
+            continue
+        pointer = _DUPLICATE_OF_RE.search(str(row.get("body") or ""))
+        if pointer is not None and pointer.group(1) in replies:
+            return replace(replies[pointer.group(1)], via="duplicate_of_disposition",
+                           disposition_comment_id=row["id"])
+    return max(replies.values(), key=lambda reply: reply.row["id"])
 
 
 def _repost_request(queue: TaskQueue, task: TaskRequest, context: dict, thread: dict,

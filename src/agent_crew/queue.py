@@ -7512,6 +7512,15 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def record_exec_event(self, task_id: str, event: str, **fields) -> None:
+        """Append one typed, best-effort instrumentation event for a task."""
+        conn = self._connect()
+        try:
+            self._append_exec_event_on(conn, task_id, event, time.time(), **fields)
+            conn.commit()
+        finally:
+            conn.close()
+
     def get_exec_state(self, task_id: str) -> Optional[dict]:
         """Snapshot columns plus the ordered event history, for GET /tasks/{id}."""
         conn = self._connect()
@@ -7824,7 +7833,9 @@ class TaskQueue:
         try:
             rows = conn.execute(
                 "SELECT t.task_id, t.status, t.dispatched_at, t.dispatch_target, "
-                "e.at, e.fields FROM task_exec_events e "
+                "e.at, e.fields, EXISTS (SELECT 1 FROM task_exec_events parked "
+                "WHERE parked.task_id=e.task_id AND parked.event='codex_quota_parked' "
+                "AND parked.event_id>e.event_id) AS reparked FROM task_exec_events e "
                 "JOIN tasks t ON t.task_id=e.task_id "
                 "WHERE e.event='codex_quota_resumed' AND e.at>=? ORDER BY e.at DESC",
                 (since,)).fetchall()
@@ -7837,6 +7848,7 @@ class TaskQueue:
                     continue
                 probes.append({"task_id": row["task_id"], "status": row["status"],
                                "marker": {"probe": True, "resumed_at": row["at"]},
+                               "reparked": bool(row["reparked"]),
                                "dispatched_at": row["dispatched_at"],
                                "dispatch_target": row["dispatch_target"]})
             return probes
@@ -8165,6 +8177,28 @@ class TaskQueue:
             conn.execute("COMMIT")
         except Exception:
             logger.exception("exec-state: orphan record failed task_id=%s pid=%s", task_id, pid)
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+
+    def record_exec_event(self, task_id: str, event: str, *, at: Optional[float] = None,
+                          **fields) -> None:
+        """Append one event to a task's exec history without touching its row.
+
+        For provenance a reconciler owes an operator but no snapshot column
+        holds (#1036: which sibling reply a chatgpt review adopted). Append-only
+        and non-raising, like :meth:`record_worker_orphaned`: the note must never
+        become a second incident on the path that writes it.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._append_exec_event_on(conn, task_id, event,
+                                       time.time() if at is None else float(at), **fields)
+            conn.execute("COMMIT")
+        except Exception:
+            logger.exception("exec-state: %s record failed task_id=%s", event, task_id)
             with contextlib.suppress(Exception):
                 conn.execute("ROLLBACK")
         finally:

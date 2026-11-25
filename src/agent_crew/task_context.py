@@ -116,6 +116,7 @@ TASK_CONTEXT_KEYS = frozenset({
     'files',
     'findings_only',
     'fix_round',
+    'fix_round_grant',
     'gate_kind',
     'fleet',
     'github_discussion',

@@ -1770,11 +1770,16 @@ def _codex_quota_ready(marker: dict, cache: dict, now: float) -> bool:
     remaining = cache.get("base_remaining_pct")
     current = cache.get("account_fingerprint")
     previous = marker.get("account_fingerprint")
-    return (isinstance(fetched, (int, float)) and fetched > marker.get("failed_at", now)
-            and ((isinstance(current, str) and bool(current)
-                  and isinstance(previous, str) and bool(previous) and current != previous)
-                 or (isinstance(remaining, (int, float)) and not isinstance(remaining, bool)
-                     and remaining > 0)))
+    fresh = isinstance(fetched, (int, float)) and fetched > marker.get("failed_at", now)
+    changed_account = (isinstance(current, str) and bool(current)
+                       and isinstance(previous, str) and bool(previous) and current != previous)
+    if fresh and changed_account:
+        return True
+    # CLI exhaustion is authoritative for this account until its reset.
+    if isinstance(reset_at, (int, float)) and now < reset_at:
+        return False
+    return (fresh and isinstance(remaining, (int, float))
+            and not isinstance(remaining, bool) and remaining > 0)
 
 
 #: G12 / D6 `dispatch_channel` for a dispatcher subprocess, by agent.
@@ -3699,7 +3704,7 @@ def create_app(
                 task_id, result, x_agent_crew_project=_server_identity()["project"]))
 
     def _resume_codex_quota_holds() -> list[str]:
-        """Release one probe, then its cohort after a dispatch was recorded."""
+        """Release one probe, then its cohort only after successful completion."""
         rows = q().codex_quota_holds()
         now = time.time()
         cache = _codex_quota_cache()
@@ -3709,12 +3714,18 @@ def create_app(
             return []
         probes = q().codex_quota_probes(
             since=min(row["marker"].get("failed_at", now) for row in ready))
+        holds_by_id = {row["task_id"]: row for row in rows}
         for probe in probes:
+            if probe["reparked"]:
+                hold = holds_by_id.get(probe["task_id"])
+                if hold and not _codex_quota_ready(hold["marker"], cache, now):
+                    return []
+                continue
             resumed_at = probe["marker"].get("resumed_at") or 0
             dispatched_at = probe["dispatched_at"] or 0
             if (dispatched_at >= resumed_at and resumed_at
                     and str(probe.get("dispatch_target") or "").startswith("pid:")
-                    and probe["status"] in ("in_progress", "completed")):
+                    and probe["status"] == "completed"):
                 cohort = [row for row in ready
                           if row["marker"].get("failed_at", now) <= resumed_at]
                 released = []
@@ -7115,7 +7126,7 @@ def create_app(
                    "risk_tier": tier}
         for key in ("implementer_agent", "reviewer_agent", "coordinator_managed",
                     "external_operation_id", "lineage_root_task_id", "fix_round",
-                    "risk_declaration"):
+                    "fix_round_grant", "risk_declaration"):
             value = inherited(key)
             if value is not None:
                 context[key] = value
@@ -7897,6 +7908,12 @@ def create_app(
             raise HTTPException(status_code=422, detail=f"unknown_context_key:{unknown[0]}")
         if "suppressed_merge" in ctx:
             raise HTTPException(status_code=422, detail="reserved_context_key:suppressed_merge")
+        if "fix_round_grant" in ctx and (type(ctx["fix_round_grant"]) is not int
+                                         or ctx["fix_round_grant"] < 0):
+            # #1039: the grant is a round budget; anything else would be
+            # quarantined as a malformed row at fix time instead of refused here.
+            raise HTTPException(status_code=422,
+                                detail="fix_round_grant must be an integer >= 0")
         if (ctx.get("directive") or ctx.get("op")) and not ctx.get("external_operation_id"):
             raise HTTPException(status_code=422, detail="directive requires external_operation_id")
         is_rebase_directive = (task.task_type == "implement" and
