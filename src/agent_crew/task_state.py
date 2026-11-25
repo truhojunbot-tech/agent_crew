@@ -289,7 +289,8 @@ def transition(conn, task_id: str, event: str, expect_from: Iterable[str],
       row no longer exists.
 
     The refusal row is written in the caller's transaction; a caller that
-    rolls back discards it with everything else.
+    rolls back discards it with everything else. A database error during the
+    status write itself is not a refusal and is raised unchanged.
     """
     at = time.time() if now is None else now
     expect = frozenset([expect_from] if isinstance(expect_from, str) else expect_from)
@@ -322,14 +323,11 @@ def transition(conn, task_id: str, event: str, expect_from: Iterable[str],
     order = sorted(expect)
     sql = ("UPDATE tasks SET status = ?" + "".join(f", {c} = ?" for c in cols)
            + " WHERE task_id = ? AND status IN (" + ", ".join("?" * len(order)) + ")")
-    try:
-        rowcount = conn.execute(
-            sql, (to_status, *(fields[c] for c in cols), task_id, *order)).rowcount
-    except Exception as exc:
-        logger.exception("task_state: transition write failed task_id=%s event=%s",
-                         task_id, event)
-        return TransitionOutcome(False, event, None, to_status, refusal=ILLEGAL_TRANSITION,
-                                 reason=f"write_error:{type(exc).__name__}")
+    # A database error (lock, trigger abort, I/O) is not a refusal: it
+    # propagates exactly as the caller's own UPDATE did, so its rollback and
+    # retry handling stay as they are.
+    rowcount = conn.execute(
+        sql, (to_status, *(fields[c] for c in cols), task_id, *order)).rowcount
     if rowcount == 1:
         # Exactly one row matched, so its prior status was in ``expect``; with a
         # single expected status that is the prior status itself.
