@@ -18,11 +18,16 @@ remembering is not a boundary.
 """
 
 import os
+import pathlib
+import subprocess
 import sys
+import textwrap
 
 import pytest
 
 from tests.conftest import GITHUB_WRITE_FUNCTIONS, GitHubWriteFromTest
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def _pytest_subprocess_env(env=None):
@@ -30,6 +35,32 @@ def _pytest_subprocess_env(env=None):
     result = dict(os.environ if env is None else env)
     result["PYTHONPATH"] = os.pathsep.join(path for path in sys.path if path)
     return result
+
+
+def _run_probe_file(tmp_path, body, *pytest_args, env=None):
+    """Run `body` as a throwaway test file in a fresh pytest subprocess.
+
+    The probe lives under `tmp_path`, never inside the repo (#1052): every
+    probe used to be written to one fixed `tests/unit/test_tmp_*_probe.py`, so
+    under `--numprocesses=8` one worker overwrote or deleted another's probe
+    mid-collection ("Interrupted: 1 error during collection" instead of the
+    assertion text), and a stray probe left behind was collected by the outer
+    run as an unnamed error.
+
+    The subprocess is still pointed at the repo config (`-c`/`--rootdir`) and
+    loads `tests/conftest.py` explicitly as a plugin — pytest does not discover
+    conftests for a file outside the rootdir — so the #263 boundary applies to
+    the probe exactly as it does to a test under `tests/`.
+    """
+    probe = tmp_path / "test_probe.py"
+    probe.write_text(textwrap.dedent(body))
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "-c", str(REPO_ROOT / "pyproject.toml"), "--rootdir", str(REPO_ROOT),
+         "-p", "tests.conftest", *pytest_args, str(probe)],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=180,
+        env=_pytest_subprocess_env(env),
+    )
 
 
 def test_every_mutating_github_function_is_covered():
@@ -83,7 +114,7 @@ def test_calling_a_write_function_from_a_test_raises(fn_name, github_writes_reco
     github_writes_recorder.clear()
 
 
-def test_a_swallowed_write_attempt_still_fails_the_test(testdir_factory=None):
+def test_a_swallowed_write_attempt_still_fails_the_test(tmp_path):
     """★★Raising is not enough, and this is the part that matters.
 
     The dispatcher catches every exception around its GitHub calls, so a
@@ -95,11 +126,7 @@ def test_a_swallowed_write_attempt_still_fails_the_test(testdir_factory=None):
     fixture's source: what matters is the observable outcome for a test that
     swallows the error.
     """
-    import subprocess
-    import sys
-    import textwrap
-
-    body = textwrap.dedent('''
+    r = _run_probe_file(tmp_path, '''
         def test_swallows_the_write():
             import agent_crew.github as gh
             try:
@@ -107,20 +134,11 @@ def test_a_swallowed_write_attempt_still_fails_the_test(testdir_factory=None):
             except Exception:
                 pass          # exactly what the dispatcher does
     ''')
-    import pathlib
-    tmp = pathlib.Path("tests/unit/test_tmp_swallow_probe.py")
-    tmp.write_text(body)
-    try:
-        r = subprocess.run([sys.executable, "-m", "pytest", str(tmp), "-q"],
-                           capture_output=True, text=True, timeout=180,
-                           env=_pytest_subprocess_env())
-        assert r.returncode != 0, (
-            "a test that swallowed a blocked GitHub write still passed — the "
-            "attempt has to fail the test, not just be blocked"
-        )
-        assert "post_pr_comment" in (r.stdout + r.stderr)
-    finally:
-        tmp.unlink(missing_ok=True)
+    assert r.returncode != 0, (
+        "a test that swallowed a blocked GitHub write still passed — the "
+        "attempt has to fail the test, not just be blocked"
+    )
+    assert "post_pr_comment" in (r.stdout + r.stderr)
 
 
 def test_a_test_may_opt_in_to_observing_writes(github_writes):
@@ -201,34 +219,22 @@ def test_an_unapproved_live_github_test_is_skipped_and_still_blocked(tmp_path):
     quietly. Run in-process as a throwaway file, because what matters is what
     pytest actually does with the marker — not what the fixture source says.
     """
-    import pathlib
-    import subprocess
-    import sys
-    import textwrap
-
-    probe = pathlib.Path("tests/unit/test_tmp_live_probe.py")
-    probe.write_text(textwrap.dedent('''
+    env = {k: v for k, v in os.environ.items()
+           if k not in (LIVE_GITHUB_ENV, LIVE_GITHUB_REPO_ENV)}
+    r = _run_probe_file(tmp_path, '''
         import pytest
 
         @pytest.mark.live_github
         def test_wants_to_write_for_real():
             import agent_crew.github as gh
             gh.post_pr_comment(999241, "this must never reach GitHub")
-    '''))
-    env = {k: v for k, v in __import__("os").environ.items()
-           if k not in (LIVE_GITHUB_ENV, LIVE_GITHUB_REPO_ENV)}
-    try:
-        r = subprocess.run([sys.executable, "-m", "pytest", str(probe), "-q", "-rs"],
-                           capture_output=True, text=True, timeout=180,
-                           env=_pytest_subprocess_env(env))
-        assert r.returncode == 0, r.stdout + r.stderr      # skipped, not failed
-        combined = r.stdout + r.stderr
-        assert "skipped" in combined
-        assert "not approved" in combined, (
-            "an unapproved live_github test ran instead of being skipped"
-        )
-    finally:
-        probe.unlink(missing_ok=True)
+    ''', "-rs", env=env)
+    assert r.returncode == 0, r.stdout + r.stderr      # skipped, not failed
+    combined = r.stdout + r.stderr
+    assert "skipped" in combined
+    assert "not approved" in combined, (
+        "an unapproved live_github test ran instead of being skipped"
+    )
 
 
 def test_the_unapproved_stub_refuses_and_explains():
@@ -286,27 +292,34 @@ def _flat(text):
 
 def _run_probe(tmp_path, body, *, approved=True, target=APPROVED_TARGET):
     """Run a `live_github`-marked test in a subprocess and return the result."""
-    import os as _os
-    import pathlib
-    import subprocess
-    import sys
-    import textwrap
-
-    probe = pathlib.Path("tests/unit/test_tmp_approved_probe.py")
-    probe.write_text(textwrap.dedent(body))
-    env = dict(_os.environ)
+    env = dict(os.environ)
     if approved:
         env[LIVE_GITHUB_ENV] = "1"
         env[LIVE_GITHUB_REPO_ENV] = target
     else:
         env.pop(LIVE_GITHUB_ENV, None)
         env.pop(LIVE_GITHUB_REPO_ENV, None)
-    try:
-        return subprocess.run([sys.executable, "-m", "pytest", str(probe), "-q"],
-                              capture_output=True, text=True, timeout=180,
-                              env=_pytest_subprocess_env(env))
-    finally:
-        probe.unlink(missing_ok=True)
+    return _run_probe_file(tmp_path, body, env=env)
+
+
+def test_probes_run_outside_the_repo_and_under_the_repo_conftest(tmp_path):
+    """#1052: the probe must not touch `tests/unit/` (parallel workers collided
+    on one fixed file, and a leftover was collected by the outer run), and
+    moving it out must not drop the repo conftest — otherwise the probes above
+    would be testing an unguarded interpreter and passing for the wrong reason.
+    """
+    r = _run_probe_file(tmp_path, f'''
+        import pathlib
+
+        def test_probe_location_and_harness():
+            assert pathlib.Path(__file__).resolve().parent == pathlib.Path({str(tmp_path)!r}).resolve()
+            from agent_crew.cea.engine import test_harness_active
+            assert test_harness_active(), "tests/conftest.py did not register this session"
+    ''')
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "1 passed" in r.stdout
+    strays = sorted(p.name for p in (REPO_ROOT / "tests" / "unit").glob("test_tmp_*probe*.py"))
+    assert strays == [], f"probe files left inside the repo: {strays}"
 
 
 def test_an_approved_test_cannot_write_with_the_default_repo(tmp_path):
