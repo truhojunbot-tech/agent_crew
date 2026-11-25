@@ -3838,7 +3838,11 @@ def create_app(
                     and _pool_grant_for(task, pool, signals[pool]) is None
                     and _park_for_pool(task, signals[pool])):
                 out["parked"].append(task.task_id)
+        cap_parked = {t.task_id for t in q().waiting_pool_rows_by_park_code(
+            _pool_signal.REVIEW_OPEN_CAP_REASON)}
         for task in q().list_tasks(status=_pool_signal.WAITING_POOL_STATUS):
+            if task.task_id in cap_parked:
+                continue   # #1037: the review cap owns that park
             pool = _pool_of(task) or _pool_signal.CLAUDE_POOL
             signal, reason = signals[pool], signals[pool]["reason"]
             if signal["rule"] != _pool_signal.OPEN:
@@ -3855,6 +3859,83 @@ def create_app(
         return out
 
     app.state.apply_pool_signal = _apply_pool_signal
+
+    def _review_provider_of(task: TaskRequest) -> str:
+        """The reviewer provider this row dispatches to (override honoured)."""
+        return _resolve_dispatch_target(task, "reviewer")[0]
+
+    def _apply_review_open_cap() -> dict:
+        """#1037: per reviewer provider, keep open (pending + in_progress)
+        reviews at or under ``AGENT_CREW_REVIEW_OPEN_CAP``. Over the cap,
+        auto-enqueued pending reviews (cascade successors: they carry
+        ``prev_task_id``) are parked as ``waiting_pool`` / REVIEW_OPEN_CAP,
+        lowest priority and newest first, with one typed event and one
+        coordinator notice each. Under the cap, that provider's cap-parked
+        rows resume oldest first, exactly once (the status predicate is the
+        claim). Rows parked by the #1033 pool sweep keep their park: only
+        REVIEW_OPEN_CAP rows are resumed here. No cap (unset, empty or
+        invalid value): nothing is parked and every REVIEW_OPEN_CAP park is
+        released, since the pool sweep never touches them (review of PR
+        #1071: the documented rollback stranded them). STOP still keeps
+        them parked, inside ``resume_pool_hold``."""
+        cap = _pool_signal.review_open_cap()
+        out: dict = {"cap": cap, "parked": [], "resumed": []}
+        if cap is None:
+            for task in q().waiting_pool_rows_by_park_code(_pool_signal.REVIEW_OPEN_CAP_REASON):
+                reason = f"{_pool_signal.REVIEW_OPEN_CAP_ENV} cap disabled"
+                if q().resume_pool_hold(task.task_id, rule=_pool_signal.REVIEW_OPEN_CAP_RULE,
+                                        reason=reason):
+                    logger.info("review open cap: resumed %s — %s", task.task_id, reason)
+                    out["resumed"].append(task.task_id)
+            return out
+        open_by_provider: dict[str, int] = {}
+        pending_by_provider: dict[str, list] = {}
+        for status in ("pending", "in_progress"):
+            for task in q().list_tasks(status=status):
+                if task.task_type != "review":
+                    continue
+                provider = _review_provider_of(task)
+                open_by_provider[provider] = open_by_provider.get(provider, 0) + 1
+                if status == "pending":
+                    pending_by_provider.setdefault(provider, []).append(task)
+        parked_by_provider: dict[str, list] = {}
+        for task in q().waiting_pool_rows_by_park_code(_pool_signal.REVIEW_OPEN_CAP_REASON):
+            parked_by_provider.setdefault(_review_provider_of(task), []).append(task)
+        for provider in sorted(set(open_by_provider) | set(parked_by_provider)):
+            open_n = open_by_provider.get(provider, 0)
+            # list_tasks is priority ASC, created_at ASC: reversed parks the
+            # lowest-priority, newest auto review first.
+            for task in reversed(pending_by_provider.get(provider, [])):
+                if open_n <= cap:
+                    break
+                ctx = task.context if isinstance(task.context, dict) else {}
+                if not isinstance(ctx.get("prev_task_id"), str):
+                    continue   # not auto-enqueued: never parked by the cap
+                reason = (f"{_pool_signal.REVIEW_OPEN_CAP_REASON}: {provider} "
+                          f"open reviews {open_n} > cap {cap}")
+                if not q().park_pool_hold(task.task_id, reason=reason,
+                                          rule=_pool_signal.REVIEW_OPEN_CAP_RULE,
+                                          code=_pool_signal.REVIEW_OPEN_CAP_REASON,
+                                          pool=provider):
+                    continue
+                open_n -= 1
+                logger.info("review open cap: parked %s as %s — %s", task.task_id,
+                            _pool_signal.WAITING_POOL_STATUS, reason)
+                _coordinator_notice(task.task_id, "review_open_cap_parked",
+                                    f"reason={reason}")
+                out["parked"].append(task.task_id)
+            for task in parked_by_provider.get(provider, []):
+                if open_n >= cap:
+                    break
+                reason = f"{provider} open reviews {open_n} < cap {cap}"
+                if q().resume_pool_hold(task.task_id, rule=_pool_signal.REVIEW_OPEN_CAP_RULE,
+                                        reason=reason):
+                    open_n += 1
+                    logger.info("review open cap: resumed %s — %s", task.task_id, reason)
+                    out["resumed"].append(task.task_id)
+        return out
+
+    app.state.apply_review_open_cap = _apply_review_open_cap
 
     def _hold_or_skip_provider_limit(task: TaskRequest, agent: str,
                                      until: Optional[float]) -> None:
@@ -6530,6 +6611,10 @@ def create_app(
                     except Exception:
                         logger.exception("pool signal scan failed — continuing dispatch")
                     try:
+                        _apply_review_open_cap()
+                    except Exception:
+                        logger.exception("review open cap scan failed — continuing dispatch")
+                    try:
                         for op in q().pending_ci_merge_ops():
                             number = op.get("pr_number")
                             detail = op.get("last_error") or ""
@@ -6921,6 +7006,10 @@ def create_app(
             reviewer_provider=_DISPATCH_ROLE_TO_AGENT.get("reviewer", ""),
         )
         if isinstance(review_id, str) and review_id:
+            try:
+                _apply_review_open_cap()   # #1037: park over the cap before any push
+            except Exception:
+                logger.exception("review open cap check failed after enqueue of %s", review_id)
             _try_push_next("reviewer")
         elif ((parent := q().get_task(impl_task_id)) is not None
               and isinstance(parent.context, dict)

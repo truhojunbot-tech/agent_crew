@@ -23,6 +23,7 @@ can never authorise a dispatch. Per-pool ``admissions_effective``: see ``POOLS``
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import tempfile
@@ -62,8 +63,39 @@ CLAUDE_POOL, CODEX_POOL = "claude", "codex"
 POOLS = (CLAUDE_POOL, CODEX_POOL)
 #: Typed reason for a park on a present but invalid ``admissions_effective``.
 INVALID_EFFECTIVE_REASON = "POOL_EFFECTIVE_INVALID"
+#: #1037: per-project, per-reviewer-provider cap on open (pending or
+#: in_progress) reviews. Unset = no cap (behaviour before #1037). An
+#: auto-enqueued review over the cap parks as ``waiting_pool`` under this
+#: reason code and resumes FIFO, exactly once, when a review of the same
+#: provider reaches a terminal state.
+REVIEW_OPEN_CAP_ENV = "AGENT_CREW_REVIEW_OPEN_CAP"
+REVIEW_OPEN_CAP_REASON = "REVIEW_OPEN_CAP"
+REVIEW_OPEN_CAP_RULE = "review_open_cap"
+
+logger = logging.getLogger(__name__)
 
 _state_lock = threading.Lock()
+
+
+def review_open_cap() -> Optional[int]:
+    """``AGENT_CREW_REVIEW_OPEN_CAP`` read at call time (#1037), parsed like
+    ``claude_cloud.cloud_max_concurrency``: unset or empty is no cap, and a
+    malformed or non-positive value logs and falls back to the default (no
+    cap) rather than taking the dispatcher down."""
+    raw = (os.getenv(REVIEW_OPEN_CAP_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("pool_signal: invalid %s=%r, using default (no cap)",
+                       REVIEW_OPEN_CAP_ENV, raw)
+        return None
+    if value <= 0:
+        logger.warning("pool_signal: %s=%d must be positive, using default (no cap)",
+                       REVIEW_OPEN_CAP_ENV, value)
+        return None
+    return value
 
 
 def pool_signal_path() -> str:
