@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import re
 import time
 from enum import Enum
@@ -75,11 +76,58 @@ def _agy_reset_after(message: str) -> Optional[float]:
     return float(int(match["h"] or 0) * 3600 + int(match["m"] or 0) * 60 + int(match["s"] or 0))
 
 
+def _agy_structured_quota(record: dict) -> bool:
+    """Require both the HTTP code and the provider's quota status."""
+    error = record.get("error")
+    fields = [record, error] if isinstance(error, dict) else [record]
+    return (
+        any(str(item.get(key, "")).upper() == "RESOURCE_EXHAUSTED"
+            for item in fields for key in ("status", "code"))
+        and any(item.get(key) in (429, "429")
+                for item in fields
+                for key in ("code", "error_code", "http_status", "api_error_status", "status_code"))
+    )
+
+
+def _agy_structured_retry_after(record: dict, failed_at: float) -> Optional[float]:
+    """Read delay/reset fields and Google RetryInfo, never the error message."""
+    error = record.get("error")
+    fields = [record, error] if isinstance(error, dict) else [record]
+    for item in list(fields):
+        details = item.get("details")
+        if isinstance(details, list):
+            fields.extend(detail for detail in details if isinstance(detail, dict)
+                          and detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo")
+    for item in fields:
+        for key in ("retry_after", "retry_delay", "retryDelay", "retry_at", "reset_at"):
+            value = item.get(key)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                if key in {"retry_at", "reset_at"}:
+                    if isinstance(value, str):
+                        value = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                        if value.tzinfo is None:
+                            continue
+                        value = value.timestamp()
+                    delay = max(0, float(value) - failed_at) if math.isfinite(float(value)) else None
+                else:
+                    if isinstance(value, str) and value.endswith("s"):
+                        value = value[:-1]
+                    delay = float(value)
+                if delay is not None and math.isfinite(delay) and delay >= 0:
+                    return delay
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return None
+
+
 def classify_provider_record(agent: str, record: dict, *,
                              failed_at: Optional[float] = None) -> Optional[dict]:
     """Classify a provider event from fields with defined machine meanings."""
     if not isinstance(record, dict):
         return None
+    structured_quota = agent in {"gemini", "agy"} and _agy_structured_quota(record)
     if agent == "claude":
         if record.get("type") not in {"result", "error"} or record.get("is_error") is not True:
             return None
@@ -87,7 +135,8 @@ def classify_provider_record(agent: str, record: dict, *,
         if record.get("type") not in {"error", "turn.failed"}:
             return None
     elif agent in {"gemini", "agy"}:
-        if str(record.get("status") or "").upper() != "ERROR" and record.get("type") != "error":
+        if (not structured_quota and str(record.get("status") or "").upper() != "ERROR"
+                and record.get("type") != "error"):
             return None
     else:
         return None
@@ -132,6 +181,15 @@ def classify_provider_record(agent: str, record: dict, *,
             if retry_after is None:
                 retry_after = _agy_reset_after(message)
 
+    if structured_quota:
+        failed_at = failed_at if failed_at is not None else time.time()
+        retry_after = _agy_structured_retry_after(record, failed_at)
+        result = {"kind": FailureKind.PROVIDER_LIMIT.value,
+                  "provider_code": "resource_exhausted", "retry_after": retry_after}
+        if retry_after is not None:
+            result["retry_at"] = failed_at + retry_after
+        return result
+
     if code in {"MODEL_CAPACITY_EXHAUSTED", "CODEX_CAPACITY"}:
         kind = FailureKind.CAPACITY
         retry_after = retry_after if retry_after is not None else 120
@@ -170,9 +228,14 @@ def provider_failure_from_log(log_path: str, *, agent: str,
                 FailureKind.CONFIG_ERROR.value: 2,
                 FailureKind.PROVIDER_LIMIT.value: 3}
     for line in data.splitlines():
+        agy_envelope = agent in {"agy", "gemini"} and line.startswith("AGY_ERROR: ")
+        if agy_envelope:
+            line = line.removeprefix("AGY_ERROR: ")
         try:
             record = json.loads(line)
         except (TypeError, ValueError):
+            continue
+        if agy_envelope and (not isinstance(record, dict) or not _agy_structured_quota(record)):
             continue
         classified = classify_provider_record(agent, record, failed_at=failed_at)
         if classified and (failure is None or
