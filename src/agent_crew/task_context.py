@@ -14,6 +14,7 @@ TASK_CONTEXT_KEYS = frozenset({
     'agent_override',
     'allow_duplicate_review',
     'allow_parallel_implement',
+    'allow_stale_base',
     'approved_sha',
     'artifact_kind',
     'authority_decision_ids',

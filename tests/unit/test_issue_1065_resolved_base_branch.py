@@ -365,3 +365,22 @@ def test_sync_with_resolved_base_lands_on_master_not_stale_main(tmp_path, monkey
     assert landed["codex"]["status"] == "known"
     assert landed["codex"]["sha"] == tips["master"]
     assert _git("-C", worker, "rev-parse", "HEAD") == tips["master"]
+
+
+def test_allow_stale_base_is_admitted_at_post_tasks(tmp_db):
+    """The server override is read from ``task_context`` (prep check), so a
+    non-CLI producer must be able to POST it. Before this entry the #941
+    allowlist refused it with 422 and the documented override was unreachable."""
+    app = server.create_app(tmp_db, project="demo", pane_map={}, worktree_map={},
+                            watchdog_disabled=True, anomaly_disabled=True)
+    payload = {"task_id": "impl-1065-stale", "task_type": "implement",
+               "description": "work", "branch": "agent/1065-stale",
+               "context": {"risk_tier": 1, "base_branch": "main",
+                           "allow_stale_base": True}}
+    with TestClient(app) as client:
+        resp = client.post("/tasks", json=payload,
+                           headers={"X-Agent-Crew-Project": "demo"})
+    assert resp.status_code == 201, resp.text
+    stored = TaskQueue(tmp_db).get_task("impl-1065-stale")
+    assert stored is not None
+    assert stored.context["allow_stale_base"] is True
