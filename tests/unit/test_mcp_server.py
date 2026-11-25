@@ -7,6 +7,9 @@ FastMCP's `_tool_manager` registry — that's the same path the MCP runtime
 uses, just without the JSON-RPC envelope.
 """
 import asyncio
+import sqlite3
+
+import pytest
 
 from agent_crew.mcp_server import build_mcp_server
 from agent_crew.protocol import TaskRequest
@@ -55,17 +58,27 @@ class TestBuild:
 
 
 class TestGetNextTask:
-    def test_guard_error_refuses_delivery_with_typed_reason(self, tmp_db, monkeypatch):
+    @pytest.mark.parametrize("discuss", [False, True])
+    @pytest.mark.parametrize("exc,kind", [
+        (RuntimeError("guard broke"), "config_error"),
+        (sqlite3.OperationalError("database is locked"), "transient"),
+        (sqlite3.OperationalError("no such table: tasks"), "config_error"),
+    ])
+    def test_guard_error_refuses_delivery_with_typed_reason(self, tmp_db, monkeypatch, exc, kind, discuss):
         from agent_crew import server
-        TaskQueue(tmp_db).enqueue(_make_task("t-guard", task_type="review"))
+        guard_task = _make_task("t-guard", task_type="discuss" if discuss else "review")
+        if discuss:
+            guard_task.context = {"agent": "claude"}
+        TaskQueue(tmp_db).enqueue(guard_task)
         monkeypatch.setattr(server, "_guard_description",
-                            lambda task: (_ for _ in ()).throw(RuntimeError("guard broke")))
+                            lambda task: (_ for _ in ()).throw(exc))
         mcp = build_mcp_server(tmp_db)
-        result = _call_tool(mcp, "get_next_task", role="reviewer", agent="claude")
+        result = (_call_tool(mcp, "get_next_discuss_task", agent="claude") if discuss else
+                  _call_tool(mcp, "get_next_task", role="reviewer", agent="claude"))
         assert result == {"task_id": "t-guard", "dispatch_refused": "guard_unavailable"}
         task = TaskQueue(tmp_db).get_task("t-guard")
         assert task.status == "needs_human"
-        assert task.error_info["kind"] == "config_error"
+        assert task.error_info["kind"] == kind
 
     def test_returns_dict_for_pending_task(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-impl"))

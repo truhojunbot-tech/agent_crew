@@ -2,12 +2,13 @@
 
 import inspect
 import json
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew import claude_cloud, instructions, pipeline, server
-from agent_crew.failure_kind import FailureKind, classify_provider_record, provider_failure_from_log
+from agent_crew.failure_kind import FailureKind, classify_provider_record, provider_failure_from_log, exception_failure_kind
 from agent_crew.loop import handle_test_result
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import RuntimeTransitionRefused, TaskQueue
@@ -152,3 +153,13 @@ def test_legacy_drain_without_trigger_kind_cannot_self_undrain(tmp_path):
         conn.close()
     with pytest.raises(RuntimeTransitionRefused):
         q.transition_runtime_state("ACTIVE", who="operator:alfred")
+
+
+@pytest.mark.parametrize("code,expected", [
+    (5, "transient"), (6, "transient"), (261, "transient"),
+    (262, "transient"), (1, "config_error"), (10, "config_error"),
+])
+def test_sqlite_exception_primary_and_extended_codes(code, expected):
+    exc = sqlite3.OperationalError("opaque SQLite diagnostic")
+    exc.sqlite_errorcode = code
+    assert exception_failure_kind(exc).value == expected

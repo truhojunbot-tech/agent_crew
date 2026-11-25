@@ -1,8 +1,8 @@
-"""Typed provider failure evidence used by retry and escalation decisions.
+"""Typed local and provider failure evidence used by retry and escalation decisions.
 
-Only provider-owned JSON events are interpreted. Codex supplies quota and
-capacity as terminal error messages in those events; echoed prompts, pane
-captures, and diagnostic log lines never classify a failure.
+For provider failures, only provider-owned JSON events are interpreted. Codex
+supplies quota and capacity as terminal error messages in those events; echoed
+prompts, pane captures, and diagnostic log lines never classify a failure.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import datetime
 import json
 import math
 import re
+import sqlite3
 import time
 from enum import Enum
 from typing import Optional
@@ -24,6 +25,23 @@ class FailureKind(str, Enum):
     TIMEOUT = "timeout"
     AGENT_FAILED = "agent_failed"
     TEST_FAILURE = "test_failure"
+
+
+def exception_failure_kind(exc: Exception) -> FailureKind:
+    """Local configuration failures are transient only for SQLite contention."""
+    if isinstance(exc, sqlite3.OperationalError):
+        # SQLite extended result codes retain the primary code in the low byte.
+        # Numeric values also support Python 3.10, which lacks these constants.
+        code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(code, int) and (code & 0xff) in {5, 6}:  # BUSY, LOCKED
+            return FailureKind.TRANSIENT
+        message = str(exc).strip().lower()
+        if (message in {"database is locked", "database table is locked",
+                        "database schema is locked", "sqlite_busy", "sqlite_locked"}
+                or message.startswith(("database table is locked:",
+                                       "database schema is locked:"))):
+            return FailureKind.TRANSIENT
+    return FailureKind.CONFIG_ERROR
 
 
 def failure_kind(error_info: Optional[dict]) -> Optional[str]:
