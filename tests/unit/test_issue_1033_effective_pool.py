@@ -265,9 +265,17 @@ def test_codex_hold_turned_unreadable_neither_dispatches_nor_resumes(
         assert dispatched == []
         assert queue.get_task_status(parked_id) == "waiting_pool"
         path.write_text(_eff_body({"claude": "open", "codex": "open"}))
+        # #1046: the dispatcher's own tick applies the fresh open too, so
+        # either caller may win a row's exactly-once resume claim. Assert
+        # the outcome, not who returned the rows.
         out = app.state.apply_pool_signal()
-        assert set(out["resumed"]) == {parked_id, new_id}
+        assert set(out["resumed"]) <= {parked_id, new_id}
         assert _wait(lambda: sorted(dispatched) == sorted([parked_id, new_id]))
+        time.sleep(0.3)
+    assert sorted(dispatched) == sorted([parked_id, new_id])
+    for task_id in (parked_id, new_id):
+        assert queue.get_task_status(task_id) != "waiting_pool"
+        assert len(_events(queue, task_id, "pool_hold_resumed")) == 1
 
 
 def test_fresh_claude_open_resumes_claude_row_only(tmp_path, monkeypatch, notices):
