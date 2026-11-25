@@ -47,6 +47,9 @@ def test_two_agy_dispatches_start_fresh_and_bind_distinct_conversations(
     mapping.parent.mkdir(parents=True)
     monkeypatch.setattr(server, "_agy_home", lambda home=None: agy_home)
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    # Dispatch is driven by hand below; the loop must not claim the rows first
+    # (it sleeps one interval before its first tick, #1076).
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", "3600")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     commands = []
 

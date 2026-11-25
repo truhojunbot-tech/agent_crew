@@ -69,6 +69,16 @@ def _pending_merge(tmp_path, monkeypatch, *, timeout=False):
     return app, queue, repo_cwds, ci_calls, merged, str(worktree)
 
 
+# One dispatcher tick takes 1-4s under full-suite load on the gate box (#1076).
+_TICK_WAIT = 10
+
+
+def _wait_until(predicate):
+    deadline = time.monotonic() + _TICK_WAIT
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
 def _post_result(client, task_id):
     response = client.post(f"/tasks/{task_id}/result", json={
         "task_id": task_id, "status": "completed", "summary": "passed",
@@ -89,7 +99,7 @@ def test_tick_rechecks_pending_then_merges_with_worktree_repo(tmp_path, monkeypa
         since = op["last_error"].split("since=")[1].split()[0]
         queue.external_op_mark("merge:pr:641", "reserved", last_error=(
             f"head={'a' * 40} CI pending since={since} checked=0: unit"))
-        assert merged.wait(2), "dispatcher tick did not merge after CI turned green"
+        assert merged.wait(_TICK_WAIT), "dispatcher tick did not merge after CI turned green"
     assert len(ci_calls) == 2
     assert repo_cwds == [worktree, worktree]
     assert queue.external_op_get("merge:pr:641")["state"] == "done"
@@ -104,16 +114,17 @@ def test_pending_timeout_preserves_since_and_stays_skipped(tmp_path, monkeypatch
         since = op["last_error"].split("since=")[1].split()[0]
         queue.external_op_mark("merge:pr:641", "reserved", last_error=(
             f"head={'a' * 40} CI pending since={since} checked=0: unit"))
-        deadline = time.monotonic() + 2
-        while len(ci_calls) < 2 and time.monotonic() < deadline:
-            time.sleep(0.02)
+        # Wait for the recheck to write its own `checked=<now>` back, not just
+        # for the CI call: overwriting the op while that write is still in
+        # flight lets the recheck's write land last and re-arm the 10s
+        # throttle, so the timeout below never fires (#1076).
+        _wait_until(lambda: len(ci_calls) >= 2
+                    and "checked=0:" not in queue.external_op_get("merge:pr:641")["last_error"])
         assert len(ci_calls) == 2
         assert f"since={since}" in queue.external_op_get("merge:pr:641")["last_error"]
         queue.external_op_mark("merge:pr:641", "reserved", last_error=(
             f"head={'a' * 40} CI pending since={time.time() - 121} checked=0: unit"))
-        deadline = time.monotonic() + 2
-        while queue.external_op_get("merge:pr:641")["state"] != "skipped" and time.monotonic() < deadline:
-            time.sleep(0.02)
+        _wait_until(lambda: queue.external_op_get("merge:pr:641")["state"] == "skipped")
         op = queue.external_op_get("merge:pr:641")
         assert op["state"] == "skipped"
         assert "CI pending timed out" in op["last_error"]

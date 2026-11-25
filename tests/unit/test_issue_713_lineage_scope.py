@@ -40,6 +40,9 @@ def _dispatch_pair(tmp_path, monkeypatch, unused_tcp_port, *, related=False,
         return Process()
 
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    # This fixture dispatches by hand; keep the loop from claiming the rows
+    # first (it sleeps one interval before its first tick, #1076).
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", "3600")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     if scope is None:
         monkeypatch.delenv("AGENT_CREW_CLAUDE_CONTEXT_SCOPE", raising=False)

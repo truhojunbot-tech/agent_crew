@@ -25,6 +25,11 @@ def _cloud_checkout_contract(monkeypatch):
     # published-branch, and cwd checks have dedicated real-git tests in #744.
     monkeypatch.setattr(cloud, "_validated_cloud_checkout",
                         lambda project, repo, state_path=None: ("/fixture/claude", repo))
+    # The headless loop's cloud-reconcile refresh runs in a thread the test
+    # cannot join; left alone it reads PR comments via `gh api`, which the
+    # GitHub write guard records and fails at teardown (#1076). Tests that
+    # reconcile comments pass their own ``pr_comments_fn``.
+    monkeypatch.setattr(cloud._github, "pr_comments", lambda *_args, **_kwargs: [])
 
 
 def _state(tmp_path, reviewer_agent="claude_cloud", reviewer_worktree=True):
@@ -54,7 +59,9 @@ def _enqueue_review(queue, task_id="review-cloud"):
     ))
 
 
-def _wait_for(predicate, timeout=4.0):
+def _wait_for(predicate, timeout=10.0):
+    # One dispatcher tick takes 1-4s under full-suite load on the gate box
+    # (#1076); the bound is generous because a passing wait returns early.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -359,8 +366,8 @@ def test_shadow_launch_error_does_not_hold_local_reviewer_slot(tmp_path, monkeyp
     app = create_app(queue._db_path, state_path=_state(tmp_path, reviewer_agent="claude"),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
-        _wait_for(lambda: len(attempts) >= 2, timeout=1.0)
-        _wait_for(lambda: len(local_dispatches) >= 2, timeout=1.0)
+        _wait_for(lambda: len(attempts) >= 2)
+        _wait_for(lambda: len(local_dispatches) >= 2)
     # A second local dispatch requires the first attempt to release its slot.
     assert local_dispatches[:2] == ["claude", "claude"]
 

@@ -65,10 +65,13 @@ def test_inherited_live_style_memory_db_remains_untouched(tmp_path):
     # HOME isolation hides user-site packages from the child interpreter.
     env["PYTHONPATH"] = os.pathsep.join((str(root / "src"),
                                           str(Path(pytest.__file__).resolve().parent.parent)))
+    # A child pytest imports the whole suite's conftest; under full-suite load
+    # on the gate box that alone exceeded 60s (#1076). 150s stays inside the
+    # outer --timeout=180 so a hang still fails cleanly here.
     run = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", str(Path(__file__)), "-k",
-         "test_capture_child_cannot_reach_inherited_sentinel"],
-        cwd=root, env=env, text=True, capture_output=True, timeout=60,
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         str(Path(__file__)), "-k", "test_capture_child_cannot_reach_inherited_sentinel"],
+        cwd=root, env=env, text=True, capture_output=True, timeout=150,
     )
     assert run.returncode == 0, run.stdout + run.stderr
     assert sentinel.read_bytes() == before

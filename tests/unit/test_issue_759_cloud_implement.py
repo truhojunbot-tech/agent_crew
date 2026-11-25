@@ -128,13 +128,17 @@ def test_cloud_usd_cap_leaves_second_implement_pending(tmp_path, monkeypatch):
             "session_id": "session_abc12345", "url": "https://claude.ai/code/session_abc12345"}))
 
     assert cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement", run_fn=run).dispatched
+    # The session end must precede the "after" reading, or the reading is not
+    # fresh (#989) and the cost stays PENDING_SETTLE. Pin the end before
+    # writing the credit: under load the two statements can be >1s apart.
+    ended = time.time() - 1
     _credit(credit, 5.2)
     monkeypatch.setattr(cloud._github, "pr_number_for_branch", lambda *a, **kw: 759)
     monkeypatch.setattr(cloud._github, "pr_head_sha", lambda *a, **kw: "a" * 40)
     monkeypatch.setattr(cloud._github, "pr_state", lambda *a, **kw: "open")
     cloud.reconcile_all_cloud_tasks(queue)
     monkeypatch.setenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "0")
-    queue.patch_context("one", {"cloud_ended_at": time.time() - 1})
+    queue.patch_context("one", {"cloud_ended_at": ended})
     cloud.reconcile_all_cloud_tasks(queue)
     assert queue.get_attribution("one")["cloud_usd"] == 1.2
     outcome = cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement", run_fn=run)
