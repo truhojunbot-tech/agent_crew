@@ -235,6 +235,82 @@ def test_e_prep_refuses_context_base_behind_default(tmp_path, monkeypatch):
     ) == tips["master"]
 
 
+def _fail_default_fetch(monkeypatch, worker, default, fetched):
+    """Fetch of ``default`` times out; every other fetch runs for real."""
+    real = server.git_fetch_origin
+
+    def fetch(repo_cwd, *branches):
+        fetched.append(tuple(branches))
+        if default in branches:
+            return subprocess.CompletedProcess(
+                ["git", "fetch", "origin", default], 124, "", "fetch timed out")
+        return real(repo_cwd, *branches)
+    monkeypatch.setattr(server, "git_fetch_origin", fetch)
+
+
+def test_e_prep_refuses_when_the_default_cannot_be_refreshed(tmp_path, monkeypatch):
+    """A failed default fetch must refuse, not fall back to a cached ref (PR #1066 review).
+
+    The clone's tracking ref for the default is pinned at the stale base, so a
+    gap measured from cached refs is 0 while remote master is 3 commits ahead.
+    """
+    monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    worker, tips = _repo(tmp_path, stale="main", advance=3)
+    _git("-C", worker, "update-ref", "refs/remotes/origin/master", tips["main"])
+    _git("-C", worker, "checkout", "--detach", "origin/main")
+    fetched = []
+    _fail_default_fetch(monkeypatch, worker, "master", fetched)
+
+    with pytest.raises(server.WorktreeFetchFailed, match="origin/master.*timed out") as exc:
+        _prepare_worktree_for_task(
+            str(worker), "impl-1065", "fix/output", "implementer",
+            {"base_branch": "main"}, "implement",
+        )
+    assert exc.value.reason == "prep_fetch_failed"
+    assert ("master",) in fetched
+    assert _git("-C", worker, "rev-parse", "HEAD") == tips["main"]
+    assert _git("-C", worker, "rev-parse", "origin/master") == tips["main"]
+
+
+def test_e_dispatcher_refuses_when_default_fetch_fails_without_launch(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    worker, tips = _repo(tmp_path, stale="main", advance=3)
+    _git("-C", worker, "update-ref", "refs/remotes/origin/master", tips["main"])
+    _git("-C", worker, "checkout", "--detach", "origin/main")
+    _fail_default_fetch(monkeypatch, worker, "master", [])
+
+    db = str(tmp_path / "tasks.db")
+    notices = []
+    app = server.create_app(
+        db, worktree_map={"implementer": str(worker)},
+        identity_required=False, watchdog_disabled=True, anomaly_disabled=True,
+        coordinator_notify_fn=lambda message: notices.append(message) or True,
+    )
+    queue = TaskQueue(db)
+    queue.enqueue(TaskRequest("impl-1065", "implement", "work", branch="fix/work",
+                              project="demo",
+                              context={"risk_tier": 1, "base_branch": "main"}))
+    monkeypatch.setattr(server, "_ensure_role_protocol", lambda *a, **kw: True)
+    launches = []
+
+    async def no_launch(*args, **kwargs):
+        launches.append(args)
+        raise AssertionError("worker launched although the default could not be refreshed")
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", no_launch)
+
+    with TestClient(app):
+        task = queue.dequeue(role="implementer")
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    assert launches == []
+    assert queue.get_result("impl-1065").error_info["reason"] == "prep_fetch_failed"
+    assert _git("-C", worker, "rev-parse", "HEAD") == tips["main"]
+    assert len(notices) == 1
+    assert "prep_fetch_failed" in notices[0]
+
+
 def test_e_dispatcher_refuses_stale_base_with_one_notice(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)

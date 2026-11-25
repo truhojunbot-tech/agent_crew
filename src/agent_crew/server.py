@@ -840,8 +840,17 @@ def _refuse_stale_prep_base(worktree_path: str, task_id: str, base: str) -> None
     if not default or default == base:
         return
     # The declared base was just fetched; refresh the default too so the gap
-    # is measured against origin, not a tracking ref from the last sync.
-    git_fetch_origin(worktree_path, default)
+    # is measured against origin, not a tracking ref from the last sync. A
+    # failed refresh refuses outright: a cached origin/<default> pinned at the
+    # same commit as origin/<base> measures a gap of 0 and would start the
+    # implementer from the stale base without the override (PR #1066 review).
+    fetch = git_fetch_origin(worktree_path, default)
+    if fetch.returncode != 0:
+        raise WorktreeFetchFailed(
+            f"implementer {task_id}: could not fetch origin/{default} to check "
+            f"the declared base {base!r} against the repo default: "
+            f"{(fetch.stderr or '').strip()}"
+        )
     gap = stale_base_gap(worktree_path, base, default)
     if gap:
         raise WorktreeBaseStale(
