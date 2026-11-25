@@ -7103,7 +7103,7 @@ def create_app(
                    "risk_tier": tier}
         for key in ("implementer_agent", "reviewer_agent", "coordinator_managed",
                     "external_operation_id", "lineage_root_task_id", "fix_round",
-                    "risk_declaration"):
+                    "fix_round_grant", "risk_declaration"):
             value = inherited(key)
             if value is not None:
                 context[key] = value
@@ -7870,6 +7870,12 @@ def create_app(
             raise HTTPException(status_code=422, detail=f"unknown_context_key:{unknown[0]}")
         if "suppressed_merge" in ctx:
             raise HTTPException(status_code=422, detail="reserved_context_key:suppressed_merge")
+        if "fix_round_grant" in ctx and (type(ctx["fix_round_grant"]) is not int
+                                         or ctx["fix_round_grant"] < 0):
+            # #1039: the grant is a round budget; anything else would be
+            # quarantined as a malformed row at fix time instead of refused here.
+            raise HTTPException(status_code=422,
+                                detail="fix_round_grant must be an integer >= 0")
         if (ctx.get("directive") or ctx.get("op")) and not ctx.get("external_operation_id"):
             raise HTTPException(status_code=422, detail="directive requires external_operation_id")
         is_rebase_directive = (task.task_type == "implement" and

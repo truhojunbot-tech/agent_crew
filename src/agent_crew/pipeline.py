@@ -126,7 +126,7 @@ _LINEAGE_INTENT_FIELDS = (
     "repo", "issue", "issue_number", "issue_title", "issue_body", "issue_url",
     "base_branch", "coordinator_managed", "coordinator_generation",
     "implementer_agent", "reviewer_agent", "no_tester", "risk_tier",
-    "lineage_root_task_id", "external_operation_id",
+    "lineage_root_task_id", "external_operation_id", "fix_round_grant",
 )
 
 
@@ -1343,6 +1343,37 @@ def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
         current = tasks_by_id[prev]
 
 
+#: Per-lineage budget of automated fix rounds (#1039). Set by the coordinator on
+#: the implement task from the #44 row or Quota grant; successors carry it along.
+FIX_ROUND_GRANT_KEY = "fix_round_grant"
+
+
+def lineage_fix_round_grant(tasks_by_id: dict, task) -> Optional[int]:
+    """Smallest ``fix_round_grant`` anywhere on the lineage, or ``None`` (#1039).
+
+    The grant is narrow-only: a successor carrying a larger value cannot widen
+    what the root was granted, so the minimum over every ancestor wins. An
+    absent key on every ancestor means today's behaviour (the port ceiling).
+    Contexts are operator-writable JSON, so a malformed value is reported the
+    same way as a malformed ``fix_round`` rather than silently widened.
+    """
+    grant: Optional[int] = None
+    current = task
+    seen: set = set()
+    while current is not None and current.task_id not in seen:
+        seen.add(current.task_id)
+        ctx = current.context if isinstance(current.context, dict) else {}
+        if FIX_ROUND_GRANT_KEY in ctx:
+            raw = ctx[FIX_ROUND_GRANT_KEY]
+            if type(raw) is not int or raw < 0:
+                raise MalformedStoredRow(
+                    f"malformed {FIX_ROUND_GRANT_KEY} for task {current.task_id}")
+            grant = raw if grant is None else min(grant, raw)
+        prev = ctx.get("prev_task_id")
+        current = tasks_by_id.get(prev) if isinstance(prev, str) else None
+    return grant
+
+
 def _ancestor_tasks_by_id(queue: TaskQueue, task) -> dict:
     """Load only the requested task's lineage, never unrelated stored rows."""
     tasks = {}
@@ -2095,6 +2126,12 @@ def auto_enqueue_fix(
         baseline_cap = contract.fix_round_cap(review_fix_max_rounds())
         tasks_by_id = _ancestor_tasks_by_id(queue, review_task)
         lineage_root_id = _lineage_root_task_id(tasks_by_id, review_task)
+        # #1039: a per-lineage grant narrows the port ceiling, never widens it.
+        # The canary below narrows again, so the cap in force is the minimum
+        # of all three.
+        fix_round_grant = lineage_fix_round_grant(tasks_by_id, review_task)
+        if fix_round_grant is not None:
+            baseline_cap = min(baseline_cap, fix_round_grant)
         # A prior evaluation may already have held this lineage at the canary
         # cap. That decision is durable: replay must not recompute against a
         # newer clock or a changed/missing contract and enqueue the held fix.
@@ -2254,9 +2291,27 @@ def auto_enqueue_fix(
             # durable marker and notice do not. A canary hold is a HUMAN_GATE
             # that may still release the fix, so it is not a terminal refusal.
             if not canary_fired:
+                grant_exhausted = (fix_round_grant is not None
+                                   and fix_round > fix_round_grant)
+                if grant_exhausted and not review_ctx.get("lineage_terminal_reason"):
+                    # #1039: the typed event tells the lineage's grant apart
+                    # from the port ceiling in GET /tasks/{id} and tasks.db.
+                    # The marker below is durable, so a replayed result POST
+                    # records the event once, like the comment and the notice.
+                    try:
+                        queue.record_exec_event(
+                            review_task_id, "fix_grant_exhausted",
+                            grant=fix_round_grant, round=fix_round, max=max_rounds)
+                    except Exception:
+                        logger.exception(
+                            "auto_enqueue_fix: fix_grant_exhausted event failed for %s",
+                            review_task_id)
                 _record_successor_refused(
-                    queue, review_task_id, "fix_rounds_exhausted",
-                    f"round={fix_round} max={max_rounds}", coordinator_notify_fn)
+                    queue, review_task_id,
+                    "fix_grant_exhausted" if grant_exhausted else "fix_rounds_exhausted",
+                    f"round={fix_round} max={max_rounds}"
+                    + (f" grant={fix_round_grant}" if fix_round_grant is not None else ""),
+                    coordinator_notify_fn)
             # #314 §4 P0: replay 중에는 exhaustion PR comment를 게시하지 않는다(중복 방지).
             if suppress_side_effects:
                 logger.debug(f"auto_enqueue_fix: replay 중 — fix-budget exhaustion comment skip "
@@ -2344,6 +2399,9 @@ def auto_enqueue_fix(
                 fix_context[key] = root_ctx[key]
         if failed_test:
             fix_context["feedback"] = findings_text
+        if fix_round_grant is not None:
+            # Carried as the lineage minimum, so a successor never widens it.
+            fix_context[FIX_ROUND_GRANT_KEY] = fix_round_grant
         inherited_tier = review_ctx.get("risk_tier")
         if type(inherited_tier) is int and 0 <= inherited_tier <= 3:
             fix_context["risk_tier"] = inherited_tier
