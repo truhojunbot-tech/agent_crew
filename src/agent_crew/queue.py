@@ -3314,21 +3314,24 @@ class TaskQueue:
             # Check inside the same write transaction as INSERT (no TOCTOU).
             if task.task_type == "implement":
                 from agent_crew.lineage_human_gate import blocking_lineage_gate
+                lineage_refusal = {}
                 blocker = blocking_lineage_gate(
                     conn, project=scope,
                     pr_number=(_normalize_pr_number(task.pr_number)
                                or _normalize_pr_number(context.get("pr_number"))),
-                    issue_number=context.get("issue"),
-                    receipt=receipt,
+                    issue_number=context.get("issue", context.get("issue_number")),
+                    receipt=receipt, task_context=context, task_id=task.task_id,
+                    refusal=lineage_refusal,
                 )
                 if blocker is not None:
                     self._append_exec_event_on(
                         conn, task.task_id, "lineage_human_gate_refused", time.time(),
-                        blocking_task_id=blocker, code="LINEAGE_HUMAN_GATE")
+                        blocking_task_id=blocker, code="LINEAGE_HUMAN_GATE",
+                        reason=lineage_refusal.get("reason"))
                     conn.commit()  # refusal evidence, but no task row
                     raise PermissionError(
-                        f"LINEAGE_HUMAN_GATE: predecessor {blocker} exhausted "
-                        "the fix budget; verified owner re-execution approval required")
+                        f"LINEAGE_HUMAN_GATE: predecessor {blocker}: "
+                        f"{lineage_refusal.get('reason', 'fix_budget_exhausted')}")
             admit_at = time.time()
             reservation_ttl = self.review_reservation_ttl()
             expired_reservations: list = []
