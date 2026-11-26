@@ -1862,7 +1862,7 @@ def _findings_block(findings: list, review_task_id: str) -> str:
 ROOT_ACCEPTANCE_CONTEXT_KEYS = ("acceptance_verbatim", "verification_contract",
                                 "test_gate", "ops_deps")
 _ACCEPTANCE_MARKER = re.compile(
-    r"^(acceptance|done when|test gate|full suite)\b", re.IGNORECASE)
+    r"^(acceptance|done when|test gate|full suite|out of scope)\b", re.IGNORECASE)
 _FULL_SUITE_COMMAND = re.compile(r"\bpytest\b.*\stests\b")
 _MD_HEADING = re.compile(r"^(#{1,6})\s")
 _LIST_OR_CONTINUATION = re.compile(r"^(\s+\S|\s*([-*+]|\d+[.)]|[A-Za-z][.)])\s)")
@@ -1906,7 +1906,8 @@ def extract_acceptance_sections(description: str) -> str:
 
     A section starts at a marker line: a line whose text, after any leading
     ``#``/``*``/``-``/``>`` and whitespace, starts with ``Acceptance``,
-    ``Done when``, ``Test gate`` or ``Full suite`` (case-insensitive).
+    ``Done when``, ``Test gate``, ``Full suite`` or ``Out of scope``
+    (case-insensitive).
 
       * A markdown heading marker runs until the next heading of the same or a
         higher level.
