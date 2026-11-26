@@ -1165,12 +1165,8 @@ def _recover_implementer_agent(queue: TaskQueue, task, pr_number=None):
                 or (candidate.context or {}).get("repo") != context.get("repo")):
             return None
         attribution = queue.get_attribution(candidate.task_id) or {}
-        candidate_context = candidate.context or {}
-        return (attribution.get("agent") or candidate_context.get("agent_override")
-                or candidate_context.get("implementer_agent"))
+        return attribution.get("agent") or queue.get_dispatch_agent(candidate.task_id)
 
-    if task.task_type == "implement":
-        return lineage_agent(task)
     seen = set()
     parent = task
     while parent and parent.task_id not in seen:
@@ -1227,12 +1223,10 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
         if predecessor is None:
             return None
         implementer_agent = _recover_implementer_agent(queue, predecessor, pr_number)
-        if not implementer_agent:
-            _record_successor_refused(queue, review_task_id, "implementer_unknown",
-                                      "cannot resolve lineage implementer_agent",
-                                      coordinator_notify_fn)
-            return None
-        context["implementer_agent"] = implementer_agent
+        if implementer_agent:
+            context["implementer_agent"] = implementer_agent
+        else:
+            context.pop("implementer_agent", None)
         prior_attribution = queue.get_attribution(review_task_id) or {}
         provider = (base.get("agent_override") or base.get("reviewer_agent")
                     or reviewer_provider or prior_attribution.get("agent")
@@ -2896,17 +2890,9 @@ def auto_enqueue_review(
                 f"from a stale local copy."
             )
 
-        # Identify which agent actually implemented this task. Prefer the
-        # recorded execution attribution, then explicit routing, then
-        # the pane mapping before the dispatcher default. Recorded so the rate-limit fallback
-        # handler can skip it during reviewer selection (#117 — self-review
-        # prevention).
-        implementer_agent = (
-            _recover_implementer_agent(queue, impl_task, pr_number)
-            or default_agent_for_role("implementer", pane_map)
-            or implementer_provider
-            or baseline_agent_for_role("implementer")
-        )
+        # Historical execution identity must come from recorded rows; today's
+        # pane map and role defaults say nothing about who produced this change.
+        implementer_agent = _recover_implementer_agent(queue, impl_task, pr_number)
 
         review_context = {
             "checklist_layers": ["test_quality", "code_quality", "business_gap"],
@@ -2970,6 +2956,8 @@ def auto_enqueue_review(
         if _impl_repo:
             review_context["repo"] = _impl_repo
         _carry_lineage_intent(review_context, impl_task, "reviewer")
+        if not implementer_agent:
+            review_context.pop("implementer_agent", None)
 
         # #305: pin the review to the commit the implementer actually pushed.
         # ⛔Only when it is a real object id — `TaskResult` normalises anything

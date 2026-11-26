@@ -81,6 +81,7 @@ def test_generated_successor_inherits_tier_without_prose_escalation(tmp_db):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("parent-928", "implement", "work",
                               context={"risk_tier": 0}), ingress="loop.implement")
+    queue.record_attribution("parent-928", agent="codex", role="implementer")
     queue.enqueue(TaskRequest("child-928", "review", "deploy delete server",
                               context={"prev_task_id": "parent-928"}),
                   ingress="cascade.review",

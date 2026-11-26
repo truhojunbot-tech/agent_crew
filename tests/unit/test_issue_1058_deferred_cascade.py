@@ -18,6 +18,7 @@ def case(tmp_path, monkeypatch):
     q.enqueue(TaskRequest("impl-1058", "implement", "work", branch="agent/1058",
                           context={"repo": "owner/repo", "risk_tier": 1,
                                    "agent_override": "codex", "pr_number": 1058}))
+    q.record_attribution("impl-1058", agent="codex", role="implementer")
     q.submit_result("impl-1058", TaskResult("impl-1058", "completed", "done", pr_number=1058))
     state = {"value": "unknown"}
     monkeypatch.setattr(github, "pr_state", lambda *a, **k: state["value"])
@@ -207,38 +208,38 @@ def test_cli_review_with_explicit_implementer(case):
     assert q.get_task(result.output.strip()).context["implementer_agent"] == "codex"
 
 
-def test_unresolved_stale_review_records_refusal(case, monkeypatch):
+def test_unresolved_stale_review_parks_with_typed_blocker(case):
     q, _, _, _ = case
     ctx = {"risk_tier": 1, "pr_number": 999}
     q.enqueue(TaskRequest("orphan-stale", "review", "review", context=ctx))
-    refusals = []
-    monkeypatch.setattr(pipeline, "_record_successor_refused",
-                        lambda *args: refusals.append(args))
-    assert pipeline.requeue_review_at_head(
-        q, "orphan-stale", 999, "b" * 40, ctx, project="") is None
-    assert refusals[0][2] == "implementer_unknown"
-    assert not any(t.context.get("superseded_review") == "orphan-stale"
-                   for t in q.list_tasks())
+    rid = pipeline.requeue_review_at_head(
+        q, "orphan-stale", 999, "b" * 40, ctx, project="")
+    assert rid is not None
+    assert q.get_task(rid).status == "blocked"
+    assert q.get_task(rid).context["review_identity_blocker"]["missing_keys"] == [
+        "implementer_agent"]
 
 
-def test_dispatcher_review_uses_configured_implementer_without_attribution(case):
+def test_dispatcher_review_parks_without_attribution(case):
     q, _, _, _ = case
     q.enqueue(TaskRequest("mapped-impl", "implement", "work",
                           context={"risk_tier": 1, "pr_number": 1060}))
     rid = pipeline.auto_enqueue_review(
         q, "mapped-impl", 1060, pane_map={}, implementer_provider="claude",
         pr_state_fn=lambda _: "open")
-    assert q.get_task(rid).context["implementer_agent"] == "claude"
+    assert q.get_task(rid).status == "blocked"
+    assert "implementer_agent" not in q.get_task(rid).context
 
 
 @pytest.mark.parametrize("pane_map,expected", [
     ({"implementer": "%100", "claude": "%100"}, "claude"),
     ({"reviewer": "%200", "claude": "%200"}, "codex"),
 ])
-def test_review_prefers_pane_implementer_over_dispatcher_provider(case, pane_map, expected):
+def test_review_prefers_recorded_implementer_over_current_roles(case, pane_map, expected):
     q, _, _, _ = case
     q.enqueue(TaskRequest("pane-impl", "implement", "work",
                           context={"risk_tier": 1, "pr_number": 1060}))
+    q.record_attribution("pane-impl", agent=expected, role="implementer")
     rid = pipeline.auto_enqueue_review(
         q, "pane-impl", 1060, pane_map=pane_map, implementer_provider="codex",
         pr_state_fn=lambda _: "open")
