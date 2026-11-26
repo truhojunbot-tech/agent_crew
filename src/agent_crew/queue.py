@@ -4687,7 +4687,19 @@ class TaskQueue:
                 validate_http_root_risk(context)
                 validate_local_inputs(context)
                 if task.task_type == "review":
-                    missing = [key for key in ("prev_task_id", "implementer_agent")
+                    required_keys = ("prev_task_id", "implementer_agent")
+                    if _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
+                        # System successors predate mandatory implementer metadata.
+                        # Recover a recorded identity when possible, but preserve
+                        # admission for legacy lineages with no recorded agent.
+                        from agent_crew.pipeline import _recover_implementer_agent
+                        if not context.get("implementer_agent"):
+                            agent = _recover_implementer_agent(
+                                self, replace(task, context=context))
+                            if agent:
+                                context["implementer_agent"] = agent
+                        required_keys = ("prev_task_id",)
+                    missing = [key for key in required_keys
                                if not isinstance(context.get(key), str) or not context[key].strip()]
                     if missing:
                         raise ValueError("review requires context keys: " + ", ".join(missing))

@@ -135,10 +135,6 @@ def _tier_legacy_task_posts(monkeypatch, request):
             context = payload.get("context")
             if (context is None or isinstance(context, dict)):
                 context = context or {}
-                if payload["task_type"] == "review" and "issue_1058" not in request.node.path.name:
-                    context = {"prev_task_id": f"legacy-implement-{payload.get('task_id', 'review')}",
-                               "implementer_agent": "codex", **context}
-                    kwargs["json"] = {**payload, "context": context}
                 if "risk_tier" not in context and "risk_declaration" not in context:
                     kwargs["json"] = {**payload, "context": {**context, "risk_tier": 1}}
         return original_post(client, url, *args, **kwargs)
@@ -159,18 +155,6 @@ def _tier_legacy_task_posts(monkeypatch, request):
             if (test_authored_root and "risk_tier" not in task.context
                     and "risk_declaration" not in task.context):
                 task = replace(task, context={**task.context, "risk_tier": 1})
-        # #1058: old fixtures predate mandatory review lineage. Give only
-        # test-authored rows an explicit implementer; production successors
-        # must carry it themselves. The contract suite exercises missing keys.
-        if ("issue_1058" not in request.node.path.name
-                and isinstance(task, TaskRequest)
-                and "_successor_provenance" not in kwargs):
-            context = dict(task.context or {})
-            if task.task_type == "review":
-                if kwargs.get("ingress") is not None:
-                    context.setdefault("prev_task_id", f"legacy-implement-{task.task_id}")
-                context.setdefault("implementer_agent", "codex")
-            task = replace(task, context=context)
         return original_enqueue(queue, task, *args, **kwargs)
 
     monkeypatch.setattr(TaskQueue, "enqueue", enqueue)
