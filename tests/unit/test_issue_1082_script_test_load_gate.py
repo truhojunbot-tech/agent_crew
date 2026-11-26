@@ -97,26 +97,58 @@ def xdist_present(monkeypatch):
 
 
 _CMD = f"{sys.executable} -m pytest -q"
+_SH = f"{_CMD} tests > out.log"          # shell syntax: best-effort PYTEST_ADDOPTS
+
+
+@pytest.mark.usefixtures("xdist_present")
+@pytest.mark.parametrize(("addopts", "command"), [
+    (None, _CMD),
+    (None, f"{_CMD} -n 8 --maxprocesses=8"),
+    ("-n 8 --maxprocesses=8", f"{_CMD} --maxprocesses 8 tests"),
+    (None, "pytest -n 8 'tests/a b.py'"),
+])
+def test_direct_pytest_launch_appends_the_cap_last(addopts, command, tmp_path):
+    """Scope decision on #1082: a direct pytest argv is bounded at launch."""
+    (tmp_path / "pytest").write_text(f"#!{sys.executable}\n")
+    (tmp_path / "pytest").chmod(0o755)
+    env = {"PATH": f"{tmp_path}:/bin", **({"PYTEST_ADDOPTS": addopts} if addopts else {})}
+    launched, capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd="/")
+    assert launched == f"{command} --maxprocesses=4" and capped == env
+    assert evidence == {"cap_requested": 4, "mechanism": "argv --maxprocesses",
+                        "injection": "appended"}
+
+
+@pytest.mark.usefixtures("xdist_present")
+@pytest.mark.parametrize("command", [
+    f"{_CMD} tests > out.log", f"{_CMD} a && {_CMD} b", f"{_CMD} tests | tee log",
+    f"{_CMD} tests # note", f"{_CMD} tests; echo done", f"{_CMD} -- tests",
+    f"(cd sub && {_CMD})", f"X=1 {_CMD}", f"{_CMD} 'a;b'",
+])
+def test_shell_commands_are_not_rewritten(command):
+    launched, _, evidence = script_tester.cap_xdist_workers(command, {"PATH": "/bin"}, 4,
+                                                            cwd="/")
+    assert launched == command and evidence["injection"] != "appended"
 
 
 @pytest.mark.usefixtures("xdist_present")
 @pytest.mark.parametrize(("addopts", "command", "expected", "injection"), [
-    (None, _CMD, "--maxprocesses=4", "injected"),
-    ("-n 8 -q", _CMD, "-n 8 -q --maxprocesses=4", "injected"),
-    ("--maxprocesses=8", _CMD, "--maxprocesses=8 --maxprocesses=4", "injected"),
-    ("--maxprocesses 2", _CMD, "--maxprocesses 2", "already_configured"),
-    ("--maxprocesses=4", _CMD, "--maxprocesses=4", "already_configured"),
+    (None, _SH, "--maxprocesses=4", "injected"),
+    ("-n 8 -q", _SH, "-n 8 -q --maxprocesses=4", "injected"),
+    ("--maxprocesses=8", _SH, "--maxprocesses=8 --maxprocesses=4", "injected"),
+    ("--maxprocesses 2", _SH, "--maxprocesses 2", "already_configured"),
+    ("--maxprocesses=4", _SH, "--maxprocesses=4", "already_configured"),
     # Duplicates: the last one is effective, not any low one (review of #1083).
-    ("--maxprocesses=2 --maxprocesses=8 -n 8", _CMD,
+    ("--maxprocesses=2 --maxprocesses=8 -n 8", _SH,
      "--maxprocesses=2 --maxprocesses=8 -n 8 --maxprocesses=4", "injected"),
-    ("--maxprocesses=8 --maxprocesses=2", _CMD, "--maxprocesses=8 --maxprocesses=2",
+    ("--maxprocesses=8 --maxprocesses=2", _SH, "--maxprocesses=8 --maxprocesses=2",
      "already_configured"),
     # A command value at or under the cap stays within it after ours.
-    (None, f"{_CMD} -n 8 --maxprocesses=3", "--maxprocesses=4", "injected"),
+    (None, f"{_CMD} -n 8 --maxprocesses=3 > out.log", "--maxprocesses=4", "injected"),
 ])
 def test_cap_goes_into_pytest_addopts(addopts, command, expected, injection):
     env = {"PATH": "/bin"} if addopts is None else {"PATH": "/bin", "PYTEST_ADDOPTS": addopts}
-    capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd="/")
+    launched, capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd="/")
+    assert launched == command
     assert capped["PYTEST_ADDOPTS"] == expected and capped["PATH"] == "/bin"
     assert evidence["injection"] == injection and evidence["cap_requested"] == 4
     assert env.get("PYTEST_ADDOPTS") == addopts           # the input is not mutated
@@ -125,8 +157,9 @@ def test_cap_goes_into_pytest_addopts(addopts, command, expected, injection):
 @pytest.mark.usefixtures("xdist_present")
 @pytest.mark.parametrize(("command", "env", "reason"), [
     # pytest reads the command after PYTEST_ADDOPTS, so a larger value wins.
-    (f"{_CMD} -n 8 --maxprocesses=8", {}, "command_overrides_cap"),
-    (f"{_CMD} -n 8 --maxprocesses 3 --maxprocesses 8", {}, "command_overrides_cap"),
+    (f"{_CMD} -n 8 --maxprocesses=8 > out.log", {}, "command_overrides_cap"),
+    (f"{_CMD} -n 8 --maxprocesses 3 --maxprocesses 8 > out.log", {},
+     "command_overrides_cap"),
     (f"{_CMD} --maxprocesses=$N", {}, "command_expands_at_runtime"),
     ("make test", {}, "pytest_launcher_unresolved"),
     ("missing-python3 -m pytest", {}, "pytest_launcher_unresolved"),
@@ -137,8 +170,8 @@ def test_cap_goes_into_pytest_addopts(addopts, command, expected, injection):
 ])
 def test_unresolvable_invocations_skip_the_injection(command, env, reason):
     env = {"PATH": "/bin", **env}
-    capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd="/")
-    assert capped == env                                   # nothing injected
+    launched, capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd="/")
+    assert (launched, capped) == (command, env)                                  # nothing injected
     assert evidence == {"cap_requested": 4, "mechanism": "PYTEST_ADDOPTS --maxprocesses",
                         "injection": "skipped", "reason": reason}
 
@@ -160,7 +193,8 @@ def test_xdist_is_probed_in_the_target_interpreter_not_the_crew(tmp_path):
                             ("venv/bin/pytest tests", "xdist_unavailable"),
                             (f"{_CMD} unit && pytest e2e", "xdist_unavailable"),
                             ("venv/bin/py.test", "pytest_launcher_unresolved")]:
-        capped, evidence = script_tester.cap_xdist_workers(command, env, 4, cwd=str(tmp_path))
+        _, capped, evidence = script_tester.cap_xdist_workers(command, env, 4,
+                                                              cwd=str(tmp_path))
         assert (evidence["injection"], evidence["reason"]) == ("skipped", reason), command
         assert capped == env
     assert script_tester._target_has_xdist(str(tmp_path / "nope"), env, str(tmp_path)) is False
@@ -202,7 +236,7 @@ def test_real_shell_command_keeps_its_redirect_and_implicit_workers_are_capped(
     else:
         test_env["PYTEST_ADDOPTS"] = "-n 8"
     command = "python3 -m pytest -p no:cacheprovider tests > result.log 2>&1 && echo shell-ok"
-    env, evidence = script_tester.cap_xdist_workers(
+    _, env, evidence = script_tester.cap_xdist_workers(
         command, script_tester.test_environment(str(tmp_path), {"test_env": test_env}), 2,
         cwd=str(tmp_path))
     assert evidence["injection"] == "injected"
@@ -225,7 +259,7 @@ def test_real_hidden_parallel_invocation_leaves_observed_workers_unknown(tmp_pat
     out = tmp_path / "workers.txt"
     command = ("PYTEST_ADDOPTS='-n 8' python3 -m pytest -p no:cacheprovider tests"
                " > hidden.log 2>&1; python3 -m pytest -p no:cacheprovider -p no:xdist tests")
-    env, evidence = script_tester.cap_xdist_workers(
+    _, env, evidence = script_tester.cap_xdist_workers(
         command, script_tester.test_environment(
             str(tmp_path), {"test_env": {"WORKERS_OUT": str(out)}}), 2, cwd=str(tmp_path))
     outcome = script_tester.run_command(command, str(tmp_path), 120, env=env)
@@ -236,14 +270,25 @@ def test_real_hidden_parallel_invocation_leaves_observed_workers_unknown(tmp_pat
     assert "status" not in receipt and not any("enforced" in k for k in receipt)
 
 
-def test_real_cli_cap_after_addopts_is_reported_unenforced(tmp_path):
-    """The command's own --maxprocesses=8 is read after PYTEST_ADDOPTS and wins,
-    so the cap is not injected and the env is left as configured."""
-    command = "python3 -m pytest -n 8 --maxprocesses=8 tests > result.log"
-    base = script_tester.test_environment(str(tmp_path), {})
-    env, evidence = script_tester.cap_xdist_workers(command, base, 2, cwd=str(tmp_path))
-    assert evidence["injection"] == "skipped"
-    assert evidence["reason"] == "command_overrides_cap" and env == base
+@pytest.mark.skipif(not script_tester._target_has_xdist(sys.executable, dict(os.environ), "."),
+                    reason="needs pytest-xdist")
+def test_real_cli_cap_after_addopts_is_bounded(tmp_path):
+    """A direct launch with its own --maxprocesses=8 (and -n 8 in PYTEST_ADDOPTS)
+    gets --maxprocesses=4 last, and really runs with 4 workers (review of #1083)."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_w.py").write_text(_WORKER_COUNT_TEST)
+    out = tmp_path / "workers.txt"
+    command = "python3 -m pytest -p no:cacheprovider -n 8 --maxprocesses=8 tests"
+    base = script_tester.test_environment(
+        str(tmp_path), {"test_env": {"WORKERS_OUT": str(out), "PYTEST_ADDOPTS": "-n 8"}})
+    launched, env, evidence = script_tester.cap_xdist_workers(command, base, 4,
+                                                              cwd=str(tmp_path))
+    assert launched.endswith(" --maxprocesses=4") and evidence["injection"] == "appended"
+    outcome = script_tester.run_command(launched, str(tmp_path), 120, env=env)
+    assert outcome.exit_code == 0, outcome.output_tail
+    assert out.read_text() == "4"
+    receipt = script_tester.worker_cap_receipt(evidence, launched, outcome)
+    assert receipt["observed_workers"] == 4, outcome.output_tail
 
 
 def _reported(output, exit_code=0):
@@ -274,8 +319,9 @@ _XDIST_2 = "created: 2/2 workers\n2 workers [12 items]\n\n....\n12 passed in 3.1
 ])
 def test_observed_workers_only_from_an_explicit_line_of_one_invocation(
         command, output, observed):
-    _, injection = script_tester.cap_xdist_workers(command, {"PATH": "/bin"}, 4, cwd="/")
-    receipt = script_tester.worker_cap_receipt(injection, command, _reported(output))
+    launched, _, injection = script_tester.cap_xdist_workers(command, {"PATH": "/bin"}, 4,
+                                                             cwd="/")
+    receipt = script_tester.worker_cap_receipt(injection, launched, _reported(output))
     assert (receipt["cap_requested"], receipt["observed_workers"]) == (4, observed)
     assert "status" not in receipt
 
@@ -321,37 +367,59 @@ def test_full_suite_runs_with_capped_workers_and_gate(project, tmp_path, monkeyp
     assert "load_contended" not in record
 
 
-@pytest.mark.usefixtures("xdist_present")
-def test_isolated_reruns_keep_the_configured_command(project, tmp_path):
-    repo, head = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
-    node, calls = "tests/test_b.py::test_two", []
-    command = f"{PYTEST} --numprocesses=8"
-
+def _rerun_runner(calls, node, base_workers):
     def runner(cmd, cwd, timeout_s, *, env=None):
         calls.append((cmd, (env or {}).get("PYTEST_ADDOPTS")))
         if cmd.endswith(node):
             return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
         if os.path.exists(os.path.join(cwd, "tests", "test_b.py")):
             return _reported(f"created: 4/4 workers\nFAILED {node}\n1 failed in 1s\n", 1)
-        return _reported("created: 8/8 workers\n1 passed in 1s\n")
+        return _reported(f"created: {base_workers}/{base_workers} workers\n1 passed in 1s\n")
+    return runner
 
+
+@pytest.mark.usefixtures("xdist_present")
+def test_isolated_reruns_keep_the_configured_command(project, tmp_path):
+    repo, head = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    node, calls = "tests/test_b.py::test_two", []
+    command, cache = f"{PYTEST} --numprocesses=8", str(tmp_path / "cache")
+    base_sha, state = _git_rev(repo, "origin/main"), {"test_command": command}
+    runner = _rerun_runner(calls, node, 3)
     record = script_tester.run_script_test(
-        repo, base_sha=_git_rev(repo, "origin/main"), head_sha=head,
-        state={"test_command": command}, cache_dir=str(tmp_path / "cache"), runner=runner,
+        repo, base_sha=base_sha, head_sha=head, state=state, cache_dir=cache, runner=runner,
         load_gate=_gate(FakeHost([1.0])))
-    capped = (command, "--maxprocesses=4")
+    capped = (f"{command} --maxprocesses=4", None)             # bounded at launch
     assert calls[:2] == [capped, capped]                       # head + base full suites
     assert calls[2:] == [(f"{command} {node}", None)] * 2      # reruns unchanged
-    assert len(record["host_load"]) == 2
-    # Head and base each keep their own worker evidence, so parity shows both.
-    assert (record["worker_cap"]["cap_requested"],
-            record["worker_cap"]["observed_workers"]) == (4, 4)
-    assert (record["base"]["worker_cap"]["cap_requested"],
-            record["base"]["worker_cap"]["observed_workers"]) == (4, 8)
+    assert record["suite_command"] == capped[0] and len(record["host_load"]) == 2
+    assert record["worker_cap"]["observed_workers"] == 4
+    assert record["base"]["worker_cap"]["observed_workers"] == 3
+    assert record["outcome"] == script_tester.FAILED and record["new_failures"] == [node]
+    # Keyed by the observed 3 workers: reused under cap 4, never under cap 2.
     cached, was_cached = script_tester.base_outcome(
-        repo, _git_rev(repo, "origin/main"), command, record["timeout_s"], str(tmp_path / "cache"),
-        {"test_command": command}, runner, worker_cap=4)
+        repo, base_sha, command, record["timeout_s"], cache, state, runner, worker_cap=4)
     assert was_cached and cached.worker_cap == record["base"]["worker_cap"]
+    _, was_cached = script_tester.base_outcome(
+        repo, base_sha, command, record["timeout_s"], cache, state, runner, worker_cap=2)
+    assert not was_cached
+
+
+@pytest.mark.usefixtures("xdist_present")
+def test_base_with_more_workers_than_the_cap_is_not_used_for_parity(project, tmp_path):
+    repo, head = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    node, calls = "tests/test_b.py::test_two", []
+    command, cache = f"{PYTEST} --numprocesses=8", str(tmp_path / "cache")
+    base_sha, state = _git_rev(repo, "origin/main"), {"test_command": command}
+    runner = _rerun_runner(calls, node, 8)
+    record = script_tester.run_script_test(
+        repo, base_sha=base_sha, head_sha=head, state=state, cache_dir=cache, runner=runner,
+        load_gate=_gate(FakeHost([1.0])))
+    assert (record["outcome"], record["reason"]) == (
+        script_tester.INCOMPLETE, "script_test_base_over_cap")
+    assert record["base"]["worker_cap"]["observed_workers"] == 8 and len(calls) == 2
+    _, was_cached = script_tester.base_outcome(
+        repo, base_sha, command, record["timeout_s"], cache, state, runner, worker_cap=4)
+    assert not was_cached                                  # the 8-worker base is not reused
 
 
 def _git_rev(repo, ref):

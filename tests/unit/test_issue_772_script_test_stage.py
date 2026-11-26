@@ -23,6 +23,11 @@ from tests.dispatch_provenance import record_dispatch_provenance
 pytestmark = pytest.mark.usefixtures("admit_crew_run")  # #1006: subject is not admission
 
 PYTEST = f"{sys.executable} -m pytest -q -p no:cacheprovider"
+
+
+def _suite(command):
+    """A full-suite launch: PYTEST, or PYTEST bounded by the #1082 worker cap."""
+    return command in (PYTEST, f"{PYTEST} --maxprocesses=4")
 PR = 7
 
 
@@ -196,7 +201,7 @@ def test_new_failure_is_judged_from_isolated_head_reruns(
         if len(calls) == 1:
             return script_tester.RunOutcome(exit_code=1, failing_ids=[node],
                                             counts={"failed": 1}, duration_s=3)
-        if command == PYTEST:
+        if _suite(command):
             return script_tester.RunOutcome(exit_code=0, duration_s=2)
         code = rerun_exit_codes.pop(0)
         return script_tester.RunOutcome(exit_code=code, duration_s=1,
@@ -210,13 +215,9 @@ def test_new_failure_is_judged_from_isolated_head_reruns(
     assert record["flaky"] == expected_flaky
     assert record["new_failures"] == ([] if expected_flaky else [node])
     assert len(record["reruns"][node]) == expected_reruns
-    rerun_calls = [call for call in calls if call[0] != PYTEST]
+    rerun_calls = [call for call in calls if not _suite(call[0])]
     assert all(command.endswith(" " + node) for command, _, _ in rerun_calls)
-    # #1082: only the full suite carries the worker cap; reruns keep the rest.
-    head_env = dict(calls[0][2])
-    if head_env.get("PYTEST_ADDOPTS") == "--maxprocesses=4":
-        del head_env["PYTEST_ADDOPTS"]
-    assert all(cwd == calls[0][1] and env == head_env
+    assert all(cwd == calls[0][1] and env == calls[0][2]
                for _, cwd, env in rerun_calls)
     result = script_tester.record_to_result("test-flake", record)
     assert result.status == ("completed" if expected_flaky else "failed")
@@ -231,7 +232,7 @@ def test_isolated_rerun_timeout_is_incomplete(project, tmp_path):
     node = "tests/test_b.py::test_two"
 
     def runner(command, cwd, timeout_s, *, env=None):
-        if command != PYTEST:
+        if not _suite(command):
             return script_tester.RunOutcome(exit_code=None, timed_out=True, duration_s=10)
         if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
             return script_tester.RunOutcome(exit_code=1, failing_ids=[node], duration_s=1)
@@ -255,7 +256,7 @@ def test_many_new_failures_do_not_start_unbounded_reruns(project, tmp_path):
 
     def runner(command, cwd, timeout_s, *, env=None):
         calls.append(command)
-        if command != PYTEST:
+        if not _suite(command):
             pytest.fail("a large failure set must not start isolated reruns")
         if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
             return script_tester.RunOutcome(exit_code=1, failing_ids=ids)
@@ -275,7 +276,7 @@ def test_many_new_failures_do_not_start_unbounded_reruns(project, tmp_path):
     assert result.findings == [f"new failure: {node}" for node in ids]
     from agent_crew.loop import handle_test_result
     assert handle_test_result(result) == "failed"
-    assert calls == [PYTEST, PYTEST]
+    assert len(calls) == 2 and all(_suite(call) for call in calls)
 
 
 @pytest.mark.parametrize("command", ["pytest tests/unit", "make test", "pytest -q && echo done"])
@@ -318,7 +319,7 @@ def test_isolated_reruns_share_bounded_watchdog_allowance(project, tmp_path):
     rerun_timeouts = []
 
     def runner(command, cwd, timeout_s, *, env=None):
-        if command != PYTEST:
+        if not _suite(command):
             rerun_timeouts.append(timeout_s)
             return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
         if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
@@ -345,7 +346,7 @@ def test_default_limit_reruns_three_through_five_candidates(project, tmp_path, c
 
     def runner(command, cwd, timeout_s, *, env=None):
         calls.append(command)
-        if command != PYTEST:
+        if not _suite(command):
             return script_tester.RunOutcome(exit_code=0)
         if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
             return script_tester.RunOutcome(exit_code=1, failing_ids=ids)
@@ -398,7 +399,7 @@ def test_configured_rerun_budget_limits_attempt_time(project, tmp_path, monkeypa
     monkeypatch.setenv("AGENT_CREW_SCRIPT_TEST_RERUN_BUDGET_S", "0.05")
 
     def runner(command, cwd, timeout_s, *, env=None):
-        if command != PYTEST:
+        if not _suite(command):
             timeouts.append(timeout_s)
             return script_tester.RunOutcome(exit_code=0)
         if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
@@ -420,7 +421,7 @@ def test_unjudged_rerun_is_incomplete_and_notifies_once(project, server, monkeyp
     node = "tests/test_b.py::test_two"
 
     def runner(command, cwd, timeout_s, *, env=None):
-        if command != PYTEST:
+        if not _suite(command):
             return script_tester.RunOutcome(exit_code=2, output_tail="collection failed")
         if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
             return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
@@ -771,7 +772,7 @@ def test_server_flaky_head_failure_has_no_implement_successor(
     node = "tests/test_b.py::test_two"
 
     def runner(command, cwd, timeout_s, *, env=None):
-        if command != PYTEST:
+        if not _suite(command):
             return script_tester.RunOutcome(exit_code=0, counts={"passed": 1})
         if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
             return script_tester.RunOutcome(exit_code=1, failing_ids=[node])

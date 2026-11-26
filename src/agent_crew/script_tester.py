@@ -163,6 +163,16 @@ class HostLoadGate:
 
 _MAXPROCESSES = "--maxprocesses"
 _SHELL_EXPANSION = re.compile(r"[$`]")
+# Anything that would make an appended word mean something other than one more
+# pytest argument: operators, redirects, subshells, comments, continuations.
+_SHELL_SYNTAX = re.compile(r"[;&|<>()#\n\\]")
+
+
+def _direct_pytest(command: str, words: list[str]) -> bool:
+    """Whether ``command`` is one plain pytest argv, safe to extend at its end."""
+    return (bool(words) and not _SHELL_SYNTAX.search(command)
+            and _pytest_launcher(words, 0) is not None and "--" not in words
+            and sum(_pytest_launcher(words, i) is not None for i in range(len(words))) == 1)
 
 
 def _maxprocesses_values(words: list[str]) -> list[str]:
@@ -233,10 +243,16 @@ def _target_has_xdist(interpreter: str, env: Mapping[str, str], cwd: str) -> boo
 
 
 def cap_xdist_workers(command: str, env: Mapping[str, str], cap: int, *,
-                      cwd: str) -> tuple[dict[str, str], dict]:
-    """Inject a full suite's xdist worker cap ``cap`` through ``PYTEST_ADDOPTS``.
+                      cwd: str) -> tuple[str, dict[str, str], dict]:
+    """Bound a full suite's xdist workers by ``cap``; returns (command, env, evidence).
 
-    The command is never rewritten: it runs under ``/bin/sh -c``, so redirects,
+    A direct pytest launch (one plain pytest argv, no shell syntax) gets
+    ``--maxprocesses=<cap>`` appended as its last argument, which wins over any
+    earlier value: ``injection`` is ``appended`` and the bound is enforced
+    (scope decision on #1082). Every other command is best-effort through
+    ``PYTEST_ADDOPTS`` as below.
+
+    Such a command is never rewritten: it runs under ``/bin/sh -c``, so redirects,
     pipes, variables and chained commands keep their meaning (review of #1083).
     pytest reads ini ``addopts``, then ``PYTEST_ADDOPTS``, then the command's
     own arguments, and the last ``--maxprocesses`` wins; xdist then bounds any
@@ -252,8 +268,8 @@ def cap_xdist_workers(command: str, env: Mapping[str, str], cap: int, *,
     env = dict(env)
     evidence: dict = {"cap_requested": cap, "mechanism": f"PYTEST_ADDOPTS {_MAXPROCESSES}"}
 
-    def skipped(reason: str) -> tuple[dict[str, str], dict]:
-        return env, {**evidence, "injection": "skipped", "reason": reason}
+    def skipped(reason: str) -> tuple[str, dict[str, str], dict]:
+        return command, env, {**evidence, "injection": "skipped", "reason": reason}
 
     addopts = env.get("PYTEST_ADDOPTS", "")
     try:
@@ -264,20 +280,23 @@ def cap_xdist_workers(command: str, env: Mapping[str, str], cap: int, *,
         return skipped("command_expands_at_runtime")
     if "PYTEST_DISABLE_PLUGIN_AUTOLOAD" in env or "no:xdist" in words + addopt_words:
         return skipped("xdist_disabled")
-    command_values = _maxprocesses_values(words)
-    if not all(_within(value, cap) for value in command_values):
-        return skipped("command_overrides_cap")
     interpreters = _pytest_interpreters(words, env, cwd)
     if interpreters is None:
         return skipped("pytest_launcher_unresolved")
     if not all(_target_has_xdist(interpreter, env, cwd) for interpreter in interpreters):
         return skipped("xdist_unavailable")
+    if _direct_pytest(command, words):
+        return f"{command} {_MAXPROCESSES}={cap}", env, {
+            "cap_requested": cap, "mechanism": f"argv {_MAXPROCESSES}",
+            "injection": "appended"}
+    if not all(_within(value, cap) for value in _maxprocesses_values(words)):
+        return skipped("command_overrides_cap")
     addopt_values = _maxprocesses_values(addopt_words)
     if addopt_values and _within(addopt_values[-1], cap):
-        return env, {**evidence, "injection": "already_configured",
-                     "configured": int(addopt_values[-1])}
+        return command, env, {**evidence, "injection": "already_configured",
+                              "configured": int(addopt_values[-1])}
     env["PYTEST_ADDOPTS"] = " ".join([addopts, f"{_MAXPROCESSES}={cap}"]).strip()
-    return env, {**evidence, "injection": "injected"}
+    return command, env, {**evidence, "injection": "injected"}
 
 
 _XDIST_WORKERS_RE = re.compile(
@@ -669,24 +688,37 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
                  load_gate: Optional[HostLoadGate] = None,
                  record: Optional[dict] = None,
                  worker_cap: Optional[int] = None) -> tuple[RunOutcome, bool]:
-    """The base outcome, cached per base sha, command and test environment."""
+    """The base outcome, cached per base sha, command and test environment.
+
+    Under ``worker_cap`` a baseline is keyed by the workers it was observed to
+    run with (or ``unknown``), never by the requested cap: a base seen with
+    more workers than the cap is not reused under it.
+    """
     identity = _test_environment_identity(state, timeout_s)
-    if worker_cap is not None:
-        identity = f"{identity}-cap-w{worker_cap}"
-    path = _cache_path(cache_dir, base_sha, command, identity)
-    try:
-        with open(path) as f:
-            return RunOutcome.from_dict(json.load(f)), True
-    except (OSError, ValueError):
-        pass
+
+    def path_for(workers) -> str:
+        if worker_cap is None:
+            return _cache_path(cache_dir, base_sha, command, identity)
+        return _cache_path(cache_dir, base_sha, command, f"{identity}-w{workers}")
+
+    keys = [None] if worker_cap is None else [*range(worker_cap, 0, -1), "unknown"]
+    for key in keys:
+        try:
+            with open(path_for(key)) as f:
+                return RunOutcome.from_dict(json.load(f)), True
+        except (OSError, ValueError):
+            pass
     _admit_full_suite(load_gate, record)
     with Checkout(repo, base_sha) as checkout:
-        env = test_environment(checkout, state)
+        env, launched = test_environment(checkout, state), command
         if worker_cap is not None:
-            env, injection = cap_xdist_workers(command, env, worker_cap, cwd=checkout)
-        outcome = runner(command, checkout, timeout_s, env=env)
+            launched, env, injection = cap_xdist_workers(command, env, worker_cap,
+                                                         cwd=checkout)
+        outcome = runner(launched, checkout, timeout_s, env=env)
         if worker_cap is not None:
-            outcome.worker_cap = worker_cap_receipt(injection, command, outcome)
+            outcome.worker_cap = worker_cap_receipt(injection, launched, outcome)
+    path = path_for(None if worker_cap is None else
+                    outcome.worker_cap["observed_workers"] or "unknown")
     if not outcome.timed_out:
         os.makedirs(cache_dir, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
@@ -717,10 +749,13 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 return record
             head_env = test_environment(checkout, state)
             cap = max_workers()
-            suite_env, injection = cap_xdist_workers(command, head_env, cap, cwd=checkout)
+            suite_command, suite_env, injection = cap_xdist_workers(
+                command, head_env, cap, cwd=checkout)
+            if suite_command != command:
+                record["suite_command"] = suite_command
             _admit_full_suite(load_gate, record)
-            head = runner(command, checkout, timeout_s, env=suite_env)
-            record["worker_cap"] = worker_cap_receipt(injection, command, head)
+            head = runner(suite_command, checkout, timeout_s, env=suite_env)
+            record["worker_cap"] = worker_cap_receipt(injection, suite_command, head)
             record["head"] = head.to_dict()
             record["counts"] = dict(head.counts)
             record["duration_s"] = head.duration_s
@@ -736,6 +771,10 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 record["duration_s"] += base.duration_s
                 if base.timed_out:
                     record.update(outcome=INCOMPLETE, reason="script_test_timeout")
+                    return record
+                if ((base.worker_cap or {}).get("observed_workers") or 0) > cap:
+                    # Not comparable with a head bounded by the cap (#1082).
+                    record.update(outcome=INCOMPLETE, reason="script_test_base_over_cap")
                     return record
                 base_ids = set(base.failing_ids)
                 record["pre_existing"] = [i for i in head.failing_ids if i in base_ids]
