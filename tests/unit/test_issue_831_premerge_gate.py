@@ -31,7 +31,7 @@ def test_main_creates_missing_work_dir_before_testing(tmp_path, monkeypatch):
                         HEAD if args == ["git", "rev-parse", "FETCH_HEAD"] else "")
     tested = []
 
-    def fake_test_pr(number, head, main, passed_work_dir):
+    def fake_test_pr(number, head, main, passed_work_dir, record):
         assert work_dir.is_dir()
         tested.append((number, head, main, passed_work_dir))
         return "1 passed", 0

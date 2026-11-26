@@ -217,10 +217,11 @@ def _isolate_pool_signal(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _idle_host_load(monkeypatch):
+def _idle_host_load(monkeypatch, tmp_path):
     """Never hold a script test on the real host load (#1082): the gate would
     really sleep. Tests of the gate inject their own reader, sleep and clock."""
     from agent_crew import script_tester
+    monkeypatch.setenv("AGENT_CREW_HOST_SUITE_LOCK", str(tmp_path / "host_full_suite.lock"))
     monkeypatch.setattr(script_tester, "read_load_5m", lambda: 0.0)
     monkeypatch.delenv(script_tester.MAX_LOAD_ENV, raising=False)
     monkeypatch.delenv(script_tester.WORKERS_ENV, raising=False)
