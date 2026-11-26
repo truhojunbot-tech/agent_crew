@@ -216,6 +216,17 @@ def _isolate_pool_signal(monkeypatch, tmp_path):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _idle_host_load(monkeypatch):
+    """Never hold a script test on the real host load (#1082): the gate would
+    really sleep. Tests of the gate inject their own reader, sleep and clock."""
+    from agent_crew import script_tester
+    monkeypatch.setattr(script_tester, "read_load_5m", lambda: 0.0)
+    monkeypatch.delenv(script_tester.MAX_LOAD_ENV, raising=False)
+    monkeypatch.delenv(script_tester.WORKERS_ENV, raising=False)
+    yield
+
+
 @pytest.fixture
 def admit_crew_run(monkeypatch):
     """Opt-in: admit `crew run` without the #44 trigger (#1006).

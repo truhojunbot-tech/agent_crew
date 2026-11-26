@@ -84,6 +84,250 @@ def _rerun_limit(state: Mapping, key: str, env_key: str, default: int | float,
         return default
 
 
+MAX_LOAD_ENV = "AGENT_CREW_SCRIPT_TEST_MAX_LOAD"
+WORKERS_ENV = "AGENT_CREW_SCRIPT_TEST_WORKERS"
+DEFAULT_MAX_LOAD = 20.0
+DEFAULT_WORKERS = 4
+LOAD_RECHECK_S = 120.0
+LOAD_MAX_WAIT_S = 3600.0
+HOST_BUSY_WAIT_EVENT = "host_busy_wait"
+_LOADAVG_PATH = "/proc/loadavg"
+
+
+def read_load_5m() -> Optional[float]:
+    """The host's 5-minute load average; ``None`` when it cannot be read."""
+    try:
+        with open(_LOADAVG_PATH) as f:
+            value = float(f.read().split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def max_load() -> float:
+    """``AGENT_CREW_SCRIPT_TEST_MAX_LOAD``: 5-min load under which a full suite starts."""
+    return float(_rerun_limit({}, "max_load", MAX_LOAD_ENV, DEFAULT_MAX_LOAD, integer=False))
+
+
+def max_workers() -> int:
+    """``AGENT_CREW_SCRIPT_TEST_WORKERS``: xdist worker cap for a full suite."""
+    return int(_rerun_limit({}, "workers", WORKERS_ENV, DEFAULT_WORKERS, integer=True))
+
+
+@dataclass
+class HostLoadGate:
+    """#1082: hold a full suite while the host is loaded, for a bounded time.
+
+    The load is read every ``recheck_s`` for at most ``max_wait_s``; after that
+    the suite runs anyway and the record says ``load_contended``. ``sleep``,
+    ``clock`` and ``read_load`` are injectable so tests never really wait.
+    ``on_wait_start`` fires once per wait; ``on_check`` on every reading.
+    """
+    max_load: float = DEFAULT_MAX_LOAD
+    recheck_s: float = LOAD_RECHECK_S
+    max_wait_s: float = LOAD_MAX_WAIT_S
+    read_load: Optional[Callable[[], Optional[float]]] = None
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], float] = time.monotonic
+    on_wait_start: Optional[Callable[[dict], None]] = None
+    on_check: Optional[Callable[[dict], None]] = None
+
+    @classmethod
+    def from_env(cls, **kwargs) -> "HostLoadGate":
+        return cls(max_load=max_load(), **kwargs)
+
+    def admit(self) -> dict:
+        """Block until the suite may start; return the admission evidence."""
+        read = self.read_load or read_load_5m
+        started = self.clock()
+        readings: list = []
+        while True:
+            load = read()
+            waited = self.clock() - started
+            readings.append({"load_5m": load, "waited_s": round(waited, 3)})
+            if self.on_check:
+                self.on_check(readings[-1])
+            if load is None or load < self.max_load:
+                return {"max_load": self.max_load, "readings": readings,
+                        "waited_s": round(waited, 3), "load_contended": False,
+                        **({"load_unavailable": True} if load is None else {})}
+            if waited >= self.max_wait_s:
+                return {"max_load": self.max_load, "readings": readings,
+                        "waited_s": round(waited, 3), "load_contended": True}
+            if len(readings) == 1 and self.on_wait_start:
+                self.on_wait_start({"load_5m": load, "max_load": self.max_load,
+                                    "recheck_s": self.recheck_s,
+                                    "max_wait_s": self.max_wait_s})
+            self.sleep(min(self.recheck_s, self.max_wait_s - waited))
+
+
+_MAXPROCESSES = "--maxprocesses"
+_SHELL_EXPANSION = re.compile(r"[$`]")
+# Anything that would make an appended word mean something other than one more
+# pytest argument: operators, redirects, subshells, comments, continuations.
+_SHELL_SYNTAX = re.compile(r"[;&|<>()#\n\\]")
+
+
+def _direct_pytest(command: str, words: list[str]) -> bool:
+    """Whether ``command`` is one plain pytest argv, safe to extend at its end."""
+    return (bool(words) and not _SHELL_SYNTAX.search(command)
+            and _pytest_launcher(words, 0) is not None and "--" not in words
+            and sum(_pytest_launcher(words, i) is not None for i in range(len(words))) == 1)
+
+
+def _maxprocesses_values(words: list[str]) -> list[str]:
+    """Every ``--maxprocesses`` value in ``words``, in order (argparse: last wins)."""
+    values = []
+    for index, word in enumerate(words):
+        if word.startswith(_MAXPROCESSES + "="):
+            values.append(word[len(_MAXPROCESSES) + 1:])
+        elif word == _MAXPROCESSES:
+            values.append(words[index + 1] if index + 1 < len(words) else "")
+    return values
+
+
+def _within(value: str, cap: int) -> bool:
+    return bool(re.fullmatch(r"\d+", value)) and 0 < int(value) <= cap
+
+
+def _pytest_launcher(words: list[str], index: int) -> Optional[str]:
+    """``module`` for ``python -m pytest``, ``script`` for ``pytest``, else None."""
+    name = os.path.basename(words[index])
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", name) and words[index + 1:index + 3] == [
+            "-m", "pytest"]:
+        return "module"
+    if name in {"pytest", "py.test"} and words[index - 1:index] != ["-m"]:
+        return "script"
+    return None
+
+
+def _pytest_interpreters(words: list[str], env: Mapping[str, str],
+                         cwd: str) -> Optional[list[str]]:
+    """The interpreter of every pytest launcher in ``words``; None if any is unknown."""
+    interpreters = []
+    for index, word in enumerate(words):
+        launcher_kind = _pytest_launcher(words, index)
+        if launcher_kind == "module":
+            interpreter = word
+        elif launcher_kind == "script":
+            launcher = shutil.which(word, path=env.get("PATH", os.defpath)) if (
+                os.sep not in word) else os.path.join(cwd, word)
+            try:
+                with open(launcher or "", "rb") as f:
+                    shebang = f.readline().decode(errors="replace")[2:].split()
+            except OSError:
+                return None
+            if shebang[:1] and os.path.basename(shebang[0]) == "env":
+                shebang = shebang[1:]
+            if not shebang or not re.fullmatch(r"python(?:\d+(?:\.\d+)?)?",
+                                               os.path.basename(shebang[0])):
+                return None                       # an sh wrapper or unknown launcher
+            interpreter = shebang[0]
+        else:
+            continue
+        resolved = (shutil.which(interpreter, path=env.get("PATH", os.defpath))
+                    if os.sep not in interpreter else os.path.join(cwd, interpreter))
+        if not resolved:
+            return None
+        interpreters.append(resolved)
+    return interpreters or None
+
+
+def _target_has_xdist(interpreter: str, env: Mapping[str, str], cwd: str) -> bool:
+    """Whether the interpreter the command runs pytest with can import xdist."""
+    try:
+        return subprocess.run([interpreter, "-c", "import xdist"], cwd=cwd, env=dict(env),
+                              capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def cap_xdist_workers(command: str, env: Mapping[str, str], cap: int, *,
+                      cwd: str) -> tuple[str, dict[str, str], dict]:
+    """Bound a full suite's xdist workers by ``cap``; returns (command, env, evidence).
+
+    A direct pytest launch (one plain pytest argv, no shell syntax) gets
+    ``--maxprocesses=<cap>`` appended as its last argument, which wins over any
+    earlier value: ``injection`` is ``appended`` and the bound is enforced
+    (scope decision on #1082). Every other command is best-effort through
+    ``PYTEST_ADDOPTS`` as below.
+
+    Such a command is never rewritten: it runs under ``/bin/sh -c``, so redirects,
+    pipes, variables and chained commands keep their meaning (review of #1083).
+    pytest reads ini ``addopts``, then ``PYTEST_ADDOPTS``, then the command's
+    own arguments, and the last ``--maxprocesses`` wins; xdist then bounds any
+    ``-n`` by it. The option is injected only where pytest accepts it: every
+    pytest the command launches can load xdist, and no larger or unreadable
+    value follows in the command. Otherwise the env is unchanged and
+    ``injection`` is ``skipped`` with a ``reason``.
+
+    Shell-local assignments, ini settings and launchers can still change what
+    runs, so the cap is a request, never a claim: ``worker_cap_receipt``
+    records it next to the workers the run explicitly reported, if any.
+    """
+    env = dict(env)
+    evidence: dict = {"cap_requested": cap, "mechanism": f"PYTEST_ADDOPTS {_MAXPROCESSES}"}
+
+    def skipped(reason: str) -> tuple[str, dict[str, str], dict]:
+        return command, env, {**evidence, "injection": "skipped", "reason": reason}
+
+    addopts = env.get("PYTEST_ADDOPTS", "")
+    try:
+        words, addopt_words = shlex.split(command), shlex.split(addopts)
+    except ValueError:
+        return skipped("unparseable")
+    if any(_SHELL_EXPANSION.search(word) for word in words):
+        return skipped("command_expands_at_runtime")
+    if "PYTEST_DISABLE_PLUGIN_AUTOLOAD" in env or "no:xdist" in words + addopt_words:
+        return skipped("xdist_disabled")
+    interpreters = _pytest_interpreters(words, env, cwd)
+    if interpreters is None:
+        return skipped("pytest_launcher_unresolved")
+    if not all(_target_has_xdist(interpreter, env, cwd) for interpreter in interpreters):
+        return skipped("xdist_unavailable")
+    if _direct_pytest(command, words):
+        return f"{command} {_MAXPROCESSES}={cap}", env, {
+            "cap_requested": cap, "mechanism": f"argv {_MAXPROCESSES}",
+            "injection": "appended"}
+    if not all(_within(value, cap) for value in _maxprocesses_values(words)):
+        return skipped("command_overrides_cap")
+    addopt_values = _maxprocesses_values(addopt_words)
+    if addopt_values and _within(addopt_values[-1], cap):
+        return command, env, {**evidence, "injection": "already_configured",
+                              "configured": int(addopt_values[-1])}
+    env["PYTEST_ADDOPTS"] = " ".join([addopts, f"{_MAXPROCESSES}={cap}"]).strip()
+    return command, env, {**evidence, "injection": "injected"}
+
+
+_XDIST_WORKERS_RE = re.compile(
+    r"^(?:created: \d+/(\d+) workers?|(\d+) workers? \[\d+ items?\])\s*$", re.M)
+
+
+def observed_xdist_workers(output: str) -> Optional[int]:
+    """The worker count of an explicit xdist line in ``output``, else None.
+
+    A summary without such a line proves nothing: quiet flags, plugins and
+    redirected invocations all hide it, so the count stays unknown.
+    """
+    workers = [int(a or b) for a, b in _XDIST_WORKERS_RE.findall(output)]
+    return max(workers) if workers else None
+
+
+def worker_cap_receipt(injection: Mapping, command: str, outcome: "RunOutcome") -> dict:
+    """The requested cap and the observed workers; never a claim of enforcement.
+
+    ``observed_workers`` is kept only when the command visibly launches exactly
+    one pytest, so the output cannot belong to a different invocation.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = []
+    launches = sum(_pytest_launcher(words, index) is not None for index in range(len(words)))
+    return {**injection,
+            "observed_workers": outcome.observed_workers if launches == 1 else None}
+
+
 CI_GATE_ENV = "AGENT_CREW_SCRIPT_TEST_CI_GATE"
 # #1038: CI states that establish no job ran a step: no check at all, or every
 # failure is an Actions job with no runner and no steps (billing block). Only
@@ -114,6 +358,8 @@ class RunOutcome:
     timed_out: bool = False
     duration_s: float = 0.0
     output_tail: str = ""
+    observed_workers: Optional[int] = None        # None: the run did not report it
+    worker_cap: Optional[dict] = None
 
     @property
     def clean(self) -> bool:
@@ -122,14 +368,18 @@ class RunOutcome:
     def to_dict(self) -> dict:
         return {"exit_code": self.exit_code, "counts": dict(self.counts),
                 "failing_ids": list(self.failing_ids), "timed_out": self.timed_out,
-                "duration_s": round(self.duration_s, 3)}
+                "duration_s": round(self.duration_s, 3),
+                "observed_workers": self.observed_workers,
+                **({"worker_cap": dict(self.worker_cap)} if self.worker_cap else {})}
 
     @classmethod
     def from_dict(cls, data: Mapping) -> "RunOutcome":
         return cls(exit_code=data.get("exit_code"), counts=dict(data.get("counts") or {}),
                    failing_ids=list(data.get("failing_ids") or []),
                    timed_out=bool(data.get("timed_out")),
-                   duration_s=float(data.get("duration_s") or 0.0))
+                   duration_s=float(data.get("duration_s") or 0.0),
+                   observed_workers=data.get("observed_workers"),
+                   worker_cap=data.get("worker_cap"))
 
 
 def resolve_test_config(state: Optional[Mapping], checkout: str) -> TestConfig:
@@ -342,7 +592,8 @@ def run_command(command: str, cwd: str, timeout_s: float,
     return RunOutcome(exit_code=None if timed_out else proc.returncode, counts=counts,
                       failing_ids=ids, timed_out=timed_out,
                       duration_s=time.monotonic() - started,
-                      output_tail=(output or "")[-_OUTPUT_TAIL_CHARS:])
+                      output_tail=(output or "")[-_OUTPUT_TAIL_CHARS:],
+                      observed_workers=observed_xdist_workers(output or ""))
 
 
 def _git(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -420,21 +671,60 @@ def _cache_path(cache_dir: str, base_sha: str, command: str,
     return os.path.join(cache_dir, f"{base_sha}-{digest}.json")
 
 
+def _admit_full_suite(load_gate: Optional[HostLoadGate], record: Optional[dict]) -> bool:
+    """Hold a full suite on host load (#1082) and keep the evidence in ``record``.
+
+    Returns whether the suite was admitted ``load_contended``.
+    """
+    if load_gate is None:
+        return False
+    admission = load_gate.admit()
+    if record is not None:
+        record.setdefault("host_load", []).append(admission)
+        if admission["load_contended"]:
+            record["load_contended"] = True
+    return admission["load_contended"]
+
+
 def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
                  cache_dir: str, state: Optional[Mapping],
-                 runner: Callable = run_command) -> tuple[RunOutcome, bool]:
-    """The base outcome, cached per base sha, command and test environment."""
-    path = _cache_path(cache_dir, base_sha, command,
-                       _test_environment_identity(state, timeout_s))
-    try:
-        with open(path) as f:
-            return RunOutcome.from_dict(json.load(f)), True
-    except (OSError, ValueError):
-        pass
+                 runner: Callable = run_command, *,
+                 load_gate: Optional[HostLoadGate] = None,
+                 record: Optional[dict] = None,
+                 worker_cap: Optional[int] = None) -> tuple[RunOutcome, bool]:
+    """The base outcome, cached per base sha, command and test environment.
+
+    Under ``worker_cap`` a baseline is keyed by the workers it was observed to
+    run with (or ``unknown``), never by the requested cap: a base seen with
+    more workers than the cap is not reused under it. A base admitted
+    ``load_contended`` is used for this run but not cached as a clean baseline.
+    """
+    identity = _test_environment_identity(state, timeout_s)
+
+    def path_for(workers) -> str:
+        if worker_cap is None:
+            return _cache_path(cache_dir, base_sha, command, identity)
+        return _cache_path(cache_dir, base_sha, command, f"{identity}-w{workers}")
+
+    keys = [None] if worker_cap is None else [*range(worker_cap, 0, -1), "unknown"]
+    for key in keys:
+        try:
+            with open(path_for(key)) as f:
+                return RunOutcome.from_dict(json.load(f)), True
+        except (OSError, ValueError):
+            pass
+    contended = _admit_full_suite(load_gate, record)
     with Checkout(repo, base_sha) as checkout:
-        outcome = runner(command, checkout, timeout_s,
-                         env=test_environment(checkout, state))
-    if not outcome.timed_out:
+        env, launched = test_environment(checkout, state), command
+        if worker_cap is not None:
+            launched, env, injection = cap_xdist_workers(command, env, worker_cap,
+                                                         cwd=checkout)
+        outcome = runner(launched, checkout, timeout_s, env=env)
+        if worker_cap is not None:
+            outcome.worker_cap = worker_cap_receipt(injection, launched, outcome)
+    path = path_for(None if worker_cap is None else
+                    outcome.worker_cap["observed_workers"] or "unknown")
+    if not outcome.timed_out and not contended:
         os.makedirs(cache_dir, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
@@ -444,8 +734,13 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
 
 
 def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[Mapping],
-                    cache_dir: str, runner: Callable = run_command) -> dict:
-    """Run the stage and return its durable record (``outcome`` is the verdict)."""
+                    cache_dir: str, runner: Callable = run_command,
+                    load_gate: Optional[HostLoadGate] = None) -> dict:
+    """Run the stage and return its durable record (``outcome`` is the verdict).
+
+    Full suites (head and uncached base) wait on ``load_gate`` and run with
+    their xdist workers capped; isolated reruns use the plain environment.
+    """
     record: dict = {"executor": SCRIPT_TESTER, "provider_calls": 0,
                     "base_sha": base_sha, "head_sha": head_sha, "rebased": True,
                     "pre_existing": [], "new_failures": [], "flaky": [], "reruns": {}}
@@ -458,7 +753,14 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 record["outcome"] = SKIPPED_NO_TEST_COMMAND
                 return record
             head_env = test_environment(checkout, state)
-            head = runner(command, checkout, timeout_s, env=head_env)
+            cap = max_workers()
+            suite_command, suite_env, injection = cap_xdist_workers(
+                command, head_env, cap, cwd=checkout)
+            if suite_command != command:
+                record["suite_command"] = suite_command
+            _admit_full_suite(load_gate, record)
+            head = runner(suite_command, checkout, timeout_s, env=suite_env)
+            record["worker_cap"] = worker_cap_receipt(injection, suite_command, head)
             record["head"] = head.to_dict()
             record["counts"] = dict(head.counts)
             record["duration_s"] = head.duration_s
@@ -467,11 +769,17 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 return record
             if head.failing_ids:
                 base, cached = base_outcome(repo, base_sha, command, timeout_s,
-                                            cache_dir, state, runner)
+                                            cache_dir, state, runner,
+                                            load_gate=load_gate, record=record,
+                                            worker_cap=cap)
                 record["base"] = {**base.to_dict(), "cached": cached}
                 record["duration_s"] += base.duration_s
                 if base.timed_out:
                     record.update(outcome=INCOMPLETE, reason="script_test_timeout")
+                    return record
+                if ((base.worker_cap or {}).get("observed_workers") or 0) > cap:
+                    # Not comparable with a head bounded by the cap (#1082).
+                    record.update(outcome=INCOMPLETE, reason="script_test_base_over_cap")
                     return record
                 base_ids = set(base.failing_ids)
                 record["pre_existing"] = [i for i in head.failing_ids if i in base_ids]
@@ -597,7 +905,8 @@ def head_has_workflows(repo: str, head_sha: str) -> bool:
 
 
 def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: str,
-                      runner: Callable = run_command) -> TaskResult:
+                      runner: Callable = run_command,
+                      load_gate: Optional[HostLoadGate] = None) -> TaskResult:
     """Run one ``test`` task by script. Never raises; never calls a provider."""
     ctx = task.context if isinstance(task.context, dict) else {}
     pr_number = ctx.get("pr_number")
@@ -618,7 +927,7 @@ def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: s
             head_sha=ctx.get("reviewed_sha") or ctx.get("expected_head_sha") or "",
             branch=task.branch or "")
         record = run_script_test(repo, base_sha=base_sha, head_sha=head_sha, state=state,
-                                 cache_dir=cache_dir, runner=runner)
+                                 cache_dir=cache_dir, runner=runner, load_gate=load_gate)
         record["base_branch"] = base_branch
         if record.get("outcome") == PASSED and head_has_workflows(repo, head_sha):
             from agent_crew.github import get_repo, head_checks_state
