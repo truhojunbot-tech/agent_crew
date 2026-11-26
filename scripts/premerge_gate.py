@@ -23,6 +23,10 @@ import tempfile
 
 REPO = "truhojunbot-tech/agent_crew"
 ROOT = Path(__file__).resolve().parent.parent
+# This entry point also runs from cron without an installed package.
+sys.path.insert(0, str(ROOT / "src"))
+from agent_crew.host_suite import host_suite_slot
+
 BASETEMP_ROOT = Path("/dev/shm")
 REVIEW = "[agent_crew review] verdict:"
 MARKER = "[agent_crew premerge gate]"
@@ -176,6 +180,8 @@ def gate_payload(number, body):
             fields["main_sha"] = line[5:]
         elif line.startswith("pytest: "):
             fields["summary"] = line[8:]
+        elif line.startswith("host_suite: "):
+            fields["host_suite"] = json.loads(line[len("host_suite: "):])
         elif line.startswith("EXIT "):
             fields["exit_code"] = int(line[5:])
     return {"repo": REPO, "pr_number": number, **fields}
@@ -211,13 +217,15 @@ def pytest_summary(output):
     return summary[:300]
 
 
-def gate_comment(head, main, summary, exit_code):
+def gate_comment(head, main, summary, exit_code, record=None):
     return (f"{MARKER}\n"
             f"HEAD {head}\nMAIN {main}\n"
-            f"pytest: {summary}\nEXIT {exit_code}\n")
+            f"pytest: {summary}\nEXIT {exit_code}\n"
+            + (f"host_suite: {json.dumps(record['host_suite'])}\n"
+               if record and "host_suite" in record else ""))
 
 
-def test_pr(number, head, main, work_dir):
+def test_pr(number, head, main, work_dir, record=None):
     scratch = Path(tempfile.mkdtemp(prefix=f"ac_gate_{number}_", dir=work_dir))
     worktree = scratch / "worktree"
     basetemp = BASETEMP_ROOT / f"ac_gate_{number}"
@@ -235,7 +243,11 @@ def test_pr(number, head, main, work_dir):
                "-p", "no:cacheprovider", f"--basetemp={basetemp}", "-rf", "tests"]
         env = dict(os.environ, PYTHONPATH="src")
         try:
-            result = run(cmd, cwd=worktree, env=env, timeout=7300)
+            with host_suite_slot(kind="premerge_gate") as receipt:
+                if record is not None:
+                    record["host_suite"] = receipt
+                print(json.dumps({"pr_number": number, "host_suite": receipt}), flush=True)
+                result = run(cmd, cwd=worktree, env=env, timeout=7300)
         except subprocess.TimeoutExpired:
             return "pytest timed out after 7200s", 124
         return pytest_summary(result.stdout + "\n" + result.stderr), result.returncode
@@ -312,8 +324,9 @@ def main(argv=None):
                     fetched = checked(["git", "rev-parse", "FETCH_HEAD"], cwd=ROOT).strip()
                     if fetched != head:
                         raise RuntimeError("head changed during selection; skipping")
-                    summary, exit_code = test_pr(number, head, main, args.work_dir)
-                    body = gate_comment(head, main, summary, exit_code)
+                    record = {}
+                    summary, exit_code = test_pr(number, head, main, args.work_dir, record)
+                    body = gate_comment(head, main, summary, exit_code, record)
                     checked(["gh", "pr", "comment", str(number), "--repo", REPO,
                              "--body", body], cwd=ROOT)
                     deliver_blackboard(args.blackboard_command, number, body)

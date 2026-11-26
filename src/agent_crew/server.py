@@ -4739,6 +4739,7 @@ def create_app(
         # each load reading is a heartbeat so the watchdog does not expire the
         # wait, and one typed event marks the start of each wait.
         load_gate = _script_tester.HostLoadGate.from_env(
+            port=port,
             on_wait_start=lambda fields: q().record_exec_event(
                 task.task_id, _script_tester.HOST_BUSY_WAIT_EVENT, **fields),
             on_check=lambda _reading: q().record_heartbeat(

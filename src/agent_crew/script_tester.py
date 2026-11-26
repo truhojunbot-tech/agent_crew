@@ -28,10 +28,12 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import NamedTuple, Optional
 
 from agent_crew.protocol import TaskResult
+from agent_crew.host_suite import host_suite_slot
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +133,7 @@ class HostLoadGate:
     clock: Callable[[], float] = time.monotonic
     on_wait_start: Optional[Callable[[dict], None]] = None
     on_check: Optional[Callable[[dict], None]] = None
+    port: Optional[int] = None
 
     @classmethod
     def from_env(cls, **kwargs) -> "HostLoadGate":
@@ -686,6 +689,21 @@ def _admit_full_suite(load_gate: Optional[HostLoadGate], record: Optional[dict])
     return admission["load_contended"]
 
 
+@contextmanager
+def _full_suite_slot(load_gate: Optional[HostLoadGate], record: Optional[dict]):
+    timing = ({"clock": load_gate.clock, "sleep": load_gate.sleep,
+               "on_check": load_gate.on_check, "port": load_gate.port}
+              if load_gate is not None else {})
+    with host_suite_slot(kind="script_test", **timing) as receipt:
+        if record is not None:
+            record.setdefault("host_suite", []).append(receipt)
+            record["queue_wait_s"] = round(
+                record.get("queue_wait_s", 0.0) + receipt["queue_wait_s"], 3)
+            record["host_suite_contended"] = (
+                record.get("host_suite_contended", False) or receipt["host_suite_contended"])
+        yield receipt
+
+
 def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
                  cache_dir: str, state: Optional[Mapping],
                  runner: Callable = run_command, *,
@@ -697,7 +715,8 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
     Under ``worker_cap`` a baseline is keyed by the workers it was observed to
     run with (or ``unknown``), never by the requested cap: a base seen with
     more workers than the cap is not reused under it. A base admitted
-    ``load_contended`` is used for this run but not cached as a clean baseline.
+    ``load_contended`` or ``host_suite_contended`` is used for this run but not
+    cached as a clean baseline.
     """
     identity = _test_environment_identity(state, timeout_s)
 
@@ -719,12 +738,14 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
         if worker_cap is not None:
             launched, env, injection = cap_xdist_workers(command, env, worker_cap,
                                                          cwd=checkout)
-        outcome = runner(launched, checkout, timeout_s, env=env)
+        with _full_suite_slot(load_gate, record) as slot_receipt:
+            outcome = runner(launched, checkout, timeout_s, env=env)
         if worker_cap is not None:
             outcome.worker_cap = worker_cap_receipt(injection, launched, outcome)
     path = path_for(None if worker_cap is None else
                     outcome.worker_cap["observed_workers"] or "unknown")
-    if not outcome.timed_out and not contended:
+    if (not outcome.timed_out and not contended
+            and not slot_receipt["host_suite_contended"]):
         os.makedirs(cache_dir, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
@@ -759,7 +780,8 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
             if suite_command != command:
                 record["suite_command"] = suite_command
             _admit_full_suite(load_gate, record)
-            head = runner(suite_command, checkout, timeout_s, env=suite_env)
+            with _full_suite_slot(load_gate, record):
+                head = runner(suite_command, checkout, timeout_s, env=suite_env)
             record["worker_cap"] = worker_cap_receipt(injection, suite_command, head)
             record["head"] = head.to_dict()
             record["counts"] = dict(head.counts)
