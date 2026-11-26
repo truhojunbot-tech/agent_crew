@@ -11,7 +11,9 @@ Non-literal SQL is checked where it runs: every ``.execute`` /
 ``.executemany`` / ``.executescript`` call whose SQL argument is not a string
 literal (or a name assigned only from literals in its function or module)
 fails with file:line unless its (file, function) is in ``DYNAMIC_ALLOWLIST``,
-whatever that SQL might contain.
+whatever that SQL might contain. Any other reference to one of those methods
+(an alias, a stored or passed bound method, functools.partial) fails the same
+way: the guard cannot see what SQL such a value runs.
 """
 
 from __future__ import annotations
@@ -328,12 +330,18 @@ def _unresolved_exec_calls(tree: ast.Module, rel: str) -> dict:
     """(file, function) -> ``file:line`` of each SQL execution call whose SQL
     argument does not resolve to a literal."""
     out: dict = {}
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
 
     def visit(node, chain, fn_name):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                 visit(child, [child] + chain, getattr(child, "name", fn_name))
                 continue
+            if (isinstance(child, ast.Attribute) and child.attr in _EXEC_METHODS
+                    and id(child) not in called):
+                # Fail closed: an execute method used as a value (aliased,
+                # stored, passed, partial'd) runs SQL this rule cannot see.
+                out.setdefault((rel, fn_name), []).append(f"{rel}:{child.lineno}")
             if (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
                     and child.func.attr in _EXEC_METHODS):
                 arg = child.args[0] if child.args else None
@@ -715,6 +723,48 @@ def test_allowlisted_function_may_run_non_literal_sql(schema, tmp_path):
     # A listed count is a cap: a second site in the same function fails both.
     assert _unallowed_dynamic({("c.py", "f"): ["c.py:1", "c.py:2"]},
                               {("c.py", "f"): (1, "test")}) == ["c.py:1", "c.py:2"]
+
+
+# Round 6: an execute method used as a value fails closed, whatever SQL it
+# later runs (scope decision on #1081: one bounded rule, no more parsing).
+_ALIAS_MODULE = (
+    "import functools\n"
+    "def aliased(conn):\n"
+    "    run = conn.execute\n"
+    "    run(' '.join(['UPDATE', 'tasks', 'SET status=?']), ('x',))\n"
+    "def passed(conn):\n"
+    "    helper(conn.executemany)\n"
+    "def partial(conn):\n"
+    "    functools.partial(conn.executescript)('UPDATE tasks SET summary=1')\n"
+    "def stored(self, conn):\n"
+    "    self.run = conn.execute\n"
+    "def direct(conn):\n"
+    "    conn.execute('UPDATE tasks SET summary=? WHERE task_id=?', ('x', 't'))\n")
+
+
+def _alias_scan(schema, tmp_path):
+    pkg = tmp_path / "agent_crew"
+    pkg.mkdir()
+    (pkg / "a.py").write_text(_ALIAS_MODULE)
+    return _scan(schema, tmp_path)
+
+
+def test_execute_method_used_as_a_value_fails_closed(schema, tmp_path):
+    found, _, _, dynamic = _alias_scan(schema, tmp_path)
+    assert dynamic == {("a.py", "aliased"): ["a.py:3"],  # the round-6 bypass
+                       ("a.py", "passed"): ["a.py:6"],
+                       ("a.py", "partial"): ["a.py:8"],
+                       ("a.py", "stored"): ["a.py:10"]}, dynamic
+    assert found == Counter()
+    assert _unallowed_dynamic(dynamic) == ["a.py:10", "a.py:3", "a.py:6", "a.py:8"]
+
+
+def test_execute_alias_in_an_allowlisted_function_passes(schema, tmp_path):
+    _, _, _, dynamic = _alias_scan(schema, tmp_path)
+    allow = {w: (len(locs), "test") for w, locs in dynamic.items()}
+    assert _unallowed_dynamic(dynamic, allow) == []
+    del allow[("a.py", "aliased")]
+    assert _unallowed_dynamic(dynamic, allow) == ["a.py:3"]
 
 
 def test_every_dynamic_allowlist_entry_has_a_reason_and_exact_count(schema):
