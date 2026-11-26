@@ -6893,6 +6893,7 @@ def create_app(
             repo_cwd=_any_worktree_path(),
             coordinator_notify_fn=coordinator_notify_fn,
             reviewer_provider=_DISPATCH_ROLE_TO_AGENT.get("reviewer", ""),
+            implementer_provider=_DISPATCH_ROLE_TO_AGENT.get("implementer", ""),
         )
         if isinstance(review_id, str) and review_id:
             _try_push_next("reviewer")

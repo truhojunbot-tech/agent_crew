@@ -1153,6 +1153,45 @@ def _review_round_cap(queue: TaskQueue, predecessor: TaskRequest, review_id: str
     return outcome
 
 
+def _recover_implementer_agent(queue: TaskQueue, task, pr_number=None):
+    """Recover recorded implementer identity within this project's repository."""
+    context = task.context or {}
+    if task.task_type != "implement" and context.get("implementer_agent"):
+        return context["implementer_agent"]
+
+    def lineage_agent(candidate):
+        if (not candidate or candidate.task_type != "implement"
+                or candidate.project != task.project
+                or (candidate.context or {}).get("repo") != context.get("repo")):
+            return None
+        attribution = queue.get_attribution(candidate.task_id) or {}
+        candidate_context = candidate.context or {}
+        return (attribution.get("agent") or candidate_context.get("agent_override")
+                or candidate_context.get("implementer_agent"))
+
+    if task.task_type == "implement":
+        return lineage_agent(task)
+    seen = set()
+    parent = task
+    while parent and parent.task_id not in seen:
+        seen.add(parent.task_id)
+        agent = lineage_agent(parent)
+        if agent:
+            return agent
+        parent = queue.get_task((parent.context or {}).get("prev_task_id") or "")
+    agent = lineage_agent(queue.get_task(context.get("lineage_root_task_id") or ""))
+    if agent:
+        return agent
+    if pr_number:
+        agents = {
+            lineage_agent(candidate) for candidate in queue.list_tasks()
+            if (candidate.pr_number or (candidate.context or {}).get("pr_number")) == pr_number
+        } - {None, ""}
+        if len(agents) == 1:
+            return agents.pop()
+    return None
+
+
 def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, head: str,
                            ctx, *, project: str, reviewer_provider: str = "",
                            coordinator_notify_fn=None) -> str | ReviewRoundCapReached | None:
@@ -1187,6 +1226,13 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
         predecessor = queue.get_task(review_task_id)
         if predecessor is None:
             return None
+        implementer_agent = _recover_implementer_agent(queue, predecessor, pr_number)
+        if not implementer_agent:
+            _record_successor_refused(queue, review_task_id, "implementer_unknown",
+                                      "cannot resolve lineage implementer_agent",
+                                      coordinator_notify_fn)
+            return None
+        context["implementer_agent"] = implementer_agent
         prior_attribution = queue.get_attribution(review_task_id) or {}
         provider = (base.get("agent_override") or base.get("reviewer_agent")
                     or reviewer_provider or prior_attribution.get("agent")
@@ -2356,27 +2402,7 @@ def auto_enqueue_fix(
                     "issue_url", "repo"):
             if review_ctx.get(key) is not None:
                 fix_context[key] = review_ctx[key]
-        implementer_agent = review_ctx.get("implementer_agent")
-        if not implementer_agent:
-            def lineage_agent(task):
-                if not task or task.task_type != "implement" or task.project != review_task.project:
-                    return None
-                task_ctx = task.context or {}
-                if task_ctx.get("repo") != review_ctx.get("repo"):
-                    return None
-                attribution = queue.get_attribution(task.task_id) or {}
-                return (attribution.get("agent") or task_ctx.get("agent_override")
-                        or task_ctx.get("implementer_agent"))
-
-            root = queue.get_task(review_ctx.get("lineage_root_task_id") or "")
-            implementer_agent = lineage_agent(root)
-            if not implementer_agent and pr_number:
-                agents = {
-                    lineage_agent(task) for task in queue.list_tasks()
-                    if (task.pr_number or (task.context or {}).get("pr_number")) == pr_number
-                } - {None, ""}
-                if len(agents) == 1:
-                    implementer_agent = agents.pop()
+        implementer_agent = _recover_implementer_agent(queue, review_task, pr_number)
         _carry_lineage_intent(fix_context, review_task, "implementer")
         if implementer_agent:
             fix_context["implementer_agent"] = implementer_agent
@@ -2649,6 +2675,7 @@ def auto_enqueue_review(
     repo_cwd: str = "",
     coordinator_notify_fn=None,
     reviewer_provider: str = "",
+    implementer_provider: str = "",
 ) -> str | ReviewRoundCapReached | None:
     """Create the review task that follows a completed impl task.
 
@@ -2870,14 +2897,15 @@ def auto_enqueue_review(
             )
 
         # Identify which agent actually implemented this task. Prefer the
-        # explicit override (set by upstream fallback), else fall back to
+        # recorded execution attribution, then explicit routing, then
         # the role's default mapping. Recorded so the rate-limit fallback
         # handler can skip it during reviewer selection (#117 — self-review
         # prevention).
         implementer_agent = (
-            impl_ctx.get("agent_override")
-            or impl_ctx.get("implementer_agent")
-            or (default_agent_for_role("implementer", pane_map) if pane_map else None)
+            _recover_implementer_agent(queue, impl_task, pr_number)
+            or implementer_provider
+            or (default_agent_for_role("implementer", pane_map) if pane_map
+                else baseline_agent_for_role("implementer"))
         )
 
         review_context = {

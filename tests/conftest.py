@@ -166,9 +166,7 @@ def _tier_legacy_task_posts(monkeypatch, request):
                 and isinstance(task, TaskRequest)
                 and "_successor_provenance" not in kwargs):
             context = dict(task.context or {})
-            if task.task_type == "implement":
-                context.setdefault("implementer_agent", "codex")
-            elif task.task_type == "review":
+            if task.task_type == "review":
                 if kwargs.get("ingress") is not None:
                     context.setdefault("prev_task_id", f"legacy-implement-{task.task_id}")
                 context.setdefault("implementer_agent", "codex")

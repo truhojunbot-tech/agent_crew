@@ -167,3 +167,65 @@ def test_http_review_refusal_names_missing_keys(case):
         assert response.status_code == 422
         assert "prev_task_id" in response.text
         assert "implementer_agent" in response.text
+
+
+def test_dispatcher_review_recovers_attribution(case):
+    q, _, _, _ = case
+    q.enqueue(TaskRequest("triage-impl", "implement", "work",
+                          context={"risk_tier": 1, "pr_number": 1059}))
+    assert "implementer_agent" not in q.get_task("triage-impl").context
+    q.record_attribution("triage-impl", agent="codex", role="implementer")
+    rid = pipeline.auto_enqueue_review(q, "triage-impl", 1059, pane_map={},
+                                       pr_state_fn=lambda _: "open")
+    assert rid == "review-triage-impl-r0"
+    assert q.get_task(rid).context["implementer_agent"] == "codex"
+
+
+def test_legacy_stale_review_recovers_implementer(case):
+    q, _, _, _ = case
+    ctx = {"repo": "owner/repo", "pr_number": 1058, "risk_tier": 1,
+           "prev_task_id": "impl-1058"}
+    q.enqueue(TaskRequest("legacy-stale", "review", "review", context=ctx))
+    q.submit_result("legacy-stale", TaskResult("legacy-stale", "completed", "done",
+                                              pr_number=1058, verdict="approve"))
+    rid = pipeline.requeue_review_at_head(q, "legacy-stale", 1058, "a" * 40,
+                                          ctx, project="")
+    assert rid is not None
+    assert q.get_task(rid).context["implementer_agent"] == "codex"
+
+
+def test_cli_review_with_explicit_implementer(case):
+    from click.testing import CliRunner
+    from agent_crew.cli import crew
+    q, _, _, _ = case
+    result = CliRunner().invoke(crew, [
+        "enqueue", "review", "manual review", "--db", str(q.db_path),
+        "--prev-task-id", "impl-1058", "--pr", "1058",
+        "--reviewed-sha", "a" * 40, "--implementer-agent", "codex",
+    ])
+    assert result.exit_code == 0, result.output
+    assert q.get_task(result.output.strip()).context["implementer_agent"] == "codex"
+
+
+def test_unresolved_stale_review_records_refusal(case, monkeypatch):
+    q, _, _, _ = case
+    ctx = {"risk_tier": 1, "pr_number": 999}
+    q.enqueue(TaskRequest("orphan-stale", "review", "review", context=ctx))
+    refusals = []
+    monkeypatch.setattr(pipeline, "_record_successor_refused",
+                        lambda *args: refusals.append(args))
+    assert pipeline.requeue_review_at_head(
+        q, "orphan-stale", 999, "b" * 40, ctx, project="") is None
+    assert refusals[0][2] == "implementer_unknown"
+    assert not any(t.context.get("superseded_review") == "orphan-stale"
+                   for t in q.list_tasks())
+
+
+def test_dispatcher_review_uses_configured_implementer_without_attribution(case):
+    q, _, _, _ = case
+    q.enqueue(TaskRequest("mapped-impl", "implement", "work",
+                          context={"risk_tier": 1, "pr_number": 1060}))
+    rid = pipeline.auto_enqueue_review(
+        q, "mapped-impl", 1060, pane_map={}, implementer_provider="claude",
+        pr_state_fn=lambda _: "open")
+    assert q.get_task(rid).context["implementer_agent"] == "claude"
