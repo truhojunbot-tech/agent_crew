@@ -28,6 +28,7 @@ from agent_crew.cea import shadow_decision_log as _shadow_decision_log
 from agent_crew.cea import validator as _cea_validator
 from agent_crew.cea.auth import in_process_caller as _cea_in_process_caller
 from agent_crew.cea.engine import EngineConfig as _CeaEngineConfig, get_engine as _cea_get_engine
+from agent_crew import task_state as _task_state
 from agent_crew.cea.intent import (
     CallerProvenance as _CeaProvenance, Intent as _CeaIntent,
     IntentIdentity as _CeaIdentity, InvalidScopeAnchor as _CeaInvalidScopeAnchor,
@@ -3567,16 +3568,19 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            changed = conn.execute(
-                "UPDATE tasks SET status='cancelled', summary=? "
-                "WHERE task_id=? AND status='needs_human' "
+            # #1081: the row's own preconditions are read under the write lock;
+            # only a row that meets them reaches the single status writer.
+            eligible = conn.execute(
+                "SELECT 1 FROM tasks WHERE task_id=? AND status='needs_human' "
                 "AND json_extract(context, '$.owner_conflict.successor_task_id')=? "
                 "AND EXISTS (SELECT 1 FROM tasks WHERE task_id=?)",
-                (f"owner approval re-admitted as {successor_id}", task_id,
-                 successor_id, successor_id),
-            ).rowcount
+                (task_id, successor_id, successor_id),
+            ).fetchone()
+            changed = eligible is not None and bool(_task_state.transition(
+                conn, task_id, "owner_readmission_retire", ("needs_human",),
+                {"summary": f"owner approval re-admitted as {successor_id}"}))
             conn.commit()
-            return bool(changed)
+            return changed
         finally:
             conn.close()
 
@@ -8146,7 +8150,11 @@ class TaskQueue:
             if status in TERMINAL_TASK_STATUSES:
                 conn.execute("ROLLBACK")
                 return False, status, pane
-            conn.execute("UPDATE tasks SET status = 'cancelled' WHERE task_id = ?", (task_id,))
+            if not _task_state.transition(conn, task_id, "cancel", (status,)):
+                # Unreachable under BEGIN IMMEDIATE (the status was just read);
+                # keep the refusal row and change nothing else.
+                conn.commit()
+                return False, status, pane
             # Revocation is append-only.  Spending every outstanding nonce makes
             # a copied task block unusable even if its worker ignores cancellation.
             receipt_id = row["receipt_id"]
@@ -8161,14 +8169,12 @@ class TaskQueue:
                                 prior_status=status, reason=reason)
             # Mark pending dependents as orphaned (not cancelled) so the operator
             # can see them and decide whether to cancel or reassign.
-            conn.execute(
-                """
-                UPDATE tasks SET status = 'orphaned'
-                WHERE status IN ('pending', 'in_progress')
-                AND json_extract(context, '$.prev_task_id') = ?
-                """,
-                (task_id,),
-            )
+            for dependent in conn.execute(
+                    "SELECT task_id FROM tasks WHERE status IN ('pending', 'in_progress') "
+                    "AND json_extract(context, '$.prev_task_id') = ?",
+                    (task_id,)).fetchall():
+                _task_state.transition(conn, dependent[0], "orphan_dependent",
+                                       ("pending", "in_progress"))
             conn.commit()
             return True, status, pane
         finally:
