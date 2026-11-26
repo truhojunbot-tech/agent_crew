@@ -100,6 +100,25 @@ def test_bad_stored_review_cannot_be_skipped_by_dedup(tmp_path):
     assert queue.get_task("incoming") is None
 
 
+def test_lineage_lookup_reports_malformed_stored_context(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    task = _task("implementation", pr_number=931)
+    task.project = "demo"
+    queue.enqueue(task)
+    _corrupt(queue, task.task_id, context="{bad")
+    with pytest.raises(MalformedStoredRow, match="malformed context"):
+        queue.implementer_families(task)
+
+
+def test_lineage_lookup_preserves_database_errors():
+    class BrokenConnection:
+        def execute(self, *_args):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        TaskQueue._implementation_lineage_in_txn(BrokenConnection(), "demo")
+
+
 def test_bad_findings_cannot_retain_a_verdict(tmp_path):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(_task("review", "review", reviewed_sha="a" * 40))

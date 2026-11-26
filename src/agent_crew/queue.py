@@ -3800,12 +3800,21 @@ class TaskQueue:
         keys = ("lineage_root_task_id", "prev_task_id", "provider_capacity_root",
                 *_CEA_LINEAGE_PARENT_KEYS)
         paths = ", ".join(f"'$.{key}'" for key in ("pr_number", *keys))
-        rows = conn.execute(
-            "SELECT task_id, task_type, pr_number, "
-            f"json_extract(context, {paths}) AS lineage, dispatch_agent, "
-            "(SELECT agent FROM task_attribution WHERE task_id=tasks.task_id) "
-            "AS attributed_agent FROM tasks "
-            "WHERE project=? AND quarantine_field=''", (project,)).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, task_type, pr_number, "
+                f"json_extract(context, {paths}) AS lineage, dispatch_agent, "
+                "(SELECT agent FROM task_attribution WHERE task_id=tasks.task_id) "
+                "AS attributed_agent FROM tasks "
+                "WHERE project=? AND quarantine_field=''", (project,)).fetchall()
+        except sqlite3.OperationalError as exc:
+            # SQL extraction reaches corrupt JSON before _stored_context does.
+            # Preserve the stored-data guard without masking database failures.
+            if str(exc) != "malformed JSON":
+                raise
+            raise MalformedStoredRow(
+                f"malformed context in implementation lineage for project {project}"
+            ) from exc
         graph, implementations, by_pr = {}, {}, {}
         for row in rows:
             values = json.loads(row["lineage"])
