@@ -671,15 +671,19 @@ def _cache_path(cache_dir: str, base_sha: str, command: str,
     return os.path.join(cache_dir, f"{base_sha}-{digest}.json")
 
 
-def _admit_full_suite(load_gate: Optional[HostLoadGate], record: Optional[dict]) -> None:
-    """Hold a full suite on host load (#1082) and keep the evidence in ``record``."""
+def _admit_full_suite(load_gate: Optional[HostLoadGate], record: Optional[dict]) -> bool:
+    """Hold a full suite on host load (#1082) and keep the evidence in ``record``.
+
+    Returns whether the suite was admitted ``load_contended``.
+    """
     if load_gate is None:
-        return
+        return False
     admission = load_gate.admit()
     if record is not None:
         record.setdefault("host_load", []).append(admission)
         if admission["load_contended"]:
             record["load_contended"] = True
+    return admission["load_contended"]
 
 
 def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
@@ -692,7 +696,8 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
 
     Under ``worker_cap`` a baseline is keyed by the workers it was observed to
     run with (or ``unknown``), never by the requested cap: a base seen with
-    more workers than the cap is not reused under it.
+    more workers than the cap is not reused under it. A base admitted
+    ``load_contended`` is used for this run but not cached as a clean baseline.
     """
     identity = _test_environment_identity(state, timeout_s)
 
@@ -708,7 +713,7 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
                 return RunOutcome.from_dict(json.load(f)), True
         except (OSError, ValueError):
             pass
-    _admit_full_suite(load_gate, record)
+    contended = _admit_full_suite(load_gate, record)
     with Checkout(repo, base_sha) as checkout:
         env, launched = test_environment(checkout, state), command
         if worker_cap is not None:
@@ -719,7 +724,7 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
             outcome.worker_cap = worker_cap_receipt(injection, launched, outcome)
     path = path_for(None if worker_cap is None else
                     outcome.worker_cap["observed_workers"] or "unknown")
-    if not outcome.timed_out:
+    if not outcome.timed_out and not contended:
         os.makedirs(cache_dir, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:

@@ -422,6 +422,28 @@ def test_base_with_more_workers_than_the_cap_is_not_used_for_parity(project, tmp
     assert not was_cached                                  # the 8-worker base is not reused
 
 
+@pytest.mark.parametrize("load, cached_after", [(99.0, False), (1.0, True)])
+def test_contended_base_is_not_cached_as_a_clean_baseline(project, tmp_path, load,
+                                                          cached_after):
+    repo, _ = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert True\n"})
+    base_sha, cache, state = _git_rev(repo, "origin/main"), str(tmp_path / "cache"), {}
+    runs = []
+
+    def runner(cmd, cwd, timeout_s, *, env=None):
+        runs.append(cmd)
+        return _reported("1 passed in 1s\n")
+
+    record = {}
+    gate = _gate(FakeHost([load]), max_load=50.0, max_wait_s=0.0)
+    _, was_cached = script_tester.base_outcome(
+        repo, base_sha, PYTEST, 60.0, cache, state, runner, load_gate=gate, record=record)
+    assert not was_cached and record.get("load_contended", False) is not cached_after
+    _, was_cached = script_tester.base_outcome(
+        repo, base_sha, PYTEST, 60.0, cache, state, runner, load_gate=_gate(FakeHost([1.0])))
+    assert was_cached is cached_after
+    assert len(runs) == (1 if cached_after else 2)        # a contended base re-runs
+
+
 def _git_rev(repo, ref):
     return subprocess.run(["git", "-C", repo, "rev-parse", ref], check=True,
                           capture_output=True, text=True).stdout.strip()
