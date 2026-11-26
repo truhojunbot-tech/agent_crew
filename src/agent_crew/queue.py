@@ -3309,6 +3309,26 @@ class TaskQueue:
             if self._stop_active_in_txn(conn, point=_cea_validator.ValidationPoint.ENQUEUE):
                 conn.execute("ROLLBACK")
                 raise PausedError(f"enqueue blocked by runtime STOP (task_id={task.task_id})")
+            # #405 Owner authority: a fix-budget HUMAN_GATE is durable across
+            # fresh Task IDs, coordinator-direct enqueue and successor retries.
+            # Check inside the same write transaction as INSERT (no TOCTOU).
+            if task.task_type == "implement":
+                from agent_crew.lineage_human_gate import blocking_lineage_gate
+                blocker = blocking_lineage_gate(
+                    conn, project=scope,
+                    pr_number=(_normalize_pr_number(task.pr_number)
+                               or _normalize_pr_number(context.get("pr_number"))),
+                    issue_number=context.get("issue"),
+                    receipt=receipt,
+                )
+                if blocker is not None:
+                    self._append_exec_event_on(
+                        conn, task.task_id, "lineage_human_gate_refused", time.time(),
+                        blocking_task_id=blocker, code="LINEAGE_HUMAN_GATE")
+                    conn.commit()  # refusal evidence, but no task row
+                    raise PermissionError(
+                        f"LINEAGE_HUMAN_GATE: predecessor {blocker} exhausted "
+                        "the fix budget; verified owner re-execution approval required")
             admit_at = time.time()
             reservation_ttl = self.review_reservation_ttl()
             expired_reservations: list = []
