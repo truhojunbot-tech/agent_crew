@@ -3797,13 +3797,13 @@ class TaskQueue:
         Project sweeps pass a local cache; it must never survive the transaction
         because another implementation round can add a provider at any time.
         """
-        keys = ("lineage_root_task_id", "prev_task_id", "provider_capacity_root",
-                *_CEA_LINEAGE_PARENT_KEYS)
-        paths = ", ".join(f"'$.{key}'" for key in ("pr_number", *keys))
         try:
             rows = conn.execute(
                 "SELECT task_id, task_type, pr_number, "
-                f"json_extract(context, {paths}) AS lineage, dispatch_agent, "
+                "json_extract(context, '$.pr_number', '$.lineage_root_task_id', "
+                "'$.prev_task_id', '$.provider_capacity_root', '$.retry_of', "
+                "'$.fallback_of', '$.fallback_from_task_id', '$.original_task_id') "
+                "AS lineage, dispatch_agent, "
                 "(SELECT agent FROM task_attribution WHERE task_id=tasks.task_id) "
                 "AS attributed_agent FROM tasks "
                 "WHERE project=? AND quarantine_field=''", (project,)).fetchall()
