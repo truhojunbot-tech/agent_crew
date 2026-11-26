@@ -155,7 +155,8 @@ def test_dispatch_memory_uses_only_effective_project_owner_statements(tmp_path, 
     assert current in block
     assert old not in block
     assert foreign not in block
-    assert counts == {"authoritative": 1, "failure_pattern": 0}
+    assert counts == {"authoritative": 1, "failure_pattern": 0,
+                      "authoritative_omitted": 0, "failure_pattern_omitted": 0}
 
 
 def test_migrated_column_retirements_stay_out_of_live_readers(tmp_path, monkeypatch):
@@ -190,7 +191,8 @@ def test_migrated_column_retirements_stay_out_of_live_readers(tmp_path, monkeypa
     assert "retired-truth" not in block
     assert "current-failure" in block
     assert "current-truth" in block
-    assert counts == {"authoritative": 1, "failure_pattern": 1}
+    assert counts == {"authoritative": 1, "failure_pattern": 1,
+                      "authoritative_omitted": 0, "failure_pattern_omitted": 0}
     assert {item.artifact_id for item in artifacts} == {"memory:current-failure"}
 
 
@@ -209,8 +211,135 @@ def test_dispatch_memory_budget_counts_only_rendered_rows(tmp_path, monkeypatch)
     assert len(block) <= 1600
     assert counts["authoritative"] == block.count("authoritative key=")
     assert counts["failure_pattern"] == block.count("failure_pattern key=")
-    assert counts["authoritative"] < 30
+    assert counts["authoritative"] == 30
     assert "long excerpt" not in block
+
+
+def test_dispatch_memory_caps_utf8_bytes_after_all_authoritative_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    for number in range(300):
+        storage.put(MemoryRecord("authoritative", f"fact:{number:03d}",
+                                 {"text": "한글 " * 100},
+                                 MemoryScope(project="agent_crew")))
+    storage.put(MemoryRecord("failure_pattern", "wc1:budget",
+                             {"text": "warning"}, MemoryScope(fleet="fleet")))
+    block, counts = dispatch_memory_block(
+        storage, "implementer", "impl-738", MemoryScope(project="agent_crew"))
+    assert len(block.encode("utf-8")) <= 8900
+    assert counts == {"authoritative": 300, "failure_pattern": 1,
+                      "authoritative_omitted": 0, "failure_pattern_omitted": 0}
+    assert all(f"authoritative key=fact:{number:03d}" in block for number in range(300))
+    assert "failure_pattern key=wc1:budget" in block
+    if "authoritative excerpt=" in block:
+        assert block.index("authoritative key=fact:299") < block.index("authoritative excerpt=")
+
+
+def test_dispatch_memory_reports_truncated_keys_and_reserves_patterns(
+        tmp_path, monkeypatch, unused_tcp_port):
+    from tests.unit.test_context_pack_inject_gate import _dispatch
+
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    owner_keys = [f"owner:agent_crew:telegram:6419236710:{100000000000 + n}"
+                  for n in range(300)]
+    for key in owner_keys:
+        storage.put(MemoryRecord("authoritative", key, {"text": "한글 " * 80},
+                                 MemoryScope(project="agent_crew")))
+    storage.put(MemoryRecord("failure_pattern", "wc1:fleet",
+                             {"text": "fleet warning"}, MemoryScope(fleet="fleet")))
+    for n in range(4):
+        storage.put(MemoryRecord("failure_pattern", f"local:{n}",
+                                 {"text": "local warning"},
+                                 MemoryScope(project="agent_crew")))
+
+    block, counts = dispatch_memory_block(
+        storage, "implementer", "impl-738", MemoryScope(project="agent_crew"))
+    assert len(block.encode("utf-8")) <= 8900
+    assert 0 < counts["authoritative"] < len(owner_keys)
+    assert counts["authoritative_omitted"] == len(owner_keys) - counts["authoritative"]
+    assert counts["failure_pattern"] == 3
+    assert counts["failure_pattern_omitted"] == 2
+    assert "failure_pattern key=wc1:fleet" in block
+    assert "failure_pattern key=local:0" in block
+    assert f"omitted authoritative={counts['authoritative_omitted']}" in block
+    assert f"failure_pattern={counts['failure_pattern_omitted']}" in block
+    lines = block.splitlines()
+    assert all(line in {"=== ADR-001 MEMORY (scoped, verify current sources) ===",
+                        "=== END ADR-001 MEMORY ==="}
+               or line.startswith(("authoritative key=", "failure_pattern key=",
+                                   "omitted ", "authoritative excerpt=", "failure_pattern excerpt="))
+               for line in lines)
+    assert all(f"authoritative key={key}" in lines for key in owner_keys[:counts["authoritative"]])
+    assert [line for line in lines if line.startswith("authoritative key=")] == [
+        f"authoritative key={key}" for key in owner_keys[:counts["authoritative"]]]
+    assert set(line for line in lines if line.startswith("failure_pattern key=")) <= {
+        "failure_pattern key=wc1:fleet",
+        *(f"failure_pattern key=local:{n}" for n in range(4)),
+    }
+    if any(line.startswith("authoritative excerpt=") for line in lines):
+        assert max(i for i, line in enumerate(lines) if line.startswith("authoritative key=")) < min(
+            i for i, line in enumerate(lines) if line.startswith("authoritative excerpt="))
+
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", storage.path)
+    result = _dispatch(tmp_path / "dispatch", monkeypatch, unused_tcp_port,
+                       task_project="agent_crew")
+    assert result["row_context"]["memory_served"] == counts
+    assert result["memory"][0]["memory_served"] == counts
+
+
+def test_dispatch_memory_uses_scope_only_rows_and_alias_preserves_local_patterns(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    for layer, key, scope in (
+        ("authoritative", "owner:Quota:telegram:6419236710:2154", MemoryScope(project="Quota")),
+        ("failure_pattern", "wc1:fleet", MemoryScope(fleet="fleet")),
+        ("failure_pattern", "local:quota-ops", MemoryScope(project="quota-ops")),
+        ("failure_pattern", "foreign:Quota", MemoryScope(project="Quota")),
+        ("episodic", "episode:ranked", MemoryScope(project="Quota")),
+        ("decision", "decision:ranked", MemoryScope(project="Quota")),
+    ):
+        value = {"text": key}
+        if layer == "authoritative":
+            value.update(kind="owner_statement", chat_id="6419236710", message_id="2154",
+                         verification_status="VERIFIED", supersedes=[],
+                         text_sha256=hashlib.sha256(key.encode()).hexdigest())
+        storage.put(MemoryRecord(layer, key, value, scope))
+    block, counts = dispatch_memory_block(
+        storage, "implementer", "impl-738", MemoryScope(project="Quota"),
+        local_project="quota-ops")
+    assert "owner:Quota:telegram:6419236710:2154" in block
+    assert "wc1:fleet" in block
+    assert "local:quota-ops" in block
+    assert "foreign:Quota" not in block
+    assert "episode:ranked" not in block
+    assert "decision:ranked" not in block
+    assert counts == {"authoritative": 1, "failure_pattern": 2,
+                      "authoritative_omitted": 0, "failure_pattern_omitted": 0}
+
+
+def test_dispatch_alias_keeps_the_crews_own_failure_pattern(
+        tmp_path, monkeypatch, unused_tcp_port):
+    from tests.unit.test_context_pack_inject_gate import _dispatch
+
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    storage.put(MemoryRecord("authoritative", "quota:policy", {"text": "Quota owner rule"},
+                             MemoryScope(project="Quota")))
+    storage.put(MemoryRecord("failure_pattern", "local:quota-ops",
+                             {"text": "Quota Ops local warning"},
+                             MemoryScope(project="quota-ops")))
+    storage.put(MemoryRecord("failure_pattern", "foreign:Quota",
+                             {"text": "wrong local warning"},
+                             MemoryScope(project="Quota")))
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", storage.path)
+    monkeypatch.setenv("AGENT_CREW_MEMORY_PROJECT_ALIASES", json.dumps({"quota-ops": "Quota"}))
+    result = _dispatch(tmp_path / "dispatch", monkeypatch, unused_tcp_port,
+                       task_project="quota-ops")
+    assert "quota:policy" in result["message"]
+    assert "local:quota-ops" in result["message"]
+    assert "foreign:Quota" not in result["message"]
 
 
 @pytest.mark.parametrize("failure", ["missing", "exception", "timeout"])
@@ -237,5 +366,6 @@ def test_adr001_live_read_failure_keeps_message_and_zero_receipt(
                        task_project="agent_crew")
     assert result["message"] == "baseline message"
     assert result["row_context"]["memory_served"] == {
-        "authoritative": 0, "failure_pattern": 0}
+        "authoritative": 0, "failure_pattern": 0,
+        "authoritative_omitted": 0, "failure_pattern_omitted": 0}
     assert result["memory"][0]["memory_served"] == result["row_context"]["memory_served"]
