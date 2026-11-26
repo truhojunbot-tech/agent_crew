@@ -1,6 +1,9 @@
 """Unit tests for rate-limit auto-fallback (Issue #81)."""
 import json
 
+import pytest
+from agent_crew.role_mapping import RoleResolutionError
+
 from agent_crew.fallback import (
     DEFAULT_CHAINS,
     default_agent_for_role,
@@ -40,30 +43,31 @@ class TestLoadFallbackChains:
         assert chains["review"] == DEFAULT_CHAINS["review"]
         assert chains["test"] == DEFAULT_CHAINS["test"]
 
-    def test_malformed_override_returns_defaults(self, tmp_path):
+    def test_malformed_override_refuses(self, tmp_path):
         state_path = tmp_path / "state.json"
         state_path.write_text("{}")
         override_path = tmp_path / "fallback_chains.json"
         override_path.write_text("not json at all")
-        assert load_fallback_chains(str(state_path)) == DEFAULT_CHAINS
+        with pytest.raises(RoleResolutionError, match="invalid_fallback_chains"):
+            load_fallback_chains(str(state_path))
 
-    def test_override_with_non_list_value_ignored(self, tmp_path):
+    def test_override_with_non_list_value_refuses(self, tmp_path):
         state_path = tmp_path / "state.json"
         state_path.write_text("{}")
         override_path = tmp_path / "fallback_chains.json"
         override_path.write_text(json.dumps({"implement": "claude"}))
-        # Non-list value silently ignored
-        chains = load_fallback_chains(str(state_path))
-        assert chains["implement"] == DEFAULT_CHAINS["implement"]
+        with pytest.raises(RoleResolutionError, match="invalid_fallback_chains"):
+            load_fallback_chains(str(state_path))
 
-    def test_override_filters_non_string_entries(self, tmp_path):
+    def test_override_refuses_non_string_entries(self, tmp_path):
         state_path = tmp_path / "state.json"
         state_path.write_text("{}")
         override_path = tmp_path / "fallback_chains.json"
         override_path.write_text(
             json.dumps({"implement": ["codex", None, 1, "claude"]})
         )
-        assert load_fallback_chains(str(state_path))["implement"] == ["codex", "claude"]
+        with pytest.raises(RoleResolutionError, match="invalid_fallback_chains"):
+            load_fallback_chains(str(state_path))
 
 
 # ---------------------------------------------------------------------------

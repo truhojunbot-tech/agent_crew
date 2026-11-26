@@ -51,6 +51,7 @@ def test_current_fleet_shapes_resolve(state):
 @pytest.mark.parametrize("state_body,reason", [
     (json.dumps({"role_agents": {"implementer": "codex"}}), "invalid_role_agents"),
     ("{broken", "unreadable_state"),
+    (json.dumps({"role_agents": None}), "invalid_role_agents"),
 ])
 def test_bad_state_starts_but_refuses_dispatch_once(tmp_path, monkeypatch, state_body, reason):
     state = tmp_path / "state.json"
@@ -122,3 +123,55 @@ def test_no_default_role_map_or_agent_role_get_outside_resolver():
                 continue
             if node.func.attr == "get" and isinstance(node.func.value, ast.Name):
                 assert not (node.func.value.id == "_AGENT_TO_ROLE" and len(node.args) > 1), path.name
+
+
+@pytest.mark.parametrize("body", ["{broken", "[]", '{"implement": "codex"}',
+                                  '{"implement": ["codex", null]}',
+                                  '{"implement": []}', '{"implement": ["typo"]}'])
+def test_bad_fallback_refuses_dispatch_once(tmp_path, monkeypatch, body):
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"role_agents": VALID}))
+    (tmp_path / "fallback_chains.json").write_text(body)
+    notices = []
+    monkeypatch.setattr("agent_crew.server._deliver_coordinator_notice",
+                        lambda message: notices.append(message) or True)
+    app = create_app(str(tmp_path / "tasks.db"), state_path=str(state),
+                     pane_map={"implementer": "%100"},
+                     push_fn=lambda *args: pytest.fail("dispatched with bad fallback config"),
+                     watchdog_disabled=True, anomaly_disabled=True, identity_required=False)
+    with TestClient(app) as client:
+        client.post("/tasks", json={"task_id": "impl-bad-fallback", "task_type": "implement",
+                    "description": "work", "branch": "main", "context": {"risk_tier": 1}})
+        for _ in range(2):
+            assert client.get("/tasks/next?role=implementer&agent=codex").status_code == 409
+    assert len(notices) == 1
+    assert "invalid_fallback_chains" in notices[0]
+    assert TaskQueue(str(tmp_path / "tasks.db")).get_task_status("impl-bad-fallback") == "pending"
+
+
+def test_missing_supplied_state_refuses(tmp_path):
+    with pytest.raises(RoleResolutionError, match="unreadable_state"):
+        _load_role_to_agent_with_source(str(tmp_path / "state.json"))
+
+
+def test_fallback_changes_refresh_refusal_and_recovery(tmp_path, monkeypatch):
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"role_agents": VALID}))
+    override = tmp_path / "fallback_chains.json"
+    override.write_text('{"implement": ["claude", "codex"]}')
+    assert _load_role_to_agent_with_source(str(state))[0] == VALID
+    monkeypatch.setattr("agent_crew.server._deliver_coordinator_notice", lambda message: True)
+    app = create_app(str(tmp_path / "tasks.db"), state_path=str(state),
+                     watchdog_disabled=True, anomaly_disabled=True, identity_required=False)
+    with TestClient(app) as client:
+        assert client.get("/tasks/next?role=implementer&agent=codex").status_code != 409
+        override.write_text("{broken")
+        assert client.get("/tasks/next?role=implementer&agent=codex").status_code == 409
+        override.unlink()
+        assert client.get("/tasks/next?role=implementer&agent=codex").status_code != 409
+
+
+def test_unreadable_fallback_refuses(tmp_path):
+    (tmp_path / "fallback_chains.json").mkdir()
+    with pytest.raises(RoleResolutionError, match="invalid_fallback_chains"):
+        _load_role_to_agent_with_source(str(tmp_path / "state.json"))
