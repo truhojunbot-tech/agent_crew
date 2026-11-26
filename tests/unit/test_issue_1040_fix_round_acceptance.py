@@ -164,3 +164,11 @@ def test_heading_section_runs_to_same_level_heading():
 def test_plain_marker_stops_at_non_list_paragraph():
     description = "Intro.\n\nDone when:\n- a\n\n- b\n\nUnrelated prose."
     assert extract_acceptance_sections(description) == "Done when:\n- a\n\n- b"
+
+
+@pytest.mark.parametrize("marker", ["Out of scope", "out of scope", "OUT OF SCOPE"])
+def test_separate_out_of_scope_paragraph_copied_byte_for_byte(marker):
+    out_of_scope = f"{marker}: other markers; enqueue logic.\nKeep tasks.db unchanged."
+    expected = f"{ACCEPTANCE}\n\n{out_of_scope}"
+    description = f"Problem statement.\n\n{expected}\n\nUnrelated background."
+    assert extract_acceptance_sections(description).encode() == expected.encode()
