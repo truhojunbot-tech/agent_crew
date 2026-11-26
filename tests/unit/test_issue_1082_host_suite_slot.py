@@ -65,6 +65,76 @@ def test_exception_releases_slot():
         assert not receipt["host_suite_contended"]
 
 
+@pytest.mark.parametrize("with_record", [False, True])
+def test_slot_contended_base_is_not_cached(tmp_path, monkeypatch, with_record):
+    clock = Clock()
+    runs = []
+    record = {} if with_record else None
+
+    @contextmanager
+    def checkout(*args):
+        yield str(tmp_path)
+
+    monkeypatch.setattr(script_tester, "Checkout", checkout)
+
+    def runner(*args, **kwargs):
+        runs.append(clock.now)
+        return script_tester.RunOutcome(exit_code=1, failing_ids=["test_a.py::test_a"])
+
+    gate = script_tester.HostLoadGate(read_load=lambda: 0,
+                                      clock=clock.clock, sleep=clock.sleep)
+    args = (str(tmp_path), "base", "python3 -m pytest -q", 60,
+            str(tmp_path / "cache"), {})
+    with host_suite_slot(kind="premerge_gate", port=8105):
+        outcome, cached = script_tester.base_outcome(
+            *args, runner=runner, load_gate=gate, record=record)
+        assert not cached and outcome.failing_ids == ["test_a.py::test_a"]
+        assert runs == [3600]
+        if record is not None:
+            assert record["host_suite_contended"] is True
+            assert record["host_load"][0]["load_contended"] is False
+        assert not list((tmp_path / "cache").glob("*.json"))
+
+    # With the holder gone, the same base must run again and can then be cached.
+    _, cached = script_tester.base_outcome(
+        *args, runner=runner, load_gate=gate, record=record)
+    assert not cached and runs == [3600, 3600]
+    _, cached = script_tester.base_outcome(
+        *args, runner=runner, load_gate=gate, record=record)
+    assert cached and len(runs) == 2
+
+
+def test_head_slot_contention_does_not_prevent_clean_base_cache(tmp_path, monkeypatch):
+    clock = Clock()
+    gate = script_tester.HostLoadGate(read_load=lambda: 0,
+                                      clock=clock.clock, sleep=clock.sleep)
+    record = {}
+    with host_suite_slot(kind="premerge_gate"):
+        with script_tester._full_suite_slot(gate, record):
+            pass
+
+    @contextmanager
+    def checkout(*args):
+        yield str(tmp_path)
+
+    monkeypatch.setattr(script_tester, "Checkout", checkout)
+    runs = []
+
+    def runner(*args, **kwargs):
+        runs.append(True)
+        return script_tester.RunOutcome(exit_code=0)
+
+    args = (str(tmp_path), "base", "python3 -m pytest -q", 60,
+            str(tmp_path / "cache"), {})
+    _, cached = script_tester.base_outcome(
+        *args, runner=runner, load_gate=gate, record=record)
+    assert not cached and record["host_suite_contended"] is True
+    assert record["host_suite"][-1]["host_suite_contended"] is False
+    _, cached = script_tester.base_outcome(
+        *args, runner=runner, load_gate=gate, record=record)
+    assert cached and len(runs) == 1
+
+
 def test_head_base_take_slot_after_load_rerun_and_cached_base_do_not(tmp_path, monkeypatch, slot_path):
     clock = Clock()
     events = []

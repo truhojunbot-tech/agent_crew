@@ -701,7 +701,7 @@ def _full_suite_slot(load_gate: Optional[HostLoadGate], record: Optional[dict]):
                 record.get("queue_wait_s", 0.0) + receipt["queue_wait_s"], 3)
             record["host_suite_contended"] = (
                 record.get("host_suite_contended", False) or receipt["host_suite_contended"])
-        yield
+        yield receipt
 
 
 def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
@@ -715,7 +715,8 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
     Under ``worker_cap`` a baseline is keyed by the workers it was observed to
     run with (or ``unknown``), never by the requested cap: a base seen with
     more workers than the cap is not reused under it. A base admitted
-    ``load_contended`` is used for this run but not cached as a clean baseline.
+    ``load_contended`` or ``host_suite_contended`` is used for this run but not
+    cached as a clean baseline.
     """
     identity = _test_environment_identity(state, timeout_s)
 
@@ -737,13 +738,14 @@ def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
         if worker_cap is not None:
             launched, env, injection = cap_xdist_workers(command, env, worker_cap,
                                                          cwd=checkout)
-        with _full_suite_slot(load_gate, record):
+        with _full_suite_slot(load_gate, record) as slot_receipt:
             outcome = runner(launched, checkout, timeout_s, env=env)
         if worker_cap is not None:
             outcome.worker_cap = worker_cap_receipt(injection, launched, outcome)
     path = path_for(None if worker_cap is None else
                     outcome.worker_cap["observed_workers"] or "unknown")
-    if not outcome.timed_out and not contended:
+    if (not outcome.timed_out and not contended
+            and not slot_receipt["host_suite_contended"]):
         os.makedirs(cache_dir, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
