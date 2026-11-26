@@ -2898,14 +2898,14 @@ def auto_enqueue_review(
 
         # Identify which agent actually implemented this task. Prefer the
         # recorded execution attribution, then explicit routing, then
-        # the role's default mapping. Recorded so the rate-limit fallback
+        # the pane mapping before the dispatcher default. Recorded so the rate-limit fallback
         # handler can skip it during reviewer selection (#117 — self-review
         # prevention).
         implementer_agent = (
             _recover_implementer_agent(queue, impl_task, pr_number)
+            or default_agent_for_role("implementer", pane_map)
             or implementer_provider
-            or (default_agent_for_role("implementer", pane_map) if pane_map
-                else baseline_agent_for_role("implementer"))
+            or baseline_agent_for_role("implementer")
         )
 
         review_context = {

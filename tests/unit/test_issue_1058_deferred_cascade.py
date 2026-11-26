@@ -229,3 +229,17 @@ def test_dispatcher_review_uses_configured_implementer_without_attribution(case)
         q, "mapped-impl", 1060, pane_map={}, implementer_provider="claude",
         pr_state_fn=lambda _: "open")
     assert q.get_task(rid).context["implementer_agent"] == "claude"
+
+
+@pytest.mark.parametrize("pane_map,expected", [
+    ({"implementer": "%100", "claude": "%100"}, "claude"),
+    ({"reviewer": "%200", "claude": "%200"}, "codex"),
+])
+def test_review_prefers_pane_implementer_over_dispatcher_provider(case, pane_map, expected):
+    q, _, _, _ = case
+    q.enqueue(TaskRequest("pane-impl", "implement", "work",
+                          context={"risk_tier": 1, "pr_number": 1060}))
+    rid = pipeline.auto_enqueue_review(
+        q, "pane-impl", 1060, pane_map=pane_map, implementer_provider="codex",
+        pr_state_fn=lambda _: "open")
+    assert q.get_task(rid).context["implementer_agent"] == expected
