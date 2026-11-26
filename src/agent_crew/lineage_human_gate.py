@@ -5,11 +5,13 @@ context.lineage_terminal_reason.  The successor's task ID is NOT an authority
 boundary: direct coordinator enqueues must see this refusal too.
 
 A verified CEA owner receipt or the bounded technical exception in authority
-amendment 405-v1 may override the block. Usage is counted from durable events.
+amendment 405-v1.1 may override the block. Usage is counted from durable events.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
+import math
 import re
 import sqlite3
 import time
@@ -21,6 +23,32 @@ _TERMINAL_PREFIXES = (
     "successor_refused: fix_rounds_exhausted",
     "successor_refused: fix_grant_exhausted",
 )
+
+# First published authority amendment, alfred#405 c7203724080. v1.1
+# explicitly preserves non-retroactivity. Existing rows are never rewritten
+# to opt them in: ambiguous legacy lineages require verified owner authority.
+_TECHNICAL_AUTHORITY_START = datetime(2026, 11, 26, 21, 26, 10, tzinfo=timezone.utc).timestamp()
+_LINK_KEYS = ("prev_task_id", "parent_task_id", "lineage_root_id",
+              "lineage_root_task_id", "root_task_id")
+
+
+def _lineage_links(context):
+    links = set()
+    for key in _LINK_KEYS:
+        if key not in context:
+            continue
+        value = context[key]
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            return links, "invalid_lineage_reference"
+        links.add(value)
+    return links, None
+
+
+def _finding_id(value):
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"(?:c|issuecomment-)?([1-9][0-9]*)", value)
+    return match[1] if match else None
 
 
 def blocking_lineage_gate(
@@ -44,8 +72,6 @@ def blocking_lineage_gate(
         return None
     issue = issue_number if type(issue_number) is int and issue_number > 0 else None
     pr = pr_number if type(pr_number) is int and pr_number > 0 else None
-    if pr is None and issue is None:
-        return None
 
     # The existing CEA gate verifies the immutable receipt before reaching
     # this function.  Neither a context claim nor a coordinator statement
@@ -58,6 +84,20 @@ def blocking_lineage_gate(
             and bool(reuse["approved_by"].strip())):
         return None
 
+    context = task_context or {}
+    incoming_links, link_error = _lineage_links(context)
+    blocker = task_id or "unresolved_lineage"
+
+    def deny(reason):
+        if refusal is not None:
+            refusal["reason"] = reason
+        return blocker
+
+    if link_error:
+        return deny(link_error)
+    if pr is None and issue is None and not incoming_links:
+        return None
+
     # Follow shared PR/issue anchors to closure: changing PR then omitting the
     # issue must not reset the allowance. Unknown legacy metadata stays blocked.
     candidates = conn.execute(
@@ -66,12 +106,12 @@ def blocking_lineage_gate(
     ).fetchall()
     prs, issues = {pr} - {None}, {issue} - {None}
     rows = []
-    linked_ids = set()
-    link_keys = ("prev_task_id", "parent_task_id", "lineage_root_id", "root_task_id")
+    linked_ids = set(incoming_links)
+    selected_ids = set()
     while True:
         added = False
         for row in candidates:
-            if any(old["task_id"] == row["task_id"] for old, _ in rows):
+            if row["task_id"] in selected_ids:
                 continue
             try:
                 ctx = json.loads(row["context"])
@@ -81,11 +121,21 @@ def blocking_lineage_gate(
                 ctx = {}
             row_issue = ctx.get("issue", ctx.get("issue_number"))
             row_pr = row["pr_number"]
-            links = {ctx[key] for key in link_keys
-                     if isinstance(ctx.get(key), str) and ctx[key]}
+            links, link_error = _lineage_links(ctx)
             if (row_pr in prs or (type(row_issue) is int and row_issue in issues)
                     or row["task_id"] in linked_ids or links & linked_ids):
+                if link_error:
+                    return deny(link_error)
+                if not ctx:
+                    return deny("invalid_lineage_metadata")
+                if (context.get("repo") and ctx.get("repo")
+                        and context["repo"] != ctx["repo"]):
+                    return deny("conflicting_lineage_repo")
+                if ("issue" in ctx and "issue_number" in ctx
+                        and ctx["issue"] != ctx["issue_number"]):
+                    return deny("conflicting_lineage_issue")
                 rows.append((row, ctx))
+                selected_ids.add(row["task_id"])
                 linked_ids.update(links | {row["task_id"]})
                 if type(row_pr) is int:
                     prs.add(row_pr)
@@ -94,18 +144,17 @@ def blocking_lineage_gate(
                 added = True
         if not added:
             break
+    if linked_ids - selected_ids:
+        return deny("unresolved_lineage_reference")
+    if ("issue" in context and "issue_number" in context
+            and context["issue"] != context["issue_number"]):
+        return deny("conflicting_lineage_issue")
     blocker = next((str(row["task_id"]) for row, ctx in rows
                     if isinstance(ctx.get("lineage_terminal_reason"), str)
                     and ctx["lineage_terminal_reason"].startswith(_TERMINAL_PREFIXES)), None)
     if blocker is None:
         return None
 
-    def deny(reason):
-        if refusal is not None:
-            refusal["reason"] = reason
-        return blocker
-
-    context = task_context or {}
     grant = context.get("technical_extra_round")
     if grant is None:
         return deny("fix_budget_exhausted")
@@ -124,8 +173,8 @@ def blocking_lineage_gate(
         return deny("invalid_technical_extra_round:issue")
     if grant.get("authorizer") not in ("coordinator", "alfred"):
         return deny("invalid_technical_extra_round:authorizer")
-    if not isinstance(grant.get("finding"), str) or not re.fullmatch(
-            r"(?:c|issuecomment-)?[1-9][0-9]*", grant["finding"]):
+    finding = _finding_id(grant.get("finding"))
+    if finding is None:
         return deny("invalid_technical_extra_round:finding")
     if not task_id:
         return deny("missing_admission_task_id")
@@ -151,9 +200,22 @@ def blocking_lineage_gate(
         reason = _technical_refusal(ctx)
         if reason:
             return deny(reason)
+    # Task creation is server-written, unlike caller context timestamps. Only
+    # lineages whose entire durable history starts after publication are
+    # prospectively eligible. Old/undated roots stay held even if a caller adds
+    # a fresh successor and an otherwise valid grant.
+    for row, ctx in rows:
+        row_issue = ctx.get("issue", ctx.get("issue_number"))
+        if row_issue is not None and row_issue != issue:
+            return deny("conflicting_lineage_issue")
+        created = row["created_at"]
+        if (not isinstance(created, (int, float)) or not math.isfinite(created)
+                or created < _TECHNICAL_AUTHORITY_START):
+            return deny("nonretroactive_lineage")
     if "task_exec_events" not in tables:
         return deny("extra_round_usage_unknown")
     ids = {row["task_id"] for row, _ in rows}
+    used = 0
     for event in conn.execute(
             "SELECT task_id, fields FROM task_exec_events "
             "WHERE event='lineage_extra_round_admitted'"):
@@ -164,14 +226,23 @@ def blocking_lineage_gate(
         if (event["task_id"] in ids or
                 (isinstance(fields, dict) and fields.get("project") == project
                  and (fields.get("issue") == grant["issue"]
-                      or fields.get("blocking_task_id") in ids))):
-            return deny("extra_round_already_used")
+                      or fields.get("blocking_task_id") in ids
+                      or fields.get("admitted_task_id") in ids))):
+            used += 1
+            previous_finding = _finding_id(fields.get("finding")) if isinstance(fields, dict) else None
+            if previous_finding is None:
+                return deny("extra_round_usage_unknown")
+            if previous_finding == finding:
+                return deny("extra_round_finding_reused")
+    if used >= 2:
+        return deny("extra_rounds_exhausted")
     # The queue owns BEGIN IMMEDIATE and commits this with INSERT INTO tasks.
     # Associate evidence with the durable predecessor as well as the new task.
     conn.execute(
         "INSERT INTO task_exec_events (task_id, event, at, fields) VALUES (?, ?, ?, ?)",
         (blocker, "lineage_extra_round_admitted", time.time(), json.dumps({
-            **grant, "project": project, "admitted_task_id": task_id,
+            **grant, "finding": finding, "authority_amendment": "405-v1.1",
+            "project": project, "admitted_task_id": task_id,
             "blocking_task_id": blocker,
         })),
     )

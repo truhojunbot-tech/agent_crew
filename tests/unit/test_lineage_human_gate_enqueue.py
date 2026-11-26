@@ -1,5 +1,6 @@
 """Regression: HUMAN_GATE survives successor IDs and coordinator-direct enqueue."""
 import json
+from datetime import datetime, timezone
 import sqlite3
 
 import pytest
@@ -74,6 +75,8 @@ def test_non_exhaustion_terminal_reason_is_not_global_hold():
     assert _block(c) is None
 
 
+PROSPECTIVE_AT = datetime(2026, 11, 26, 22, tzinfo=timezone.utc).timestamp()
+
 TECHNICAL = {"repo": "org/repo", "risk_tier": 1}
 GRANT = {
     "grant_kind": "technical_extra_round", "authority_version": "405-v1",
@@ -90,7 +93,7 @@ def _technical_connection():
         "review-r1", "alfred", 593, json.dumps({
             **TECHNICAL, "issue": 590,
             "lineage_terminal_reason": "successor_refused: fix_rounds_exhausted",
-        }), 1.0, "completed"))
+        }), PROSPECTIVE_AT, "completed"))
     return c
 
 
@@ -103,7 +106,7 @@ def _extra(c, grant=None, **updates):
     return blocked, detail
 
 
-def test_extra_round_admitted_once_from_durable_events():
+def test_same_finding_refused_from_durable_events():
     c = _technical_connection()
     assert _extra(c)[0] is None
     event = c.execute("SELECT * FROM task_exec_events").fetchone()
@@ -111,7 +114,7 @@ def test_extra_round_admitted_once_from_durable_events():
     assert json.loads(event["fields"])["finding"] == GRANT["finding"]
     blocked, detail = _extra(c, extra_rounds_used=0)
     assert blocked == "review-r1"
-    assert detail["reason"] == "extra_round_already_used"
+    assert detail["reason"] == "extra_round_finding_reused"
 
 
 @pytest.mark.parametrize("field", list(GRANT))
@@ -207,7 +210,7 @@ def test_queue_admission_and_duplicate_insert_rollback(tmp_path):
     with pytest.raises(TaskAlreadyExistsError):
         q.enqueue(task("root", True))
     q.enqueue(task("extra", True))
-    with pytest.raises(PermissionError, match="LINEAGE_HUMAN_GATE.*extra_round_already_used"):
+    with pytest.raises(PermissionError, match="LINEAGE_HUMAN_GATE.*extra_round_finding_reused"):
         q.enqueue(task("extra2", True))
     c = q._connect()
     try:
@@ -231,7 +234,7 @@ def test_predecessor_without_issue_still_checked():
     assert _extra(c)[0] == "review-r1"
 
 
-def test_concurrent_records_only_admit_once(tmp_path):
+def test_concurrent_same_finding_only_admitted_once(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
     import threading
 
@@ -260,3 +263,173 @@ def test_concurrent_records_only_admit_once(tmp_path):
         results = list(pool.map(lambda _: admit(), range(2)))
     assert results.count(None) == 1
     assert results.count("review-r1") == 1
+
+
+def test_v11_second_distinct_finding_admitted_third_refused():
+    c = _technical_connection()
+    assert _extra(c)[0] is None
+    assert _extra(c, {**GRANT, "finding": "7204988620"})[0] is None
+    assert _extra(c, {**GRANT, "finding": "7205022943"})[1]["reason"] == "extra_rounds_exhausted"
+
+
+@pytest.mark.parametrize("anchors", [(999, 998), (None, None)])
+@pytest.mark.parametrize("risk", [{}, {"owner_gate": "HUMAN_GATE"}, {"capability_tags": ["orders"]}])
+@pytest.mark.parametrize("with_grant", [False, True])
+def test_queue_incoming_predecessor_cannot_reset_lineage(tmp_path, anchors, risk, with_grant):
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+
+    q = TaskQueue(str(tmp_path / "linked.db"))
+    q.enqueue(TaskRequest(
+        task_id="old", task_type="implement", description="technical fix",
+        project="alfred", pr_number=593, context={**TECHNICAL, "issue": 590}))
+    q.patch_context("old", {
+        "lineage_terminal_reason": "successor_refused: fix_rounds_exhausted", **risk,
+    })
+    pr, issue = anchors
+    with pytest.raises(PermissionError, match="LINEAGE_HUMAN_GATE"):
+        q.enqueue(TaskRequest(
+            task_id="new", task_type="implement", description="technical fix",
+            project="alfred", pr_number=pr,
+            context={**TECHNICAL, "issue": issue, "prev_task_id": "old",
+                     **({"technical_extra_round": {**GRANT, "issue": f"org/repo#{issue}"}}
+                        if with_grant else {})}))
+
+
+def test_earlier_held_technical_lineage_stays_held():
+    c = _technical_connection()
+    c.execute("UPDATE tasks SET created_at=1.0")
+    assert _extra(c)[1].get("reason") == "nonretroactive_lineage"
+
+
+@pytest.mark.parametrize("first", ["7204988620", "c7204988620", "issuecomment-7204988620"])
+@pytest.mark.parametrize("second", ["7204988620", "c7204988620", "issuecomment-7204988620"])
+def test_finding_aliases_cannot_spend_another_round(first, second):
+    c = _technical_connection()
+    assert _extra(c, {**GRANT, "finding": first})[0] is None
+    assert _extra(c, {**GRANT, "finding": second})[1]["reason"] == "extra_round_finding_reused"
+
+
+@pytest.mark.parametrize("key", [
+    "prev_task_id", "parent_task_id", "lineage_root_id", "lineage_root_task_id", "root_task_id",
+])
+def test_incoming_reference_without_numeric_anchors(key):
+    c = _technical_connection()
+    detail = {}
+    assert blocking_lineage_gate(
+        c, project="alfred", pr_number=None, issue_number=None, receipt={},
+        task_context={**TECHNICAL, key: "review-r1"}, task_id="new", refusal=detail,
+    ) == "review-r1"
+    assert detail["reason"] == "fix_budget_exhausted"
+
+
+@pytest.mark.parametrize("reference, reason", [
+    ("missing", "unresolved_lineage_reference"),
+    (" review-r1", "invalid_lineage_reference"),
+    (None, "invalid_lineage_reference"),
+    (123, "invalid_lineage_reference"),
+])
+def test_bad_incoming_reference_fails_closed(reference, reason):
+    c = _technical_connection()
+    assert _extra(c, prev_task_id=reference)[1]["reason"] == reason
+
+
+def test_cross_project_reference_is_unresolved():
+    c = _technical_connection()
+    c.execute("UPDATE tasks SET project='other'")
+    assert _extra(c, prev_task_id="review-r1")[1]["reason"] == "unresolved_lineage_reference"
+
+
+def test_conflicting_repo_fails_closed():
+    c = _technical_connection()
+    assert _extra(c, repo="other/repo", prev_task_id="review-r1")[1]["reason"] == "conflicting_lineage_repo"
+
+
+def test_legacy_root_is_not_released_by_new_exhausted_successor():
+    c = _technical_connection()
+    c.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)", (
+        "old-root", "alfred", 593, json.dumps({**TECHNICAL, "issue": 590}),
+        1.0, "completed"))
+    assert _extra(c, extra_rounds_used=0, lineage_created_at=PROSPECTIVE_AT)[1]["reason"] == "nonretroactive_lineage"
+
+
+@pytest.mark.parametrize("created_at", [None, "unknown", float("inf")])
+def test_undated_lineage_stays_held(created_at):
+    c = _technical_connection()
+    c.execute("UPDATE tasks SET created_at=?", (created_at,))
+    assert _extra(c)[1]["reason"] == "nonretroactive_lineage"
+
+
+def test_events_on_linked_predecessors_share_allowance():
+    c = _technical_connection()
+    c.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)", (
+        "root", "alfred", None, json.dumps({**TECHNICAL, "issue": 590}),
+        PROSPECTIVE_AT, "completed"))
+    for task_id, finding in [("root", "c111"), ("review-r1", "issuecomment-222")]:
+        c.execute("INSERT INTO task_exec_events VALUES (?, ?, ?, ?)", (
+            task_id, "lineage_extra_round_admitted", PROSPECTIVE_AT,
+            json.dumps({"finding": finding})))
+    assert _extra(c)[1]["reason"] == "extra_rounds_exhausted"
+
+
+def test_concurrent_distinct_findings_cannot_admit_third_round(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    path = tmp_path / "distinct.db"
+    c = _technical_connection()
+    assert _extra(c)[0] is None  # One slot remains.
+    c.commit()
+    disk = sqlite3.connect(path)
+    c.backup(disk)
+    disk.close()
+    c.close()
+    barrier = threading.Barrier(2)
+
+    def admit(finding):
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        try:
+            barrier.wait(timeout=5)
+            conn.execute("BEGIN IMMEDIATE")
+            result = _extra(conn, {**GRANT, "finding": finding})
+            conn.commit()
+            return result
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(admit, ["111", "222"]))
+    assert sum(blocked is None for blocked, _ in results) == 1
+    assert [detail["reason"] for blocked, detail in results if blocked] == ["extra_rounds_exhausted"]
+
+
+def test_queue_two_distinct_rounds_then_third_refused(tmp_path):
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+
+    q = TaskQueue(str(tmp_path / "two-rounds.db"))
+    def task(task_id, finding=None):
+        return TaskRequest(
+            task_id=task_id, task_type="implement", description="technical fix",
+            project="alfred", pr_number=593,
+            context={**TECHNICAL, "issue": 590, **({
+                "prev_task_id": "root",
+                "technical_extra_round": {**GRANT, "finding": finding},
+            } if finding else {})})
+    q.enqueue(task("root"))
+    q.patch_context("root", {
+        "lineage_terminal_reason": "successor_refused: fix_rounds_exhausted",
+    })
+    q.enqueue(task("first", "c111"))
+    q.enqueue(task("second", "issuecomment-222"))
+    with pytest.raises(PermissionError, match="LINEAGE_HUMAN_GATE.*extra_rounds_exhausted"):
+        q.enqueue(task("third", "333"))
+    c = q._connect()
+    try:
+        assert c.execute(
+            "SELECT COUNT(*) FROM task_exec_events WHERE event='lineage_extra_round_admitted'"
+        ).fetchone()[0] == 2
+        assert c.execute("SELECT 1 FROM tasks WHERE task_id='third'").fetchone() is None
+    finally:
+        c.close()
