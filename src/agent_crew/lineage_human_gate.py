@@ -277,11 +277,13 @@ def _round_disposition(conn, rows, admitted_id, tables):
     if not isinstance(admitted_id, str) or admitted_id not in by_id:
         return "extra_round_disposition_unknown"
     descendants = {admitted_id}
+    parents = set()
     while True:
         before = len(descendants)
         for row, context in rows:
             links, _ = _lineage_links(context)
             if links & descendants:
+                parents.update(links & descendants)
                 descendants.add(row["task_id"])
         if len(descendants) == before:
             break
@@ -294,6 +296,25 @@ def _round_disposition(conn, rows, admitted_id, tables):
         if "cascade_outbox" in tables and conn.execute(
                 "SELECT 1 FROM cascade_outbox WHERE parent_task_id=? "
                 "AND state IN ('pending', 'replaying')", (task_id,)).fetchone():
+            return "extra_round_active"
+    # ACTIVE result commits mark the outbox applied BEFORE live cascade.
+    # Every leaf needs positive disposition: absence of its successor is not
+    # evidence that the round ended (including a failed synchronous cascade).
+    leaves = descendants - parents
+    if not leaves:
+        return "extra_round_disposition_unknown"
+    for task_id in leaves:
+        row = by_id[task_id]
+        reviewed = (
+            "task_type" in row.keys() and row["task_type"] == "review"
+            and row["status"] == "completed" and "verdict" in row.keys()
+            and row["verdict"] in ("approve", "request_changes"))
+        terminal_notice = conn.execute(
+            "SELECT 1 FROM task_exec_events WHERE task_id=? "
+            "AND event='coordinator_notice' AND json_valid(fields) "
+            "AND json_extract(fields, '$.kind') IN ('lineage_end', 'successor_refused')",
+            (task_id,)).fetchone()
+        if not reviewed and not terminal_notice:
             return "extra_round_active"
     return None
 

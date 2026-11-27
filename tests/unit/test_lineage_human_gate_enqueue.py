@@ -108,6 +108,10 @@ def _extra(c, grant=None, **updates):
         c.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)", (
             task_id, "alfred", 594, json.dumps({**TECHNICAL, "issue": 590}),
             PROSPECTIVE_AT, "completed"))
+        # Model the queue caller finishing this round with its durable notice.
+        c.execute("INSERT INTO task_exec_events VALUES (?, ?, ?, ?)", (
+            task_id, "coordinator_notice", PROSPECTIVE_AT,
+            json.dumps({"kind": "lineage_end"})))
     return blocked, detail
 
 
@@ -451,10 +455,18 @@ def test_queue_two_distinct_rounds_then_third_refused(tmp_path, first_state):
     with pytest.raises(PermissionError, match="LINEAGE_HUMAN_GATE.*extra_round_active"):
         q.enqueue(task("second", "issuecomment-222"))
     c = q._connect()
-    c.execute("UPDATE tasks SET status='completed' WHERE task_id IN ('first', 'review-first')")
+    c.execute("UPDATE tasks SET status='completed' WHERE task_id='first'")
     c.execute("UPDATE cascade_outbox SET state='applied' WHERE parent_task_id='first'")
     c.commit()
     c.close()
+    if first_state == "review_pending":
+        from agent_crew.protocol import TaskResult
+        q.submit_result("review-first", TaskResult(
+            task_id="review-first", status="completed", summary="needs changes",
+            verdict="request_changes", findings=["next finding"]))
+    else:
+        from agent_crew.server import notify_lineage_end
+        notify_lineage_end(q, "first", notify_fn=lambda *args, **kwargs: True)
     q.enqueue(task("second", "issuecomment-222"))
     with pytest.raises(PermissionError, match="LINEAGE_HUMAN_GATE.*extra_rounds_exhausted"):
         q.enqueue(task("third", "333"))
@@ -524,3 +536,79 @@ def test_caller_cannot_claim_active_round_finished():
         c, {**GRANT, "finding": "222"}, extra_round_status="completed")
     assert blocked == "extra-0"
     assert detail["reason"] == "extra_round_active"
+
+
+@pytest.mark.parametrize("ending", [
+    "review", "failed_cascade", "no_event", "successor_refused", "review_without_verdict",
+])
+def test_real_result_before_live_cascade_keeps_round_active(tmp_path, ending):
+    from agent_crew.protocol import TaskRequest, TaskResult
+    from agent_crew.queue import TaskQueue
+    from agent_crew.pipeline import record_cascade_enqueue_failure
+
+    q = TaskQueue(str(tmp_path / "result-cascade.db"))
+    def task(task_id, finding=None):
+        return TaskRequest(
+            task_id=task_id, task_type="implement", description="technical fix",
+            project="alfred", pr_number=593,
+            context={**TECHNICAL, "issue": 590, **({
+                "prev_task_id": "root",
+                "technical_extra_round": {**GRANT, "finding": finding},
+            } if finding else {})})
+    q.enqueue(task("root"))
+    q.patch_context("root", {
+        "lineage_terminal_reason": "successor_refused: fix_rounds_exhausted",
+    })
+    q.enqueue(task("first", "111"))
+    # The server calls this before its live cascade. Stop at that boundary,
+    # using the real result transaction, not hand-written status/outbox rows.
+    q.submit_result("first", TaskResult(
+        task_id="first", status="completed", summary="implemented", pr_number=593))
+    assert q.outbox_get("first")["state"] == "applied"
+    assert not q.has_successor("first")
+    with pytest.raises(PermissionError, match="extra_round_active"):
+        q.enqueue(task("second", "222"))
+    if ending in ("review", "review_without_verdict"):
+        q.enqueue(TaskRequest(
+            task_id="review-first", task_type="review", description="review fix",
+            project="alfred", pr_number=593, context={
+                **TECHNICAL, "issue": 590, "prev_task_id": "first",
+                "expected_head_sha": "a" * 40,
+            }))
+        with pytest.raises(PermissionError, match="extra_round_active"):
+            q.enqueue(task("second", "222"))
+        if ending == "review_without_verdict":
+            q.submit_result("review-first", TaskResult(
+                task_id="review-first", status="failed", summary="review failed"))
+            with pytest.raises(PermissionError, match="extra_round_active"):
+                q.enqueue(task("second", "222"))
+            return
+        q.submit_result("review-first", TaskResult(
+            task_id="review-first", status="completed", summary="changes required",
+            verdict="request_changes", findings=["second distinct finding"]))
+    elif ending == "failed_cascade":
+        record_cascade_enqueue_failure(
+            q, "first", "review", RuntimeError("review enqueue failed"),
+            coordinator_notify_fn=lambda *args, **kwargs: True)
+        c = q._connect()
+        try:
+            assert c.execute(
+                "SELECT 1 FROM task_exec_events WHERE task_id='first' "
+                "AND event='coordinator_notice' "
+                "AND json_extract(fields, '$.kind')='lineage_end'"
+            ).fetchone() is not None
+        finally:
+            c.close()
+    elif ending == "successor_refused":
+        from agent_crew.pipeline import _record_successor_refused
+        _record_successor_refused(
+            q, "first", "fix_rounds_exhausted", "no successor",
+            coordinator_notify_fn=lambda *args, **kwargs: True)
+    else:
+        # A failure annotation without the durable terminal notice is not
+        # proof that a delayed cascade cannot still create a review.
+        q.annotate_error_info("first", {"reason": "cascade_enqueue_failed"})
+        with pytest.raises(PermissionError, match="extra_round_active"):
+            q.enqueue(task("second", "222"))
+        return
+    q.enqueue(task("second", "222"))
