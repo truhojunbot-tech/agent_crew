@@ -1488,7 +1488,7 @@ def _record_successor_refused(queue: TaskQueue, task_id: str, reason: str,
     """
     terminal = f"successor_refused: {reason}"
     try:
-        queue.merge_task_context(task_id, {"lineage_terminal_reason": terminal})
+        queue.record_successor_refusal(task_id, reason)
     except Exception:
         logger.exception("successor refusal marker failed for %s", task_id)
     try:

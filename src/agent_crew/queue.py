@@ -3248,16 +3248,26 @@ class TaskQueue:
         # queue's own declaration wins over the task when there is one, so a
         # request body cannot pick the mode it is judged under.
         enqueue_config = self.cea_config(scope)
-        if not enqueue_config.recording:
-            # `off`: no verdict. Neither B′ (the provider sweep in
-            # `current_inputs`) nor the validator runs; the gate records that
-            # it stood down (PR #818 review, round 1).
-            gate = _cea_callsites.gate_off(_cea_validator.ValidationPoint.ENQUEUE, receipt)
-        else:
+        reuse = receipt.get("reuse") or {}
+        owner_candidate = (task.task_type == "implement"
+                           and receipt.get("decision") in ("ALLOW", "REVIEW")
+                           and reuse.get("approver_identity_verified") is True
+                           and bool(reuse.get("approved_by")))
+        verified_owner = False
+        if enqueue_config.recording or owner_candidate:
+            current = _cea_callsites.current_inputs(engine, receipt)
             gate = _cea_callsites.gate_enqueue(
-                receipt, task_id=task.task_id,
-                current=_cea_callsites.current_inputs(engine, receipt),
+                receipt, task_id=task.task_id, current=current,
                 config=enqueue_config)
+            # Reuse the single ENQUEUE validation for owner proof. A JSON
+            # assertion or an unenforced refusal never supplies this override.
+            verified_owner = (owner_candidate
+                              and current.signature_verification is True
+                              and gate.outcome is _CeaOutcome.PROCEED)
+        if not enqueue_config.recording:
+            # Off-mode admission records no verdict. Only an owner-reuse
+            # candidate above requires validation for the lineage override.
+            gate = _cea_callsites.gate_off(_cea_validator.ValidationPoint.ENQUEUE, receipt)
         reason = receipt.get("reason")
         if (not gate.proceed and isinstance(reason, dict)
                 and reason.get("code") == "BROKER_UNREACHABLE"):
@@ -3309,6 +3319,15 @@ class TaskQueue:
             if self._stop_active_in_txn(conn, point=_cea_validator.ValidationPoint.ENQUEUE):
                 conn.execute("ROLLBACK")
                 raise PausedError(f"enqueue blocked by runtime STOP (task_id={task.task_id})")
+            if task.task_type == "implement":
+                from agent_crew.lineage_human_gate import admit_lineage_extra_round
+                admit_lineage_extra_round(
+                    conn, project=scope or "",
+                    pr_number=(_normalize_pr_number(task.pr_number)
+                               or _normalize_pr_number(context.get("pr_number"))),
+                    issue_number=context.get("issue", context.get("issue_number")),
+                    task_context=context, task_id=task.task_id,
+                    verified_owner=verified_owner)
             admit_at = time.time()
             reservation_ttl = self.review_reservation_ttl()
             expired_reservations: list = []
@@ -5639,6 +5658,33 @@ class TaskQueue:
             with contextlib.suppress(Exception):
                 conn.execute("ROLLBACK")
             raise
+        finally:
+            conn.close()
+
+    def record_successor_refusal(self, task_id: str, reason: str) -> None:
+        """Cascade-owned evidence: marker and event commit together (#1081 c-r)."""
+        from agent_crew.lineage_human_gate import durable_cap_refusal
+
+        terminal = f"successor_refused: {reason}"
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Replay diagnostics are recorded below, but cannot replace a
+            # cascade's historical cap refusal (or restore ordinary admission).
+            cap_terminal = durable_cap_refusal(conn, task_id)
+            conn.execute(
+                "UPDATE tasks SET context=json_patch(context, ?) WHERE task_id=?",
+                (json.dumps({"lineage_terminal_reason": cap_terminal or terminal}), task_id))
+            if not conn.execute(
+                "SELECT 1 FROM task_exec_events WHERE task_id=? "
+                "AND event='successor_refused' "
+                "AND json_extract(fields, '$.terminal_reason')=?",
+                (task_id, terminal),
+            ).fetchone():
+                self._append_exec_event_on(
+                    conn, task_id, "successor_refused", time.time(),
+                    terminal_reason=terminal)
+            conn.commit()
         finally:
             conn.close()
 
