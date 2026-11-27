@@ -157,6 +157,14 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
         raise LineageHumanGateError(blocker or task_id, reason)
 
     metadata_error = link_error
+    # An issue is a shared accounting anchor, not itself a predecessor. A new
+    # root has no PR or parent; its optional self root marker is not a missing
+    # stored task. Continuations still traverse all shared history below.
+    root_keys = {"lineage_root_id", "lineage_root_task_id", "root_task_id"}
+    if (pr is None and not link_error and "technical_extra_round" not in context
+            and all(key in root_keys and context[key] == task_id
+                    for key in _LINK_KEYS if key in context)):
+        return None
     if (pr is None and issue is None and not incoming_links
             and "technical_extra_round" not in context):
         return None
@@ -298,7 +306,7 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
         return deny("review_not_from_previous_round")
 
     for row, ctx in rows:
-        if ctx.get("repo") != repo:
+        if row["task_id"] in ancestors and ctx.get("repo") != repo:
             return deny("unknown_capability:repo")
         if conn.execute(
             "SELECT 1 FROM authorization_receipts WHERE receipt_id=? "
@@ -311,7 +319,8 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
         if row_issue is not None and row_issue != issue:
             return deny("conflicting_lineage_issue")
         created = row["created_at"]
-        if (not isinstance(created, (int, float)) or not math.isfinite(created)
+        if row["task_id"] in ancestors and (
+                not isinstance(created, (int, float)) or not math.isfinite(created)
                 or created < _TECHNICAL_AUTHORITY_START):
             return deny("nonretroactive_lineage")
         if conn.execute(
@@ -319,7 +328,7 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
             "AND canary_cea_receipt_id IS NOT NULL", (row["task_id"],),
         ).fetchone():
             return deny("owner_gate:canary_HELD")
-    for ctx in [context] + [ctx for _, ctx in rows]:
+    for ctx in [context] + [ctx for row, ctx in rows if row["task_id"] in ancestors]:
         reason = _technical_refusal(ctx)
         if reason:
             return deny(reason)
