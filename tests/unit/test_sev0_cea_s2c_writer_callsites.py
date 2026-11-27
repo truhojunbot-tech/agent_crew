@@ -386,8 +386,6 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
     assert q.get_task("t1").status == "cancelled"
     assert q.get_task("owner-readmit-t1-g9").status == "pending"
     assert q.parked_owner_conflict_count() == 1  # t2 still awaits its own approval
-    # Same-PR implement successors serialize even with verified owner receipts.
-    q.cancel("owner-readmit-t1-g9")
     t2 = q.get_task("t2")
     snapshot.generation = 10
     snapshot.grant = DecisionRev("OWNER-594-t2", "d" * 32,

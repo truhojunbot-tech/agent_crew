@@ -35,7 +35,6 @@ from agent_crew.fallback import (
     default_agent_for_role,
 )
 from agent_crew.failure_kind import FailureKind, exception_failure_kind
-from agent_crew.lineage_human_gate import LineageSiblingActiveError
 from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.role_mapping import default_agent_for_role as baseline_agent_for_role
 from agent_crew.protocol import (
@@ -2464,11 +2463,6 @@ def auto_enqueue_fix(
             ), tasks_by_id, review_task, ingress="cascade.fix",
                 successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                 coordinator_notify_fn=coordinator_notify_fn)
-        except LineageSiblingActiveError as exc:
-            # A competing implement is temporary contention, not cap evidence.
-            queue.record_successor_refusal(review_task_id, exc.reason)
-            logger.info("auto_enqueue_fix: %s refused: %s", fix_id, exc)
-            return None
         except (sqlite3.IntegrityError, TaskAlreadyExistsError):
             # A concurrent submission (or replay 재실행) won the insert. That is the
             # mechanism working, not an error: exactly one fix task exists.

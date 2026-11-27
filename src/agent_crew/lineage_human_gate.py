@@ -26,49 +26,6 @@ class LineageHumanGateError(Exception):
                          f"; admitted_task_id={admitted_task_id}")
 
 
-class LineageSiblingActiveError(LineageHumanGateError):
-    code = "LINEAGE_SIBLING_ACTIVE"
-
-    def __init__(self, active_task_id):
-        super().__init__(active_task_id, f"sibling_active:{active_task_id}", active_task_id)
-
-
-def active_implement_sibling(conn, *, project, pr_number, task_context, task_id):
-    """Find conflicting work while holding the enqueue writer lock.
-
-    A PR is the work boundary, irrespective of grant, finding or override.
-    Without a PR, follow explicit lineage edges (never shared issue numbers).
-    """
-    rows = conn.execute(
-        "SELECT task_id, task_type, status, pr_number, context FROM tasks "
-        "WHERE project=? ORDER BY created_at, task_id", (project,),
-    ).fetchall()
-    linked_ids = {task_id} | _lineage_links(task_context)[0]
-    if pr_number is None:
-        remaining = list(rows)
-        while True:
-            added = []
-            for row in remaining:
-                try:
-                    context = json.loads(row["context"])
-                except (TypeError, ValueError):
-                    context = {}
-                links = _lineage_links(context)[0] if isinstance(context, dict) else set()
-                if row["task_id"] in linked_ids or links & linked_ids:
-                    linked_ids.update(links | {row["task_id"]})
-                    added.append(row)
-            if not added:
-                break
-            remaining = [row for row in remaining if row not in added]
-    for row in rows:
-        if (row["task_id"] != task_id and row["task_type"] == "implement"
-                and row["status"] in ("pending", "queued", "waiting_pool", "in_progress", "claimed")
-                and (row["pr_number"] == pr_number if pr_number is not None
-                     else row["task_id"] in linked_ids)):
-            return row["task_id"]
-    return None
-
-
 _TERMINAL_PREFIXES = (
     "successor_refused: fix_rounds_exhausted",
     "successor_refused: fix_grant_exhausted",
