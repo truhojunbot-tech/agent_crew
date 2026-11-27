@@ -268,3 +268,26 @@ def test_verified_scoped_owner_receipt_can_admit(q, tmp_path):
     assert auth.receipt['reuse']['approver_identity_verified'] is True
     assert owner_queue.cea_engine('agent_crew').verify(auth.receipt)
     assert owner_queue.enqueue_with_receipt(request, auth.receipt) == 'owner-approved'
+
+
+def test_cap_refusal_survives_default_branch_replay(q, monkeypatch):
+    exhausted(q)
+    monkeypatch.setattr('agent_crew.pipeline._default_branches', lambda *a, **kw: None)
+    assert auto_enqueue_fix(q, 'review', repo=REPO, pr_state_fn=lambda _: 'open',
+                            coordinator_notify_fn=lambda _: True) is None
+    events = q.get_exec_state('review')['events']
+    assert any(e['event'] == 'successor_refused'
+               and e.get('terminal_reason') == 'successor_refused: default_branch_unverified'
+               for e in events)
+    denied(q, task('fresh-after-replay'), 'fix_budget_exhausted')
+    assert q.get_task('review').context['lineage_terminal_reason'] == (
+        'successor_refused: fix_grant_exhausted')
+    q.enqueue(extra('authorized-after-replay'))
+
+
+def test_context_overwrite_cannot_hide_durable_cap_refusal(q):
+    exhausted(q)
+    q.merge_task_context('review', {'lineage_terminal_reason': 'successor_refused: default_branch_unverified'})
+    denied(q, task('fresh-after-overwrite'), 'fix_budget_exhausted')
+    # Both matching predecessor facts are still required for an extra round.
+    denied(q, extra('extra-after-overwrite'), 'durable_refusal_required')

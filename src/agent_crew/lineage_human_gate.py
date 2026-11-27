@@ -59,6 +59,17 @@ def _finding_id(value):
     return match[1] if match else None
 
 
+def durable_cap_refusal(conn, task_id):
+    """The first cascade cap refusal survives later terminal diagnostics."""
+    row = conn.execute(
+        "SELECT json_extract(fields, '$.terminal_reason') AS terminal "
+        "FROM task_exec_events WHERE task_id=? AND event='successor_refused' "
+        "AND json_extract(fields, '$.terminal_reason') IN (?, ?) "
+        "ORDER BY event_id LIMIT 1", (task_id, *_TERMINAL_PREFIXES),
+    ).fetchone()
+    return row["terminal"] if row else None
+
+
 def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
                              task_context, task_id, verified_owner=False):
     """Check and record admission under the task writer's BEGIN IMMEDIATE."""
@@ -130,8 +141,9 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
             and context["issue"] != context["issue_number"]):
         metadata_error = "conflicting_lineage_issue"
     blocker = next((str(row["task_id"]) for row, ctx in rows
-                    if isinstance(ctx.get("lineage_terminal_reason"), str)
-                    and ctx["lineage_terminal_reason"].startswith(_TERMINAL_PREFIXES)), None)
+                    if durable_cap_refusal(conn, row["task_id"])
+                    or (isinstance(ctx.get("lineage_terminal_reason"), str)
+                        and ctx["lineage_terminal_reason"].startswith(_TERMINAL_PREFIXES))), None)
     if blocker is None and "technical_extra_round" not in context:
         return None
 

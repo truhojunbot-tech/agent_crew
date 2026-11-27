@@ -5665,13 +5665,18 @@ class TaskQueue:
 
     def record_successor_refusal(self, task_id: str, reason: str) -> None:
         """Cascade-owned evidence: marker and event commit together (#1081 c-r)."""
+        from agent_crew.lineage_human_gate import durable_cap_refusal
+
         terminal = f"successor_refused: {reason}"
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # Replay diagnostics are recorded below, but cannot replace a
+            # cascade's historical cap refusal (or restore ordinary admission).
+            cap_terminal = durable_cap_refusal(conn, task_id)
             conn.execute(
                 "UPDATE tasks SET context=json_patch(context, ?) WHERE task_id=?",
-                (json.dumps({"lineage_terminal_reason": terminal}), task_id))
+                (json.dumps({"lineage_terminal_reason": cap_terminal or terminal}), task_id))
             if not conn.execute(
                 "SELECT 1 FROM task_exec_events WHERE task_id=? "
                 "AND event='successor_refused' "
