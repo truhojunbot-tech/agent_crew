@@ -1,0 +1,132 @@
+{
+  "head_only": [
+    "FAILED tests/stress/test_stress_50runs.py::test_s01_50_runs_no_watchdog_timeout",
+    "FAILED tests/unit/test_issue_1081_single_status_writer.py::test_every_dynamic_allowlist_entry_has_a_reason_and_exact_count",
+    "FAILED tests/unit/test_issue_1081_single_status_writer.py::test_no_status_writer_outside_the_allowlist",
+    "FAILED tests/unit/test_issue_240_procedural_memory.py::test_enabled_dispatcher_respects_module_scope"
+  ],
+  "base_only": [
+    "FAILED tests/stress/test_stress_50runs.py::test_s03_watchdog_tick_after_completion_clean",
+    "FAILED tests/unit/test_issue_631_automerge_cap_per_head.py::test_new_head_runs_after_three_failures_while_same_head_stays_capped[True]"
+  ],
+  "shared": [
+    "ERROR tests/e2e/test_e2e_loop.py::test_e_lo03_escalation_gate",
+    "ERROR tests/unit/test_80_fresh_contract_reresolve.py::test_dispatcher_tick_reresolves_without_waiting_in_cascade",
+    "ERROR tests/unit/test_80_fresh_contract_reresolve.py::test_fresh_contract_citing_spawned_fix_reresolves",
+    "ERROR tests/unit/test_80_fresh_contract_reresolve.py::test_fresh_contract_reresolves_once_with_sha_and_would_fire",
+    "ERROR tests/unit/test_80_fresh_contract_reresolve.py::test_out_of_window_contract_stays_baseline[-1]",
+    "ERROR tests/unit/test_80_fresh_contract_reresolve.py::test_out_of_window_contract_stays_baseline[90]",
+    "ERROR tests/unit/test_80_fresh_contract_reresolve.py::test_restart_after_window_finalizes_stale",
+    "ERROR tests/unit/test_80_fresh_contract_reresolve.py::test_spawned_fix_contract_after_window_stays_stale",
+    "ERROR tests/unit/test_80_fresh_contract_reresolve.py::test_unrelated_contract_does_not_reresolve",
+    "ERROR tests/unit/test_issue_591_cap_on_reresolve.py::test_fresh_contract_cuts_without_enqueuing_fix",
+    "ERROR tests/unit/test_issue_591_cap_on_reresolve.py::test_pending_and_resolved_history_counterfactual_are_objects",
+    "ERROR tests/unit/test_issue_591_cap_on_reresolve.py::test_resume_first_settle_allows_budget_comment_then_replay_suppresses_it",
+    "ERROR tests/unit/test_issue_591_cap_on_reresolve.py::test_resume_retry_suppresses_side_effects",
+    "ERROR tests/unit/test_issue_591_cap_on_reresolve.py::test_resume_routes_new_fix_and_only_once",
+    "ERROR tests/unit/test_issue_591_cap_on_reresolve.py::test_terminal_pr_does_not_replay_unfinishable_cascade_forever",
+    "ERROR tests/unit/test_issue_591_cap_on_reresolve.py::test_timeout_enqueues_at_baseline_with_explicit_reason",
+    "ERROR tests/unit/test_issue_591_cap_on_reresolve.py::test_unpinned_during_wait_uses_baseline_cap",
+    "FAILED tests/e2e/test_e2e_gates.py::test_e_ga01_gate_approve_loop_continues",
+    "FAILED tests/e2e/test_e2e_gates.py::test_e_ga02_gate_reject_skips_task",
+    "FAILED tests/e2e/test_e2e_gates.py::test_e_ga03_gate_timeout_auto_rejected",
+    "FAILED tests/e2e/test_e2e_gates.py::test_e_ga04_multiple_pending_gates",
+    "FAILED tests/e2e/test_e2e_recovery.py::test_e_rc03_sqlite_persistence",
+    "FAILED tests/integration/test_persistence_integration.py::test_i_ps04_gates_survive_restart",
+    "FAILED tests/integration/test_server_integration.py::test_i_sv06_create_gate_pending",
+    "FAILED tests/integration/test_server_integration.py::test_i_sv07_resolve_gate",
+    "FAILED tests/integration/test_server_integration.py::test_i_sv07b_resolve_gate_rejected",
+    "FAILED tests/stress/test_stress_50runs.py::test_s02_all_tasks_complete",
+    "FAILED tests/unit/test_issue_1040_fix_round_acceptance.py::test_second_round_takes_acceptance_from_root_once",
+    "FAILED tests/unit/test_issue_1040_fix_round_acceptance.py::test_second_round_walks_prev_chain_without_lineage_key",
+    "FAILED tests/unit/test_issue_1050_parked_result.py::test_undispatched_pending_completed_result_is_409_over_http",
+    "FAILED tests/unit/test_issue_244_auto_fix.py::test_round_counter_starts_at_one_and_is_recorded",
+    "FAILED tests/unit/test_issue_244_auto_fix.py::test_the_counter_survives_the_round_trip_through_a_new_review",
+    "FAILED tests/unit/test_issue_706_duplicate_review_cascade.py::test_pending_survivor_adopts_enqueue_refusal_lineage[request_changes-implement]",
+    "FAILED tests/unit/test_issue_759_cloud_implement.py::test_cloud_usd_cap_leaves_second_implement_pending",
+    "FAILED tests/unit/test_issue_759_cloud_implement.py::test_cloud_usd_cap_reserves_in_flight_implement",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_cap_not_reached_keeps_review_then_test",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_contract_after_review_verdict_narrows",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_contract_between_fix_and_review_verdict_keeps_baseline",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_contract_mtime_only_when_produced_at_absent[False-0-0-cap_not_reached]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_contract_produced_after_review_decision_cannot_narrow_retroactively",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_existing_identical_sha_canary_receipt_is_preserved",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_held_fix_stays_held_on_replay_when_evidence_drifts[contract_missing]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_held_fix_stays_held_on_replay_when_evidence_drifts[time]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_kill_switch_off_preserves_fix_and_shadow_receipt",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_latest_fix_requires_its_own_post_result_decision[False-False-contract_predates_latest_fix]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_latest_fix_requires_its_own_post_result_decision[True-False-contract_predates_latest_fix]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_narrow_cap_holds_fix_with_cea_receipt",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_no_narrowing_uses_baseline[0-0-invalid_recommendation]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_no_narrowing_uses_baseline[1-2-contract_missing_or_stale]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_no_narrowing_uses_baseline[3-0-recommendation_does_not_narrow]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_other_lineage_uses_baseline",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_pre_verdict_lineage_receipt_cannot_narrow_with_future_contract",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_pre_verdict_mtime_receipt_cannot_narrow_with_future_contract",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_project_pin_applies_narrow_fresh_cap",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_project_pin_matches_only_its_lineage[agent_crew-cap_not_reached]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_project_pin_uses_server_project_for_legacy_approved_review",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_project_pin_uses_server_project_for_legacy_review",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_recently_read_stale_contract_receipt_uses_baseline",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_slow_result_submission_still_refreshes_fresh_contract[0-cap_not_reached-0]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_slow_result_submission_still_refreshes_fresh_contract[1-round_cap_reached-1]",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_switch_off_records_fresh_counterfactual_without_holding",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_tier3_resume_uses_server_project_for_legacy_approved_review",
+    "FAILED tests/unit/test_sev0_canary_rounds_cap.py::test_untimed_legacy_contract_has_no_citation_or_recommended_value",
+    "FAILED tests/unit/test_sev0_cea_p0_1_shadow_rounds.py::test_a_multi_hop_lineage_cites_the_latest_resolved_recommendation",
+    "FAILED tests/unit/test_sev0_cea_p0_1_shadow_rounds.py::test_absent_or_unreadable_contract_leaves_the_field_null_and_the_cascade_whole[None]",
+    "FAILED tests/unit/test_sev0_cea_p0_1_shadow_rounds.py::test_absent_or_unreadable_contract_leaves_the_field_null_and_the_cascade_whole[not json]",
+    "FAILED tests/unit/test_sev0_cea_p0_1_shadow_rounds.py::test_absent_or_unreadable_contract_leaves_the_field_null_and_the_cascade_whole[{\"contract_version\": \"1.0\", \"mode\": \"shadow\", \"decisions\": []}]",
+    "FAILED tests/unit/test_sev0_cea_p0_1_shadow_rounds.py::test_fix_task_carries_recommended_beside_the_cap_actually_used"
+  ],
+  "kind": "result",
+  "base_commit": "35875f8954084b35b54756c221d72402186f6372",
+  "compared_head": "4d401291363123f61e617696facc04e87d9b69e1",
+  "command": "~/alfred/instances/agent_crew/tools/host_suite_run.sh python3 -m pytest -q -n 4 tests/",
+  "base_counts": {
+    "passed": 6331,
+    "failed": 53,
+    "errors": 17,
+    "skipped": 20,
+    "xfailed": 38
+  },
+  "head_counts": {
+    "passed": 6352,
+    "failed": 55,
+    "errors": 17,
+    "skipped": 20,
+    "xfailed": 38
+  },
+  "targeted_memory": {
+    "passed": 219,
+    "skipped": 15
+  },
+  "disposition": {
+    "audit": "Two head-only SQL audit failures caused by PR: registered one read-only composed SELECT in DYNAMIC_ALLOWLIST and changed exact total 45 to 46. Final audit plus ranked-read tests: 113 passed.",
+    "stress": "test_s01_50_runs_no_watchdog_timeout failed again on both base and head in paired targeted reruns.",
+    "procedural": "test_enabled_dispatcher_respects_module_scope passed on both base and head in paired targeted reruns; original head-only failure at q.dequeue() returning None did not reproduce.",
+    "limits": "Shared failures are demonstrated on base, not necessarily environment-only. Full-suite counts are from compared_head before the test-only SQL audit inventory correction; full suite not repeated after that correction. Full-suite gate is not green. No actual-copy acceptance claimed."
+  },
+  "logs": {
+    "1088q-r5-base.log": {
+      "path": "/tmp/1088q-r5-base.log",
+      "sha256": "0e503d8fed9f9ab29a275e9f4a1fba20622da67f861cc5ecbcf5498c0bae4fea"
+    },
+    "1088q-r5-head.log": {
+      "path": "/tmp/1088q-r5-head.log",
+      "sha256": "e464077d2c68b3854b2f8003fa09dd8bc6abec39465cf2d78ba40315ecb3c6c9"
+    },
+    "1088q-r5-base-rerun.log": {
+      "path": "/tmp/1088q-r5-base-rerun.log",
+      "sha256": "e0e7b7421832b2178970baf912e9e37c25f9bb4d375ed231d3d2a35ace5739dc"
+    },
+    "1088q-r5-head-rerun.log": {
+      "path": "/tmp/1088q-r5-head-rerun.log",
+      "sha256": "049b872175d834dd4af7c0eb19a726bdfab6954b70ce4124166e2a0340d2fbee"
+    },
+    "1088q-r5-audit-final.log": {
+      "path": "/tmp/1088q-r5-audit-final.log",
+      "sha256": "c59d4c0d5f11d6841e7f9f1d56c7bd04a6472fcbf978383050b0c545969341e4"
+    }
+  }
+}
