@@ -501,8 +501,9 @@ class SQLiteMemoryStorage:
 
         Bytes count UTF-8 JSON records (asdict, sorted keys, ensure_ascii=False).
         Non-authoritative results are a ranked prefix within both output bounds.
-        Authority is never returned partially. Without FTS, at most the existing
-        shadow row bound is ranked; larger candidate sets are UNKNOWN(budget).
+        Authority is validated and resolved in full before relevance ordering;
+        queries never exclude applicable authority. Authority and non-FTS reads
+        use the existing shadow row bound; larger sets are UNKNOWN(budget).
         The shadow read timeout bounds SQLite work and Python filtering alike.
         """
         if layer not in LAYERS or layer == "checkpoint":
@@ -539,15 +540,18 @@ class SQLiteMemoryStorage:
                 fts = db.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone()
                 terms = re.findall(r"\w+", query)
+                authoritative = layer == "authoritative"
+                use_match = bool(fts and terms and not authoritative)
+                bounded = authoritative or not fts
                 sql = "SELECT m.layer,m.key,m.value,m.scope,m.version FROM adr001_memory m "
-                if fts and terms:
+                if use_match:
                     sql += "JOIN adr001_fts ON adr001_fts.rowid=m.rowid "
                     clauses.append("adr001_fts MATCH ?")
                     params.append(" OR ".join('"' + term + '"' for term in terms))
                 sql += "WHERE " + " AND ".join(clauses)
                 sql += (" ORDER BY bm25(adr001_fts),m.key,m.rowid"
-                        if fts and terms else " ORDER BY m.key,m.rowid")
-                if not fts:
+                        if use_match else " ORDER BY m.key,m.rowid")
+                if bounded:
                     sql += " LIMIT ?"
                     params.append(SHADOW_RETRIEVAL_MAX_ROWS + 1)
                 cursor = db.execute(sql, params)
@@ -555,7 +559,7 @@ class SQLiteMemoryStorage:
                 def records():
                     for index, row in enumerate(cursor):
                         check_deadline()
-                        if not fts and index >= SHADOW_RETRIEVAL_MAX_ROWS:
+                        if bounded and index >= SHADOW_RETRIEVAL_MAX_ROWS:
                             raise OverflowError("budget")
                         record = MemoryRecord(row[0], _logical_revision_key(row[1]),
                                               json.loads(row[2]), _scope_from_json(row[3]), row[4])
@@ -569,7 +573,18 @@ class SQLiteMemoryStorage:
                             yield record
 
                 candidates = records()
-                if not fts:
+                if authoritative:
+                    # Immutable owner corrections link predecessors in their
+                    # values, so SQL head flags alone cannot resolve authority.
+                    candidates = list(candidates)
+                    owners = [r for r in candidates
+                              if r.value.get("kind") == "owner_statement"]
+                    _validate_owner_records(owners, scope.project)
+                    superseded = {link for r in owners
+                                  for link in r.value.get("supersedes", [])}
+                    candidates = [r for r in candidates if r.key not in superseded]
+                    check_deadline()
+                if not fts or authoritative:
                     candidates = sorted(candidates, key=lambda r: _retrieval_rank(
                         r, set(query.lower().replace("-", " ").split())))
                 rows, used, truncated = [], 0, False
@@ -922,11 +937,18 @@ def _scoped_owner_records(storage: MemoryStorage, project: str) -> list[MemoryRe
                                           layers={"authoritative"})
                if r.layer == "authoritative" and r.value.get("kind") == "owner_statement"
                and same_memory_project(project, r.scope.project)]
+    _validate_owner_records(records, project)
+    return records
+
+
+def _validate_owner_records(records: list[MemoryRecord], project: str) -> None:
+    """Validate identities and correction links against a complete owner set."""
     for record in records:
         value = record.value
         expected = owner_statement_key(project, "telegram", str(value.get("chat_id") or ""),
                                        str(value.get("message_id") or ""))
-        if (record.key != expected or value.get("verification_status") != "VERIFIED"
+        if (record.scope.project != project or record.key != expected
+                or value.get("verification_status") != "VERIFIED"
                 or value.get("text_sha256") != hashlib.sha256(
                     str(value.get("text") or "").encode()).hexdigest()):
             raise ValueError("invalid authoritative owner record")
@@ -936,7 +958,6 @@ def _scoped_owner_records(storage: MemoryStorage, project: str) -> list[MemoryRe
         if (not isinstance(links, list)
                 or any(not isinstance(link, str) or link not in keys for link in links)):
             raise ValueError("invalid owner statement supersedes link")
-    return records
 
 
 def memory_enabled() -> bool:

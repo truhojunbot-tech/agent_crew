@@ -162,3 +162,60 @@ def test_legacy_columns_and_empty_layer_filter(tmp_path):
     reader = SQLiteMemoryStorage.existing(str(path))
     assert reader.retrieve_layer_ranked(SCOPE, "episodic", "signal", 1, 10000)["status"] == "AVAILABLE"
     assert reader.retrieve(SCOPE, layers=set()) == []
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("query", ["Friday", ""])
+def test_ranked_authority_resolves_complete_set(tmp_path, hybrid, query):
+    from agent_crew.memory_runtime import capture_owner_statement
+    cls = HybridMemoryStorage if hybrid else SQLiteMemoryStorage
+    store = cls(str(tmp_path / "source.db"))
+    prior = None
+    for mid, text in (("1", "Friday"), ("2", "Monday")):
+        current = capture_owner_statement(
+            store, project="athena", target_project="athena", text=text, source_ref="test",
+            proof={"status": "VERIFIED", "chat_id": "42", "user_id": "42",
+                   "message_id": mid, "ts": "now",
+                   "text_sha256": hashlib.sha256(text.encode()).hexdigest()},
+            supersedes=[prior.key] if prior else [])
+        prior = current
+    put(store, "unrelated", layer="authoritative", text="Always retain audit evidence")
+    reader, path = readonly(store, tmp_path)
+    before = path.read_bytes()
+    result = reader.retrieve_layer_ranked(SCOPE, "authoritative", query, 10, 10000)
+    assert result["status"] == "AVAILABLE"
+    assert {r.key for r in result["rows"]} == {current.key, "unrelated"}
+    assert not result["truncated"]
+    for k, budget in ((1, 10000), (10, 1)):
+        result = reader.retrieve_layer_ranked(SCOPE, "authoritative", query, k, budget)
+        assert result == {"status": "UNKNOWN", "reason": "budget", "rows": [],
+                          "bytes": 0, "truncated": False}
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_ranked_authority_incomplete_or_invalid_fails_closed(tmp_path, hybrid):
+    cls = HybridMemoryStorage if hybrid else SQLiteMemoryStorage
+    store = cls(str(tmp_path / "source.db"))
+    put(store, "matching", layer="authoritative", text="Friday")
+    store.put(MemoryRecord("authoritative", "owner:athena:telegram:42:2", {
+        "kind": "owner_statement", "text": "Monday",
+        "text_sha256": hashlib.sha256(b"Monday").hexdigest(),
+        "chat_id": "42", "message_id": "2", "verification_status": "VERIFIED",
+        "supersedes": ["owner:athena:telegram:42:1"],
+    }, SCOPE))
+    result = store.retrieve_layer_ranked(SCOPE, "authoritative", "Friday", 10, 10000)
+    assert result["status"] == "UNKNOWN"
+    assert result["rows"] == [] and result["bytes"] == 0
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_ranked_authority_candidate_budget(tmp_path, hybrid):
+    from agent_crew.memory_runtime import SHADOW_RETRIEVAL_MAX_ROWS
+    cls = HybridMemoryStorage if hybrid else SQLiteMemoryStorage
+    store = cls(str(tmp_path / "source.db"))
+    for i in range(SHADOW_RETRIEVAL_MAX_ROWS + 1):
+        put(store, str(i), layer="authoritative", text="Friday" if i == 0 else "Monday")
+    result = store.retrieve_layer_ranked(SCOPE, "authoritative", "Friday", 100, 100000)
+    assert result == {"status": "UNKNOWN", "reason": "budget", "rows": [],
+                      "bytes": 0, "truncated": False}
