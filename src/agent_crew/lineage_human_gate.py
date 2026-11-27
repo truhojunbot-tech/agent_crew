@@ -17,6 +17,7 @@ import sqlite3
 import time
 
 from agent_crew.risk_tier import risk_declaration
+from agent_crew.task_state import TERMINAL_STATUSES
 
 
 _TERMINAL_PREFIXES = (
@@ -216,6 +217,7 @@ def blocking_lineage_gate(
         return deny("extra_round_usage_unknown")
     ids = {row["task_id"] for row, _ in rows}
     used = 0
+    admitted_ids = []
     for event in conn.execute(
             "SELECT task_id, fields FROM task_exec_events "
             "WHERE event='lineage_extra_round_admitted'"):
@@ -232,10 +234,25 @@ def blocking_lineage_gate(
             previous_finding = _finding_id(fields.get("finding")) if isinstance(fields, dict) else None
             if previous_finding is None:
                 return deny("extra_round_usage_unknown")
+            admitted_id = fields.get("admitted_task_id")
             if previous_finding == finding:
+                if not isinstance(admitted_id, str) or not admitted_id:
+                    return deny("extra_round_usage_unknown")
+                blocker = admitted_id
+                if refusal is not None:
+                    refusal["admitted_task_id"] = admitted_id
                 return deny("extra_round_finding_reused")
+            admitted_ids.append(admitted_id)
     if used >= 2:
         return deny("extra_rounds_exhausted")
+    for admitted_id in admitted_ids:
+        disposition = _round_disposition(conn, rows, admitted_id, tables)
+        if disposition:
+            if isinstance(admitted_id, str) and admitted_id:
+                blocker = admitted_id
+                if refusal is not None:
+                    refusal["admitted_task_id"] = admitted_id
+            return deny(disposition)
     # The queue owns BEGIN IMMEDIATE and commits this with INSERT INTO tasks.
     # Associate evidence with the durable predecessor as well as the new task.
     conn.execute(
@@ -246,6 +263,38 @@ def blocking_lineage_gate(
             "blocking_task_id": blocker,
         })),
     )
+    return None
+
+
+def _round_disposition(conn, rows, admitted_id, tables):
+    """A completed implementation with an active review is still an active round.
+
+    Follow directed successor links only, not shared PR/issue anchors (which
+    also select predecessors). All reads occur under enqueue's write lock.
+    Missing disposition evidence cannot authorize another round.
+    """
+    by_id = {row["task_id"]: row for row, _ in rows}
+    if not isinstance(admitted_id, str) or admitted_id not in by_id:
+        return "extra_round_disposition_unknown"
+    descendants = {admitted_id}
+    while True:
+        before = len(descendants)
+        for row, context in rows:
+            links, _ = _lineage_links(context)
+            if links & descendants:
+                descendants.add(row["task_id"])
+        if len(descendants) == before:
+            break
+    for task_id in descendants:
+        row = by_id[task_id]
+        if "status" not in row.keys() or not row["status"]:
+            return "extra_round_disposition_unknown"
+        if row["status"] not in TERMINAL_STATUSES:
+            return "extra_round_active"
+        if "cascade_outbox" in tables and conn.execute(
+                "SELECT 1 FROM cascade_outbox WHERE parent_task_id=? "
+                "AND state IN ('pending', 'replaying')", (task_id,)).fetchone():
+            return "extra_round_active"
     return None
 
 

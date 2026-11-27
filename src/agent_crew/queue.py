@@ -3327,10 +3327,11 @@ class TaskQueue:
                     self._append_exec_event_on(
                         conn, task.task_id, "lineage_human_gate_refused", time.time(),
                         blocking_task_id=blocker, code="LINEAGE_HUMAN_GATE",
-                        reason=lineage_refusal.get("reason"))
+                        reason=lineage_refusal.get("reason"),
+                        admitted_task_id=lineage_refusal.get("admitted_task_id"))
                     conn.commit()  # refusal evidence, but no task row
                     raise PermissionError(
-                        f"LINEAGE_HUMAN_GATE: predecessor {blocker}: "
+                        f"LINEAGE_HUMAN_GATE: blocking task {blocker}: "
                         f"{lineage_refusal.get('reason', 'fix_budget_exhausted')}")
             admit_at = time.time()
             reservation_ttl = self.review_reservation_ttl()

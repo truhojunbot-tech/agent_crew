@@ -99,10 +99,15 @@ def _technical_connection():
 
 def _extra(c, grant=None, **updates):
     detail = {}
+    task_id = "extra-" + str(c.execute("SELECT COUNT(*) FROM task_exec_events").fetchone()[0])
     blocked = blocking_lineage_gate(
         c, project="alfred", pr_number=594, issue_number=590, receipt={},
         task_context={**TECHNICAL, "technical_extra_round": GRANT if grant is None else grant,
-                      **updates}, task_id="extra", refusal=detail)
+                      **updates}, task_id=task_id, refusal=detail)
+    if blocked is None:
+        c.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)", (
+            task_id, "alfred", 594, json.dumps({**TECHNICAL, "issue": 590}),
+            PROSPECTIVE_AT, "completed"))
     return blocked, detail
 
 
@@ -113,7 +118,7 @@ def test_same_finding_refused_from_durable_events():
     assert event["event"] == "lineage_extra_round_admitted"
     assert json.loads(event["fields"])["finding"] == GRANT["finding"]
     blocked, detail = _extra(c, extra_rounds_used=0)
-    assert blocked == "review-r1"
+    assert blocked == "extra-0"
     assert detail["reason"] == "extra_round_finding_reused"
 
 
@@ -262,7 +267,7 @@ def test_concurrent_same_finding_only_admitted_once(tmp_path):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _: admit(), range(2)))
     assert results.count(None) == 1
-    assert results.count("review-r1") == 1
+    assert results.count("extra-0") == 1
 
 
 def test_v11_second_distinct_finding_admitted_third_refused():
@@ -404,7 +409,8 @@ def test_concurrent_distinct_findings_cannot_admit_third_round(tmp_path):
     assert [detail["reason"] for blocked, detail in results if blocked] == ["extra_rounds_exhausted"]
 
 
-def test_queue_two_distinct_rounds_then_third_refused(tmp_path):
+@pytest.mark.parametrize("first_state", ["pending", "in_progress", "review_pending", "outbox_pending", "outbox_replaying"])
+def test_queue_two_distinct_rounds_then_third_refused(tmp_path, first_state):
     from agent_crew.protocol import TaskRequest
     from agent_crew.queue import TaskQueue
 
@@ -422,6 +428,33 @@ def test_queue_two_distinct_rounds_then_third_refused(tmp_path):
         "lineage_terminal_reason": "successor_refused: fix_rounds_exhausted",
     })
     q.enqueue(task("first", "c111"))
+    if first_state != "pending":
+        c = q._connect()
+        c.execute("UPDATE tasks SET status=? WHERE task_id='first'", (
+            "in_progress" if first_state == "in_progress" else "completed",))
+        c.commit()
+        c.close()
+    if first_state.startswith("outbox_"):
+        c = q._connect()
+        c.execute(
+            "INSERT INTO cascade_outbox (parent_task_id, result_json, state) VALUES (?, ?, ?)",
+            ("first", "{}", first_state.removeprefix("outbox_")))
+        c.commit()
+        c.close()
+    if first_state == "review_pending":
+        q.enqueue(TaskRequest(
+            task_id="review-first", task_type="review", description="review technical fix",
+            project="alfred", pr_number=593, context={
+                **TECHNICAL, "issue": 590, "prev_task_id": "first",
+                "expected_head_sha": "a" * 40,
+            }))
+    with pytest.raises(PermissionError, match="LINEAGE_HUMAN_GATE.*extra_round_active"):
+        q.enqueue(task("second", "issuecomment-222"))
+    c = q._connect()
+    c.execute("UPDATE tasks SET status='completed' WHERE task_id IN ('first', 'review-first')")
+    c.execute("UPDATE cascade_outbox SET state='applied' WHERE parent_task_id='first'")
+    c.commit()
+    c.close()
     q.enqueue(task("second", "issuecomment-222"))
     with pytest.raises(PermissionError, match="LINEAGE_HUMAN_GATE.*extra_rounds_exhausted"):
         q.enqueue(task("third", "333"))
@@ -433,3 +466,61 @@ def test_queue_two_distinct_rounds_then_third_refused(tmp_path):
         assert c.execute("SELECT 1 FROM tasks WHERE task_id='third'").fetchone() is None
     finally:
         c.close()
+
+
+
+def test_cascade_then_hand_same_finding_names_survivor(tmp_path):
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+
+    q = TaskQueue(str(tmp_path / "survivor.db"))
+    def task(task_id, finding=None):
+        return TaskRequest(
+            task_id=task_id, task_type="implement", description="technical fix",
+            project="alfred", pr_number=593,
+            context={**TECHNICAL, "issue": 590, **({
+                "prev_task_id": "root",
+                "technical_extra_round": {**GRANT, "finding": finding},
+            } if finding else {})})
+    q.enqueue(task("root"))
+    q.patch_context("root", {
+        "lineage_terminal_reason": "successor_refused: fix_rounds_exhausted",
+    })
+    survivor = "fix-review-root-r1"
+    q.enqueue(task(survivor, "c111"))
+    with pytest.raises(PermissionError, match=f"LINEAGE_HUMAN_GATE.*{survivor}.*extra_round_finding_reused"):
+        q.enqueue(task("hand-successor", "issuecomment-111"))
+    c = q._connect()
+    try:
+        events = c.execute(
+            "SELECT event, fields FROM task_exec_events WHERE event IN "
+            "('lineage_extra_round_admitted', 'lineage_human_gate_refused')"
+        ).fetchall()
+        assert len(events) == 2
+        assert events[0]["event"] == "lineage_extra_round_admitted"
+        assert events[1]["event"] == "lineage_human_gate_refused"
+        fields = json.loads(events[1]["fields"])
+        assert fields["blocking_task_id"] == survivor
+        assert fields["admitted_task_id"] == survivor
+        assert c.execute("SELECT 1 FROM tasks WHERE task_id='hand-successor'").fetchone() is None
+    finally:
+        c.close()
+
+
+
+def test_missing_admitted_round_disposition_fails_closed():
+    c = _technical_connection()
+    c.execute("INSERT INTO task_exec_events VALUES (?, ?, ?, ?)", (
+        "review-r1", "lineage_extra_round_admitted", PROSPECTIVE_AT,
+        json.dumps({"finding": "111", "admitted_task_id": "missing"})))
+    assert _extra(c)[1]["reason"] == "extra_round_disposition_unknown"
+
+
+def test_caller_cannot_claim_active_round_finished():
+    c = _technical_connection()
+    assert _extra(c)[0] is None
+    c.execute("UPDATE tasks SET status='in_progress' WHERE task_id='extra-0'")
+    blocked, detail = _extra(
+        c, {**GRANT, "finding": "222"}, extra_round_status="completed")
+    assert blocked == "extra-0"
+    assert detail["reason"] == "extra_round_active"
