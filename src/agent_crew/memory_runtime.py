@@ -243,7 +243,8 @@ def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope,
 
 class MemoryStorage(Protocol):
     def put(self, record: MemoryRecord) -> None: ...
-    def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]: ...
+    def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "", *,
+                 layers: Optional[set[str]] = None) -> list[MemoryRecord]: ...
     def has_active_task_decision(self, project: str, task_id: str) -> bool: ...
 
 
@@ -494,8 +495,109 @@ class SQLiteMemoryStorage:
             db.commit()
             self._revision_columns = True
 
+    def retrieve_layer_ranked(self, scope: MemoryScope, layer: str, query: str,
+                              k: int, byte_budget: int) -> dict:
+        """Read one effective layer, ranking the entire FTS history.
+
+        Bytes count UTF-8 JSON records (asdict, sorted keys, ensure_ascii=False).
+        Non-authoritative results are a ranked prefix within both output bounds.
+        Authority is never returned partially. Without FTS, at most the existing
+        shadow row bound is ranked; larger candidate sets are UNKNOWN(budget).
+        The shadow read timeout bounds SQLite work and Python filtering alike.
+        """
+        if layer not in LAYERS or layer == "checkpoint":
+            raise ValueError("a non-checkpoint memory layer is required")
+        if k < 0 or byte_budget < 0:
+            raise ValueError("row and byte budgets must be nonnegative")
+        timeout = shadow_sqlite_timeout_seconds()
+        deadline = time.monotonic() + timeout
+
+        def check_deadline():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("deadline")
+
+        def unknown(reason):
+            return {"status": "UNKNOWN", "reason": reason, "rows": [],
+                    "bytes": 0, "truncated": False}
+
+        try:
+            uri = Path(self.path).resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True, timeout=timeout)) as db:
+                db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                columns = {r[1] for r in db.execute("PRAGMA table_info(adr001_memory)")}
+                clauses, params = ["m.layer=?"], [layer]
+                for column in ("invalidated_at", "superseded_by"):
+                    if column in columns:
+                        clauses.append(f"m.{column} IS NULL")
+                # Coarse scope filter before ranking; Python is the final authority.
+                clauses.append(
+                    "((COALESCE(json_extract(m.scope,'$.project'),'')=? AND "
+                    "COALESCE(json_extract(m.scope,'$.fleet'),'')=?) OR "
+                    "(COALESCE(json_extract(m.scope,'$.project'),'')='' AND "
+                    "COALESCE(json_extract(m.scope,'$.fleet'),'')<>''))")
+                params.extend((scope.project, scope.fleet))
+                fts = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone()
+                terms = re.findall(r"\w+", query)
+                sql = "SELECT m.layer,m.key,m.value,m.scope,m.version FROM adr001_memory m "
+                if fts and terms:
+                    sql += "JOIN adr001_fts ON adr001_fts.rowid=m.rowid "
+                    clauses.append("adr001_fts MATCH ?")
+                    params.append(" OR ".join('"' + term + '"' for term in terms))
+                sql += "WHERE " + " AND ".join(clauses)
+                sql += (" ORDER BY bm25(adr001_fts),m.key,m.rowid"
+                        if fts and terms else " ORDER BY m.key,m.rowid")
+                if not fts:
+                    sql += " LIMIT ?"
+                    params.append(SHADOW_RETRIEVAL_MAX_ROWS + 1)
+                cursor = db.execute(sql, params)
+
+                def records():
+                    for index, row in enumerate(cursor):
+                        check_deadline()
+                        if not fts and index >= SHADOW_RETRIEVAL_MAX_ROWS:
+                            raise OverflowError("budget")
+                        record = MemoryRecord(row[0], _logical_revision_key(row[1]),
+                                              json.loads(row[2]), _scope_from_json(row[3]), row[4])
+                        if not isinstance(record.value, dict):
+                            raise ValueError("memory value must be an object")
+                        if (_scope_applies(record.scope, scope, strict=False)
+                                and not record.value.get("invalidated_at")
+                                and not record.value.get("superseded_at")
+                                and not record.value.get("superseded")
+                                and procedural_row_servable(layer, record.value, key=record.key)):
+                            yield record
+
+                candidates = records()
+                if not fts:
+                    candidates = sorted(candidates, key=lambda r: _retrieval_rank(
+                        r, set(query.lower().replace("-", " ").split())))
+                rows, used, truncated = [], 0, False
+                for record in candidates:
+                    check_deadline()
+                    size = len(json.dumps(asdict(record), ensure_ascii=False,
+                                          sort_keys=True).encode("utf-8"))
+                    if len(rows) >= k or used + size > byte_budget:
+                        truncated = True
+                        break
+                    rows.append(record)
+                    used += size
+                check_deadline()
+                if truncated and layer == "authoritative":
+                    return unknown("budget")
+                return {"status": "AVAILABLE", "reason": "", "rows": rows,
+                        "bytes": used, "truncated": truncated}
+        except OverflowError:
+            return unknown("budget")
+        except TimeoutError:
+            return unknown("deadline")
+        except (sqlite3.Error, ValueError, TypeError, OSError) as exc:
+            return unknown("deadline" if time.monotonic() >= deadline
+                           else f"read_error:{type(exc).__name__}")
+
     def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "", *,
-                 include_inactive_procedures: bool = False) -> list[MemoryRecord]:
+                 include_inactive_procedures: bool = False,
+                 layers: Optional[set[str]] = None) -> list[MemoryRecord]:
         """Scoped effective rows.
 
         ``include_inactive_procedures`` is for the #716 lifecycle API only:
@@ -504,6 +606,9 @@ class SQLiteMemoryStorage:
         """
         fields = asdict(scope)
         clauses, params = [], []
+        if layers is not None:
+            clauses.append("layer IN (" + ",".join("?" for _ in layers) + ")")
+            params.extend(sorted(layers))
         for name, value in fields.items():
             # A stored empty field is an ancestor; a nonempty one must agree.
             path = f"$.{name}"
@@ -523,7 +628,7 @@ class SQLiteMemoryStorage:
             revision_prefix = exact_key + "@v"
             clauses.append("(key=? OR (key>=? AND key<?))")
             params.extend((exact_key, revision_prefix, revision_prefix + "\uffff"))
-        with closing(sqlite3.connect(self.path)) as db:
+        with closing(sqlite3.connect(Path(self.path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
             if "invalidated_at" in columns:
                 clauses.append("invalidated_at IS NULL")
@@ -813,7 +918,8 @@ def _scoped_owner_records(storage: MemoryStorage, project: str) -> list[MemoryRe
     if not project:
         raise ValueError("owner project is required")
     from .memory import same_memory_project
-    records = [r for r in storage.retrieve(MemoryScope(project=project))
+    records = [r for r in storage.retrieve(MemoryScope(project=project),
+                                          layers={"authoritative"})
                if r.layer == "authoritative" and r.value.get("kind") == "owner_statement"
                and same_memory_project(project, r.scope.project)]
     for record in records:

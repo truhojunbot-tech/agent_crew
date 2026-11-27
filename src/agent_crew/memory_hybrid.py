@@ -324,7 +324,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         clause, params = _scope_sql(MemoryScope(project=project, fleet=fleet))
         prefix = ("SELECT m.rowid,m.layer,m.key,m.value,m.scope,m.version,m.created "
                   "FROM adr001_memory m WHERE " + clause + " AND " + _effective_sql())
-        with closing(sqlite3.connect(self.path)) as db:
+        with closing(sqlite3.connect(Path(self.path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
             principles = _servable([_row_record(row) for row in db.execute(
                 prefix + " AND m.layer='procedural' AND "
                 "(m.key LIKE 'owner_principle:%' OR json_extract(m.value,'$.kind')='owner_principle') "
@@ -393,7 +393,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             return [], False
         terms = re.findall(r"[\w]+", query)
         bm25 = {}
-        with closing(sqlite3.connect(self.path)) as db:
+        with closing(sqlite3.connect(Path(self.path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
             if terms:
                 expression = " OR ".join('"' + term.replace('"', '') + '"' for term in terms)
                 for rowid, score in db.execute(
