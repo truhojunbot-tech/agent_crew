@@ -82,6 +82,8 @@ DYNAMIC_ALLOWLIST = {
     ("memory_runtime.py", "has_active_task_decision"): (
         1, "SELECT on adr001_memory, clauses by present columns"),
     ("memory_runtime.py", "retrieve"): (1, "SELECT on adr001_memory, clauses by present columns"),
+    ("memory_runtime.py", "retrieve_layer_ranked"): (
+        1, "read-only SELECT on adr001_memory, layer/scope clauses and optional FTS ranking"),
     ("memory_runtime.py", "retrieve_shadow"): (1, "one SELECT of composed adr001_memory subqueries"),
     ("queue.py", "execute"): (2, "timing Connection.execute wrapper: forwards its caller's SQL"),
     ("queue.py", "_initialize_schema"): (7, "loops over module DDL/migration tuples and _DDL_INDEXES"),
@@ -772,7 +774,7 @@ def test_every_dynamic_allowlist_entry_has_a_reason_and_exact_count(schema):
     assert {w: len(locs) for w, locs in dynamic.items()} == {
         w: n for w, (n, _) in DYNAMIC_ALLOWLIST.items()}
     assert all(why.strip() for _, why in DYNAMIC_ALLOWLIST.values())
-    assert sum(n for n, _ in DYNAMIC_ALLOWLIST.values()) == 45
+    assert sum(n for n, _ in DYNAMIC_ALLOWLIST.values()) == 46
 
 
 
