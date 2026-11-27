@@ -3248,16 +3248,26 @@ class TaskQueue:
         # queue's own declaration wins over the task when there is one, so a
         # request body cannot pick the mode it is judged under.
         enqueue_config = self.cea_config(scope)
-        if not enqueue_config.recording:
-            # `off`: no verdict. Neither B′ (the provider sweep in
-            # `current_inputs`) nor the validator runs; the gate records that
-            # it stood down (PR #818 review, round 1).
-            gate = _cea_callsites.gate_off(_cea_validator.ValidationPoint.ENQUEUE, receipt)
-        else:
+        reuse = receipt.get("reuse") or {}
+        owner_candidate = (task.task_type == "implement"
+                           and receipt.get("decision") in ("ALLOW", "REVIEW")
+                           and reuse.get("approver_identity_verified") is True
+                           and bool(reuse.get("approved_by")))
+        verified_owner = False
+        if enqueue_config.recording or owner_candidate:
+            current = _cea_callsites.current_inputs(engine, receipt)
             gate = _cea_callsites.gate_enqueue(
-                receipt, task_id=task.task_id,
-                current=_cea_callsites.current_inputs(engine, receipt),
+                receipt, task_id=task.task_id, current=current,
                 config=enqueue_config)
+            # Reuse the single ENQUEUE validation for owner proof. A JSON
+            # assertion or an unenforced refusal never supplies this override.
+            verified_owner = (owner_candidate
+                              and current.signature_verification is True
+                              and gate.outcome is _CeaOutcome.PROCEED)
+        if not enqueue_config.recording:
+            # Off-mode admission records no verdict. Only an owner-reuse
+            # candidate above requires validation for the lineage override.
+            gate = _cea_callsites.gate_off(_cea_validator.ValidationPoint.ENQUEUE, receipt)
         reason = receipt.get("reason")
         if (not gate.proceed and isinstance(reason, dict)
                 and reason.get("code") == "BROKER_UNREACHABLE"):
@@ -3285,18 +3295,6 @@ class TaskQueue:
                 "generation": int(receipt.get("binding", {}).get("policy_generation") or 0),
                 "last_attempt_generation": int(receipt.get("binding", {}).get("policy_generation") or 0),
             }
-        # Owner reuse only counts after cryptographic and current ENQUEUE
-        # validation, including in shadow/off mode. A JSON assertion is not proof.
-        verified_owner = False
-        reuse = receipt.get("reuse") or {}
-        if (task.task_type == "implement" and receipt.get("decision") in ("ALLOW", "REVIEW")
-                and reuse.get("approver_identity_verified") is True
-                and reuse.get("approved_by")):
-            current = _cea_callsites.current_inputs(engine, receipt)
-            owner_gate = _cea_callsites.gate_enqueue(
-                receipt, task_id=task.task_id, current=current, config=enqueue_config)
-            verified_owner = (current.signature_verification is True
-                              and owner_gate.outcome is _CeaOutcome.PROCEED)
         receipt_id = receipt.get("receipt_id")
         # A coordinator can enqueue a review before it has a reviewed_sha.
         # Resolve outside the SQLite write lock; the dispatch-time check still

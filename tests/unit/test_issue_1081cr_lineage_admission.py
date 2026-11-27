@@ -243,7 +243,8 @@ def test_unexhausted_legacy_reference_does_not_add_new_policy(q):
     assert q.enqueue(task('legacy', prev_task_id='missing-legacy-parent')) == 'legacy'
 
 
-def test_verified_scoped_owner_receipt_can_admit(q, tmp_path):
+@pytest.mark.parametrize("mode", ["test", "shadow", "off"])
+def test_verified_scoped_owner_receipt_can_admit(q, tmp_path, monkeypatch, mode):
     from agent_crew.cea.engine import EngineConfig
     from agent_crew.cea.receipt import DecisionRev, MatchedCapability
     from tests.unit.test_sev0_cea_engine import (
@@ -267,7 +268,16 @@ def test_verified_scoped_owner_receipt_can_admit(q, tmp_path):
     assert auth.receipt['decision'] in ('ALLOW', 'REVIEW'), auth.receipt['reason']
     assert auth.receipt['reuse']['approver_identity_verified'] is True
     assert owner_queue.cea_engine('agent_crew').verify(auth.receipt)
-    assert owner_queue.enqueue_with_receipt(request, auth.receipt) == 'owner-approved'
+    from agent_crew.cea import callsites
+    from unittest.mock import patch
+    monkeypatch.setattr(owner_queue, '_cea_config_override',
+                        EngineConfig(mode=mode, key_path=str(key)))
+    with patch.object(callsites, 'gate_enqueue', wraps=callsites.gate_enqueue) as gate:
+        assert owner_queue.enqueue_with_receipt(request, auth.receipt) == 'owner-approved'
+    assert gate.call_count == 1
+    if mode == 'off':
+        assert owner_queue.get_task('owner-approved').context['cea_enqueue']['reason'].startswith(
+            'CEA_MODE_OFF:')
 
 
 def test_cap_refusal_survives_default_branch_replay(q, monkeypatch):
