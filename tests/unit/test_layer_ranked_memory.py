@@ -40,8 +40,6 @@ def test_full_history_and_scope_readonly(tmp_path, layer):
     assert hashlib.sha256(path.read_bytes()).digest() == before
     assert reader.retrieve(SCOPE, layers={layer})
     assert hashlib.sha256(path.read_bytes()).digest() == before
-    with pytest.raises(ValueError):
-        reader.retrieve_layer_ranked(SCOPE, "checkpoint", "", 10, 10000)
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
@@ -205,3 +203,21 @@ def test_owner_api_remains_complete_beyond_shadow_bound(tmp_path, hybrid):
     assert {r.key for r in rows} == expected
     assert all(r.layer == "authoritative" for r in rows)
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("layer", ["decision", "failure_pattern", "checkpoint", "unknown"])
+def test_unsupported_layer_rejected_without_database_access(tmp_path, monkeypatch, hybrid, layer):
+    cls = HybridMemoryStorage if hybrid else SQLiteMemoryStorage
+    store = cls(str(tmp_path / "source.db"))
+    if layer != "unknown":
+        put(store, "present", layer=layer)
+
+    def forbidden_connect(*args, **kwargs):
+        pytest.fail("unsupported layer must not open the database")
+
+    monkeypatch.setattr(sqlite3, "connect", forbidden_connect)
+    assert store.retrieve_layer_ranked(SCOPE, layer, "", 100, 100000) == {
+        "status": "UNKNOWN", "reason": "UNSUPPORTED_LAYER", "rows": [],
+        "bytes": 0, "truncated": False,
+    }

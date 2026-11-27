@@ -497,7 +497,7 @@ class SQLiteMemoryStorage:
 
     def retrieve_layer_ranked(self, scope: MemoryScope, layer: str, query: str,
                               k: int, byte_budget: int) -> dict:
-        """Read one effective layer, ranking the entire FTS history.
+        """Read episodic or procedural evidence, ranking the entire FTS history.
 
         Bytes count UTF-8 JSON records (asdict, sorted keys, ensure_ascii=False).
         Non-authoritative results are a ranked prefix within both output bounds.
@@ -507,8 +507,9 @@ class SQLiteMemoryStorage:
         UNKNOWN(budget).
         The shadow read timeout bounds SQLite work and Python filtering alike.
         """
-        if layer not in LAYERS or layer == "checkpoint":
-            raise ValueError("a non-checkpoint memory layer is required")
+        if layer not in {"episodic", "procedural", "authoritative"}:
+            return {"status": "UNKNOWN", "reason": "UNSUPPORTED_LAYER",
+                    "rows": [], "bytes": 0, "truncated": False}
         if k < 0 or byte_budget < 0:
             raise ValueError("row and byte budgets must be nonnegative")
         if layer == "authoritative":
