@@ -501,15 +501,20 @@ class SQLiteMemoryStorage:
 
         Bytes count UTF-8 JSON records (asdict, sorted keys, ensure_ascii=False).
         Non-authoritative results are a ranked prefix within both output bounds.
-        Authority is validated and resolved in full before relevance ordering;
-        queries never exclude applicable authority. Authority and non-FTS reads
-        use the existing shadow row bound; larger sets are UNKNOWN(budget).
+        Authority is rejected without database access; callers must use
+        effective_owner_statements for complete binding owner authority.
+        Non-FTS reads use the existing shadow row bound; larger sets are
+        UNKNOWN(budget).
         The shadow read timeout bounds SQLite work and Python filtering alike.
         """
         if layer not in LAYERS or layer == "checkpoint":
             raise ValueError("a non-checkpoint memory layer is required")
         if k < 0 or byte_budget < 0:
             raise ValueError("row and byte budgets must be nonnegative")
+        if layer == "authoritative":
+            return {"status": "UNKNOWN",
+                    "reason": "AUTHORITY_VIA_EFFECTIVE_OWNER_STATEMENTS",
+                    "rows": [], "bytes": 0, "truncated": False}
         timeout = shadow_sqlite_timeout_seconds()
         deadline = time.monotonic() + timeout
 
@@ -540,9 +545,8 @@ class SQLiteMemoryStorage:
                 fts = db.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone()
                 terms = re.findall(r"\w+", query)
-                authoritative = layer == "authoritative"
-                use_match = bool(fts and terms and not authoritative)
-                bounded = authoritative or not fts
+                use_match = bool(fts and terms)
+                bounded = not fts
                 sql = "SELECT m.layer,m.key,m.value,m.scope,m.version FROM adr001_memory m "
                 if use_match:
                     sql += "JOIN adr001_fts ON adr001_fts.rowid=m.rowid "
@@ -573,18 +577,7 @@ class SQLiteMemoryStorage:
                             yield record
 
                 candidates = records()
-                if authoritative:
-                    # Immutable owner corrections link predecessors in their
-                    # values, so SQL head flags alone cannot resolve authority.
-                    candidates = list(candidates)
-                    owners = [r for r in candidates
-                              if r.value.get("kind") == "owner_statement"]
-                    _validate_owner_records(owners, scope.project)
-                    superseded = {link for r in owners
-                                  for link in r.value.get("supersedes", [])}
-                    candidates = [r for r in candidates if r.key not in superseded]
-                    check_deadline()
-                if not fts or authoritative:
+                if not fts:
                     candidates = sorted(candidates, key=lambda r: _retrieval_rank(
                         r, set(query.lower().replace("-", " ").split())))
                 rows, used, truncated = [], 0, False
@@ -598,8 +591,6 @@ class SQLiteMemoryStorage:
                     rows.append(record)
                     used += size
                 check_deadline()
-                if truncated and layer == "authoritative":
-                    return unknown("budget")
                 return {"status": "AVAILABLE", "reason": "", "rows": rows,
                         "bytes": used, "truncated": truncated}
         except OverflowError:

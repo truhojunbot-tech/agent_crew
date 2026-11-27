@@ -24,20 +24,21 @@ def readonly(store, tmp_path):
     return SQLiteMemoryStorage.existing(str(path)), path
 
 
-def test_full_history_and_scope_readonly(tmp_path):
+@pytest.mark.parametrize("layer", ["episodic", "procedural"])
+def test_full_history_and_scope_readonly(tmp_path, layer):
     store = HybridMemoryStorage(str(tmp_path / "source.db"))
-    put(store, "old", scope=MemoryScope(project="athena", issue="758"), text="rareterm")
+    put(store, "old", layer=layer, scope=MemoryScope(project="athena", issue="758"), text="rareterm")
     for i in range(60):
-        put(store, f"new{i}", text="ordinary")
+        put(store, f"new{i}", layer=layer, text="ordinary")
     put(store, "checkpoint", layer="checkpoint", text="rareterm")
-    put(store, "foreign", scope=MemoryScope(project="other"), text="rareterm")
+    put(store, "foreign", layer=layer, scope=MemoryScope(project="other"), text="rareterm")
     reader, path = readonly(store, tmp_path)
     before = hashlib.sha256(path.read_bytes()).digest()
-    result = reader.retrieve_layer_ranked(SCOPE, "episodic", "rareterm", 10, 10000)
+    result = reader.retrieve_layer_ranked(SCOPE, layer, "rareterm", 10, 10000)
     assert result["status"] == "AVAILABLE"
     assert [r.key for r in result["rows"]] == ["old"]
     assert hashlib.sha256(path.read_bytes()).digest() == before
-    assert reader.retrieve(SCOPE, layers={"episodic"})
+    assert reader.retrieve(SCOPE, layers={layer})
     assert hashlib.sha256(path.read_bytes()).digest() == before
     with pytest.raises(ValueError):
         reader.retrieve_layer_ranked(SCOPE, "checkpoint", "", 10, 10000)
@@ -67,12 +68,8 @@ def test_bounds_and_effectiveness(tmp_path, hybrid):
     assert path.read_bytes() == before
 
 
-def test_errors_and_authority_fail_closed(tmp_path):
+def test_missing_database_fails_closed(tmp_path):
     store = SQLiteMemoryStorage(str(tmp_path / "source.db"))
-    put(store, "authority", layer="authoritative")
-    result = store.retrieve_layer_ranked(SCOPE, "authoritative", "", 10, 1)
-    assert result["status"] == "UNKNOWN" and result["reason"] == "budget"
-    assert result["rows"] == []
     store.path = str(tmp_path / "missing.db")
     result = store.retrieve_layer_ranked(SCOPE, "episodic", "", 10, 10000)
     assert result["status"] == "UNKNOWN" and result["rows"] == []
@@ -166,56 +163,45 @@ def test_legacy_columns_and_empty_layer_filter(tmp_path):
 
 @pytest.mark.parametrize("hybrid", [False, True])
 @pytest.mark.parametrize("query", ["Friday", ""])
-def test_ranked_authority_resolves_complete_set(tmp_path, hybrid, query):
-    from agent_crew.memory_runtime import capture_owner_statement
+def test_ranked_authority_rejected_without_database_access(tmp_path, monkeypatch, hybrid, query):
     cls = HybridMemoryStorage if hybrid else SQLiteMemoryStorage
     store = cls(str(tmp_path / "source.db"))
-    prior = None
-    for mid, text in (("1", "Friday"), ("2", "Monday")):
-        current = capture_owner_statement(
+
+    def forbidden_connect(*args, **kwargs):
+        pytest.fail("ranked authority must not open or scan the database")
+
+    monkeypatch.setattr(sqlite3, "connect", forbidden_connect)
+    for k, budget in ((0, 0), (10, 10000)):
+        result = store.retrieve_layer_ranked(SCOPE, "authoritative", query, k, budget)
+        assert result == {
+            "status": "UNKNOWN", "reason": "AUTHORITY_VIA_EFFECTIVE_OWNER_STATEMENTS",
+            "rows": [], "bytes": 0, "truncated": False,
+        }
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_owner_api_remains_complete_beyond_shadow_bound(tmp_path, hybrid):
+    from agent_crew.memory_runtime import capture_owner_statement, effective_owner_statements
+    cls = HybridMemoryStorage if hybrid else SQLiteMemoryStorage
+    store = cls(str(tmp_path / "source.db"))
+    expected = set()
+    first = None
+    for i in range(60):
+        text = "Friday" if i == 0 else "Monday"
+        record = capture_owner_statement(
             store, project="athena", target_project="athena", text=text, source_ref="test",
             proof={"status": "VERIFIED", "chat_id": "42", "user_id": "42",
-                   "message_id": mid, "ts": "now",
+                   "message_id": str(i), "ts": "now",
                    "text_sha256": hashlib.sha256(text.encode()).hexdigest()},
-            supersedes=[prior.key] if prior else [])
-        prior = current
-    put(store, "unrelated", layer="authoritative", text="Always retain audit evidence")
+            supersedes=[first.key] if i == 1 else [])
+        first = first or record
+        expected.add(record.key)
+    expected.remove(first.key)
+    put(store, "checkpoint", layer="checkpoint")
+    put(store, "foreign", layer="authoritative", scope=MemoryScope(project="other"))
     reader, path = readonly(store, tmp_path)
     before = path.read_bytes()
-    result = reader.retrieve_layer_ranked(SCOPE, "authoritative", query, 10, 10000)
-    assert result["status"] == "AVAILABLE"
-    assert {r.key for r in result["rows"]} == {current.key, "unrelated"}
-    assert not result["truncated"]
-    for k, budget in ((1, 10000), (10, 1)):
-        result = reader.retrieve_layer_ranked(SCOPE, "authoritative", query, k, budget)
-        assert result == {"status": "UNKNOWN", "reason": "budget", "rows": [],
-                          "bytes": 0, "truncated": False}
+    rows = effective_owner_statements(reader, "athena")
+    assert {r.key for r in rows} == expected
+    assert all(r.layer == "authoritative" for r in rows)
     assert path.read_bytes() == before
-
-
-@pytest.mark.parametrize("hybrid", [False, True])
-def test_ranked_authority_incomplete_or_invalid_fails_closed(tmp_path, hybrid):
-    cls = HybridMemoryStorage if hybrid else SQLiteMemoryStorage
-    store = cls(str(tmp_path / "source.db"))
-    put(store, "matching", layer="authoritative", text="Friday")
-    store.put(MemoryRecord("authoritative", "owner:athena:telegram:42:2", {
-        "kind": "owner_statement", "text": "Monday",
-        "text_sha256": hashlib.sha256(b"Monday").hexdigest(),
-        "chat_id": "42", "message_id": "2", "verification_status": "VERIFIED",
-        "supersedes": ["owner:athena:telegram:42:1"],
-    }, SCOPE))
-    result = store.retrieve_layer_ranked(SCOPE, "authoritative", "Friday", 10, 10000)
-    assert result["status"] == "UNKNOWN"
-    assert result["rows"] == [] and result["bytes"] == 0
-
-
-@pytest.mark.parametrize("hybrid", [False, True])
-def test_ranked_authority_candidate_budget(tmp_path, hybrid):
-    from agent_crew.memory_runtime import SHADOW_RETRIEVAL_MAX_ROWS
-    cls = HybridMemoryStorage if hybrid else SQLiteMemoryStorage
-    store = cls(str(tmp_path / "source.db"))
-    for i in range(SHADOW_RETRIEVAL_MAX_ROWS + 1):
-        put(store, str(i), layer="authoritative", text="Friday" if i == 0 else "Monday")
-    result = store.retrieve_layer_ranked(SCOPE, "authoritative", "Friday", 100, 100000)
-    assert result == {"status": "UNKNOWN", "reason": "budget", "rows": [],
-                      "bytes": 0, "truncated": False}
