@@ -160,6 +160,9 @@ def test_a_multi_hop_lineage_cites_the_latest_resolved_recommendation(
     """A pinned multi-hop lineage may cite its latest eligible hop."""
     review_1, review_2 = "review-hop-1", "review-hop-2"
     fix_1 = fix_task_id(review_1, 1)
+    # Match result/outbox ordering: an implement finishes before its review.
+    q.submit_result(ROOT, TaskResult(
+        task_id=ROOT, status="completed", summary="implemented", pr_number=51))
     _contract(tmp_path, monkeypatch, [
         {"task_id": ROOT, "recommended_max_review_fix_rounds": 2,
          "rationale": "the only decision quota-core published for this lineage"},
@@ -170,6 +173,8 @@ def test_a_multi_hop_lineage_cites_the_latest_resolved_recommendation(
 
     assert auto_enqueue_fix(q, _review(q, review_id=review_1),
                             pr_state_fn=_open) == fix_1
+    q.submit_result(fix_1, TaskResult(
+        task_id=fix_1, status="completed", summary="fixed", pr_number=51))
     # Round 2 descends from the round-1 FIX, not from ROOT: three prev_task_id
     # hops (review_2 → fix_1 → review_1 → ROOT) separate it from the decision.
     fix_2 = auto_enqueue_fix(

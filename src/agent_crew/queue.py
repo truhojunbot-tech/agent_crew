@@ -3328,6 +3328,23 @@ class TaskQueue:
                     issue_number=context.get("issue", context.get("issue_number")),
                     task_context=context, task_id=task.task_id,
                     verified_owner=verified_owner)
+                from agent_crew.lineage_human_gate import (
+                    active_implement_sibling, LineageSiblingActiveError,
+                )
+                survivor = active_implement_sibling(
+                    conn, project=task.project,
+                    pr_number=(_normalize_pr_number(task.pr_number)
+                               or _normalize_pr_number(context.get("pr_number"))),
+                    task_context=context, task_id=task.task_id)
+                if survivor:
+                    # Discard any grant writes before committing refusal evidence.
+                    conn.rollback()
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._append_exec_event_on(
+                        conn, task.task_id, "lineage_sibling_refused", time.time(),
+                        existing_task_id=survivor, code=LineageSiblingActiveError.code)
+                    conn.commit()
+                    raise LineageSiblingActiveError(survivor)
             admit_at = time.time()
             reservation_ttl = self.review_reservation_ttl()
             expired_reservations: list = []

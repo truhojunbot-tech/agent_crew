@@ -26,6 +26,78 @@ class LineageHumanGateError(Exception):
                          f"; admitted_task_id={admitted_task_id}")
 
 
+
+class LineageSiblingActiveError(LineageHumanGateError):
+    code = "LINEAGE_SIBLING_ACTIVE"
+
+    def __init__(self, survivor):
+        super().__init__(survivor, f"sibling_active:{survivor}", survivor)
+
+
+def active_implement_sibling(conn, *, project, pr_number, task_context, task_id):
+    """Identify siblings using explicit edges, never shared issue metadata.
+
+    Called under the queue writer lock. A PR match is independently sufficient;
+    without it, both the root and the review/test finding must match.
+    """
+    rows = conn.execute(
+        "SELECT task_id, task_type, status, pr_number, context FROM tasks "
+        "WHERE project=? ORDER BY created_at, task_id", (project,),
+    ).fetchall()
+    by_id = {}
+    for row in rows:
+        try:
+            context = json.loads(row["context"])
+        except (TypeError, ValueError):
+            context = {}
+        by_id[row["task_id"]] = (row, context if isinstance(context, dict) else {})
+
+    def identity(context):
+        finding = context.get("prev_task_id")
+        if not isinstance(finding, str) or not finding:
+            return None
+        predecessor = by_id.get(finding)
+        if predecessor is None or predecessor[0]["task_type"] not in ("review", "test"):
+            return None
+        seen = set()
+        current = context
+        node = None
+        while True:
+            root = current.get("lineage_root_task_id")
+            if isinstance(root, str) and root and root != node:
+                if root in seen:
+                    return None
+                seen.add(root)
+                node = root
+                ancestor = by_id.get(root)
+                if ancestor is None:
+                    return root, finding
+                current = ancestor[1]
+                continue
+            parent = current.get("prev_task_id")
+            if not isinstance(parent, str) or not parent:
+                return (node, finding) if node else None
+            if parent in seen:
+                return None
+            seen.add(parent)
+            node = parent
+            ancestor = by_id.get(parent)
+            if ancestor is None:
+                return None
+            current = ancestor[1]
+
+    incoming = identity(task_context)
+    for row, context in by_id.values():
+        if (row["task_id"] == task_id or row["task_type"] != "implement"
+                or row["status"] not in (
+                    "pending", "queued", "waiting_pool", "in_progress", "claimed")):
+            continue
+        if ((pr_number is not None and row["pr_number"] == pr_number)
+                or (incoming is not None and identity(context) == incoming)):
+            return row["task_id"]
+    return None
+
+
 _TERMINAL_PREFIXES = (
     "successor_refused: fix_rounds_exhausted",
     "successor_refused: fix_grant_exhausted",

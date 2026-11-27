@@ -34,8 +34,9 @@ def test_fix_retrieves_review_and_implement_predecessors(tmp_path, monkeypatch):
     for task in (_task("impl-root"), _task("review-root", prev="impl-root"),
                  _task("fix-root", prev="review-root")):
         q.enqueue(task)
-    with sqlite3.connect(db_path) as db:
-        db.execute("UPDATE tasks SET status='completed' WHERE task_id IN ('impl-root','review-root')")
+        if task.task_id != "fix-root":
+            with sqlite3.connect(db_path) as db:
+                db.execute("UPDATE tasks SET status='completed' WHERE task_id=?", (task.task_id,))
     for task_id in ("impl-root", "review-root"):
         capture_result_best_effort(db_path, task_id, TaskResult(
             task_id=task_id, status="completed", summary=f"result {task_id}"))
@@ -59,9 +60,9 @@ def test_same_pr_predecessor_is_required_without_prev_link(tmp_path):
     db_path = str(tmp_path / "tasks.db")
     q = TaskQueue(db_path)
     q.enqueue(_task("earlier"))
-    q.enqueue(_task("later"))
     with sqlite3.connect(db_path) as db:
         db.execute("UPDATE tasks SET status='completed' WHERE task_id='earlier'")
+    q.enqueue(_task("later"))
     assert task_lineage(db_path, "later") == (("earlier",), 590)
 
 
@@ -136,9 +137,11 @@ def test_shared_store_recalls_same_pr_without_local_task_row(tmp_path):
 
 def test_required_context_recalled_is_one_zero_or_null(tmp_path):
     q = TaskQueue(str(tmp_path / "tasks.db"))
+    for task_id in ("impl-root", "review-root"):
+        q.enqueue(_task(task_id))
+        with sqlite3.connect(q.db_path) as db:
+            db.execute("UPDATE tasks SET status='completed' WHERE task_id=?", (task_id,))
     q.enqueue(_task("fix-root"))
-    q.enqueue(_task("review-root"))
-    q.enqueue(_task("impl-root"))
     q.record_attribution("fix-root", project="agent_crew")
     storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
     storage.put(MemoryRecord("decision", "task:review-root:decision", {},

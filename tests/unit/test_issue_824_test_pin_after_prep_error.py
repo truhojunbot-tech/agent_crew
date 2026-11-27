@@ -64,6 +64,9 @@ def test_test_from_two_round_fix_chain_carries_the_approving_review_pin(tmp_path
     ]
     prev = None
     for task_id, task_type, extra in chain:
+        if prev:
+            queue.submit_result(prev, TaskResult(
+                task_id=prev, status="completed", summary="previous round finished"))
         context = {"pr_number": 824, "repo": "owner/project", **extra}
         if prev:
             context["prev_task_id"] = prev
