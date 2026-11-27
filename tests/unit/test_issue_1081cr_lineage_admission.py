@@ -301,3 +301,102 @@ def test_context_overwrite_cannot_hide_durable_cap_refusal(q):
     denied(q, task('fresh-after-overwrite'), 'fix_budget_exhausted')
     # Both matching predecessor facts are still required for an extra round.
     denied(q, extra('extra-after-overwrite'), 'durable_refusal_required')
+
+
+def ordinary_review(q):
+    q.enqueue(task('ordinary-root', fix_round_grant=1))
+    review(q, 'ordinary-root', fix_round_grant=1)
+
+
+def ordinary_fix(q):
+    return auto_enqueue_fix(q, 'review', repo=REPO, pr_state_fn=lambda _: 'open',
+                            coordinator_notify_fn=lambda _: True)
+
+
+def test_ordinary_auto_then_manual_refuses_and_releases(q):
+    ordinary_review(q)
+    auto_id = ordinary_fix(q)
+    assert auto_id
+    error = denied(q, task('manual'), 'LINEAGE_SIBLING_ACTIVE')
+    assert error.admitted_task_id == auto_id
+    with q._connect() as conn:
+        event = conn.execute(
+            "SELECT fields FROM task_exec_events WHERE task_id='manual' "
+            "AND event='lineage_sibling_refused'").fetchone()
+    import json
+    assert json.loads(event['fields'])['admitted_task_id'] == auto_id
+    assert q.enqueue(task('different-pr', pr_number=2222)) == 'different-pr'
+    finish(q, auto_id)
+    assert q.enqueue(task('manual')) == 'manual'
+
+
+def test_ordinary_manual_then_auto_diagnostic_is_not_exhaustion(q):
+    from agent_crew.lineage_human_gate import durable_cap_refusal
+    ordinary_review(q)
+    q.enqueue(task('manual'))
+    assert ordinary_fix(q) is None
+    assert q.get_task('review').context['lineage_terminal_reason'] == (
+        'successor_refused: sibling_active:manual')
+    with q._connect() as conn:
+        assert durable_cap_refusal(conn, 'review') is None
+    finish(q, 'manual')
+    assert ordinary_fix(q)
+
+
+@pytest.mark.parametrize('status', ['pending', 'queued', 'waiting_pool', 'in_progress', 'claimed'])
+def test_ordinary_sibling_all_active_states(q, status):
+    q.enqueue(task('active'))
+    with q._connect() as conn:
+        conn.execute('UPDATE tasks SET status=? WHERE task_id=?', (status, 'active'))
+    error = denied(q, task('manual', allow_parallel_implement=True), 'LINEAGE_SIBLING_ACTIVE')
+    assert error.admitted_task_id == 'active'
+
+
+def test_ordinary_siblings_without_pr_use_lineage_root(q):
+    q.enqueue(task('active', pr_number=None, lineage_root_task_id='root-without-row'))
+    error = denied(q, task('manual', pr_number=None,
+                           lineage_root_task_id='root-without-row'), 'LINEAGE_SIBLING_ACTIVE')
+    assert error.admitted_task_id == 'active'
+    assert q.enqueue(task('unrelated', pr_number=None,
+                          lineage_root_task_id='other-root')) == 'unrelated'
+
+
+def test_ordinary_concurrent_admission_has_one_survivor(q):
+    def attempt(name):
+        try:
+            return q.enqueue(task(name))
+        except Exception as exc:
+            return exc
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(attempt, ['auto', 'manual']))
+    winner = next(x for x in results if isinstance(x, str))
+    error = next(x for x in results if not isinstance(x, str))
+    assert error.code == 'LINEAGE_SIBLING_ACTIVE'
+    assert error.admitted_task_id == winner
+
+
+def test_ordinary_sibling_http_conflict_names_survivor(q):
+    q.enqueue(task('active'))
+    with TestClient(create_app(str(q.db_path), project='agent_crew')) as client:
+        response = client.post('/tasks', json=task('manual').__dict__,
+                               headers={'X-Agent-Crew-Project': 'agent_crew'})
+    assert response.status_code == 409, response.text
+    assert response.json()['detail']['error'] == 'LINEAGE_SIBLING_ACTIVE'
+    assert response.json()['detail']['admitted_task_id'] == 'active'
+
+
+def test_ordinary_same_pr_in_different_project_is_independent(q):
+    q.enqueue(task('active'))
+    request = task('other-project')
+    request.project = 'other-project'
+    assert q.enqueue(request) == 'other-project'
+
+
+def test_ordinary_no_pr_resolves_predecessor_edges(q):
+    q.enqueue(task('root', pr_number=None))
+    finish(q, 'root')
+    q.enqueue(task('review', 'review', pr_number=None, prev_task_id='root'))
+    q.enqueue(task('active', pr_number=None, prev_task_id='review'))
+    error = denied(q, task('manual', pr_number=None, lineage_root_task_id='root'),
+                   'LINEAGE_SIBLING_ACTIVE')
+    assert error.admitted_task_id == 'active'

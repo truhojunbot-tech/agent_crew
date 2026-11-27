@@ -3328,6 +3328,25 @@ class TaskQueue:
                     issue_number=context.get("issue", context.get("issue_number")),
                     task_context=context, task_id=task.task_id,
                     verified_owner=verified_owner)
+                from agent_crew.lineage_human_gate import (
+                    active_implement_sibling, LineageSiblingActiveError,
+                )
+                sibling_id = active_implement_sibling(
+                    conn, project=scope or "",
+                    pr_number=(_normalize_pr_number(task.pr_number)
+                               or _normalize_pr_number(context.get("pr_number"))),
+                    task_context=context, task_id=task.task_id)
+                if sibling_id:
+                    # Discard any extra-round admission before persisting only
+                    # the refusal audit. The survivor keeps its existing row.
+                    conn.rollback()
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._append_exec_event_on(
+                        conn, task.task_id, "lineage_sibling_refused", time.time(),
+                        code=LineageSiblingActiveError.code,
+                        admitted_task_id=sibling_id, blocking_task_id=sibling_id)
+                    conn.commit()
+                    raise LineageSiblingActiveError(sibling_id)
             admit_at = time.time()
             reservation_ttl = self.review_reservation_ttl()
             expired_reservations: list = []
