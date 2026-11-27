@@ -128,11 +128,16 @@ def test_post_approval_test_fix_gets_one_delta_review_with_bounded_fix_rounds(
         queue.enqueue(TaskRequest(task_id=task_id, task_type=kind,
                                   branch="feature", description="fixture", context=context))
     add("root", "implement")
+    # Production commits the predecessor result before cascading its review.
+    queue.submit_result("root", TaskResult(
+        task_id="root", status="completed", summary="implemented", pr_number=7))
     add("r0", "review", "root")
     queue.submit_result("r0", TaskResult(task_id="r0", status="completed",
                                          summary="changes", verdict="request_changes",
                                          findings=["HIGH x.py:1 - fix"]))
     add("fix1", "implement", "r0", fix_round=1)
+    queue.submit_result("fix1", TaskResult(
+        task_id="fix1", status="completed", summary="fixed", pr_number=7))
     add("r1", "review", "fix1", fix_round=1, sha=approved_sha)
     queue.submit_result("r1", TaskResult(task_id="r1", status="completed",
                                          summary="approved", verdict="approve"))
@@ -144,6 +149,8 @@ def test_post_approval_test_fix_gets_one_delta_review_with_bounded_fix_rounds(
                                     "new_failures": ["tests/test_x.py::test_x"]}}))
     add("fix2", "implement", "test1", fix_round=2)
     queue.patch_context("fix2", {"review_task_id": "r1"})
+    queue.submit_result("fix2", TaskResult(
+        task_id="fix2", status="completed", summary="fixed", commit=new_head, pr_number=7))
     outcome = auto_enqueue_review(queue, "fix2", 7, reviewer_provider="claude",
         pr_state_fn=lambda _: "open", result=TaskResult(
             task_id="fix2", status="completed", summary="fixed", commit=new_head))
