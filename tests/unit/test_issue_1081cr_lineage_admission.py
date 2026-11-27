@@ -320,7 +320,8 @@ def test_fresh_chain_ignores_unrelated_legacy_capabilities(q, monkeypatch, legac
     "runtime_state='PARK'", """human_gate_state='{"state":"PENDING"}'""",
     """human_gate_state='{"state":"DENIED"}'""",
 ])
-def test_unrelated_issue_receipt_still_blocks_extra_round(q, receipt_update):
+@pytest.mark.parametrize('fresh_root', [False, True])
+def test_unrelated_issue_receipt_still_blocks_extra_round(q, receipt_update, fresh_root):
     q.enqueue(task('unrelated', pr_number=999))
     exhausted(q)
     with q._connect() as conn:
@@ -339,7 +340,10 @@ def test_unrelated_issue_receipt_still_blocks_extra_round(q, receipt_update):
             "WHERE receipt_id=(SELECT receipt_id FROM tasks WHERE task_id='unrelated') "
             "ORDER BY seq DESC LIMIT 1"
         )
-    denied(q, extra('blocked-by-receipt'), 'owner_gate:receipt')
+    request = (task('blocked-by-receipt', pr_number=None,
+                    lineage_root_task_id='blocked-by-receipt')
+               if fresh_root else extra('blocked-by-receipt'))
+    denied(q, request, 'owner_gate:receipt')
 
 
 @pytest.mark.parametrize('root_context', [
@@ -352,22 +356,47 @@ def test_fresh_root_on_exhausted_issue_is_admitted(q, root_context):
     assert q.enqueue(task('fresh-root', pr_number=None, **root_context)) == 'fresh-root'
 
 
-def test_unrelated_issue_extra_rounds_still_count_toward_cap(q):
+@pytest.mark.parametrize('consumed_rounds', [1, 2])
+def test_independent_lineage_has_its_own_extra_round_cap(q, consumed_rounds):
     exhausted(q)
     q.enqueue(extra('extra1'))
     review(q, 'extra1', 'review2')
     refuse(q, 'review2')
-    q.enqueue(extra('extra2', 'review2', 'c222'))
-    # Start an independent chain on the same issue, with its own PR.
+    if consumed_rounds == 2:
+        q.enqueue(extra('extra2', 'review2', 'c222'))
+        review(q, 'extra2', 'review3')
+        refuse(q, 'review3')
+        denied(q, extra('third-a', 'review3', 'c444'), 'extra_rounds_exhausted')
+
     q.enqueue(task('independent-root', pr_number=None,
                    lineage_root_task_id='independent-root'))
-    review(q, 'independent-root', 'independent-review', pr_number=2222)
-    refuse(q, 'independent-review')
-    denied(q, extra('third', 'independent-review', 'c333', pr_number=2222),
+
+    def independent_review(parent, name):
+        for task_id, verdict in [(parent, None), (name, 'request_changes')]:
+            if verdict:
+                q.enqueue(task(name, 'review', prev_task_id=parent, pr_number=2222))
+            q.submit_result(task_id, TaskResult(
+                task_id=task_id, status='completed', summary='result',
+                pr_number=2222, verdict=verdict,
+                findings=['HIGH queue.py:1 - finding'] if verdict else []))
+        refuse(q, name)
+
+    independent_review('independent-root', 'independent-review')
+    # A caller's root claim must not change accounting derived from stored edges.
+    assert q.enqueue(extra('first-b', 'independent-review', 'c333',
+                           pr_number=2222, lineage_root_task_id='root')) == 'first-b'
+    independent_review('first-b', 'independent-review2')
+    q.enqueue(extra('second-b', 'independent-review2', 'c555', pr_number=2222))
+    independent_review('second-b', 'independent-review3')
+    denied(q, extra('third-b', 'independent-review3', 'c666', pr_number=2222),
            'extra_rounds_exhausted')
+    events = [e for e in q.get_exec_state('independent-root')['events']
+              if e['event'] == 'lineage_extra_round_admitted']
+    assert len(events) == 2
 
 
-def test_unrelated_issue_canary_hold_still_blocks_extra_round(q):
+@pytest.mark.parametrize('fresh_root', [False, True])
+def test_unrelated_issue_canary_hold_still_blocks_extra_round(q, fresh_root):
     q.enqueue(task('unrelated', pr_number=999))
     exhausted(q)
     with q._connect() as conn:
@@ -375,7 +404,9 @@ def test_unrelated_issue_canary_hold_still_blocks_extra_round(q):
             "UPDATE tokenomics_shadow_receipts SET canary_cea_receipt_id='held' "
             "WHERE task_id='unrelated'"
         )
-    denied(q, extra('blocked-by-canary'), 'owner_gate:canary_HELD')
+    request = (task('blocked-by-canary', pr_number=None)
+               if fresh_root else extra('blocked-by-canary'))
+    denied(q, request, 'owner_gate:canary_HELD')
 
 
 def test_unrelated_conflicting_issue_still_blocks_extra_round(q):

@@ -157,20 +157,20 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
         raise LineageHumanGateError(blocker or task_id, reason)
 
     metadata_error = link_error
-    # An issue is a shared accounting anchor, not itself a predecessor. A new
-    # root has no PR or parent; its optional self root marker is not a missing
-    # stored task. Continuations still traverse all shared history below.
+    # A new root has no PR or parent; its optional self root marker is not a
+    # missing stored task. It still participates in shared owner-gate checks.
     root_keys = {"lineage_root_id", "lineage_root_task_id", "root_task_id"}
-    if (pr is None and not link_error and "technical_extra_round" not in context
-            and all(key in root_keys and context[key] == task_id
-                    for key in _LINK_KEYS if key in context)):
-        return None
+    fresh_root = (
+        pr is None and not link_error and "technical_extra_round" not in context
+        and all(key in root_keys and context[key] == task_id
+                for key in _LINK_KEYS if key in context)
+    )
     if (pr is None and issue is None and not incoming_links
             and "technical_extra_round" not in context):
         return None
 
-    # Follow shared PR/issue anchors to closure: changing PR then omitting the
-    # issue must not reset the allowance. Unknown legacy metadata stays blocked.
+    # Follow shared PR/issue anchors to closure for owner controls and durable
+    # history. Extra-round accounting below uses the stored predecessor root.
     candidates = conn.execute(
         "SELECT * FROM tasks WHERE project=? ORDER BY created_at DESC, task_id DESC",
         (project,),
@@ -224,7 +224,25 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
                     if durable_cap_refusal(conn, row["task_id"])
                     or (isinstance(ctx.get("lineage_terminal_reason"), str)
                         and ctx["lineage_terminal_reason"].startswith(_TERMINAL_PREFIXES))), None)
-    if blocker is None and "technical_extra_round" not in context:
+    if not fresh_root and blocker is None and "technical_extra_round" not in context:
+        return None
+
+    # A fresh root bypasses unrelated exhaustion and legacy references only,
+    # never shared owner receipts or canary holds (including in CEA off mode).
+    for row, _ in rows:
+        if conn.execute(
+            "SELECT 1 FROM authorization_receipts WHERE receipt_id=? "
+            "AND (decision='HUMAN_GATE' OR runtime_state IN ('HOLD', 'STOP', 'PARK') "
+            "OR json_extract(human_gate_state, '$.state') IN ('PENDING', 'DENIED'))",
+            (row["receipt_id"],),
+        ).fetchone():
+            return deny("owner_gate:receipt")
+        if conn.execute(
+            "SELECT 1 FROM tokenomics_shadow_receipts WHERE task_id=? "
+            "AND canary_cea_receipt_id IS NOT NULL", (row["task_id"],),
+        ).fetchone():
+            return deny("owner_gate:canary_HELD")
+    if fresh_root:
         return None
 
     if metadata_error:
@@ -285,7 +303,8 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
     ):
         fields = json.loads(event["fields"])
         if event["task_id"] in by_id:
-            admissions.append(fields)
+            if event["task_id"] == root:
+                admissions.append(fields)
             survivor = fields.get("admitted_task_id")
             if fields.get("review_task_id") == review_id:
                 raise LineageHumanGateError(review_id, "review_already_used", survivor)
@@ -300,21 +319,14 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
         raise LineageHumanGateError(review_id, "review_already_used", child["task_id"])
     if len(admissions) >= 2:
         return deny("extra_rounds_exhausted")
-    # The next refusal must descend from the last admitted round; an unrelated
-    # old refusal sharing the issue cannot authorize concurrent work.
+    # Within this root, the next refusal must descend from the last admitted
+    # round; a sibling refusal cannot authorize concurrent work.
     if admissions and admissions[-1].get("admitted_task_id") not in ancestors:
         return deny("review_not_from_previous_round")
 
     for row, ctx in rows:
         if row["task_id"] in ancestors and ctx.get("repo") != repo:
             return deny("unknown_capability:repo")
-        if conn.execute(
-            "SELECT 1 FROM authorization_receipts WHERE receipt_id=? "
-            "AND (decision='HUMAN_GATE' OR runtime_state IN ('HOLD', 'STOP', 'PARK') "
-            "OR json_extract(human_gate_state, '$.state') IN ('PENDING', 'DENIED'))",
-            (row["receipt_id"],),
-        ).fetchone():
-            return deny("owner_gate:receipt")
         row_issue = ctx.get("issue", ctx.get("issue_number"))
         if row_issue is not None and row_issue != issue:
             return deny("conflicting_lineage_issue")
@@ -323,11 +335,6 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
                 not isinstance(created, (int, float)) or not math.isfinite(created)
                 or created < _TECHNICAL_AUTHORITY_START):
             return deny("nonretroactive_lineage")
-        if conn.execute(
-            "SELECT 1 FROM tokenomics_shadow_receipts WHERE task_id=? "
-            "AND canary_cea_receipt_id IS NOT NULL", (row["task_id"],),
-        ).fetchone():
-            return deny("owner_gate:canary_HELD")
     for ctx in [context] + [ctx for row, ctx in rows if row["task_id"] in ancestors]:
         reason = _technical_refusal(ctx)
         if reason:
