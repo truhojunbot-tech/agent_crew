@@ -499,11 +499,12 @@ def test_http_redispatched_fix_does_not_supersede_without_provenance(tmp_path):
                  _lineage_task("fix-again", "implement", "review-1", fix_round=1,
                                review_findings=["veto bug"]),
                  _lineage_task("test-793", "test", "review-1")):
+        if spec["task_id"] == "fix-again":
+            _fail(queue, "fix-1", status="timed_out")
         queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
     _complete(queue, "impl-793")
     _complete(queue, "review-1", verdict="approve")
     _complete(queue, "test-793")
-    _fail(queue, "fix-1", status="timed_out")
     _complete(queue, "fix-again")
     _assert_blocked_on(queue, "fix-1=timed_out")
 

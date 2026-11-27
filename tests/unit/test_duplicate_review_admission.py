@@ -356,9 +356,9 @@ def test_nonstanding_review_can_retry(queue, status, kind):
     assert [t.task_id for t in queue.list_tasks()] == ["first", "second"]
 
 
-def test_implement_tasks_unaffected(queue):
+def test_implement_tasks_on_different_prs_unaffected(queue):
     queue.enqueue(task("first", kind="implement"))
-    queue.enqueue(task("second", kind="implement"))
+    queue.enqueue(task("second", kind="implement", pr=24))
 
 
 def test_http_refusal_names_existing_task(tmp_path, project_task_transport):
