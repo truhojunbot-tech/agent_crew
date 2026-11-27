@@ -3556,6 +3556,16 @@ def create_app(
     from fastapi.responses import JSONResponse as _JSONResponse
     from agent_crew.queue import PausedError as _PausedError
 
+    from agent_crew.lineage_human_gate import LineageHumanGateError
+
+    @app.exception_handler(LineageHumanGateError)
+    async def lineage_human_gate_handler(request, exc):
+        return _JSONResponse(status_code=409, content={"detail": {
+            "error": exc.code, "reason": exc.reason,
+            "blocking_task_id": exc.blocking_task_id,
+            "admitted_task_id": exc.admitted_task_id,
+        }})
+
     @app.exception_handler(_PausedError)
     async def _paused_error_handler(request, exc):  # noqa: ANN001
         try:

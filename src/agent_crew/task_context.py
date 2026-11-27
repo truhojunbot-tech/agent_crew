@@ -228,6 +228,7 @@ TASK_CONTEXT_KEYS = frozenset({
     'target_repo',
     'target_issue',
     'tdd',
+    'technical_extra_round',
     'test_gate',
     'test_lock_defer_count',
     'test_lock_first_deferred_at',

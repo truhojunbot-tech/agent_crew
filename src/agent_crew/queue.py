@@ -3285,6 +3285,18 @@ class TaskQueue:
                 "generation": int(receipt.get("binding", {}).get("policy_generation") or 0),
                 "last_attempt_generation": int(receipt.get("binding", {}).get("policy_generation") or 0),
             }
+        # Owner reuse only counts after cryptographic and current ENQUEUE
+        # validation, including in shadow/off mode. A JSON assertion is not proof.
+        verified_owner = False
+        reuse = receipt.get("reuse") or {}
+        if (task.task_type == "implement" and receipt.get("decision") in ("ALLOW", "REVIEW")
+                and reuse.get("approver_identity_verified") is True
+                and reuse.get("approved_by")):
+            current = _cea_callsites.current_inputs(engine, receipt)
+            owner_gate = _cea_callsites.gate_enqueue(
+                receipt, task_id=task.task_id, current=current, config=enqueue_config)
+            verified_owner = (current.signature_verification is True
+                              and owner_gate.outcome is _CeaOutcome.PROCEED)
         receipt_id = receipt.get("receipt_id")
         # A coordinator can enqueue a review before it has a reviewed_sha.
         # Resolve outside the SQLite write lock; the dispatch-time check still
@@ -3309,6 +3321,15 @@ class TaskQueue:
             if self._stop_active_in_txn(conn, point=_cea_validator.ValidationPoint.ENQUEUE):
                 conn.execute("ROLLBACK")
                 raise PausedError(f"enqueue blocked by runtime STOP (task_id={task.task_id})")
+            if task.task_type == "implement":
+                from agent_crew.lineage_human_gate import admit_lineage_extra_round
+                admit_lineage_extra_round(
+                    conn, project=scope or "",
+                    pr_number=(_normalize_pr_number(task.pr_number)
+                               or _normalize_pr_number(context.get("pr_number"))),
+                    issue_number=context.get("issue", context.get("issue_number")),
+                    task_context=context, task_id=task.task_id,
+                    verified_owner=verified_owner)
             admit_at = time.time()
             reservation_ttl = self.review_reservation_ttl()
             expired_reservations: list = []
@@ -5639,6 +5660,28 @@ class TaskQueue:
             with contextlib.suppress(Exception):
                 conn.execute("ROLLBACK")
             raise
+        finally:
+            conn.close()
+
+    def record_successor_refusal(self, task_id: str, reason: str) -> None:
+        """Cascade-owned evidence: marker and event commit together (#1081 c-r)."""
+        terminal = f"successor_refused: {reason}"
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE tasks SET context=json_patch(context, ?) WHERE task_id=?",
+                (json.dumps({"lineage_terminal_reason": terminal}), task_id))
+            if not conn.execute(
+                "SELECT 1 FROM task_exec_events WHERE task_id=? "
+                "AND event='successor_refused' "
+                "AND json_extract(fields, '$.terminal_reason')=?",
+                (task_id, terminal),
+            ).fetchone():
+                self._append_exec_event_on(
+                    conn, task_id, "successor_refused", time.time(),
+                    terminal_reason=terminal)
+            conn.commit()
         finally:
             conn.close()
 
