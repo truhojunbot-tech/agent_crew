@@ -301,7 +301,8 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
         assert health_cea["owner_approval_requests"] == {"total": 1, "failed": 0}
         held = client.post("/tasks", json={"task_id": "t2", "task_type": "implement",
                                            "description": "another owner conflict", "branch": "feature",
-                                           "context": admitted({"pr_number": 594, "repo": owner_match.repo}),
+                                           # Independent work: the active-sibling guard serializes a shared PR.
+                                           "context": admitted({"pr_number": 595, "repo": owner_match.repo}),
                                            "project": "agent_crew"})
         assert held.status_code == 423
         assert held.json()["reason"] == "OWNER_CONFLICT"

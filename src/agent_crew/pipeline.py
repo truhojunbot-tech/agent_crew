@@ -2030,6 +2030,8 @@ def auto_enqueue_fix(
     Callers swallow the ``None`` — auto-enqueue must never crash a result
     submission.
     """
+    from agent_crew.lineage_human_gate import LineageSiblingActiveError
+
     try:
         review_task = queue.get_task(review_task_id)
         if review_task is None:
@@ -2463,6 +2465,10 @@ def auto_enqueue_fix(
             ), tasks_by_id, review_task, ingress="cascade.fix",
                 successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                 coordinator_notify_fn=coordinator_notify_fn)
+        except LineageSiblingActiveError as exc:
+            queue.record_successor_refusal(
+                review_task_id, f"sibling_active:{exc.admitted_task_id}")
+            return None
         except (sqlite3.IntegrityError, TaskAlreadyExistsError):
             # A concurrent submission (or replay 재실행) won the insert. That is the
             # mechanism working, not an error: exactly one fix task exists.
