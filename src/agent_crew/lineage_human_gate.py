@@ -195,13 +195,6 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
             links, link_error = _lineage_links(ctx)
             if (row_pr in prs or (type(row_issue) is int and row_issue in issues)
                     or row["task_id"] in linked_ids or links & linked_ids):
-                if link_error:
-                    metadata_error = link_error
-                if not ctx:
-                    metadata_error = "invalid_lineage_metadata"
-                if (context.get("repo") and ctx.get("repo")
-                        and context["repo"] != ctx["repo"]):
-                    metadata_error = "conflicting_lineage_repo"
                 if ("issue" in ctx and "issue_number" in ctx
                         and ctx["issue"] != ctx["issue_number"]):
                     metadata_error = "conflicting_lineage_issue"
@@ -215,17 +208,49 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
                 added = True
         if not added:
             break
-    if linked_ids - selected_ids:
-        metadata_error = "unresolved_lineage_reference"
     if ("issue" in context and "issue_number" in context
             and context["issue"] != context["issue_number"]):
         metadata_error = "conflicting_lineage_issue"
+    # Membership comes from persisted predecessor edges, not issue joins or
+    # caller-declared root identities. Validate only this chain's legacy links.
+    by_id = {row["task_id"]: (row, ctx) for row, ctx in rows}
+    review_id = context.get("prev_task_id")
+    root = review_id
+    ancestors = set()
+    while root is not None:
+        if not isinstance(root, str) or not root.strip() or root != root.strip():
+            return deny("invalid_lineage_reference")
+        if root in ancestors:
+            return deny("cyclic_lineage")
+        if root not in by_id:
+            return deny("unresolved_lineage_reference")
+        ancestors.add(root)
+        row, ctx = by_id[root]
+        links, error = _lineage_links(ctx)
+        if error:
+            return deny(error)
+        if not ctx:
+            return deny("invalid_lineage_metadata")
+        if links - by_id.keys():
+            return deny("unresolved_lineage_reference")
+        if (context.get("repo") and ctx.get("repo")
+                and context["repo"] != ctx["repo"]):
+            return deny("conflicting_lineage_repo")
+        parent = ctx.get("prev_task_id")
+        if parent is None:
+            break
+        root = parent
+
+    # Legacy requests identifying an existing PR but no predecessor retain
+    # that PR's exhaustion protection; issue-only history is not membership.
+    cap_ids = ancestors if review_id is not None else {
+        row["task_id"] for row, _ in rows if pr is not None and row["pr_number"] == pr
+    }
     blocker = next((str(row["task_id"]) for row, ctx in rows
-                    if durable_cap_refusal(conn, row["task_id"])
-                    or (isinstance(ctx.get("lineage_terminal_reason"), str)
-                        and ctx["lineage_terminal_reason"].startswith(_TERMINAL_PREFIXES))), None)
-    if not fresh_root and blocker is None and "technical_extra_round" not in context:
-        return None
+                    if row["task_id"] in cap_ids and (
+                        durable_cap_refusal(conn, row["task_id"])
+                        or (isinstance(ctx.get("lineage_terminal_reason"), str)
+                            and ctx["lineage_terminal_reason"].startswith(_TERMINAL_PREFIXES)))), None)
 
     # A fresh root bypasses unrelated exhaustion and legacy references only,
     # never shared owner receipts or canary holds (including in CEA off mode).
@@ -242,11 +267,14 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
             "AND canary_cea_receipt_id IS NOT NULL", (row["task_id"],),
         ).fetchone():
             return deny("owner_gate:canary_HELD")
-    if fresh_root:
-        return None
-
     if metadata_error:
         return deny(metadata_error)
+    for _, ctx in rows:
+        row_issue = ctx.get("issue", ctx.get("issue_number"))
+        if row_issue is not None and issue is not None and row_issue != issue:
+            return deny("conflicting_lineage_issue")
+    if fresh_root or (blocker is None and "technical_extra_round" not in context):
+        return None
     grant = context.get("technical_extra_round")
     if grant is None:
         return deny("fix_budget_exhausted")
@@ -269,8 +297,6 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
     if finding is None:
         return deny("invalid_technical_extra_round:finding")
 
-    by_id = {row["task_id"]: (row, ctx) for row, ctx in rows}
-    review_id = context.get("prev_task_id")
     predecessor = by_id.get(review_id)
     if predecessor is None or predecessor[0]["task_type"] != "review":
         return deny("durable_refusal_required")
@@ -281,20 +307,6 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
         (review_id, terminal),
     ).fetchone():
         return deny("durable_refusal_required")
-
-    # Derive the root from stored predecessor edges, never the incoming claim.
-    root = review_id
-    ancestors = set()
-    while root in by_id:
-        if root in ancestors:
-            return deny("cyclic_lineage")
-        ancestors.add(root)
-        parent = by_id[root][1].get("prev_task_id")
-        if not parent:
-            break
-        if parent not in by_id:
-            return deny("unresolved_lineage_reference")
-        root = parent
 
     admissions = []
     for event in conn.execute(

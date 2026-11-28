@@ -129,10 +129,10 @@ def test_missing_and_malformed_authority(q, field):
     denied(q, task('malformed', prev_task_id='review', technical_extra_round=grant))
 
 
-def test_fresh_id_and_issue_only_cannot_reset_gate(q):
+def test_existing_pr_stays_exhausted_but_independent_pr_is_not(q):
     exhausted(q)
     denied(q, task('fresh'))
-    denied(q, task('new-pr', pr_number=2222))
+    assert q.enqueue(task('new-pr', pr_number=2222)) == 'new-pr'
     assert q.enqueue(task('unrelated', issue=2222, pr_number=3333)) == 'unrelated'
 
 
@@ -239,8 +239,9 @@ def test_unsigned_owner_claim_cannot_bypass_lineage_gate(q):
         q.enqueue_with_receipt(request, receipt)
 
 
-def test_unexhausted_legacy_reference_does_not_add_new_policy(q):
-    assert q.enqueue(task('legacy', prev_task_id='missing-legacy-parent')) == 'legacy'
+def test_unresolved_actual_predecessor_fails_closed_even_without_exhaustion(q):
+    denied(q, task('legacy', prev_task_id='missing-legacy-parent'),
+           'unresolved_lineage_reference')
 
 
 @pytest.mark.parametrize("mode", ["test", "shadow", "off"])
@@ -430,3 +431,72 @@ def test_linked_implement_without_pr_still_requires_grant(q):
     exhausted(q)
     denied(q, task('continuation', pr_number=None, prev_task_id='review'),
            'fix_budget_exhausted')
+
+
+def independent_refused_review(q, grant=0):
+    q.enqueue(task('b-root', pr_number=None, fix_round_grant=grant))
+    q.submit_result('b-root', TaskResult(task_id='b-root', status='completed',
+                                      summary='result', pr_number=2222))
+    q.enqueue(task('b-review', 'review', prev_task_id='b-root',
+                   pr_number=2222, fix_round_grant=grant))
+    q.submit_result('b-review', TaskResult(
+        task_id='b-review', status='completed', summary='result', pr_number=2222,
+        verdict='request_changes', findings=['HIGH queue.py:1 - finding']))
+
+
+def test_independent_ordinary_fix_ignores_exhausted_issue_history(q):
+    exhausted(q)
+    independent_refused_review(q, grant=1)
+    successor = auto_enqueue_fix(q, 'b-review', repo=REPO,
+                                 pr_state_fn=lambda _: 'open')
+    assert successor is not None
+    assert q.get_task(successor).context['prev_task_id'] == 'b-review'
+    denied(q, task('a-continuation', prev_task_id='review'), 'fix_budget_exhausted')
+
+
+@pytest.mark.parametrize('legacy', [
+    {'lineage_root_task_id': 'missing-legacy-root'},
+    {'prev_task_id': 123},
+])
+def test_independent_extra_ignores_broken_legacy_history(q, legacy):
+    exhausted(q)
+    q.merge_task_context('root', legacy)
+    independent_refused_review(q)
+    refuse(q, 'b-review')
+    assert q.enqueue(extra('b-extra', 'b-review', pr_number=2222)) == 'b-extra'
+
+
+@pytest.mark.parametrize('broken', [
+    {'prev_task_id': 'missing-b-parent'},
+    {'prev_task_id': 123},
+    {'lineage_root_task_id': 'missing-b-root'},
+])
+def test_broken_actual_chain_is_denied(q, broken):
+    exhausted(q)
+    independent_refused_review(q)
+    refuse(q, 'b-review')
+    q.merge_task_context('b-root', broken)
+    denied(q, extra('b-extra', 'b-review', pr_number=2222),
+           'lineage_reference')
+
+
+@pytest.mark.parametrize('hold', ['receipt', 'canary'])
+def test_independent_ordinary_fix_keeps_shared_holds(q, hold):
+    exhausted(q)
+    independent_refused_review(q, grant=1)
+    with q._connect() as conn:
+        if hold == 'canary':
+            conn.execute("UPDATE tokenomics_shadow_receipts "
+                         "SET canary_cea_receipt_id='held' WHERE task_id='root'")
+        else:
+            columns = [r['name'] for r in conn.execute(
+                "PRAGMA table_info(authorization_receipts)") if r['name'] != 'row_id']
+            values = ['seq + 1' if c == 'seq' else "'HUMAN_GATE'" if c == 'decision'
+                      else c for c in columns]
+            conn.execute(
+                f"INSERT INTO authorization_receipts ({', '.join(columns)}) "
+                f"SELECT {', '.join(values)} FROM authorization_receipts "
+                "WHERE receipt_id=(SELECT receipt_id FROM tasks WHERE task_id='root') "
+                "ORDER BY seq DESC LIMIT 1")
+    denied(q, task('b-normal', prev_task_id='b-review', pr_number=2222,
+                   fix_round_grant=1), 'owner_gate')
