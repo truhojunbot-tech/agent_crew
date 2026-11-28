@@ -301,3 +301,286 @@ def test_context_overwrite_cannot_hide_durable_cap_refusal(q):
     denied(q, task('fresh-after-overwrite'), 'fix_budget_exhausted')
     # Both matching predecessor facts are still required for an extra round.
     denied(q, extra('extra-after-overwrite'), 'durable_refusal_required')
+
+
+@pytest.mark.parametrize('legacy_context', [
+    {}, {'repo': None}, {'risk_tier': None}, {'capability_tags': ['payments']},
+])
+def test_fresh_chain_ignores_unrelated_legacy_capabilities(q, monkeypatch, legacy_context):
+    from agent_crew.lineage_human_gate import _TECHNICAL_AUTHORITY_START
+    with monkeypatch.context() as patch:
+        patch.setattr('agent_crew.queue.time.time', lambda: _TECHNICAL_AUTHORITY_START - 1)
+        q.enqueue(task('legacy', pr_number=999, **legacy_context))
+    exhausted(q)
+    assert q.enqueue(extra('fresh-extra')) == 'fresh-extra'
+
+
+@pytest.mark.parametrize('receipt_update', [
+    "decision='HUMAN_GATE'", "runtime_state='HOLD'", "runtime_state='STOP'",
+    "runtime_state='PARK'", """human_gate_state='{"state":"PENDING"}'""",
+    """human_gate_state='{"state":"DENIED"}'""",
+])
+@pytest.mark.parametrize('fresh_root', [False, True])
+def test_unrelated_issue_receipt_still_blocks_extra_round(q, receipt_update, fresh_root):
+    q.enqueue(task('unrelated', pr_number=999))
+    exhausted(q)
+    with q._connect() as conn:
+        # Receipts are append-only. Preserve the stored receipt and append
+        # the historical owner-gate state at the next sequence.
+        field, value = receipt_update.split('=', 1)
+        columns = [row['name'] for row in conn.execute(
+            "PRAGMA table_info(authorization_receipts)") if row['name'] != 'row_id']
+        expressions = [
+            'seq + 1' if column == 'seq' else value if column == field else column
+            for column in columns
+        ]
+        conn.execute(
+            f"INSERT INTO authorization_receipts ({', '.join(columns)}) "
+            f"SELECT {', '.join(expressions)} FROM authorization_receipts "
+            "WHERE receipt_id=(SELECT receipt_id FROM tasks WHERE task_id='unrelated') "
+            "ORDER BY seq DESC LIMIT 1"
+        )
+    request = (task('blocked-by-receipt', pr_number=None,
+                    lineage_root_task_id='blocked-by-receipt')
+               if fresh_root else extra('blocked-by-receipt'))
+    denied(q, request, 'owner_gate:receipt')
+
+
+@pytest.mark.parametrize('root_context', [
+    {}, {'lineage_root_task_id': 'fresh-root'}, {'lineage_root_id': 'fresh-root'},
+    {'root_task_id': 'fresh-root'},
+])
+def test_fresh_root_on_exhausted_issue_is_admitted(q, root_context):
+    exhausted(q)
+    # Old issue history can also contain unresolved legacy references.
+    q.merge_task_context('root', {'lineage_root_task_id': 'missing-legacy-root'})
+    assert q.enqueue(task('fresh-root', pr_number=None, **root_context)) == 'fresh-root'
+
+
+@pytest.mark.parametrize('fresh_root', [False, True])
+def test_unrelated_issue_canary_hold_still_blocks_extra_round(q, fresh_root):
+    q.enqueue(task('unrelated', pr_number=999))
+    exhausted(q)
+    with q._connect() as conn:
+        conn.execute(
+            "UPDATE tokenomics_shadow_receipts SET canary_cea_receipt_id='held' "
+            "WHERE task_id='unrelated'"
+        )
+    request = (task('blocked-by-canary', pr_number=None)
+               if fresh_root else extra('blocked-by-canary'))
+    denied(q, request, 'owner_gate:canary_HELD')
+
+
+def test_unrelated_conflicting_issue_still_blocks_extra_round(q):
+    q.enqueue(task('unrelated', pr_number=999))
+    exhausted(q)
+    # Admission normalizes issue aliases; model conflicting legacy storage.
+    with q._connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET context=json_set(context, '$.issue_number', 2222) "
+            "WHERE task_id='unrelated'"
+        )
+    denied(q, extra('blocked-by-issue'), 'conflicting_lineage_issue')
+
+
+def test_missing_chain_repo_still_blocks_extra_round(q):
+    exhausted(q, repo=None)
+    denied(q, extra('blocked-by-repo'), 'unknown_capability:repo')
+
+
+def test_linked_implement_without_pr_still_requires_grant(q):
+    exhausted(q)
+    denied(q, task('continuation', pr_number=None, prev_task_id='review'),
+           'fix_budget_exhausted')
+
+
+@pytest.mark.parametrize('marker', ['lineage_root_task_id', 'parent_task_id', 'root_task_id'])
+def test_no_pr_marker_inherits_exhaustion(q, marker):
+    exhausted(q)
+    denied(q, task('legacy-continuation', pr_number=None, **{marker: 'root'}),
+           'fix_budget_exhausted')
+
+
+def test_unrelated_missing_root_does_not_poison_second_chain(q):
+    exhausted(q)
+    q.merge_task_context('root', {'lineage_root_task_id': 'absent'})
+    q.enqueue(task('b', pr_number=None, lineage_root_task_id='b', fix_round_grant=1))
+    review(q, 'b', 'b-review', fix_round_grant=1, pr_number=2222)
+    child = auto_enqueue_fix(q, 'b-review', repo=REPO, pr_state_fn=lambda _: 'open')
+    assert child is not None
+    review(q, child, 'b-refused', pr_number=2222)
+    refuse(q, 'b-refused')
+    assert q.enqueue(extra('b-extra', 'b-refused', 'c333', pr_number=2222)) == 'b-extra'
+    denied(q, extra('a-extra'), 'unresolved_lineage_reference')
+
+
+@pytest.mark.parametrize('with_grant', [False, True])
+def test_cycle_denied_without_cap_refusal(q, with_grant):
+    q.enqueue(task('root'))
+    q.merge_task_context('root', {'prev_task_id': 'root'})
+    request = extra('cycle', 'root') if with_grant else task('cycle', prev_task_id='root')
+    denied(q, request, 'cyclic_lineage')
+
+
+def test_missing_reference_in_own_exhausted_chain_denied(q):
+    exhausted(q)
+    q.merge_task_context('root', {'prev_task_id': 'genuinely-absent'})
+    denied(q, extra('missing'), 'unresolved_lineage_reference')
+
+
+def test_persisted_cross_anchor_parent_is_resolved(q):
+    q.enqueue(task('ancestor', issue=2222, pr_number=3333))
+    q.enqueue(task('root', prev_task_id='ancestor'))
+    finish(q, 'root')
+    assert q.enqueue(task('ordinary', prev_task_id='root')) == 'ordinary'
+
+
+@pytest.mark.parametrize('parent', ['absent', None, 42, ' whitespace '])
+def test_ordinary_truncated_legacy_chain_preserves_main(q, parent):
+    q.enqueue(task('root', prev_task_id=parent))
+    finish(q, 'root')
+    assert q.enqueue(task('ordinary', prev_task_id='root')) == 'ordinary'
+
+
+def test_malformed_link_cannot_hide_exhausted_root_marker(q):
+    exhausted(q)
+    denied(q, task('bad-link', pr_number=None, prev_task_id=42,
+                   lineage_root_task_id='root'), 'invalid_lineage_reference')
+
+
+def test_two_node_cycle_denied(q):
+    q.enqueue(task('root'))
+    review(q, 'root')
+    q.merge_task_context('root', {'parent_task_id': 'review'})
+    denied(q, task('cycle', prev_task_id='review'), 'cyclic_lineage')
+
+
+def test_extra_round_resolves_parent_without_shared_anchors(q):
+    q.enqueue(task('ancestor', issue=None, pr_number=3333))
+    # Keep this row genuinely persisted and outside the issue/PR anchor set.
+    q.enqueue(task('root', prev_task_id='ancestor'))
+    review(q, 'root')
+    refuse(q, 'review')
+    assert q.enqueue(extra('cross-anchor')) == 'cross-anchor'
+
+
+@pytest.mark.parametrize('marker', ['lineage_root_id', 'lineage_root_task_id', 'root_task_id'])
+def test_pr_self_root_marker_cannot_reset_exhaustion(q, marker):
+    exhausted(q)
+    denied(q, task('fresh', **{marker: 'fresh'}), 'fix_budget_exhausted')
+
+
+@pytest.mark.parametrize('marker', [None, 'lineage_root_id', 'lineage_root_task_id', 'root_task_id'])
+def test_missing_direct_predecessor_cannot_reset_exhausted_pr(q, marker):
+    exhausted(q)
+    context = {marker: 'fresh'} if marker else {}
+    denied(q, task('fresh', prev_task_id='genuinely-absent', **context),
+           'unresolved_lineage_reference')
+
+
+@pytest.mark.parametrize('missing_ancestor', [False, True])
+def test_resolved_chain_remains_independent_of_exhausted_pr(q, missing_ancestor):
+    exhausted(q)
+    q.enqueue(task('b', pr_number=None, lineage_root_task_id='b'))
+    # A genuinely persisted B row establishes its own chain, even when its
+    # older ancestor is missing. A missing direct incoming parent cannot.
+    if missing_ancestor:
+        q.merge_task_context('b', {'prev_task_id': 'missing-b-ancestor'})
+    q.submit_result('b', TaskResult(task_id='b', status='completed',
+                                    summary='result', pr_number=2222))
+    assert q.enqueue(task('b-fix', prev_task_id='b', pr_number=2222,
+                          lineage_root_task_id='b-fix')) == 'b-fix'
+
+
+@pytest.mark.parametrize('marker', ['prev_task_id', 'lineage_root_task_id', 'lineage_root_id', 'root_task_id'])
+def test_no_pr_unresolved_identity_cannot_reset_exhausted_issue(q, marker):
+    exhausted(q)
+    denied(q, task('unresolved', pr_number=None, **{marker: 'absent'}),
+           'unresolved_lineage_reference')
+
+
+def independent_review(q):
+    q.enqueue(task('b-root', pr_number=None, lineage_root_task_id='b-root',
+                   fix_round_grant=1))
+    q.submit_result('b-root', TaskResult(task_id='b-root', status='completed',
+                                        summary='result', pr_number=2222))
+    q.enqueue(task('b-review', 'review', prev_task_id='b-root', pr_number=2222,
+                   fix_round_grant=1))
+    q.submit_result('b-review', TaskResult(
+        task_id='b-review', status='completed', summary='result', pr_number=2222,
+        verdict='request_changes', findings=['HIGH queue.py:1 - finding']))
+
+
+def test_resolved_other_chain_cannot_authorize_exhausted_destination_pr(q):
+    exhausted(q)
+    independent_review(q)
+    denied(q, task('wrong-pr', prev_task_id='b-review', pr_number=1090),
+           'conflicting_lineage_pr')
+    assert q.enqueue(task('right-pr', prev_task_id='b-review', pr_number=2222)) == 'right-pr'
+
+
+@pytest.mark.parametrize('hold', [None, 'HOLD', 'HUMAN_GATE', 'canary_HELD'])
+def test_ordinary_independent_fix_preserves_shared_authority(q, hold, caplog):
+    exhausted(q)
+    independent_review(q)
+    if hold:
+        with q._connect() as conn:
+            if hold == 'canary_HELD':
+                conn.execute("UPDATE tokenomics_shadow_receipts SET canary_cea_receipt_id='held' "
+                             "WHERE task_id='root'")
+            else:
+                field = 'runtime_state' if hold == 'HOLD' else 'decision'
+                columns = [row['name'] for row in conn.execute(
+                    'PRAGMA table_info(authorization_receipts)') if row['name'] != 'row_id']
+                expressions = ['seq + 1' if col == 'seq' else '?' if col == field else col
+                               for col in columns]
+                conn.execute(
+                    f"INSERT INTO authorization_receipts ({', '.join(columns)}) "
+                    f"SELECT {', '.join(expressions)} FROM authorization_receipts "
+                    "WHERE receipt_id=(SELECT receipt_id FROM tasks WHERE task_id='root') "
+                    "ORDER BY seq DESC LIMIT 1", (hold,))
+    fix = auto_enqueue_fix(q, 'b-review', repo=REPO, pr_state_fn=lambda _: 'open')
+    if hold:
+        assert fix is None
+        assert ('owner_gate:canary_HELD' if hold == 'canary_HELD'
+                else 'owner_gate:receipt') in caplog.text
+    else:
+        assert fix is not None
+
+
+@pytest.mark.parametrize('actual_predecessor', [False, True])
+def test_legacy_admission_cycle_validation_is_component_local(q, actual_predecessor):
+    q.enqueue(task('other-root'))
+    finish(q, 'other-root')
+    q.merge_task_context('other-root', {'prev_task_id': 'other-root'})
+    context = {'prev_task_id': 'other-root'} if actual_predecessor else {}
+    request = task('legacy', pr_number=2222, **context)
+    if actual_predecessor:
+        denied(q, request, 'cyclic_lineage')
+    else:
+        assert q.enqueue(request) == 'legacy'
+
+
+@pytest.mark.parametrize('hold', [None, 'HOLD', 'HUMAN_GATE', 'canary_HELD'])
+def test_legacy_cycle_fallback_preserves_exhaustion_and_shared_authority(q, hold):
+    exhausted(q)
+    q.merge_task_context('root', {'prev_task_id': 'root'})
+    if hold:
+        with q._connect() as conn:
+            if hold == 'canary_HELD':
+                conn.execute("UPDATE tokenomics_shadow_receipts SET canary_cea_receipt_id='held' "
+                             "WHERE task_id='root'")
+            else:
+                field = 'runtime_state' if hold == 'HOLD' else 'decision'
+                columns = [row['name'] for row in conn.execute(
+                    'PRAGMA table_info(authorization_receipts)') if row['name'] != 'row_id']
+                expressions = ['seq + 1' if col == 'seq' else '?' if col == field else col
+                               for col in columns]
+                conn.execute(
+                    f"INSERT INTO authorization_receipts ({', '.join(columns)}) "
+                    f"SELECT {', '.join(expressions)} FROM authorization_receipts "
+                    "WHERE receipt_id=(SELECT receipt_id FROM tasks WHERE task_id='root') "
+                    "ORDER BY seq DESC LIMIT 1", (hold,))
+    reason = ('owner_gate:canary_HELD' if hold == 'canary_HELD' else
+              'owner_gate:receipt' if hold else 'fix_budget_exhausted')
+    denied(q, task('legacy', pr_number=2222), reason)

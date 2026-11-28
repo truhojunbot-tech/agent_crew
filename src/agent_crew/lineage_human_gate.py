@@ -114,14 +114,80 @@ _LINK_KEYS = ("prev_task_id", "parent_task_id", "lineage_root_id",
 
 def _lineage_links(context):
     links = set()
+    error = None
     for key in _LINK_KEYS:
         if key not in context:
             continue
         value = context[key]
         if not isinstance(value, str) or not value.strip() or value != value.strip():
-            return links, "invalid_lineage_reference"
+            error = "invalid_lineage_reference"
+            continue
         links.add(value)
-    return links, None
+    return links, error
+
+
+def _resolved_chain(conn, project, seeds, *, validate_cycles=True):
+    """Resolve persisted edges independently of shared issue/PR metadata.
+
+    Include descendants so a marker naming a root inherits its durable refusal.
+    Only persisted endpoints connect components; two missing legacy references
+    are not evidence that otherwise independent tasks belong to one chain.
+    """
+    rows = {}
+    edges = {}
+    errors = {}
+    for row in conn.execute("SELECT * FROM tasks WHERE project=?", (project,)):
+        try:
+            ctx = json.loads(row["context"])
+        except (TypeError, ValueError):
+            ctx = {}
+        if not isinstance(ctx, dict):
+            ctx = {}
+        node = row["task_id"]
+        links, error = _lineage_links(ctx)
+        # Root self-markers are declarations, not graph edges.
+        links.discard(node)
+        if any(ctx.get(key) == node for key in _LINK_KEYS
+               if key not in ("lineage_root_id", "lineage_root_task_id", "root_task_id")):
+            links.add(node)
+        rows[node] = (row, ctx)
+        edges[node] = links
+        errors[node] = error or ("invalid_lineage_metadata" if not ctx else None)
+    reverse = {}
+    for node, links in edges.items():
+        for link in links:
+            if link in rows:
+                reverse.setdefault(link, set()).add(node)
+    selected, missing = set(), set()
+    pending = list(seeds)
+    while pending:
+        node = pending.pop()
+        if node in selected or node in missing:
+            continue
+        if node not in rows:
+            missing.add(node)
+            continue
+        selected.add(node)
+        pending.extend(edges[node] | reverse.get(node, set()))
+    # Iterative DFS distinguishes cycles from convergent root/parent markers.
+    finished, active = set(), set()
+    for seed in selected if validate_cycles else ():
+        stack = [(seed, False)]
+        while stack:
+            node, leaving = stack.pop()
+            if leaving:
+                active.remove(node)
+                finished.add(node)
+            elif node in active:
+                return [], "cyclic_lineage"
+            elif node in selected and node not in finished:
+                active.add(node)
+                stack.append((node, True))
+                stack.extend((link, False) for link in edges[node])
+    error = next((errors[node] for node in sorted(selected) if errors[node]), None)
+    if missing:
+        error = "unresolved_lineage_reference"
+    return [pair for node, pair in rows.items() if node in selected], error
 
 
 def _finding_id(value):
@@ -157,12 +223,16 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
         raise LineageHumanGateError(blocker or task_id, reason)
 
     metadata_error = link_error
+    root_keys = {"lineage_root_id", "lineage_root_task_id", "root_task_id"}
+    fresh_root = (pr is None and not link_error
+                  and all(key in root_keys and context[key] == task_id
+                          for key in _LINK_KEYS if key in context))
     if (pr is None and issue is None and not incoming_links
             and "technical_extra_round" not in context):
         return None
 
-    # Follow shared PR/issue anchors to closure: changing PR then omitting the
-    # issue must not reset the allowance. Unknown legacy metadata stays blocked.
+    # Keep the shared anchor closure for owner controls, conflict checks and
+    # finding/review uniqueness. Explicit lineage resolution is separate.
     candidates = conn.execute(
         "SELECT * FROM tasks WHERE project=? ORDER BY created_at DESC, task_id DESC",
         (project,),
@@ -187,13 +257,6 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
             links, link_error = _lineage_links(ctx)
             if (row_pr in prs or (type(row_issue) is int and row_issue in issues)
                     or row["task_id"] in linked_ids or links & linked_ids):
-                if link_error:
-                    metadata_error = link_error
-                if not ctx:
-                    metadata_error = "invalid_lineage_metadata"
-                if (context.get("repo") and ctx.get("repo")
-                        and context["repo"] != ctx["repo"]):
-                    metadata_error = "conflicting_lineage_repo"
                 if ("issue" in ctx and "issue_number" in ctx
                         and ctx["issue"] != ctx["issue_number"]):
                     metadata_error = "conflicting_lineage_issue"
@@ -207,15 +270,75 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
                 added = True
         if not added:
             break
-    if linked_ids - selected_ids:
-        metadata_error = "unresolved_lineage_reference"
     if ("issue" in context and "issue_number" in context
             and context["issue"] != context["issue_number"]):
         metadata_error = "conflicting_lineage_issue"
-    blocker = next((str(row["task_id"]) for row, ctx in rows
-                    if durable_cap_refusal(conn, row["task_id"])
-                    or (isinstance(ctx.get("lineage_terminal_reason"), str)
-                        and ctx["lineage_terminal_reason"].startswith(_TERMINAL_PREFIXES))), None)
+    shared_rows = rows
+    # A self-root declaration is not a persisted edge, whether or not the
+    # request carries a PR. Keep non-root self-links for cycle validation.
+    seeds, _ = _lineage_links({
+        key: value for key, value in context.items()
+        if key not in root_keys or value != task_id
+    })
+    rows, chain_error = _resolved_chain(conn, project, seeds)
+    if chain_error == "cyclic_lineage":
+        return deny(chain_error)
+    # An absent direct reference is not evidence of an independent chain.
+    # Preserve conservative legacy handling when nothing was resolved, but
+    # never replace a real component merely because an older ancestor is absent.
+    if not fresh_root and not rows:
+        # Shared history is a conservative authority fallback, not evidence
+        # that its unrelated components belong to the incoming lineage.
+        rows, fallback_error = _resolved_chain(
+            conn, project, {row["task_id"] for row, _ in shared_rows},
+            validate_cycles=False)
+        chain_error = chain_error or fallback_error
+    metadata_error = metadata_error or chain_error
+    if any(context.get("repo") and ctx.get("repo")
+           and context["repo"] != ctx["repo"] for _, ctx in rows):
+        metadata_error = "conflicting_lineage_repo"
+    # Exhaustion stays component-scoped, but shared exhaustion tells us when
+    # isolation has made an ordinary request newly eligible. That path still
+    # owes the shared owner/canary checks that guarded it before isolation.
+    cap_rows = {row["task_id"]: (row, ctx) for row, ctx in shared_rows + rows}
+    refused_ids = {
+        node for node, (row, ctx) in cap_rows.items()
+        if durable_cap_refusal(conn, node)
+        or (isinstance(ctx.get("lineage_terminal_reason"), str)
+            and ctx["lineage_terminal_reason"].startswith(_TERMINAL_PREFIXES))
+    }
+    blocker = next((str(row["task_id"]) for row, _ in rows
+                    if row["task_id"] in refused_ids), None)
+    shared_exhausted = any(row["task_id"] in refused_ids for row, _ in shared_rows)
+
+    def stored_pr(row, ctx):
+        return row["pr_number"] or ctx.get("pr_number")
+
+    # A real B component cannot be used to target an exhausted A PR. Changing
+    # PRs remains possible unless the destination itself has exhausted history.
+    if (pr is not None
+            and any(row["task_id"] in refused_ids and stored_pr(row, ctx) == pr
+                    for row, ctx in shared_rows)
+            and not any(stored_pr(row, ctx) == pr for row, ctx in rows)):
+        return deny("conflicting_lineage_pr")
+    if (not fresh_root and blocker is None and not shared_exhausted
+            and "technical_extra_round" not in context):
+        return None
+    # Shared owner authority remains issue-wide, including fresh roots;
+    # unrelated capability and legacy facts do not.
+    for row, _ in shared_rows:
+        if conn.execute(
+            "SELECT 1 FROM authorization_receipts WHERE receipt_id=? "
+            "AND (decision='HUMAN_GATE' OR runtime_state IN ('HOLD', 'STOP', 'PARK') "
+            "OR json_extract(human_gate_state, '$.state') IN ('PENDING', 'DENIED'))",
+            (row["receipt_id"],),
+        ).fetchone():
+            return deny("owner_gate:receipt")
+        if conn.execute(
+            "SELECT 1 FROM tokenomics_shadow_receipts WHERE task_id=? "
+            "AND canary_cea_receipt_id IS NOT NULL", (row["task_id"],),
+        ).fetchone():
+            return deny("owner_gate:canary_HELD")
     if blocker is None and "technical_extra_round" not in context:
         return None
 
@@ -276,8 +399,9 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
         "WHERE event='lineage_extra_round_admitted' ORDER BY event_id"
     ):
         fields = json.loads(event["fields"])
-        if event["task_id"] in by_id:
-            admissions.append(fields)
+        if event["task_id"] in selected_ids:
+            if event["task_id"] == root:
+                admissions.append(fields)
             survivor = fields.get("admitted_task_id")
             if fields.get("review_task_id") == review_id:
                 raise LineageHumanGateError(review_id, "review_already_used", survivor)
@@ -297,16 +421,13 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
     if admissions and admissions[-1].get("admitted_task_id") not in ancestors:
         return deny("review_not_from_previous_round")
 
+    for row, ctx in shared_rows:
+        row_issue = ctx.get("issue", ctx.get("issue_number"))
+        if row_issue is not None and row_issue != issue:
+            return deny("conflicting_lineage_issue")
     for row, ctx in rows:
         if ctx.get("repo") != repo:
             return deny("unknown_capability:repo")
-        if conn.execute(
-            "SELECT 1 FROM authorization_receipts WHERE receipt_id=? "
-            "AND (decision='HUMAN_GATE' OR runtime_state IN ('HOLD', 'STOP', 'PARK') "
-            "OR json_extract(human_gate_state, '$.state') IN ('PENDING', 'DENIED'))",
-            (row["receipt_id"],),
-        ).fetchone():
-            return deny("owner_gate:receipt")
         row_issue = ctx.get("issue", ctx.get("issue_number"))
         if row_issue is not None and row_issue != issue:
             return deny("conflicting_lineage_issue")
@@ -314,11 +435,6 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
         if (not isinstance(created, (int, float)) or not math.isfinite(created)
                 or created < _TECHNICAL_AUTHORITY_START):
             return deny("nonretroactive_lineage")
-        if conn.execute(
-            "SELECT 1 FROM tokenomics_shadow_receipts WHERE task_id=? "
-            "AND canary_cea_receipt_id IS NOT NULL", (row["task_id"],),
-        ).fetchone():
-            return deny("owner_gate:canary_HELD")
     for ctx in [context] + [ctx for _, ctx in rows]:
         reason = _technical_refusal(ctx)
         if reason:
