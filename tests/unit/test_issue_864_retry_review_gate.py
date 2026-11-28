@@ -56,7 +56,7 @@ def test_retry_review_by_implementer_is_refused(tmp_path, monkeypatch):
         "", "", "", "reviewer agent equals implementer agent (claude)")
 
 
-def test_retry_review_without_implement_in_bounded_lineage_is_refused(
+def test_retry_review_finds_attribution_beyond_old_depth_limit(
         tmp_path, monkeypatch):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     _task(queue, "distant-implement", "implement")
@@ -70,4 +70,4 @@ def test_retry_review_without_implement_in_bounded_lineage_is_refused(
     monkeypatch.setattr(github, "pr_head_sha", lambda *_args, **_kwargs: SHA)
 
     assert github.independent_review_for_head(queue, 865, "owner/repo") == (
-        "", "", "", "author or reviewer attribution unavailable")
+        SHA, "claude", "retry-review", "independent approval")
