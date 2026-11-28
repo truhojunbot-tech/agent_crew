@@ -125,7 +125,10 @@ from agent_crew.testing_policy import (
     TestStageLockUnavailable,
 )
 from agent_crew.telemetry_response import response_log_telemetry
-from agent_crew.worktree_default_branch import remote_default_branch
+from agent_crew.worktree_default_branch import (
+    configured_base_branch, fallback_base_branch, remote_default_branch,
+    resolve_base_branch,
+)
 
 logger = logging.getLogger(__name__)
 _unclaimed_lock_notices: set[tuple[str, str, str]] = set()
@@ -822,10 +825,18 @@ class WorktreeTargetUnresolved(WorktreePrepRefused):
 
 
 def _remote_default_branch(worktree_path: str) -> str:
-    """Resolve this worktree's origin default, preserving prep refusal semantics."""
+    """Resolve this worktree's origin default, preserving prep refusal semantics.
+
+    Same order as :func:`resolve_base_branch` (#1070): the repo's own default
+    first, then the fleet-wide ``AGENT_CREW_MAIN_BRANCH``. The one difference
+    is the end: a real worktree with neither answer is refused, not defaulted.
+    """
     branch = remote_default_branch(worktree_path)
     if branch:
         return branch
+    configured = configured_base_branch()
+    if configured:
+        return configured
 
     # Best-effort prep has always tolerated paths that are not Git worktrees.
     # A real worktree with no resolvable origin base must still refuse (#555).
@@ -834,7 +845,7 @@ def _remote_default_branch(worktree_path: str) -> str:
         capture_output=True, text=True, timeout=30,
     )
     if is_worktree.returncode != 0 or is_worktree.stdout.strip() != "true":
-        return "main"
+        return fallback_base_branch()
 
     raise WorktreeTargetUnresolved(
         f"worktree {worktree_path}: no resolvable remote default branch; "
@@ -1260,11 +1271,11 @@ def _prepare_worktree_for_task_inner(
     # Keep the historical provisional base through HEAD recovery and fetch.
     # Discover the remote default only if the selected path actually needs a
     # base; review PR-head and pinned paths must keep their own error order.
+    # #1070: without a declared base the repo's own default is discovered
+    # below; the fleet constant is only the provisional name until then.
     main_branch = str(task_context.get("base_branch") or "").strip()
-    if not main_branch:
-        main_branch = os.getenv("AGENT_CREW_MAIN_BRANCH", "").strip()
     discover_default = not main_branch
-    main_branch = main_branch or "main"
+    main_branch = main_branch or fallback_base_branch()
     # #296: is this worktree even usable? Asked before any mutating git call,
     # because an interrupted ref update can leave HEAD pointing at a branch that
     # was never created, and `stash`/`fetch`/`checkout` all behave differently
@@ -7190,7 +7201,8 @@ def create_app(
         pr_number = result.pr_number or inherited("pr_number")
         repo = inherited("repo")
         branch = parent.branch
-        base = inherited("base_branch") or "main"
+        base = resolve_base_branch({"base_branch": inherited("base_branch")},
+                                   _any_worktree_path())
         issue = inherited("issue")
         tier = inherited("risk_tier")
         if (not isinstance(pr_number, int) or isinstance(pr_number, bool)
@@ -7980,6 +7992,21 @@ def create_app(
         logger.info(f"pane_map reloaded: {pane_map}")
         return {"status": "ok", "pane_map": pane_map}
 
+    def _lineage_base_branch(ctx: dict) -> str:
+        """The nearest ``base_branch`` up the ``prev_task_id`` chain, or ``""`` (#1070)."""
+        current, seen = ctx, set()
+        while isinstance(current, dict):
+            value = str(current.get("base_branch") or "").strip()
+            if value:
+                return value
+            parent = current.get("prev_task_id")
+            if not isinstance(parent, str) or not parent or parent in seen or len(seen) >= 64:
+                return ""
+            seen.add(parent)
+            row = q().get_task(parent)
+            current = row.context if row is not None else None
+        return ""
+
     def _validate_task_admission_request(task: TaskRequest) -> None:
         """Apply the public /tasks guard to an atomically admitted first task."""
         _refresh_role_map()
@@ -8057,6 +8084,26 @@ def create_app(
             task.pr_number = canonical_pr
             ctx["pr_number"] = canonical_pr
             task.context = ctx
+        if (task.task_type in TASK_TYPE_TO_ROLE
+                and not str(ctx.get("base_branch") or "").strip()):
+            # #1070: a producer-posted task without a base inherits the
+            # lineage's, else the repo's own default. Only a real answer is
+            # written; the fleet fallback is left for the stage to resolve
+            # against its own checkout. A task bound to an existing PR never
+            # takes the repo default: its base is the PR's own, which the
+            # stage reads from GitHub only while the field is empty — a PR
+            # into `release` on a `master` repo would otherwise test on master.
+            pr_bound = (normalize_pr_number(task.pr_number) is not None
+                        or normalize_pr_number(ctx.get("pr_number")) is not None)
+            resolved = _lineage_base_branch(ctx)
+            if not resolved and worktree and not pr_bound:
+                try:
+                    resolved = remote_default_branch(worktree)
+                except (OSError, subprocess.TimeoutExpired):
+                    resolved = ""
+            if resolved:
+                ctx["base_branch"] = resolved
+                task.context = ctx
         # #889: one role policy on every route — explicit override, the
         # lineage's implementer/tester choice, and the role assignment itself.
         # The branch name is a label and never selects the agent.

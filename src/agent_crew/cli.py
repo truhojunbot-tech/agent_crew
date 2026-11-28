@@ -23,7 +23,10 @@ from agent_crew.conformance_gate import (
 from agent_crew.pipeline import ARTIFACT_KINDS
 from agent_crew.protocol import normalize_pr_number
 from agent_crew.queue import CANCEL_REASON_ATTEMPT, _TYPE_TO_ROLE
-from agent_crew.worktree_default_branch import remote_default_branch
+from agent_crew.worktree_default_branch import (
+    DEFAULT_BASE_BRANCH, fallback_base_branch, remote_default_branch,
+    resolve_base_branch,
+)
 from agent_crew.role_mapping import (
     ROLE_ORDER,
     default_role_mapping,
@@ -2420,7 +2423,6 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
     the dispatch with no task and no error. On expiry the remaining
     worktrees are recorded as ``timeout`` and the caller proceeds.
     """
-    main_branch = base_branch or os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
     try:
         budget = float(os.environ.get("AGENT_CREW_SYNC_TIMEOUT", "120"))
     except ValueError:
@@ -2438,6 +2440,10 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
     for agent, wt_path in worktrees.items():
         if not wt_path or not os.path.isdir(wt_path):
             continue
+        # #1070: a declared base, else this worktree's own repo default; the
+        # fleet constant only when neither answers.
+        main_branch = resolve_base_branch({"base_branch": base_branch}, wt_path,
+                                          deadline=deadline)
         requested_ref = f"origin/{main_branch}"
         if timed_out or deadline - time.monotonic() <= 0:
             timed_out = True
@@ -2481,9 +2487,7 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
                 # A new task base is often not on origin yet.  Do not leave
                 # the prior (unknown/stale) checkout in place: resolve the
                 # remote's advertised default branch and land there instead.
-                default_branch = remote_default_branch(wt_path, deadline=deadline)
-                fallback = (f"origin/{default_branch}" if default_branch else
-                            f"origin/{os.environ.get('AGENT_CREW_MAIN_BRANCH', 'main')}")
+                fallback = f"origin/{resolve_base_branch({}, wt_path, deadline=deadline)}"
                 actual_ref = fallback
                 status = "fallback"
                 fallback_checkout = subprocess.run(
@@ -2941,7 +2945,7 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             title=task_desc.split('\n')[0][:72],
             body=task_desc,
             branch=branch_name,
-            base="main",
+            base=declared_base,
             repo=resolved_repo
         )
         if pr_number:
@@ -3047,18 +3051,19 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
 
     _CM: dict = {"coordinator_managed": True}
 
-    declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
-    if "AGENT_CREW_MAIN_BRANCH" not in os.environ:
-        for wt_path in _run_worktrees.values():
-            if wt_path and os.path.isdir(wt_path):
-                try:
-                    resolved_base = remote_default_branch(wt_path)
-                except (OSError, subprocess.TimeoutExpired):
-                    resolved_base = ""
-                if resolved_base:
-                    declared_base = resolved_base
-                    break
-    implicit_main = ("AGENT_CREW_MAIN_BRANCH" not in os.environ and branch == "main" and
+    # #1070: the repo's own default is the base; the fleet constant is the
+    # fallback when no worktree can answer, never the first choice.
+    declared_base = ""
+    for wt_path in _run_worktrees.values():
+        if wt_path and os.path.isdir(wt_path):
+            try:
+                declared_base = remote_default_branch(wt_path)
+            except (OSError, subprocess.TimeoutExpired):
+                declared_base = ""
+            if declared_base:
+                break
+    declared_base = declared_base or fallback_base_branch()
+    implicit_main = (branch == DEFAULT_BASE_BRANCH and
                      click.get_current_context().get_parameter_source("branch") == ParameterSource.DEFAULT)
     run_branch_context = {"base_branch": declared_base,
                           "crew_run_branch": branch != declared_base and not implicit_main}

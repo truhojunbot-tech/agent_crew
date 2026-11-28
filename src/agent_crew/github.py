@@ -7,6 +7,7 @@ import subprocess
 from typing import Optional
 
 from agent_crew.role_mapping import provider_family
+from agent_crew.worktree_default_branch import fallback_base_branch
 
 
 logger = logging.getLogger(__name__)
@@ -120,10 +121,15 @@ def create_pr(
     title: str,
     body: str,
     branch: str,
-    base: str = "main",
+    base: str = "",
     repo: Optional[str] = None,
 ) -> Optional[str]:
-    """Create a GitHub PR and return the PR number."""
+    """Create a GitHub PR and return the PR number.
+
+    ``base`` defaults to the fleet fallback (#1070); callers holding a checkout
+    pass the resolved base themselves.
+    """
+    base = base or fallback_base_branch()
     if not check_gh_installed():
         return None
 

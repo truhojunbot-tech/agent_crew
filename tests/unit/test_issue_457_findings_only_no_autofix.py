@@ -135,6 +135,34 @@ def test_remote_default_branch_from_origin_head(q, tmp_path):
                             repo_cwd=str(repo)) == fix_task_id(other, 1)
 
 
+def test_explicit_task_base_keeps_the_repo_default_protected(q, tmp_path):
+    """#1070 review: a declared ``base_branch`` must not evict the checkout's
+    own default from the protected set. origin/HEAD -> trunk, task base
+    ``release``: a trunk review still gets no automated fix."""
+    repo = tmp_path / "clone"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "root"], check=True)
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/trunk", "HEAD"], check=True)
+    subprocess.run(["git", "-C", str(repo), "symbolic-ref",
+                    "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+                   check=True)
+    review_id = _review(q, branch="trunk", context={"base_branch": "release"})
+
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open,
+                            repo_cwd=str(repo)) is None
+    assert _implement_ids(q) == []
+    # The declared base and the fleet fallback stay protected alongside it.
+    for protected in ("release", "main"):
+        other = _review(q, branch=protected, context={"base_branch": "release"})
+        assert auto_enqueue_fix(q, other, pr_state_fn=_open,
+                                repo_cwd=str(repo)) is None
+    # A feature branch in the same checkout is still eligible.
+    feature = _review(q, branch=FEATURE, context={"base_branch": "release"})
+    assert auto_enqueue_fix(q, feature, pr_state_fn=_open,
+                            repo_cwd=str(repo)) == fix_task_id(feature, 1)
+
+
 def test_mcp_no_checkout_resolves_trunk_from_repo_identity(q, monkeypatch):
     """MCP supplies repo but no checkout; a trunk review cannot create a fix."""
     looked_up = []

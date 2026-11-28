@@ -31,6 +31,9 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Optional
 
+from agent_crew.worktree_default_branch import (
+    fallback_base_branch, remote_default_branch, resolve_base_branch,
+)
 from agent_crew.fallback import (
     default_agent_for_role,
 )
@@ -222,7 +225,7 @@ def verify_implement_artifact(
     rebase_target = str(context.get("rebase_onto") or "").strip()
     named_no_ref = not (result.commit or result.branch or result.pr_number)
     branch = (result.branch or task.branch or "").strip()
-    base_branch = str(context.get("base_branch") or os.getenv("AGENT_CREW_MAIN_BRANCH") or "main").strip()
+    base_branch = resolve_base_branch(context, repo_cwd)
     unnamed_base_branch = (named_no_ref and not context.get("crew_run_branch")
                            and branch == base_branch)
     unnamed_base_detail = (f"{MISSING_IMPLEMENT_REF_DETAIL}; task branch "
@@ -1174,7 +1177,7 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
                if k in ("pr_number", "repo", "project", "no_tester",
                         "coordinator_managed", "checklist_layers",
                         "findings_only", "agent_override", "reviewer_agent",
-                        "lineage_root_task_id")}
+                        "lineage_root_task_id", "base_branch")}
     context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
                     "expected_head_sha": head, "prev_task_id": review_task_id})
     inherited_tier = base.get("risk_tier")
@@ -1198,7 +1201,7 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
             task_type="review",
             description=f"Review PR #{pr_number} at {head[:12]} "
                         f"(re-dispatched: {review_task_id} reviewed an older head)",
-            branch=base.get("branch") or "main",
+            branch=base.get("branch") or resolve_base_branch(base),
             priority=3,
             context=context,
             # s4j: a re-dispatched review is the same project as the review
@@ -1285,22 +1288,23 @@ def _default_branches(review_ctx: dict, repo_cwd: str = "", *,
                       repo: str = "", require_repo_default: bool = False) -> Optional[set]:
     """Branches an automated fix must never target (#457).
 
-    The same sources the dispatcher already trusts for "the base": the
-    configured ``AGENT_CREW_MAIN_BRANCH`` (default ``main``), the task's own
-    ``base_branch``, and — when a checkout is available — the remote's
-    advertised ``origin/HEAD``. MCP has no checkout, so it requires the
-    named repository's GitHub default branch and fails closed if unavailable.
+    Every source the dispatcher trusts for "the base" (#1070), each
+    protected on its own rather than only the one the resolver would pick:
+    the task's declared ``base_branch``, the fleet fallback
+    (``AGENT_CREW_MAIN_BRANCH``, default ``main``) and — when a checkout is
+    available — the repository's own default. A task that declares
+    ``base_branch=release`` on a ``trunk`` repository must still refuse a fix
+    on ``trunk`` (review of PR #1073). MCP has no checkout, so it requires
+    the named repository's GitHub default branch and fails closed if
+    unavailable.
     """
-    names = {_normalize_branch(os.getenv("AGENT_CREW_MAIN_BRANCH") or "main"),
-             _normalize_branch(review_ctx.get("base_branch"))}
+    names = {_normalize_branch(review_ctx.get("base_branch")),
+             _normalize_branch(fallback_base_branch())}
     if repo_cwd:
         try:
-            head = _git(repo_cwd, "symbolic-ref", "--quiet", "--short",
-                        "refs/remotes/origin/HEAD", timeout=10)
-            if head.returncode == 0:
-                names.add(_normalize_branch(head.stdout))
-        except Exception:
-            logger.debug("_default_branches: origin/HEAD lookup failed in %s", repo_cwd)
+            names.add(_normalize_branch(remote_default_branch(repo_cwd)))
+        except (OSError, subprocess.TimeoutExpired):
+            logger.debug("_default_branches: repo default lookup failed in %s", repo_cwd)
     # MCP has no checkout. Its explicit repository identity must supply a
     # verified default branch; assuming `main` would allow a fix on `trunk`.
     if require_repo_default:
