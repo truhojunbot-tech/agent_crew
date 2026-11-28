@@ -274,14 +274,24 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
             and context["issue"] != context["issue_number"]):
         metadata_error = "conflicting_lineage_issue"
     shared_rows = rows
-    seeds = incoming_links - ({task_id} if fresh_root else set())
-    # Legacy requests without an explicit edge retain their conservative main
-    # behavior. Explicit chains never use the anchor closure for resolution.
-    if not seeds and not fresh_root:
-        seeds = {row["task_id"] for row, _ in shared_rows}
+    # A self-root declaration is not a persisted edge, whether or not the
+    # request carries a PR. Keep non-root self-links for cycle validation.
+    seeds, _ = _lineage_links({
+        key: value for key, value in context.items()
+        if key not in root_keys or value != task_id
+    })
     rows, chain_error = _resolved_chain(conn, project, seeds)
     if chain_error == "cyclic_lineage":
         return deny(chain_error)
+    # An absent direct reference is not evidence of an independent PR chain.
+    # Preserve conservative legacy handling when nothing was resolved, but
+    # never replace a real component merely because an older ancestor is absent.
+    if not fresh_root and (not seeds or (pr is not None and not rows)):
+        rows, fallback_error = _resolved_chain(
+            conn, project, {row["task_id"] for row, _ in shared_rows})
+        if fallback_error == "cyclic_lineage":
+            return deny(fallback_error)
+        chain_error = chain_error or fallback_error
     metadata_error = metadata_error or chain_error
     if any(context.get("repo") and ctx.get("repo")
            and context["repo"] != ctx["repo"] for _, ctx in rows):

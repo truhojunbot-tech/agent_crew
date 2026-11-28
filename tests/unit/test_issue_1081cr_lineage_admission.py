@@ -348,6 +348,7 @@ def test_unrelated_issue_receipt_still_blocks_extra_round(q, receipt_update, fre
 
 @pytest.mark.parametrize('root_context', [
     {}, {'lineage_root_task_id': 'fresh-root'}, {'lineage_root_id': 'fresh-root'},
+    {'root_task_id': 'fresh-root'},
 ])
 def test_fresh_root_on_exhausted_issue_is_admitted(q, root_context):
     exhausted(q)
@@ -461,3 +462,31 @@ def test_extra_round_resolves_parent_without_shared_anchors(q):
     review(q, 'root')
     refuse(q, 'review')
     assert q.enqueue(extra('cross-anchor')) == 'cross-anchor'
+
+
+@pytest.mark.parametrize('marker', ['lineage_root_id', 'lineage_root_task_id', 'root_task_id'])
+def test_pr_self_root_marker_cannot_reset_exhaustion(q, marker):
+    exhausted(q)
+    denied(q, task('fresh', **{marker: 'fresh'}), 'fix_budget_exhausted')
+
+
+@pytest.mark.parametrize('marker', [None, 'lineage_root_id', 'lineage_root_task_id', 'root_task_id'])
+def test_missing_direct_predecessor_cannot_reset_exhausted_pr(q, marker):
+    exhausted(q)
+    context = {marker: 'fresh'} if marker else {}
+    denied(q, task('fresh', prev_task_id='genuinely-absent', **context),
+           'unresolved_lineage_reference')
+
+
+@pytest.mark.parametrize('missing_ancestor', [False, True])
+def test_resolved_chain_remains_independent_of_exhausted_pr(q, missing_ancestor):
+    exhausted(q)
+    q.enqueue(task('b', pr_number=None, lineage_root_task_id='b'))
+    # A genuinely persisted B row establishes its own chain, even when its
+    # older ancestor is missing. A missing direct incoming parent cannot.
+    if missing_ancestor:
+        q.merge_task_context('b', {'prev_task_id': 'missing-b-ancestor'})
+    q.submit_result('b', TaskResult(task_id='b', status='completed',
+                                    summary='result', pr_number=2222))
+    assert q.enqueue(task('b-fix', prev_task_id='b', pr_number=2222,
+                          lineage_root_task_id='b-fix')) == 'b-fix'
