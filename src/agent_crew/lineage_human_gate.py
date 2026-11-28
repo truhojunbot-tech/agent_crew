@@ -283,10 +283,10 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
     rows, chain_error = _resolved_chain(conn, project, seeds)
     if chain_error == "cyclic_lineage":
         return deny(chain_error)
-    # An absent direct reference is not evidence of an independent PR chain.
+    # An absent direct reference is not evidence of an independent chain.
     # Preserve conservative legacy handling when nothing was resolved, but
     # never replace a real component merely because an older ancestor is absent.
-    if not fresh_root and (not seeds or (pr is not None and not rows)):
+    if not fresh_root and not rows:
         rows, fallback_error = _resolved_chain(
             conn, project, {row["task_id"] for row, _ in shared_rows})
         if fallback_error == "cyclic_lineage":
@@ -296,11 +296,32 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
     if any(context.get("repo") and ctx.get("repo")
            and context["repo"] != ctx["repo"] for _, ctx in rows):
         metadata_error = "conflicting_lineage_repo"
-    blocker = next((str(row["task_id"]) for row, ctx in rows
-                    if durable_cap_refusal(conn, row["task_id"])
-                    or (isinstance(ctx.get("lineage_terminal_reason"), str)
-                        and ctx["lineage_terminal_reason"].startswith(_TERMINAL_PREFIXES))), None)
-    if not fresh_root and blocker is None and "technical_extra_round" not in context:
+    # Exhaustion stays component-scoped, but shared exhaustion tells us when
+    # isolation has made an ordinary request newly eligible. That path still
+    # owes the shared owner/canary checks that guarded it before isolation.
+    cap_rows = {row["task_id"]: (row, ctx) for row, ctx in shared_rows + rows}
+    refused_ids = {
+        node for node, (row, ctx) in cap_rows.items()
+        if durable_cap_refusal(conn, node)
+        or (isinstance(ctx.get("lineage_terminal_reason"), str)
+            and ctx["lineage_terminal_reason"].startswith(_TERMINAL_PREFIXES))
+    }
+    blocker = next((str(row["task_id"]) for row, _ in rows
+                    if row["task_id"] in refused_ids), None)
+    shared_exhausted = any(row["task_id"] in refused_ids for row, _ in shared_rows)
+
+    def stored_pr(row, ctx):
+        return row["pr_number"] or ctx.get("pr_number")
+
+    # A real B component cannot be used to target an exhausted A PR. Changing
+    # PRs remains possible unless the destination itself has exhausted history.
+    if (pr is not None
+            and any(row["task_id"] in refused_ids and stored_pr(row, ctx) == pr
+                    for row, ctx in shared_rows)
+            and not any(stored_pr(row, ctx) == pr for row, ctx in rows)):
+        return deny("conflicting_lineage_pr")
+    if (not fresh_root and blocker is None and not shared_exhausted
+            and "technical_extra_round" not in context):
         return None
     # Shared owner authority remains issue-wide, including fresh roots;
     # unrelated capability and legacy facts do not.

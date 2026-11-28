@@ -490,3 +490,59 @@ def test_resolved_chain_remains_independent_of_exhausted_pr(q, missing_ancestor)
                                     summary='result', pr_number=2222))
     assert q.enqueue(task('b-fix', prev_task_id='b', pr_number=2222,
                           lineage_root_task_id='b-fix')) == 'b-fix'
+
+
+@pytest.mark.parametrize('marker', ['prev_task_id', 'lineage_root_task_id', 'lineage_root_id', 'root_task_id'])
+def test_no_pr_unresolved_identity_cannot_reset_exhausted_issue(q, marker):
+    exhausted(q)
+    denied(q, task('unresolved', pr_number=None, **{marker: 'absent'}),
+           'unresolved_lineage_reference')
+
+
+def independent_review(q):
+    q.enqueue(task('b-root', pr_number=None, lineage_root_task_id='b-root',
+                   fix_round_grant=1))
+    q.submit_result('b-root', TaskResult(task_id='b-root', status='completed',
+                                        summary='result', pr_number=2222))
+    q.enqueue(task('b-review', 'review', prev_task_id='b-root', pr_number=2222,
+                   fix_round_grant=1))
+    q.submit_result('b-review', TaskResult(
+        task_id='b-review', status='completed', summary='result', pr_number=2222,
+        verdict='request_changes', findings=['HIGH queue.py:1 - finding']))
+
+
+def test_resolved_other_chain_cannot_authorize_exhausted_destination_pr(q):
+    exhausted(q)
+    independent_review(q)
+    denied(q, task('wrong-pr', prev_task_id='b-review', pr_number=1090),
+           'conflicting_lineage_pr')
+    assert q.enqueue(task('right-pr', prev_task_id='b-review', pr_number=2222)) == 'right-pr'
+
+
+@pytest.mark.parametrize('hold', [None, 'HOLD', 'HUMAN_GATE', 'canary_HELD'])
+def test_ordinary_independent_fix_preserves_shared_authority(q, hold, caplog):
+    exhausted(q)
+    independent_review(q)
+    if hold:
+        with q._connect() as conn:
+            if hold == 'canary_HELD':
+                conn.execute("UPDATE tokenomics_shadow_receipts SET canary_cea_receipt_id='held' "
+                             "WHERE task_id='root'")
+            else:
+                field = 'runtime_state' if hold == 'HOLD' else 'decision'
+                columns = [row['name'] for row in conn.execute(
+                    'PRAGMA table_info(authorization_receipts)') if row['name'] != 'row_id']
+                expressions = ['seq + 1' if col == 'seq' else '?' if col == field else col
+                               for col in columns]
+                conn.execute(
+                    f"INSERT INTO authorization_receipts ({', '.join(columns)}) "
+                    f"SELECT {', '.join(expressions)} FROM authorization_receipts "
+                    "WHERE receipt_id=(SELECT receipt_id FROM tasks WHERE task_id='root') "
+                    "ORDER BY seq DESC LIMIT 1", (hold,))
+    fix = auto_enqueue_fix(q, 'b-review', repo=REPO, pr_state_fn=lambda _: 'open')
+    if hold:
+        assert fix is None
+        assert ('owner_gate:canary_HELD' if hold == 'canary_HELD'
+                else 'owner_gate:receipt') in caplog.text
+    else:
+        assert fix is not None
