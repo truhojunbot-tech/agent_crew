@@ -437,6 +437,9 @@ def test_shadow_pack_is_advisory_and_keeps_prompt_and_task_unchanged(tmp_path, m
     assert event["has_issue"] is True
     assert event["has_acceptance_criteria"] is True
     assert event["has_linked_review"] is False
+    # #1048: recorded on the row, not inferred from the task_id prefix.
+    assert event["fix_round"] == 0
+    assert event["no_ac"] is False
 
 
 def test_shadow_build_error_does_not_change_dispatch(tmp_path, monkeypatch, unused_tcp_port):

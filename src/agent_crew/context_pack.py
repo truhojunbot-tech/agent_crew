@@ -130,6 +130,9 @@ class Artifact:
     subject_key: str = ""
     excerpt: str = ""
     est_tokens: int = 0
+    # Mandatory regardless of type: a fix round's linked review is the bar the
+    # round is judged against, so it must not be budget-dropped (#1048).
+    required: bool = False
 
     def __post_init__(self):
         if not self.est_tokens:
@@ -139,7 +142,7 @@ class Artifact:
 
     @property
     def mandatory(self) -> bool:
-        return self.artifact_type in MANDATORY_TYPES
+        return self.required or self.artifact_type in MANDATORY_TYPES
 
 
 @dataclass
@@ -158,6 +161,12 @@ class RetrievalQuery:
     limit: int = 40
     retry_of: str = ""
     fix_round: int = 0
+    # The task's own description. Implement specs carry an "Acceptance" block
+    # even when the issue body has none in a recognised form (#1048).
+    description: str = ""
+    review_task_id: str = ""
+    review_findings: list = field(default_factory=list)
+    pr_number: Optional[int] = None
 
 
 @dataclass
@@ -339,41 +348,93 @@ class IssueProvider(RetrievalProvider):
     name = "issue"
     version = 1
 
+    # Form 1: a heading — `## Acceptance`, `## Acceptance criteria`,
+    # `## Done when`, `## Done (...)` — running to the next heading.
     _AC_RE = re.compile(
-        r"^#{1,4}\s*(?:acceptance(?:\s+criteria|\s+tests?)?|done(?:\s*\([^)]*\))?)"
-        r"\s*$(.*?)(?=^#{1,4}\s|\Z)",
+        r"^#{1,4}[ \t]*(?:acceptance(?:[ \t]+criteria|[ \t]+tests?)?"
+        r"|done(?:[ \t]+when)?(?:[ \t]*\([^)\n]*\))?)"
+        r"[ \t]*:?[ \t]*$(.*?)(?=^#{1,4}\s|\Z)",
         re.IGNORECASE | re.MULTILINE | re.DOTALL)
+    # Form 2: a label line — `**Acceptance:** text`, `**Done when**:`,
+    # `Acceptance (all required):`. A colon is required, so prose that merely
+    # starts with the word does not count (#1048).
+    _AC_NAME = (r"(?:acceptance(?:[ \t]+criteria|[ \t]+tests?)?|done[ \t]+when)"
+                r"(?:[ \t]*\([^)\n]*\))?")
+    _AC_LABEL_RE = re.compile(
+        r"^[ \t>]*(?:\*\*" + _AC_NAME + r"[ \t]*(?::[ \t]*\*\*|\*\*[ \t]*:)"
+        r"|" + _AC_NAME + r"[ \t]*:)[ \t]*(.*)$",
+        re.IGNORECASE | re.MULTILINE)
+    _HEADING_RE = re.compile(r"^#{1,6}\s")
+    _BOLD_LABEL_RE = re.compile(r"^[ \t>]*\*\*[^*\n]+\*\*")
+    _LIST_OR_INDENT_RE = re.compile(r"^(\s+\S|\s*([-*+]|\d+[.)]|[A-Za-z][.)])\s)")
 
     def retrieve(self, query: RetrievalQuery) -> list:
-        if not query.issue_body and not query.issue_title:
-            return []
         num = query.issue_number
         uri = (f"https://github.com/{query.repo}/issues/{num}"
                if query.repo and num else f"issue://{num or query.task_id}")
         body = query.issue_body or ""
-        out = [Artifact(
-            artifact_id=f"issue-{num or query.task_id}", uri=uri,
-            artifact_type=TYPE_ISSUE, revision="",
-            score=1.0, score_components={"mandatory": 1.0},
-            provenance="the claimed issue itself — mandatory",
-            freshness=FRESH,
-            excerpt=f"# {query.issue_title}\n\n{self._strip_ac(body)}".strip(),
-        )]
+        out = []
+        if body or query.issue_title:
+            out.append(Artifact(
+                artifact_id=f"issue-{num or query.task_id}", uri=uri,
+                artifact_type=TYPE_ISSUE, revision="",
+                score=1.0, score_components={"mandatory": 1.0},
+                provenance="the claimed issue itself — mandatory",
+                freshness=FRESH,
+                excerpt=f"# {query.issue_title}\n\n{self._strip_ac(body)}".strip(),
+            ))
         ac = self.extract_ac(body)
+        provenance = "acceptance criteria — the bar this task is judged against"
+        if not ac:
+            ac = self.extract_ac(query.description)
+            provenance = ("acceptance criteria from the task description (the issue "
+                          "body has none in a recognised form) — the bar this task "
+                          "is judged against")
         if ac:
             out.append(Artifact(
                 artifact_id=f"issue-{num or query.task_id}-ac", uri=uri + "#acceptance-criteria",
                 artifact_type=TYPE_AC, revision="",
                 score=1.0, score_components={"mandatory": 1.0},
-                provenance="acceptance criteria — the bar this task is judged against",
+                provenance=provenance,
                 freshness=FRESH, excerpt=ac,
             ))
         return out
 
     @classmethod
+    def _find_ac(cls, text: str):
+        """``(start, end, criteria)`` of the first AC section, or ``None``.
+
+        A heading wins over a label line, so a body that has both is read the
+        way it was before #1048.
+        """
+        text = text or ""
+        m = cls._AC_RE.search(text)
+        if m:
+            return m.start(), m.end(), m.group(1).strip()
+        m = cls._AC_LABEL_RE.search(text)
+        if not m:
+            return None
+        # The label's block: its inline text, then following lines until a
+        # heading, another bold label, or a blank line that is not followed
+        # by a list item or indented continuation.
+        lines = text[m.end():].split("\n")[1:]
+        pos, kept = m.end(), []
+        for i, line in enumerate(lines):
+            if cls._HEADING_RE.match(line) or cls._BOLD_LABEL_RE.match(line):
+                break
+            if not line.strip():
+                nxt = next((x for x in lines[i + 1:] if x.strip()), "")
+                if not cls._LIST_OR_INDENT_RE.match(nxt):
+                    break
+            kept.append(line)
+            pos += 1 + len(line)
+        criteria = "\n".join([m.group(1)] + kept).strip()
+        return (m.start(), pos, criteria) if criteria else None
+
+    @classmethod
     def extract_ac(cls, body: str) -> str:
-        m = cls._AC_RE.search(body or "")
-        return m.group(1).strip() if m else ""
+        found = cls._find_ac(body)
+        return found[2] if found else ""
 
     @classmethod
     def extract_ac_block(cls, body: str) -> str:
@@ -384,12 +445,72 @@ class IssueProvider(RetrievalProvider):
         the stored text later — including `extract_ac` itself — can still find
         the section it was carried across the cap to preserve.
         """
-        m = cls._AC_RE.search(body or "")
-        return m.group(0).strip() if m else ""
+        found = cls._find_ac(body)
+        return (body or "")[found[0]:found[1]].strip() if found else ""
 
     @classmethod
     def _strip_ac(cls, body: str) -> str:
-        return cls._AC_RE.sub("", body or "").strip()
+        body = body or ""
+        if cls._AC_RE.search(body):
+            return cls._AC_RE.sub("", body).strip()
+        found = cls._find_ac(body)
+        return (body[:found[0]] + body[found[1]:]).strip() if found else body.strip()
+
+
+def _ctx_int(value) -> int:
+    """A non-negative int from a ctx value; task rows store some as strings."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str) and value.strip().isdecimal():
+        return int(value.strip())
+    return 0
+
+
+def _ctx_findings(value) -> list:
+    """`review_findings` as ``list[str]``; rows store a JSON-encoded list."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(f) for f in value if str(f).strip()]
+
+
+class LinkedReviewProvider(RetrievalProvider):
+    """The review a fix round answers, from the fix task's own context (#1048).
+
+    Every fix round carries `review_findings`, `prev_task_id` and `pr_number`,
+    yet no provider turned them into a `pr_review` artifact, so `is_sufficient`
+    R3 fired on every fix round. Nothing is fetched: the context already holds
+    the findings the round was dispatched with.
+    """
+
+    name = "linked_review"
+    version = 1
+    _MAX_CHARS = 6000
+
+    def retrieve(self, query: RetrievalQuery) -> list:
+        if query.fix_round <= 0 or not query.review_findings:
+            return []
+        review = query.review_task_id or "unknown-review"
+        text = "\n".join(f"- {f}" for f in query.review_findings)
+        if len(text) > self._MAX_CHARS:
+            text = (text[:self._MAX_CHARS].rstrip()
+                    + f"\n[... truncated; full text in review task {review}]")
+        uri = (f"https://github.com/{query.repo}/pull/{query.pr_number}"
+               if query.repo and query.pr_number else f"task://{review}")
+        return [Artifact(
+            artifact_id=f"review:{review}", uri=uri, artifact_type=TYPE_REVIEW,
+            revision="", score=1.0, score_components={"mandatory": 1.0},
+            provenance=(f"findings of review task {review} that fix round "
+                        f"{query.fix_round} must address — mandatory"),
+            freshness=FRESH, subject_key=f"review:{review}", required=True,
+            excerpt=f"review task: {review}\n{text}",
+        )]
 
 
 class FailurePatternProvider(RetrievalProvider):
@@ -1277,7 +1398,8 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
                         budget: Optional[dict] = None,
                         extra_providers: Optional[list] = None,
                         mode: str = MODE_LEXICAL,
-                        timeout_s: float = 10.0) -> ContextPack:
+                        timeout_s: float = 10.0,
+                        description: str = "") -> ContextPack:
     """Assemble the pack for one dispatch. Never raises.
 
     ⛔Fail-soft by contract: any failure yields a *degraded* pack that says so,
@@ -1296,9 +1418,13 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
         issue_number=issue, issue_title=title, issue_body=body, branch=branch,
         keywords=keywords_from(title, body),
         retry_of=str(ctx.get("retry_of") or ""),
-        fix_round=(ctx.get("fix_round") if type(ctx.get("fix_round")) is int else 0),
+        fix_round=_ctx_int(ctx.get("fix_round")),
+        description=str(description or ctx.get("description") or ""),
+        review_task_id=str(ctx.get("prev_task_id") or ""),
+        review_findings=_ctx_findings(ctx.get("review_findings")),
+        pr_number=_ctx_int(ctx.get("pr_number")) or None,
     )
-    providers = [IssueProvider(), LexicalRepoProvider()]
+    providers = [IssueProvider(), LinkedReviewProvider(), LexicalRepoProvider()]
     memory_db = os.getenv("AGENT_CREW_SHADOW_MEMORY_DB", "").strip()
     if memory_db:
         providers.append(FailurePatternProvider(os.path.expanduser(memory_db)))
