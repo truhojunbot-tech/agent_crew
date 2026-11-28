@@ -20,10 +20,10 @@ from agent_crew.conformance_gate import (
     _conformance_gate_allows_merge, _registry_capability_for_paths,
     test_pass_for_head,
 )
-from agent_crew.pipeline import ARTIFACT_KINDS
+from agent_crew.pipeline import ARTIFACT_KINDS, git_fetch_origin
 from agent_crew.protocol import normalize_pr_number
 from agent_crew.queue import CANCEL_REASON_ATTEMPT, _TYPE_TO_ROLE
-from agent_crew.worktree_default_branch import remote_default_branch
+from agent_crew.worktree_default_branch import remote_default_branch, stale_base_gap
 from agent_crew.role_mapping import (
     ROLE_ORDER,
     default_role_mapping,
@@ -2405,6 +2405,89 @@ def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str,
         return {}
 
 
+def _resolve_run_base(worktrees: dict) -> tuple[str, str]:
+    """Return ``(declared_base, worktree_path)`` for a ``crew run`` (#555, #1065).
+
+    ``AGENT_CREW_MAIN_BRANCH`` wins when set. Otherwise the first usable
+    worktree's origin default branch is used, falling back to ``main`` only
+    when nothing resolves. ``worktree_path`` is the worktree the answer came
+    from (or the first usable one), so callers can run git checks against it;
+    it is ``""`` when there is none.
+    """
+    declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
+    configured = "AGENT_CREW_MAIN_BRANCH" in os.environ
+    first_path = ""
+    for wt_path in worktrees.values():
+        if not wt_path or not os.path.isdir(wt_path):
+            continue
+        first_path = first_path or wt_path
+        if configured:
+            break
+        try:
+            resolved_base = remote_default_branch(wt_path)
+        except (OSError, subprocess.TimeoutExpired):
+            resolved_base = ""
+        if resolved_base:
+            return resolved_base, wt_path
+    return declared_base, first_path
+
+
+def _refuse_stale_run_base(wt_path: str, base: str, *, allow_stale_base: bool) -> None:
+    """Refuse a ``crew run`` whose base is strictly behind the repo default (#1065).
+
+    A base origin does not know, or one that is ahead of or diverged from the
+    default, is not stale and passes.
+
+    The pre-enqueue sync discards its fetch result, so ``origin/<default>`` is
+    refreshed here before the gap is measured. When that refresh fails or
+    times out the comparison refs may be stale: a cached ``origin/<default>``
+    pinned at the same commit as ``origin/<base>`` measures a gap of 0 and
+    would enqueue from the stale base (PR #1066 review). Freshness that cannot
+    be established refuses, unless ``--allow-stale-base`` was given.
+    """
+    try:
+        default = remote_default_branch(wt_path)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        click.echo(f"Warning: could not compare {base!r} with the repo default: {exc}")
+        return
+    if not default or default == base:
+        return
+    fetch = git_fetch_origin(wt_path, default)
+    if fetch.returncode != 0:
+        _refuse_unknown_run_base_freshness(
+            f"could not refresh origin/{default} to check base branch {base!r} against "
+            f"the repo default: {(fetch.stderr or '').strip() or f'exit {fetch.returncode}'}",
+            allow_stale_base=allow_stale_base)
+        return
+    try:
+        gap = stale_base_gap(wt_path, base, default)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _refuse_unknown_run_base_freshness(
+            f"could not compare base branch {base!r} with the repo default {default!r} "
+            f"(origin/{default}): {exc}", allow_stale_base=allow_stale_base)
+        return
+    if not gap:
+        return
+    message = (f"base branch {base!r} is {gap} commit{'s' if gap != 1 else ''} behind "
+               f"the repo default {default!r} (origin/{base}..origin/{default})")
+    if allow_stale_base:
+        click.echo(f"Warning: {message}; proceeding because --allow-stale-base was given.")
+        return
+    raise click.ClickException(
+        f"{message}. Refusing to start from a stale base; pass --branch {default} "
+        f"or --allow-stale-base to override (#1065).")
+
+
+def _refuse_unknown_run_base_freshness(message: str, *, allow_stale_base: bool) -> None:
+    """Fail closed when the stale-base check cannot trust its refs (#1065)."""
+    if allow_stale_base:
+        click.echo(f"Warning: {message}; proceeding because --allow-stale-base was given.")
+        return
+    raise click.ClickException(
+        f"{message}. Refusing to start from a base whose freshness is unknown; "
+        f"pass --allow-stale-base to override (#1065).")
+
+
 def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
                             port: int = 0, project: str = "",
                             role_to_agent: dict | None = None) -> dict[str, dict]:
@@ -2639,7 +2722,12 @@ def _require_run_admission(repo: str, issue) -> dict:
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--max-iter", default=0, type=int, help="Max review iterations (0 = default)")
 @click.option("--no-tester", is_flag=True, help="Skip test phase after approval")
-@click.option("--branch", default="main", show_default=True)
+@click.option("--branch", default="main", show_default=True,
+              help="Base/run branch. When omitted, the repo's resolved default "
+                   "branch is used, never the literal 'main' (#1065).")
+@click.option("--allow-stale-base", is_flag=True,
+              help="Start from a base that is behind the repo default branch "
+                   "instead of refusing (#1065).")
 @click.option("--risk-tier", type=click.IntRange(0, 3), default=None,
               help="Explicit risk tier 0-3 (default: AGENT_CREW_DEFAULT_RISK_TIER if set)")
 @click.option("--issue", type=click.IntRange(min=1), default=None,
@@ -2654,7 +2742,8 @@ def _require_run_admission(repo: str, issue) -> dict:
 @click.option("--reviewer", default="", help="Agent for review (claude/codex/gemini)")
 @click.option("--auto-merge", is_flag=True, help="Auto-merge PR via gh when loop completes successfully")
 def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: str,
-            max_iter: int, no_tester: bool, branch: str, risk_tier: int | None,
+            max_iter: int, no_tester: bool, branch: str, allow_stale_base: bool,
+            risk_tier: int | None,
             issue: int | None, artifact_kind: str | None, timeout: int,
             create_issue: bool, create_pr: bool, repo: str,
             implementer: str, reviewer: str, auto_merge: bool):
@@ -2663,7 +2752,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     try:
         return _run_loop(task, db, project, allow_cross_project, base, max_iter, no_tester,
                          branch, risk_tier, issue, artifact_kind, timeout, create_issue,
-                         create_pr, repo, implementer, reviewer, auto_merge)
+                         create_pr, repo, implementer, reviewer, auto_merge,
+                         allow_stale_base=allow_stale_base)
     except urllib.error.HTTPError as exc:
         # #772: a 409 from enqueue_* means the server already owns (or refused)
         # that successor. Stop the loop with a message, not a traceback.
@@ -2682,7 +2772,8 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
               max_iter: int, no_tester: bool, branch: str, risk_tier: int | None,
               issue: int | None, artifact_kind: str | None, timeout: int,
               create_issue: bool, create_pr: bool, repo: str,
-              implementer: str, reviewer: str, auto_merge: bool):
+              implementer: str, reviewer: str, auto_merge: bool,
+              *, allow_stale_base: bool = False):
     if not task.strip():
         raise click.UsageError("task must not be empty")
 
@@ -3004,6 +3095,17 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
     if not issue_context:
         click.echo("Warning: crew run without --issue; the task will not be linked to an issue.")
 
+    # #1065: resolve the declared base BEFORE anything consumes `branch`. A
+    # defaulted `--branch main` is not a request for the literal `main`; on a
+    # repo whose real default is `master` with a stale `origin/main` beside it,
+    # syncing to the literal name started the implementer 73 commits behind and
+    # the resulting PR reverted safety commits (trader PR #292).
+    declared_base, _base_wt_path = _resolve_run_base(_run_worktrees)
+    _branch_defaulted = (click.get_current_context().get_parameter_source("branch")
+                         == ParameterSource.DEFAULT)
+    if _branch_defaulted:
+        branch = declared_base
+
     # coordinator_managed is provenance only (§7.2). The loop adopts the
     # server's persisted successors below; this flag never decides a transition.
     # A rerun may find the first implement task still queued or executing.
@@ -3045,23 +3147,19 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             _run_worktrees, base_branch=branch, port=_run_port, project=project,
             role_to_agent=_run_role_to_agent)
 
+    # #1065: refuse a base that is strictly behind the repo default. The sync
+    # above has just fetched, so the gap is current. Explicit `--branch` and
+    # an AGENT_CREW_MAIN_BRANCH that trails the default are both covered;
+    # `--allow-stale-base` keeps the old behaviour on purpose.
+    if _run_worktrees and _adopted_impl_id is None and _base_wt_path:
+        _refuse_stale_run_base(_base_wt_path, branch, allow_stale_base=allow_stale_base)
+
     _CM: dict = {"coordinator_managed": True}
 
-    declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
-    if "AGENT_CREW_MAIN_BRANCH" not in os.environ:
-        for wt_path in _run_worktrees.values():
-            if wt_path and os.path.isdir(wt_path):
-                try:
-                    resolved_base = remote_default_branch(wt_path)
-                except (OSError, subprocess.TimeoutExpired):
-                    resolved_base = ""
-                if resolved_base:
-                    declared_base = resolved_base
-                    break
-    implicit_main = ("AGENT_CREW_MAIN_BRANCH" not in os.environ and branch == "main" and
-                     click.get_current_context().get_parameter_source("branch") == ParameterSource.DEFAULT)
     run_branch_context = {"base_branch": declared_base,
-                          "crew_run_branch": branch != declared_base and not implicit_main}
+                          "crew_run_branch": branch != declared_base}
+    if allow_stale_base:
+        run_branch_context["allow_stale_base"] = True
     impl_context = {**_CM, **run_branch_context, **risk_context, **issue_context,
                     **artifact_context, **repo_context,
                     "sync_landed_bases": _sync_landed_bases}

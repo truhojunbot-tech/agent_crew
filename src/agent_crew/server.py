@@ -125,7 +125,7 @@ from agent_crew.testing_policy import (
     TestStageLockUnavailable,
 )
 from agent_crew.telemetry_response import response_log_telemetry
-from agent_crew.worktree_default_branch import remote_default_branch
+from agent_crew.worktree_default_branch import remote_default_branch, stale_base_gap
 
 logger = logging.getLogger(__name__)
 _unclaimed_lock_notices: set[tuple[str, str, str]] = set()
@@ -799,6 +799,18 @@ class WorktreeFetchFailed(WorktreePrepRefused):
     reason = "prep_fetch_failed"
 
 
+class WorktreeBaseStale(WorktreePrepRefused):
+    """The declared implementer base is strictly behind the repo default (#1065).
+
+    A stale ``origin/main`` beside the real default branch starts the
+    implementer from old code; its PR then reverts everything the default has
+    gained since. Trader PR #292 did exactly that to two safety commits.
+    ``context.allow_stale_base`` keeps the old behaviour on request.
+    """
+
+    reason = "stale_base_branch"
+
+
 class WorktreeTargetUnresolved(WorktreePrepRefused):
     """The task named a PR whose head could not be resolved (#289).
 
@@ -819,6 +831,36 @@ class WorktreeTargetUnresolved(WorktreePrepRefused):
         super().__init__(message)
         if reason is not None:
             self.reason = reason
+
+
+def _refuse_stale_prep_base(worktree_path: str, task_id: str, base: str) -> None:
+    """Raise :class:`WorktreeBaseStale` when ``origin/<base>`` trails the default (#1065)."""
+    try:
+        default = remote_default_branch(worktree_path)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if not default or default == base:
+        return
+    # The declared base was just fetched; refresh the default too so the gap
+    # is measured against origin, not a tracking ref from the last sync. A
+    # failed refresh refuses outright: a cached origin/<default> pinned at the
+    # same commit as origin/<base> measures a gap of 0 and would start the
+    # implementer from the stale base without the override (PR #1066 review).
+    fetch = git_fetch_origin(worktree_path, default)
+    if fetch.returncode != 0:
+        raise WorktreeFetchFailed(
+            f"implementer {task_id}: could not fetch origin/{default} to check "
+            f"the declared base {base!r} against the repo default: "
+            f"{(fetch.stderr or '').strip()}"
+        )
+    gap = stale_base_gap(worktree_path, base, default)
+    if gap:
+        raise WorktreeBaseStale(
+            f"implementer {task_id}: declared base {base!r} is {gap} commit"
+            f"{'s' if gap != 1 else ''} behind the repo default {default!r} "
+            f"(origin/{base}..origin/{default}); refusing to start from a stale "
+            f"base (#1065). Set context.allow_stale_base to override."
+        )
 
 
 def _remote_default_branch(worktree_path: str) -> str:
@@ -1382,6 +1424,15 @@ def _prepare_worktree_for_task_inner(
                 f"implementer {task_id}: could not fetch origin/{main_branch}: "
                 f"{fetch.stderr.strip()}"
             )
+        # #1065: a declared base that trails the repo default is refused, the
+        # same check `crew run` applies before enqueue. Here it also covers
+        # producers that never pass through the CLI (crew_enqueue, triage).
+        # Only the path that will actually start from origin/<main_branch> is
+        # checked: a pinned base was already checked when it was recorded, a
+        # continuing PR branch and a crew-run branch supply their own content.
+        if (task_context.get("base_branch") and not pinned_base and not remote_branch
+                and not branch_start and not task_context.get("allow_stale_base")):
+            _refuse_stale_prep_base(worktree_path, task_id, main_branch)
         base_ref = pinned_base or remote_branch or f"origin/{main_branch}"
         base_sha = _branch_ref(worktree_path, base_ref)
         checkout_base = base_sha or base_ref
@@ -2891,7 +2942,7 @@ _LINEAGE_REASON_CODES = frozenset({
     "test_failure", "transient", "no_artifact", "watchdog_timeout",
     "watchdog_script_test_timeout", "orphan_lease_expired",
     "worktree_prep_refused", "worktree_unhealthy", "prep_fetch_failed",
-    "pr_head_unresolved",
+    "pr_head_unresolved", "stale_base_branch",
     "worktree_base_unresolved", "prepared_base_not_recorded",
     "wip_restore_conflict", "missing_role_protocol", "no_worktree",
     "pane_target_unresolvable", "pane_not_owned", "dispatch_exception",
