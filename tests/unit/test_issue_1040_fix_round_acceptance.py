@@ -145,13 +145,16 @@ def test_missing_root_row_still_enqueues_findings_with_warning(q, caplog):
     assert any("no root implement task" in r.getMessage() for r in caplog.records)
 
 
-def test_prev_cycle_does_not_hang(q):
+def test_prev_cycle_does_not_hang(q, caplog):
     review_id = _review(q, prev="review-loop")
     q.enqueue(TaskRequest(task_id="review-loop", task_type="review",
                           description="r", branch=BRANCH,
                           context={"prev_task_id": review_id}))
-    fix = _fix(q, review_id)
-    assert "Parent acceptance and test gate" not in fix.description
+    # #1094 rejects persisted cycles at admission; acceptance traversal still
+    # terminates, but it must no longer produce an admitted fix for this graph.
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
+    assert "cyclic_lineage" in caplog.text
+    assert q.get_task(f"fix-{review_id}-r1") is None
 
 
 def test_heading_section_runs_to_same_level_heading():
