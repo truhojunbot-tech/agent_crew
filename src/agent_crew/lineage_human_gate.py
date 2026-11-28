@@ -126,7 +126,7 @@ def _lineage_links(context):
     return links, error
 
 
-def _resolved_chain(conn, project, seeds):
+def _resolved_chain(conn, project, seeds, *, validate_cycles=True):
     """Resolve persisted edges independently of shared issue/PR metadata.
 
     Include descendants so a marker naming a root inherits its durable refusal.
@@ -171,7 +171,7 @@ def _resolved_chain(conn, project, seeds):
         pending.extend(edges[node] | reverse.get(node, set()))
     # Iterative DFS distinguishes cycles from convergent root/parent markers.
     finished, active = set(), set()
-    for seed in selected:
+    for seed in selected if validate_cycles else ():
         stack = [(seed, False)]
         while stack:
             node, leaving = stack.pop()
@@ -287,10 +287,11 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
     # Preserve conservative legacy handling when nothing was resolved, but
     # never replace a real component merely because an older ancestor is absent.
     if not fresh_root and not rows:
+        # Shared history is a conservative authority fallback, not evidence
+        # that its unrelated components belong to the incoming lineage.
         rows, fallback_error = _resolved_chain(
-            conn, project, {row["task_id"] for row, _ in shared_rows})
-        if fallback_error == "cyclic_lineage":
-            return deny(fallback_error)
+            conn, project, {row["task_id"] for row, _ in shared_rows},
+            validate_cycles=False)
         chain_error = chain_error or fallback_error
     metadata_error = metadata_error or chain_error
     if any(context.get("repo") and ctx.get("repo")

@@ -546,3 +546,41 @@ def test_ordinary_independent_fix_preserves_shared_authority(q, hold, caplog):
                 else 'owner_gate:receipt') in caplog.text
     else:
         assert fix is not None
+
+
+@pytest.mark.parametrize('actual_predecessor', [False, True])
+def test_legacy_admission_cycle_validation_is_component_local(q, actual_predecessor):
+    q.enqueue(task('other-root'))
+    finish(q, 'other-root')
+    q.merge_task_context('other-root', {'prev_task_id': 'other-root'})
+    context = {'prev_task_id': 'other-root'} if actual_predecessor else {}
+    request = task('legacy', pr_number=2222, **context)
+    if actual_predecessor:
+        denied(q, request, 'cyclic_lineage')
+    else:
+        assert q.enqueue(request) == 'legacy'
+
+
+@pytest.mark.parametrize('hold', [None, 'HOLD', 'HUMAN_GATE', 'canary_HELD'])
+def test_legacy_cycle_fallback_preserves_exhaustion_and_shared_authority(q, hold):
+    exhausted(q)
+    q.merge_task_context('root', {'prev_task_id': 'root'})
+    if hold:
+        with q._connect() as conn:
+            if hold == 'canary_HELD':
+                conn.execute("UPDATE tokenomics_shadow_receipts SET canary_cea_receipt_id='held' "
+                             "WHERE task_id='root'")
+            else:
+                field = 'runtime_state' if hold == 'HOLD' else 'decision'
+                columns = [row['name'] for row in conn.execute(
+                    'PRAGMA table_info(authorization_receipts)') if row['name'] != 'row_id']
+                expressions = ['seq + 1' if col == 'seq' else '?' if col == field else col
+                               for col in columns]
+                conn.execute(
+                    f"INSERT INTO authorization_receipts ({', '.join(columns)}) "
+                    f"SELECT {', '.join(expressions)} FROM authorization_receipts "
+                    "WHERE receipt_id=(SELECT receipt_id FROM tasks WHERE task_id='root') "
+                    "ORDER BY seq DESC LIMIT 1", (hold,))
+    reason = ('owner_gate:canary_HELD' if hold == 'canary_HELD' else
+              'owner_gate:receipt' if hold else 'fix_budget_exhausted')
+    denied(q, task('legacy', pr_number=2222), reason)
