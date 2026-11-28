@@ -357,18 +357,27 @@ def test_fresh_root_on_exhausted_issue_is_admitted(q, root_context):
     assert q.enqueue(task('fresh-root', pr_number=None, **root_context)) == 'fresh-root'
 
 
+@pytest.mark.parametrize('canary_applied, receipt_id, held', [
+    (0, 'held', False),
+    (1, 'held', True),
+    (1, None, False),
+])
 @pytest.mark.parametrize('fresh_root', [False, True])
-def test_unrelated_issue_canary_hold_still_blocks_extra_round(q, fresh_root):
+def test_unrelated_issue_canary_hold_still_blocks_extra_round(
+        q, fresh_root, canary_applied, receipt_id, held):
     q.enqueue(task('unrelated', pr_number=999))
     exhausted(q)
     with q._connect() as conn:
         conn.execute(
-            "UPDATE tokenomics_shadow_receipts SET canary_cea_receipt_id='held' "
-            "WHERE task_id='unrelated'"
+            "UPDATE tokenomics_shadow_receipts SET canary_applied=?, canary_cea_receipt_id=? "
+            "WHERE task_id='unrelated'", (canary_applied, receipt_id),
         )
     request = (task('blocked-by-canary', pr_number=None)
                if fresh_root else extra('blocked-by-canary'))
-    denied(q, request, 'owner_gate:canary_HELD')
+    if held:
+        denied(q, request, 'owner_gate:canary_HELD')
+    else:
+        assert q.enqueue(request) == request.task_id
 
 
 def test_unrelated_conflicting_issue_still_blocks_extra_round(q):
@@ -526,7 +535,7 @@ def test_ordinary_independent_fix_preserves_shared_authority(q, hold, caplog):
     if hold:
         with q._connect() as conn:
             if hold == 'canary_HELD':
-                conn.execute("UPDATE tokenomics_shadow_receipts SET canary_cea_receipt_id='held' "
+                conn.execute("UPDATE tokenomics_shadow_receipts SET canary_applied=1, canary_cea_receipt_id='held' "
                              "WHERE task_id='root'")
             else:
                 field = 'runtime_state' if hold == 'HOLD' else 'decision'
@@ -568,7 +577,7 @@ def test_legacy_cycle_fallback_preserves_exhaustion_and_shared_authority(q, hold
     if hold:
         with q._connect() as conn:
             if hold == 'canary_HELD':
-                conn.execute("UPDATE tokenomics_shadow_receipts SET canary_cea_receipt_id='held' "
+                conn.execute("UPDATE tokenomics_shadow_receipts SET canary_applied=1, canary_cea_receipt_id='held' "
                              "WHERE task_id='root'")
             else:
                 field = 'runtime_state' if hold == 'HOLD' else 'decision'

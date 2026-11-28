@@ -336,7 +336,7 @@ def admit_lineage_extra_round(conn, *, project, pr_number, issue_number,
             return deny("owner_gate:receipt")
         if conn.execute(
             "SELECT 1 FROM tokenomics_shadow_receipts WHERE task_id=? "
-            "AND canary_cea_receipt_id IS NOT NULL", (row["task_id"],),
+            "AND canary_applied=1 AND canary_cea_receipt_id IS NOT NULL", (row["task_id"],),
         ).fetchone():
             return deny("owner_gate:canary_HELD")
     if blocker is None and "technical_extra_round" not in context:
