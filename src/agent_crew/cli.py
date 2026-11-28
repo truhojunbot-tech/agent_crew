@@ -4019,6 +4019,8 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
               help="Full PR head SHA required for an operator-created review/test task")
 @click.option("--artifact-kind", type=click.Choice(ARTIFACT_KINDS), default=None,
               help="Declare the task's completion artifact contract (for example, report).")
+@click.option("--implementer-agent", default="",
+              help="Implementing agent identity for an operator-created review.")
 @click.option("--prev-task-id", default="",
               help="Task id this one depends on (typically the impl task id "
                    "for review, or the review id for test).")
@@ -4031,7 +4033,7 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
             branch: str, pr_number: int, reviewed_sha: str,
             artifact_kind: str | None, risk_tier: int | None,
             prev_task_id: str, priority: int,
-            task_id: str):
+            task_id: str, implementer_agent: str):
     """Enqueue a single TASK_TYPE task without entering the loop.
 
     Pipeline successors are created from worker results by the coordinator.
@@ -4042,7 +4044,7 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
         crew enqueue review "Review PR #1666" --project alpha_engine \\
             --branch agent/claude-cli/1665-feature --pr 1666 \\
             --reviewed-sha <full-head-sha> \\
-            --prev-task-id impl-abcd1234 --risk-tier 1
+            --prev-task-id impl-abcd1234 --implementer-agent codex --risk-tier 1
 
         crew enqueue test "Verify PR #1666" --project alpha_engine \\
             --branch agent/claude-cli/1665-feature --pr 1666 \\
@@ -4067,6 +4069,8 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
         task_id = f"{task_type[:9]}-{_uuid.uuid4().hex[:8]}"
 
     context: dict = {}
+    if implementer_agent:
+        context["implementer_agent"] = implementer_agent
     if risk_tier is not None:
         context["risk_tier"] = risk_tier
     if prev_task_id:

@@ -64,7 +64,7 @@ class TestAutoEnqueueReviewRecordsImplementer:
         )
         with TestClient(app) as client:
             client.post("/tasks", json=_task_payload("impl-001", "implement"))
-            record_dispatch_provenance(tmp_db, "impl-001")
+            record_dispatch_provenance(tmp_db, "impl-001", agent="claude")
             client.post(
                 "/tasks/impl-001/result", json=_result_payload("impl-001")
             )
@@ -87,7 +87,7 @@ class TestAutoEnqueueReviewRecordsImplementer:
                 "/tasks",
                 json=_task_payload("impl-002", "implement", context=ctx),
             ).status_code == 201
-            record_dispatch_provenance(tmp_db, "impl-002")
+            record_dispatch_provenance(tmp_db, "impl-002", agent="codex")
             client.post(
                 "/tasks/impl-002/result", json=_result_payload("impl-002")
             )
@@ -116,7 +116,7 @@ class TestAutoEnqueueTestRecordsBothAgents:
         )
         with TestClient(app) as client:
             client.post("/tasks", json=_task_payload("impl-003", "implement"))
-            record_dispatch_provenance(tmp_db, "impl-003")
+            record_dispatch_provenance(tmp_db, "impl-003", agent="codex")
             client.post(
                 "/tasks/impl-003/result", json=_result_payload("impl-003")
             )

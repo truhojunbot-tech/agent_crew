@@ -29,6 +29,7 @@ def _review_payload(task_id="review-impl-77-r1", **context):
             "description": f"Review PR #{PR} for task impl-77.", "branch": "feat/x",
             "priority": 3, "pr_number": PR,
             "context": {"risk_tier": 1, "prev_task_id": "impl-77", "pr_number": PR,
+                        "implementer_agent": "claude",
                         "repo": REPO, "reviewed_sha": SHA,
                         "allow_duplicate_review": True, **context}}
 

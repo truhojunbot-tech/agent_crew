@@ -556,7 +556,8 @@ def test_replay_request_changes_fix_round_under_hold(tmp_path, monkeypatch, noti
             "task_id": "review-impl-924d-r0", "task_type": "review",
             "description": "review", "branch": "agent/claude/924d", "priority": 3,
             "context": {"repo": "owner/repo", "pr_number": 1031,
-                        "reviewed_sha": "a" * 40, "prev_task_id": "impl-924d"},
+                        "reviewed_sha": "a" * 40, "prev_task_id": "impl-924d",
+                        "implementer_agent": "claude"},
             "pr_number": 1031}).status_code in (200, 201)
         record_dispatch_provenance(db, "review-impl-924d-r0")
         response = client.post("/tasks/review-impl-924d-r0/result", json={

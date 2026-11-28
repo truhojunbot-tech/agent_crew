@@ -9,8 +9,7 @@ from agent_crew.queue import TaskQueue
 def invoke(tmp_path, *args):
     db = str(tmp_path / "tasks.db")
     result = CliRunner().invoke(
-        crew, ["enqueue", "review", "review work", "--db", db,
-               "--pr", "935", "--reviewed-sha", "a" * 40, *args])
+        crew, ["enqueue", "implement", "implementation work", "--db", db, *args])
     return result, TaskQueue(db)
 
 

@@ -2941,6 +2941,8 @@ def notify_lineage_end(queue: TaskQueue, task_id: str, *,
     if queue.has_successor(task_id):
         return
     ctx = task.context if isinstance(task.context, dict) else {}
+    if ctx.get("deferred_cascade"):
+        return
     # #914 already claimed a durable notice for this refused successor.
     # Sending lineage_end as well would wake the coordinator twice for one end.
     if str(ctx.get("lineage_terminal_reason") or "").startswith("successor_refused:"):
@@ -7029,6 +7031,7 @@ def create_app(
             repo_cwd=_any_worktree_path(),
             coordinator_notify_fn=coordinator_notify_fn,
             reviewer_provider=_DISPATCH_ROLE_TO_AGENT.get("reviewer", ""),
+            implementer_provider=_DISPATCH_ROLE_TO_AGENT.get("implementer", ""),
         )
         if isinstance(review_id, str) and review_id:
             try:
@@ -9100,6 +9103,10 @@ def create_app(
             parent = rec.get("parent_task_id")
             if not parent:
                 continue
+            task = q().get_task(parent)
+            deferred = (task.context or {}).get("deferred_cascade") if task else None
+            if isinstance(deferred, dict) and time.time() < deferred["next_retry_at"]:
+                continue
             owner = f"replay-{_uuid.uuid4().hex[:8]}"
             claim = q().outbox_claim(parent, owner)      # lease CAS: pending/만료replaying만
             if not claim:
@@ -9113,7 +9120,8 @@ def create_app(
                 created = float(claim["created_at"])
                 if not math.isfinite(created) or created > time.time():
                     disposition, reason = "pending", "invalid_created_at"
-                elif time.time() - created > max_age and not isinstance(owed, dict):
+                elif (time.time() - created > max_age and not isinstance(owed, dict)
+                      and not isinstance(deferred, dict)):
                     disposition, reason = "expired", "age_limit"
                 else:
                     if task is None:
@@ -9136,7 +9144,23 @@ def create_app(
                                     disposition, reason = "pending", "pr_repo_unavailable"
                                 else:
                                     from agent_crew.github import pr_state
-                                    state = pr_state(int(pr), repo=repo, timeout=5.0)
+                                    try:
+                                        state = pr_state(int(pr), repo=repo, timeout=5.0)
+                                    except Exception:
+                                        if not isinstance(deferred, dict):
+                                            raise
+                                        state = "unknown"
+                                    if isinstance(deferred, dict) and state != "open":
+                                        from agent_crew.pipeline import _skip_terminal_pr
+                                        _skip_terminal_pr(
+                                            q(), "auto_enqueue_" + deferred["stage"], parent, pr,
+                                            pr_state_fn=lambda _: state, repo=repo)
+                                        if state not in ("open", "merged", "closed"):
+                                            if time.time() - deferred["first_deferred_at"] >= 3600:
+                                                coordinator_notice_once(
+                                                    q(), parent, "pr_state_unknown",
+                                                    f"pr_number={pr} deferred cascade unresolved for 1h",
+                                                    coordinator_notify_fn)
                                     if state == "merged" and isinstance(owed, dict):
                                         disposition, reason = "merge_done", ""
                                     elif state == "closed" and isinstance(owed, dict):
@@ -9209,6 +9233,10 @@ def create_app(
                             q(), parent, "merge_replay_refused",
                             f"pr_number={merge['pr_number']} reason_code=merge_gate_refused",
                             coordinator_notify_fn)
+                latest = q().get_task(parent)
+                if latest and (latest.context or {}).get("deferred_cascade"):
+                    q().outbox_finish_claim(parent, owner, state="pending")
+                    continue
                 q().outbox_mark_applied(parent, owner)    # 성공분만 replaying→applied CAS
                 if (rec.get("task_type") == "test" and isinstance(
                         (ctx or {}).get("suppressed_merge"), dict)

@@ -3204,7 +3204,8 @@ class TaskQueue:
                              context: Optional[dict] = None,
                              _capacity_predecessor: str = "",
                              _successor_provenance: object | None = None,
-                             _work_intent: Optional[dict] = None) -> str:
+                             _work_intent: Optional[dict] = None,
+                             _review_identity_blocker: Optional[dict] = None) -> str:
         """Write the task row for an admitted intent. **The only writer there is.**
 
         P2: "without a valid receipt there is no enqueue". That is a property of
@@ -3287,7 +3288,7 @@ class TaskQueue:
                           and receipt.get("decision") == "HUMAN_GATE"
                           and receipt.get("intent_hash")
                           and receipt.get("binding", {}).get("matched_capability"))
-        if not gate.proceed and not owner_conflict:
+        if not gate.proceed and not owner_conflict and not _review_identity_blocker:
             raise AdmissionRefused(gate)
         if owner_conflict:
             context["owner_conflict"] = {
@@ -3295,13 +3296,15 @@ class TaskQueue:
                 "generation": int(receipt.get("binding", {}).get("policy_generation") or 0),
                 "last_attempt_generation": int(receipt.get("binding", {}).get("policy_generation") or 0),
             }
+        if _review_identity_blocker:
+            context["review_identity_blocker"] = _review_identity_blocker
         receipt_id = receipt.get("receipt_id")
         # A coordinator can enqueue a review before it has a reviewed_sha.
         # Resolve outside the SQLite write lock; the dispatch-time check still
         # pins and verifies the head if it moves after this lookup.
         resolved_review_sha = ""
         unknown_review_head = False
-        if task.task_type in ("review", "test") and not any(
+        if not _review_identity_blocker and task.task_type in ("review", "test") and not any(
             isinstance(context.get(key), str)
             and _CEA_COMMIT_RE.fullmatch(context[key].strip())
             for key in ("reviewed_sha", "expected_head_sha", "head_sha")
@@ -3352,7 +3355,7 @@ class TaskQueue:
                 conn, task, context, now=admit_at, ttl=reservation_ttl,
                 expired=expired_reservations, resolved_sha=resolved_review_sha,
                 ignore_active_task_id=_capacity_predecessor)
-            if duplicate_id:
+            if duplicate_id and not _review_identity_blocker:
                 if context.get("allow_duplicate_review") is True:
                     self._append_exec_event_on(
                         conn, task.task_id, "duplicate_review_override", time.time(),
@@ -3419,7 +3422,7 @@ class TaskQueue:
                     task.branch,
                     task.priority,
                     json.dumps(context),
-                    "needs_human" if owner_conflict else "pending",
+                    "blocked" if _review_identity_blocker else "needs_human" if owner_conflict else "pending",
                     time.time(),
                     task.project,
                     receipt_id,
@@ -3427,6 +3430,9 @@ class TaskQueue:
                     or _normalize_pr_number(context.get("pr_number")),
                 ),
             )
+            if _review_identity_blocker:
+                self._append_exec_event_on(conn, task.task_id, "review_identity_blocked",
+                                           admit_at, **_review_identity_blocker)
             if _work_intent is not None:
                 self._insert_work_intent_on(conn, _work_intent, task.task_id, admit_at,
                                             blocked=bool(owner_conflict))
@@ -3440,7 +3446,7 @@ class TaskQueue:
             # transaction, through the engine's guarded transition — which is
             # where the lifecycle graph and the lineage claim are kept in step.
             self._cea_transition_in_txn(conn, engine, receipt_id,
-                                        "HELD" if owner_conflict else "QUEUED",
+                                        "HELD" if owner_conflict or _review_identity_blocker else "QUEUED",
                                         note=f"enqueue: {gate.outcome.value}")
             conn.commit()
         except sqlite3.IntegrityError as e:
@@ -4732,6 +4738,32 @@ class TaskQueue:
             if ingress is not None:
                 validate_http_root_risk(context)
                 validate_local_inputs(context)
+                if task.task_type == "review":
+                    required_keys = ("prev_task_id", "implementer_agent")
+                    if _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
+                        from agent_crew.pipeline import _recover_implementer_agent
+                        if not context.get("implementer_agent"):
+                            agent = _recover_implementer_agent(
+                                self, replace(task, context=context),
+                                task.pr_number or context.get("pr_number"))
+                            if agent:
+                                context["implementer_agent"] = agent
+                    missing = [key for key in required_keys
+                               if not isinstance(context.get(key), str) or not context[key].strip()]
+                    if missing:
+                        detail = "review requires context keys: " + ", ".join(missing)
+                        blocker = {"blocker_type": "implementer_unknown",
+                                   "missing_keys": missing, "reason": detail}
+                        auth = self._refuse_admission(
+                            task, context=context, provenance=provenance,
+                            code="IMPLEMENTER_UNKNOWN", text=detail)
+                        parked = self.enqueue_with_receipt(
+                            task, auth.receipt, context=context,
+                            _successor_provenance=_successor_provenance,
+                            _review_identity_blocker=blocker)
+                        if _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
+                            return parked
+                        raise ValueError(detail)
             if _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
                 if (ingress == "cascade.fix" and context.get("artifact_kind") != "rebase"
                         and (type(context.get("fix_round")) is not int
@@ -7010,6 +7042,34 @@ class TaskQueue:
                 (time.time(), parent_task_id))
             conn.commit()
             return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def defer_pr_cascade(self, task_id: str, *, stage: str, pr_number: int) -> None:
+        """Persist #250 deferral and its replay eligibility in one transaction."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT context FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                return
+            context = json.loads(row["context"] or "{}")
+            deferred = context.get("deferred_cascade") or {}
+            now = time.time()
+            attempts = int(deferred.get("attempts", 0)) + 1
+            context["deferred_cascade"] = {
+                "reason": "pr_state_unknown", "stage": stage, "pr_number": pr_number,
+                "first_deferred_at": deferred.get("first_deferred_at", now),
+                "attempts": attempts, "next_retry_at": now + min(60 * 2 ** min(attempts - 1, 5), 1800),
+            }
+            conn.execute("UPDATE tasks SET context=? WHERE task_id=?", (json.dumps(context), task_id))
+            conn.execute(
+                "UPDATE cascade_outbox SET state='pending', lease_owner=NULL, attempt_id=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE parent_task_id=? "
+                "AND state != 'replaying'", (now, task_id))
+            # A replay owns its lease until outbox_finish_claim; clearing it
+            # here would allow another sweep to enter the same cascade.
+            conn.commit()
         finally:
             conn.close()
 
@@ -9607,6 +9667,16 @@ class TaskQueue:
                 (provider_session_id, time.time(), task_id),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def get_dispatch_agent(self, task_id: str) -> Optional[str]:
+        """Return the executor recorded at dispatch, never a current role default."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT dispatch_agent FROM tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            return row["dispatch_agent"] if row else None
         finally:
             conn.close()
 

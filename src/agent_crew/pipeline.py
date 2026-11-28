@@ -843,6 +843,10 @@ def _skip_terminal_pr(queue, what: str, task_id: str, pr_number, *, pr_state_fn=
     if isinstance(state, dict):
         closer = state.get("closed_by") or state.get("closedBy")
         state = state.get("state") or "unknown"
+    if state != "unknown":
+        task = queue.get_task(task_id)
+        if task and (task.context or {}).get("deferred_cascade"):
+            queue.patch_context(task_id, {"deferred_cascade": None})
     if actionable:
         return None
     if state == "closed":
@@ -859,15 +863,13 @@ def _skip_terminal_pr(queue, what: str, task_id: str, pr_number, *, pr_state_fn=
                        what, pr_number, reason, task_id, closer or "unknown")
         return state
     if state == "unknown":
-        # ⛔Louder than the terminal case, deliberately. "The PR is merged" is a
-        #   correct, permanent stop; "we could not ask GitHub" is a stop that
-        #   nothing retries, so it must be visible rather than look like normal
-        #   cascade completion. #250 asks for deferral here, not for silence.
+        queue.defer_pr_cascade(task_id, stage=what.removeprefix("auto_enqueue_"),
+                               pr_number=pr_number)
         logger.warning(
             f"{what}: could not determine the state of PR #{pr_number} — deferring "
             f"follow-up work for {task_id} rather than spending it on a "
-            f"possibly-terminal PR. The task result is recorded; re-run the cascade "
-            f"once GitHub is reachable (#250)."
+            f"possibly-terminal PR. The task result and retry are recorded; the sweep "
+            f"will retry once GitHub is reachable (#250, #1058)."
         )
     else:
         logger.info(
@@ -1151,6 +1153,41 @@ def _review_round_cap(queue: TaskQueue, predecessor: TaskRequest, review_id: str
     return outcome
 
 
+def _recover_implementer_agent(queue: TaskQueue, task, pr_number=None):
+    """Recover recorded implementer identity within this project's repository."""
+    context = task.context or {}
+    if task.task_type != "implement" and context.get("implementer_agent"):
+        return context["implementer_agent"]
+
+    def lineage_agent(candidate):
+        if (not candidate or candidate.task_type != "implement"
+                or candidate.project != task.project
+                or (candidate.context or {}).get("repo") != context.get("repo")):
+            return None
+        attribution = queue.get_attribution(candidate.task_id) or {}
+        return attribution.get("agent") or queue.get_dispatch_agent(candidate.task_id)
+
+    seen = set()
+    parent = task
+    while parent and parent.task_id not in seen:
+        seen.add(parent.task_id)
+        agent = lineage_agent(parent)
+        if agent:
+            return agent
+        parent = queue.get_task((parent.context or {}).get("prev_task_id") or "")
+    agent = lineage_agent(queue.get_task(context.get("lineage_root_task_id") or ""))
+    if agent:
+        return agent
+    if pr_number:
+        agents = {
+            lineage_agent(candidate) for candidate in queue.list_tasks()
+            if (candidate.pr_number or (candidate.context or {}).get("pr_number")) == pr_number
+        } - {None, ""}
+        if len(agents) == 1:
+            return agents.pop()
+    return None
+
+
 def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, head: str,
                            ctx, *, project: str, reviewer_provider: str = "",
                            coordinator_notify_fn=None) -> str | ReviewRoundCapReached | None:
@@ -1174,7 +1211,7 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
                if k in ("pr_number", "repo", "project", "no_tester",
                         "coordinator_managed", "checklist_layers",
                         "findings_only", "agent_override", "reviewer_agent",
-                        "lineage_root_task_id")}
+                        "implementer_agent", "lineage_root_task_id")}
     context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
                     "expected_head_sha": head, "prev_task_id": review_task_id})
     inherited_tier = base.get("risk_tier")
@@ -1185,6 +1222,11 @@ def requeue_review_at_head(queue: TaskQueue, review_task_id: str, pr_number, hea
         predecessor = queue.get_task(review_task_id)
         if predecessor is None:
             return None
+        implementer_agent = _recover_implementer_agent(queue, predecessor, pr_number)
+        if implementer_agent:
+            context["implementer_agent"] = implementer_agent
+        else:
+            context.pop("implementer_agent", None)
         prior_attribution = queue.get_attribution(review_task_id) or {}
         provider = (base.get("agent_override") or base.get("reviewer_agent")
                     or reviewer_provider or prior_attribution.get("agent")
@@ -2421,13 +2463,16 @@ def auto_enqueue_fix(
                     "issue_url", "repo"):
             if review_ctx.get(key) is not None:
                 fix_context[key] = review_ctx[key]
-        implementer_agent = (
-            review_ctx.get("implementer_agent")
-            or (default_agent_for_role("implementer", pane_map) if pane_map else None)
-        )
+        implementer_agent = _recover_implementer_agent(queue, review_task, pr_number)
+        _carry_lineage_intent(fix_context, review_task, "implementer")
         if implementer_agent:
             fix_context["implementer_agent"] = implementer_agent
-        _carry_lineage_intent(fix_context, review_task, "implementer")
+            fix_context["agent_override"] = implementer_agent
+        else:
+            _record_successor_refused(queue, review_task_id, "implementer_unknown",
+                                      "cannot resolve lineage implementer_agent",
+                                      coordinator_notify_fn)
+            return None
 
         # EGD Step 2 (#51): carry the contract's recommended round budget next
         # to the cap actually in force, so the gap between them is measurable
@@ -2695,6 +2740,7 @@ def auto_enqueue_review(
     repo_cwd: str = "",
     coordinator_notify_fn=None,
     reviewer_provider: str = "",
+    implementer_provider: str = "",
 ) -> str | ReviewRoundCapReached | None:
     """Create the review task that follows a completed impl task.
 
@@ -2915,15 +2961,9 @@ def auto_enqueue_review(
                 f"from a stale local copy."
             )
 
-        # Identify which agent actually implemented this task. Prefer the
-        # explicit override (set by upstream fallback), else fall back to
-        # the role's default mapping. Recorded so the rate-limit fallback
-        # handler can skip it during reviewer selection (#117 — self-review
-        # prevention).
-        implementer_agent = (
-            impl_ctx.get("agent_override")
-            or (default_agent_for_role("implementer", pane_map) if pane_map else None)
-        )
+        # Historical execution identity must come from recorded rows; today's
+        # pane map and role defaults say nothing about who produced this change.
+        implementer_agent = _recover_implementer_agent(queue, impl_task, pr_number)
 
         review_context = {
             "checklist_layers": ["test_quality", "code_quality", "business_gap"],
@@ -2987,6 +3027,8 @@ def auto_enqueue_review(
         if _impl_repo:
             review_context["repo"] = _impl_repo
         _carry_lineage_intent(review_context, impl_task, "reviewer")
+        if not implementer_agent:
+            review_context.pop("implementer_agent", None)
 
         # #305: pin the review to the commit the implementer actually pushed.
         # ⛔Only when it is a real object id — `TaskResult` normalises anything
